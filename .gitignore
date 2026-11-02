@@ -1,0 +1,30 @@
+# Rust
+/target
+**/target/
+**/*.rs.bk
+Cargo.lock.orig
+
+# Local, secret, or large
+config/*.local.toml
+*.local.toml
+/data
+/scratch
+*.hevc
+*.mp4
+*.mkv
+*.idx
+# The ingest regression test's recorded timeline (a sidecar index, no video).
+!crates/iris-ingest/tests/data/*.idx
+*.db
+*.db-wal
+*.db-shm
+
+# Local agent overrides
+AGENTS.override.md
+
+# Local-only documentation (identifying details about hosts, networks, cameras)
+/docs/local/
+__pycache__/
+fuzz/corpus/
+fuzz/artifacts/
+fuzz/coverage/

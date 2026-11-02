@@ -1,0 +1,76 @@
+name: check
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  GTK_PACKAGES: libgtk-4-dev libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev
+
+jobs:
+  check:
+    name: Format, clippy, tests, rustdoc
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: GTK and GStreamer development libraries (iris-gui)
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends $GTK_PACKAGES
+      - name: Install the pinned toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+      - uses: taiki-e/install-action@1919c4a95903d2c33e4a221102edca87309fc14b # v2
+        with:
+          tool: just
+      - name: just check
+        run: just check
+
+  msrv:
+    name: Minimum supported Rust version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: GTK and GStreamer development libraries (iris-gui)
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends $GTK_PACKAGES
+      - name: Install the minimum supported toolchain
+        run: rustup toolchain install 1.92.0 --profile minimal
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+      - name: Build and test on the MSRV
+        run: cargo +1.92.0 test --workspace --locked
+
+  audit:
+    name: Advisories and licenses
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Install the pinned toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+      - uses: taiki-e/install-action@1919c4a95903d2c33e4a221102edca87309fc14b # v2
+        with:
+          tool: just,cargo-audit,cargo-deny
+      - name: just audit
+        run: just audit
+
+  references:
+    name: Reference pack snapshots
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Install the pinned toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          workspaces: .rust-reference/tools/reference-maintenance
+      - name: Verify the snapshots against the manifest
+        run: cargo run --locked --manifest-path .rust-reference/tools/reference-maintenance/Cargo.toml -- sync --check

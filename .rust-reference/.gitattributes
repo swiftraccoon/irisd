@@ -1,0 +1,4 @@
+# Snapshot bytes must match references/manifest.json on every platform, so Git
+# must never convert line endings under references/. Upstream snapshots may carry
+# their own `text=auto`; the explicit `eol=lf` keeps their checkouts byte-exact.
+references/** -text eol=lf

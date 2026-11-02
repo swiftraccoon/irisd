@@ -1,0 +1,20 @@
+[package]
+name = "rust-project-reference"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+description = "Maintain and export local Rust project reference material"
+license = "0BSD"
+publish = false
+
+[workspace]
+resolver = "3"
+
+[dependencies]
+anyhow = "1"
+scraper = "0.29"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.11"
+tempfile = "3"
+time = { version = "0.3", features = ["formatting", "parsing"] }

@@ -1,0 +1,22 @@
+[package]
+name = "iris-store"
+description = "Segment files, preallocation, sync policy, sidecar index, and recovery for irisd"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+bytes = { workspace = true }
+rustix = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+iris-core = { workspace = true }
+iris-mp4 = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[lints]
+workspace = true

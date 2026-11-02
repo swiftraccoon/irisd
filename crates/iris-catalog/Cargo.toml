@@ -1,0 +1,25 @@
+[package]
+name = "iris-catalog"
+description = "SQLite catalog of recordings and events for irisd"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+rusqlite = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+iris-core = { workspace = true }
+iris-mp4 = { workspace = true }
+
+[dev-dependencies]
+bytes = { workspace = true }
+tempfile = { workspace = true }
+
+[lints]
+workspace = true

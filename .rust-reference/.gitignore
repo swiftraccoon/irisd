@@ -1,0 +1,5 @@
+/.cache/
+/target/
+/tools/reference-maintenance/target/
+.DS_Store
+/references/.reference-sync-*/
