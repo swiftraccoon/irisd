@@ -25,10 +25,10 @@
   "devDependencies": {
     "autoprefixer": "10.4.12",
     "cssnano": "5.1.13",
-    "sass": "1.55.0",
-    "postcss": "8.4.18",
-    "postcss-cli": "10.0.0",
-    "webpack": "5.74.0",
+    "sass": "1.107.1",
+    "postcss": "8.5.32",
+    "postcss-cli": "12.0.0",
+    "webpack": "5.112.2",
     "webpack-cli": "4.10.0"
   }
 }
