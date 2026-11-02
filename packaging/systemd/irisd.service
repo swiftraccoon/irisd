@@ -1,0 +1,61 @@
+# irisd: an H.265 network video recorder whose record path never decodes.
+#
+# Install at /etc/systemd/system/irisd.service. Adjust ReadWritePaths= to the
+# recording root named in /etc/irisd/irisd.toml (storage.video_roots); the
+# catalog lives under StateDirectory (/var/lib/irisd), which must match
+# storage.state_dir.
+
+[Unit]
+Description=irisd network video recorder
+Documentation=file:///usr/local/share/doc/irisd/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=notify
+NotifyAccess=main
+ExecStart=/usr/local/bin/irisd run --config /etc/irisd/irisd.toml
+Restart=always
+RestartSec=2s
+WatchdogSec=60
+TimeoutStopSec=30
+
+User=irisd
+Group=irisd
+UMask=0077
+StateDirectory=irisd
+ConfigurationDirectory=irisd
+# The recording root (storage.video_roots). Replace with the real path.
+ReadWritePaths=/srv/irisd/video
+
+# Hardening (see docs/research/03-language-runtime.md §5).
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+ProcSubset=pid
+NoNewPrivileges=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+CapabilityBoundingSet=
+# Limit the daemon to the camera network and the loopback. Example for a
+# documentation range; replace with the real subnet.
+#IPAddressDeny=any
+#IPAddressAllow=192.0.2.0/24 localhost
+
+[Install]
+WantedBy=multi-user.target

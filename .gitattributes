@@ -1,0 +1,7 @@
+# Normalise line endings for our own text; vendored material stays byte-exact so that the
+# reference pack's manifest hashes and the published documents verify on every platform.
+* text=auto eol=lf
+.rust-reference/references/** -text eol=lf
+docs/standards/ietf/** -text eol=lf
+third_party/** -text eol=lf
+*.idx binary

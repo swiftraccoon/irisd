@@ -1,0 +1,60 @@
+title: Semantic Versioning
+descriptions: A simple set of rules and requirements that dictate how version numbers are assigned and incremented
+languages:
+  en: English
+  fr: français
+  ru: pyccкий
+  uk: українська
+  es: español
+  it: italiano
+  id: Bahasa Indonesia
+  pt-BR: português brasileiro
+  zh-TW: 繁體中文
+  zh-CN: 简体中文
+  ko: 한국어
+  sk: slovensky
+  sl: slovenščina
+  sr-Cyrl: српски
+  sr-Latn: srpski
+  ar: العربية
+  ja: 日本語
+  ta: தமிழ்
+  tr: Türkçe
+  cs: čeština
+  de: Deutsch
+  sv: svenska
+  pl: polski
+  fa: فارسی
+  he: עברית
+  ka: ქართული
+  hr: hrvatski
+  hin: हिन्दी
+  ca: català
+  hu: magyar
+  vi: Tiếng Việt
+  hy: Հայերեն
+  kab: taqbaylit
+  bg: Български
+  nl: Nederlands
+  da: Dansk
+  el: Ελληνικά
+  bn: বাংলা
+versions:
+  - 2.0.0
+  - 2.0.0-rc.2
+  - 2.0.0-rc.1
+  - 1.0.0
+  - 1.0.0-beta
+current_version: 2.0.0
+author: Tom Preston-Werner
+plugins:
+  - jekyll-sitemap
+  - jekyll-seo-tag
+  - jekyll-redirect-from
+defaults:
+  - scope:
+      path: ''
+    values:
+      layout: default
+sass:
+  style: compressed

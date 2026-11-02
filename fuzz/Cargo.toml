@@ -1,0 +1,94 @@
+[package]
+name = "iris-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+bytes = "1"
+libfuzzer-sys = "0.4"
+iris-h265 = { path = "../crates/iris-h265" }
+iris-mp4 = { path = "../crates/iris-mp4" }
+iris-core = { path = "../crates/iris-core" }
+iris-events = { path = "../crates/iris-events" }
+iris-replay = { path = "../crates/iris-replay" }
+
+[[bin]]
+name = "scan"
+path = "fuzz_targets/scan.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "access_unit"
+path = "fuzz_targets/access_unit.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "index"
+path = "fuzz_targets/index.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "box_header"
+path = "fuzz_targets/box_header.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "multipart"
+path = "fuzz_targets/multipart.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "digest_challenge"
+path = "fuzz_targets/digest_challenge.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "dahua_part"
+path = "fuzz_targets/dahua_part.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "onvif_utc"
+path = "fuzz_targets/onvif_utc.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "trailer"
+path = "fuzz_targets/trailer.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "rtsp_request"
+path = "fuzz_targets/rtsp_request.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "export_rebase"
+path = "fuzz_targets/export_rebase.rs"
+test = false
+doc = false
+bench = false

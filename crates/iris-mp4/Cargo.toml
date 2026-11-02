@@ -1,0 +1,20 @@
+[package]
+name = "iris-mp4"
+description = "Fragmented MP4 writer, reader, and index for irisd recordings"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+bytes = { workspace = true }
+crc-fast = { workspace = true }
+thiserror = { workspace = true }
+iris-core = { workspace = true }
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+crc32c = { workspace = true }

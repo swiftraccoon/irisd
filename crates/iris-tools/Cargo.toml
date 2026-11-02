@@ -1,0 +1,27 @@
+[package]
+name = "iris-tools"
+description = "Operations and research tools for irisd: log summaries, the soak sampler and report, the replay benchmark, camera probes, and signed commits"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "iris-tools"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+base64 = "0.22"
+clap = { workspace = true }
+hex = { workspace = true }
+md-5 = { workspace = true }
+reqwest = { workspace = true }
+rustix = { workspace = true, features = ["param", "process"] }
+serde_json = { workspace = true }
+sha1 = "0.10"
+tokio = { workspace = true, features = ["rt-multi-thread", "process"] }
+
+[lints]
+workspace = true

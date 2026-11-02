@@ -1,0 +1,12 @@
+---
+# Keep this YAML front matter block to trigger Jekyll processing.
+# See https://jekyllrb.com/docs/frontmatter for more information.
+---
+
+@import "{{ site.theme }}";
+@import "primer-dark";
+
+// Hide “This site is open source. Improve this page.”
+.footer {
+  display: none;
+}

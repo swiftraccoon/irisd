@@ -1,0 +1,58 @@
+# irisd configuration (example). Copy to a private file such as
+# /etc/irisd/irisd.toml (service) or config/cameras.local.toml (development;
+# gitignored). It holds camera credentials, so keep it mode 0600/0640.
+#
+# Addresses below use the RFC 5737 documentation range.
+
+[storage]
+# Directories that receive recordings; the first one is used.
+video_roots = ["/srv/irisd/video"]
+# Catalog database and other small state (an SSD is ideal).
+state_dir = "/var/lib/irisd"
+# Retention deletes the oldest sealed recordings while a root has less free space than this.
+min_free_percent = 5
+# Optional cap on the catalogued recordings in GiB, for a disk shared with other data; the
+# oldest sealed recordings go first. Unset means free space and age limits alone apply.
+# quota_gib = 2000
+# Power-loss window: open files are flushed this often (milliseconds).
+sync_interval_ms = 5000
+# Longest fragment; a GOP longer than this (plus a quarter of slack) is split.
+max_fragment_ms = 2000
+
+[ingest]
+# How often camera sockets are read, in milliseconds. Packets accumulate between reads so one
+# system call covers many of them and every stream is read in the same wake-up; the live view
+# lags by this much more. 0 reads on every packet (about a quarter more CPU).
+read_interval_ms = 20
+# Receive low-water mark per camera socket in KiB: the kernel reports a socket readable only
+# once this much is queued, so a steady stream wakes the daemon once per that many bytes
+# instead of once per packet. A slow stream waits this many bytes before its frames are read
+# (a quarter second at 1 Mbit/s). 0 leaves the kernel default of one byte.
+recv_low_water_kib = 32
+
+[api]
+# Address the HTTP API listens on. Bind a LAN address only behind a VPN or firewall.
+listen = "127.0.0.1:8554"
+# Bearer tokens accepted by the API. Empty means unauthenticated (development only).
+tokens = ["replace-with-a-long-random-token"]
+
+# One [[camera]] table per camera. Field names follow the original test
+# configuration. `rtsp_url` is the main stream; `sub_url` defaults to the same
+# URL with subtype=1 for Dahua-style URLs. For cameras whose sub stream stops
+# when a second RTSP session opens (docs/research/01-camera-probe.md §5b), set
+# it to the subtype=2 (third stream) URL instead. Credentials are never embedded in
+# URLs; irisd passes them to RTSP digest auth, the vendor CGI API, and ONVIF
+# separately.
+[[camera]]
+id = "cam1"
+name = "Example"
+rtsp_url = "rtsp://192.0.2.10:554/cam/realmonitor?channel=1&subtype=0&unicast=true&proto=Onvif"
+sub_url  = "rtsp://192.0.2.10:554/cam/realmonitor?channel=1&subtype=1&unicast=true&proto=Onvif"
+username = "user"
+password = "secret"
+vendor = "dahua"            # enables vendor-specific event feeds and provisioning checks
+http_port = 80              # vendor CGI and ONVIF port
+record = ["main", "sub"]
+audio = false               # only if the camera stream is AAC
+retention_days = 21         # delete this camera's recordings after this many days
+events = ["dahua_cgi"]      # event sources: dahua_cgi, onvif_pull_point
