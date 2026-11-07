@@ -48,7 +48,7 @@ pub enum NalType {
     TrailN,
     /// Reference trailing picture (type 1).
     TrailR,
-    /// Other VCL NAL in the range 2..=15 (TSA, STSA, RADL, RASL, reserved).
+    /// Other VCL NAL in 2..=15 or 24..=31 (TSA, STSA, RADL, RASL, reserved).
     OtherVcl(u8),
     /// Broken link access picture (types 16, 17, 18).
     Bla(u8),
@@ -134,7 +134,7 @@ pub const fn nal_type(header_byte0: u8) -> NalType {
     match (header_byte0 >> 1) & 0x3f {
         0 => NalType::TrailN,
         1 => NalType::TrailR,
-        t @ 2..=15 => NalType::OtherVcl(t),
+        t @ (2..=15 | 24..=31) => NalType::OtherVcl(t),
         t @ 16..=18 => NalType::Bla(t),
         19 => NalType::IdrWRadl,
         20 => NalType::IdrNLp,
@@ -156,11 +156,11 @@ pub enum FramingError {
     /// A length prefix points past the end of the buffer.
     #[error("NAL length {len} at offset {offset} exceeds remaining {remaining} bytes")]
     Truncated {
-        /// Declared NAL length.
+        /// Declared NAL length, or zero for an incomplete prefix.
         len: usize,
         /// Offset of the length prefix.
         offset: usize,
-        /// Bytes left after the prefix.
+        /// Bytes left after a complete prefix, or bytes of an incomplete prefix.
         remaining: usize,
     },
     /// A NAL unit shorter than its two-byte header.
@@ -193,10 +193,11 @@ impl<'a> Iterator for LengthPrefixedNals<'a> {
         }
         let remaining = self.data.len() - self.offset;
         if remaining < 4 {
+            let offset = self.offset;
             self.offset = self.data.len();
             return Some(Err(FramingError::Truncated {
                 len: 0,
-                offset: self.offset,
+                offset,
                 remaining,
             }));
         }
@@ -290,6 +291,69 @@ mod tests {
         assert!(nal_type(21 << 1).is_irap());
         assert!(!nal_type(1 << 1).is_irap());
         assert_eq!(NalType::Cra.code(), 21);
+    }
+
+    #[test]
+    fn classifies_every_first_header_byte() {
+        for byte in 0..=u8::MAX {
+            let code = (byte >> 1) & 0x3f;
+            let kind = nal_type(byte);
+            assert_eq!(kind.code(), code, "header byte {byte:#04x}");
+            assert_eq!(kind.is_vcl(), code < 32, "NAL type {code}");
+            assert_eq!(kind.is_irap(), (16..=23).contains(&code), "NAL type {code}");
+            assert_eq!(
+                kind.is_parameter_set(),
+                (32..=34).contains(&code),
+                "NAL type {code}"
+            );
+        }
+    }
+
+    #[test]
+    fn partial_prefix_errors_point_to_the_prefix_start() {
+        for prefix in [Vec::new(), nal(19, b"")] {
+            for remaining in 1..=3 {
+                let mut data = prefix.clone();
+                data.extend_from_slice(&[0xff; 3][..remaining]);
+                let expected = FramingError::Truncated {
+                    len: 0,
+                    offset: prefix.len(),
+                    remaining,
+                };
+                let mut walk = LengthPrefixedNals::new(&data);
+                if !prefix.is_empty() {
+                    assert_eq!(walk.next(), Some(Ok(&prefix[4..])));
+                }
+                assert_eq!(walk.next(), Some(Err(expected.clone())));
+                assert_eq!(walk.next(), None);
+                assert_eq!(walk.next(), None);
+                assert_eq!(inspect_access_unit(&data), Err(expected.clone()));
+                assert_eq!(strip_parameter_sets(&data), Err(expected));
+            }
+        }
+    }
+
+    #[test]
+    fn complete_prefix_errors_keep_their_fields_and_terminate() {
+        for (data, expected) in [
+            (
+                vec![0, 0, 0, 4, 2, 1],
+                FramingError::Truncated {
+                    len: 4,
+                    offset: 0,
+                    remaining: 2,
+                },
+            ),
+            (vec![0, 0, 0, 0], FramingError::TooShort(0)),
+            (vec![0, 0, 0, 1, 2], FramingError::TooShort(0)),
+        ] {
+            let mut walk = LengthPrefixedNals::new(&data);
+            assert_eq!(walk.next(), Some(Err(expected.clone())));
+            assert_eq!(walk.next(), None);
+            assert_eq!(walk.next(), None);
+            assert_eq!(inspect_access_unit(&data), Err(expected.clone()));
+            assert_eq!(strip_parameter_sets(&data), Err(expected));
+        }
     }
 
     #[test]

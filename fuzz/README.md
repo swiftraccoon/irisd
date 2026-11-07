@@ -5,6 +5,7 @@ from the workspace so that stable builds do not compile it.
 
 | Target | Parser |
 |---|---|
+| `api_time` | API query and retention timestamps, including non-ASCII input and fractional seconds |
 | `scan` | the recording scanner (`iris_mp4::reader::scan`), with and without CRC verification |
 | `box_header` | ISO BMFF box headers |
 | `index` | the sidecar index codec |
@@ -15,6 +16,7 @@ from the workspace so that stable builds do not compile it.
 | `digest_challenge` | HTTP digest challenge parsing and the header built from it |
 | `dahua_part` | the vendor event-part parser and normaliser |
 | `onvif_utc` | the ONVIF timestamp parser and topic mapping |
+| `onvif_soap` | bounded SOAP/XML structure parsing and destruction |
 | `rtsp_request` | the replay server's RTSP request parser |
 
 Requirements: a nightly toolchain and `cargo-fuzz`.

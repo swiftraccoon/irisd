@@ -157,6 +157,20 @@ pub fn mount_name(url: &str) -> Option<&str> {
     (!first.is_empty() && !first.starts_with("trackID=")).then_some(first)
 }
 
+/// Returns whether `name` can be addressed as one RTSP path segment.
+///
+/// Mount names are used as map keys rather than filesystem paths, but accepting
+/// an unreachable name would let the server report a healthy listener that can
+/// never serve the configured recording.
+#[must_use]
+pub fn valid_mount_name(name: &str) -> bool {
+    !name.is_empty()
+        && !name.starts_with("trackID=")
+        && !name
+            .bytes()
+            .any(|byte| matches!(byte, b'/' | b'?' | b'#') || byte.is_ascii_whitespace())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -220,6 +234,24 @@ mod tests {
         assert_eq!(mount_name("rtsp://h/main?x=1"), Some("main"));
         assert_eq!(mount_name("rtsp://h/"), None);
         assert_eq!(mount_name("rtsp://h/trackID=0"), None);
+    }
+
+    #[test]
+    fn configured_mount_names_are_one_reachable_segment() {
+        for valid in ["cam", "front-door", "camera_01", "%63am"] {
+            assert!(valid_mount_name(valid), "{valid:?}");
+        }
+        for invalid in [
+            "",
+            "trackID=0",
+            "cam/trackID=0",
+            "cam?profile=main",
+            "cam#fragment",
+            "two words",
+            "line\nbreak",
+        ] {
+            assert!(!valid_mount_name(invalid), "{invalid:?}");
+        }
     }
 
     #[test]

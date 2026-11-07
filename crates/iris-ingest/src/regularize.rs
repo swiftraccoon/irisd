@@ -138,6 +138,15 @@ impl Regularizer {
         }
     }
 
+    /// Starts a parameter timing epoch with a different valid nominal duration.
+    pub(crate) fn retarget(&mut self, nominal_hint: u32) {
+        self.hint = Some(nominal_hint.max(1));
+        self.err = 0;
+        self.history.clear();
+        self.consecutive_snaps = 0;
+        self.adopted = None;
+    }
+
     /// Re-reads the measured estimate, moving the adopted nominal only when the
     /// estimate has shifted by at least [`NOMINAL_HYSTERESIS`] ticks.
     fn adopt_measured(&mut self) {
@@ -341,9 +350,21 @@ impl Regularizer {
         if frames == 0 {
             return None;
         }
-        let delivered = spans as f64 / frames as f64;
+        let mut delivered: Vec<f64> = self
+            .history
+            .iter()
+            .filter(|window| window.frames > 0)
+            .map(|window| window.span as f64 / f64::from(window.frames))
+            .collect();
+        delivered.sort_by(f64::total_cmp);
+        let middle = delivered.len() / 2;
+        let typical = if delivered.len().is_multiple_of(2) {
+            f64::midpoint(delivered[middle - 1], delivered[middle])
+        } else {
+            delivered[middle]
+        };
         let off_rate = self.hint.is_some_and(|hint| {
-            (delivered - f64::from(hint)).abs() / f64::from(hint) > OVERRIDE_RATIO
+            (typical - f64::from(hint)).abs() / f64::from(hint) > OVERRIDE_RATIO
         });
         let ticks = if off_rate || self.hole_ratio() > HOLE_RATIO_OVERRIDE {
             spans
@@ -524,6 +545,23 @@ mod tests {
     }
 
     #[test]
+    fn a_single_gap_does_not_override_the_typical_delivered_rate() {
+        let mut r = Regularizer::new(TimestampMode::Regularize, Some(3000), tolerance());
+        let mut start = 0;
+        for gop in 0..70 {
+            let raw: Vec<i64> = (0..60).map(|i| start + i * 3000).collect();
+            let next = start + 180_000 + if gop == 0 { 90_000 } else { 0 };
+            let assignment = r.assign(&raw, next);
+            assert!(
+                !assignment.snapped,
+                "a burst gap must stay a hold at GOP {gop}"
+            );
+            assert_eq!(r.nominal(), Some(3000), "GOP {gop}");
+            start = next;
+        }
+    }
+
+    #[test]
     fn a_wrong_declared_rate_is_replaced_by_the_measured_one() {
         // Declared 30 fps, camera delivers 20 fps (4500 ticks).
         let mut r = Regularizer::new(TimestampMode::Regularize, Some(3000), tolerance());
@@ -545,6 +583,32 @@ mod tests {
             last.durations.iter().all(|&d| (4455..=4545).contains(&d)),
             "{:?}",
             &last.durations[..4]
+        );
+    }
+
+    #[test]
+    fn a_changed_parameter_rate_starts_a_fresh_timing_epoch() {
+        let mut r = Regularizer::new(TimestampMode::Regularize, Some(3000), tolerance());
+        let mut start = 0i64;
+        for _ in 0..HISTORY_LEN {
+            let raw: Vec<i64> = (0..60).map(|index| start + index * 3000).collect();
+            start += 180_000;
+            r.assign(&raw, start);
+        }
+        assert_eq!(r.history.len(), HISTORY_LEN);
+
+        r.retarget(6000);
+        assert!(r.history.is_empty());
+        assert_eq!(r.error_ticks(), 0);
+        assert_eq!(r.nominal(), Some(6000));
+        let raw: Vec<i64> = (0..30).map(|index| start + index * 6000).collect();
+        let assignment = r.assign(&raw, start + 180_000);
+        assert_eq!((assignment.holes, assignment.hold_ticks), (0, 0));
+        assert!(
+            assignment
+                .durations
+                .iter()
+                .all(|&duration| duration == 6000)
         );
     }
 

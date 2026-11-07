@@ -1,12 +1,13 @@
 //! Event listing and live event push.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::Json;
-use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
+use axum::extract::ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade, close_code};
 use axum::extract::{FromRequestParts, Path, Query, Request, State};
 use axum::response::{IntoResponse, Response};
-use iris_catalog::{EventId, EventRow};
+use iris_catalog::{EventCursor, EventId, EventRow};
 use iris_core::event::Event;
 use iris_core::id::CameraId;
 use iris_core::time::WallUs;
@@ -16,15 +17,20 @@ use tokio::sync::broadcast::error::RecvError;
 use crate::error::ApiError;
 use crate::query::{TimeParams, resolve_range};
 use crate::state::ApiState;
+use crate::state::ApiStats;
 
 /// Default and maximum number of events returned by a listing.
 const DEFAULT_LIMIT: usize = 200;
 const MAX_LIMIT: usize = 10_000;
+/// A stalled peer cannot postpone shutdown past the daemon's outer grace.
+const SEND_DEADLINE: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Default, Deserialize)]
 pub(crate) struct EventParams {
     camera: Option<String>,
     limit: Option<usize>,
+    after_us: Option<i64>,
+    after_id: Option<i64>,
     #[serde(flatten)]
     time: TimeParams,
 }
@@ -77,6 +83,9 @@ pub(crate) async fn retain(
         .await
         .map_err(|e| match e {
             iris_catalog::CatalogError::UnknownEvent(_) => ApiError::NotFound,
+            iris_catalog::CatalogError::EventRetentionLimit => {
+                ApiError::Unavailable("event retention capacity is exhausted".to_owned())
+            }
             other => ApiError::Catalog(other),
         })?;
     Ok(Json(EventDto::from(row)))
@@ -108,13 +117,33 @@ pub(crate) async fn list_or_subscribe(
         .map_err(|e| ApiError::BadRequest(e.to_string()))?;
     let range = resolve_range(&params.time, WallUs::now())?;
     let limit = params.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT);
-    let rows = state.catalog.events(camera.as_ref(), range, limit).await?;
+    let after = match (params.after_us, params.after_id) {
+        (None, None) => None,
+        (Some(time), Some(id)) if id > 0 => Some(EventCursor {
+            time: WallUs::new(time),
+            id: EventId(id),
+        }),
+        (Some(_), Some(_)) => {
+            return Err(ApiError::BadRequest(
+                "'after_id' must be a positive event id".to_owned(),
+            ));
+        }
+        _ => {
+            return Err(ApiError::BadRequest(
+                "'after_us' and 'after_id' must be supplied together".to_owned(),
+            ));
+        }
+    };
+    let rows = state
+        .catalog
+        .events_after(camera.as_ref(), range, after, limit)
+        .await?;
     let events: Vec<EventDto> = rows.into_iter().map(EventDto::from).collect();
     Ok(Json(events).into_response())
 }
 
 async fn push(mut socket: WebSocket, state: Arc<ApiState>) {
-    state.stats.event_client_joined();
+    let _client = EventClientGauge::new(Arc::clone(&state.stats));
     let mut rx = state.events.subscribe();
     loop {
         tokio::select! {
@@ -126,14 +155,102 @@ async fn push(mut socket: WebSocket, state: Arc<ApiState>) {
             received = rx.recv() => match received {
                 Ok(event) => {
                     let Ok(text) = serde_json::to_string(&*event) else { continue };
-                    if socket.send(Message::Text(text.into())).await.is_err() {
+                    if !send(&mut socket, Message::Text(text.into()), &state.shutdown).await {
                         break;
                     }
                 }
-                Err(RecvError::Lagged(_)) => {}
+                Err(RecvError::Lagged(skipped)) => {
+                    let _ = send(
+                        &mut socket,
+                        event_gap_close(&state.stats, skipped),
+                        &state.shutdown,
+                    )
+                    .await;
+                    break;
+                }
                 Err(RecvError::Closed) => break,
             },
         }
     }
-    state.stats.event_client_left();
+}
+
+async fn send(
+    socket: &mut WebSocket,
+    message: Message,
+    shutdown: &tokio_util::sync::CancellationToken,
+) -> bool {
+    tokio::select! {
+        biased;
+        () = shutdown.cancelled() => false,
+        result = tokio::time::timeout(SEND_DEADLINE, socket.send(message)) => {
+            matches!(result, Ok(Ok(())))
+        }
+    }
+}
+
+struct EventClientGauge(Arc<ApiStats>);
+
+impl EventClientGauge {
+    fn new(stats: Arc<ApiStats>) -> Self {
+        stats.event_client_joined();
+        Self(stats)
+    }
+}
+
+impl Drop for EventClientGauge {
+    fn drop(&mut self) {
+        self.0.event_client_left();
+    }
+}
+
+fn event_gap_close(stats: &ApiStats, skipped: u64) -> Message {
+    stats.record_event_lag(skipped);
+    Message::Close(Some(CloseFrame {
+        code: close_code::AGAIN,
+        reason: format!(
+            "event gap: {skipped} messages skipped; reconnect and list the relevant event window"
+        )
+        .into(),
+    }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn lagged_receiver_gets_bounded_retry_close_and_metric() {
+        let (tx, mut rx) = tokio::sync::broadcast::channel(2);
+        tx.send(1).unwrap();
+        tx.send(2).unwrap();
+        tx.send(3).unwrap();
+        let Err(RecvError::Lagged(skipped)) = rx.recv().await else {
+            panic!("receiver should report its skipped message count");
+        };
+
+        let stats = ApiStats::default();
+        let Message::Close(Some(frame)) = event_gap_close(&stats, skipped) else {
+            panic!("lag must produce a close frame");
+        };
+        assert_eq!(frame.code, close_code::AGAIN);
+        assert!(frame.reason.contains("event gap"));
+        assert!(frame.reason.contains("reconnect"));
+        assert!(
+            frame
+                .reason
+                .contains(&format!("{skipped} messages skipped"))
+        );
+        assert!(frame.reason.len() <= 123, "WebSocket close reason bound");
+        assert_eq!(stats.event_messages_lagged(), skipped);
+    }
+
+    #[test]
+    fn client_gauge_is_released_by_drop() {
+        let stats = Arc::new(ApiStats::default());
+        {
+            let _client = EventClientGauge::new(Arc::clone(&stats));
+            assert_eq!(stats.event_clients(), 1);
+        }
+        assert_eq!(stats.event_clients(), 0);
+    }
 }

@@ -8,12 +8,14 @@ use gtk::prelude::*;
 use gtk::{cairo, glib};
 use tracing::debug;
 
-use crate::api::{EventRecord, Segment};
+use crate::api::{EventRecord, PlaybackFragment, Segment};
 
 /// Height of the drawing area in pixels.
 const HEIGHT: i32 = 48;
 /// Microseconds per second.
 const US: i64 = 1_000_000;
+/// Drawing work remains bounded even for an extreme requested window.
+const MAX_TIMELINE_TICKS: i128 = 4096;
 
 /// What the timeline draws.
 #[derive(Clone, Debug, Default)]
@@ -24,6 +26,8 @@ pub struct Model {
     pub to: i64,
     /// Recorded spans inside the window.
     pub segments: Vec<Segment>,
+    /// Complete VOD fragments in served order, including boundary GOPs.
+    pub playback: Vec<PlaybackFragment>,
     /// Events inside the window.
     pub events: Vec<EventRecord>,
     /// The playhead, Unix microseconds, when known.
@@ -35,31 +39,45 @@ pub struct Model {
 }
 
 impl Model {
-    /// Maps a wall-clock time to playlist time: the recorded duration between
-    /// the window start and `time`, since the VOD playlist holds the segments
-    /// back to back and skips the gaps between them.
+    /// Maps wall-clock time to microseconds in the actual VOD playlist.
+    /// Times in a gap map to the next fragment, and boundary GOPs count in full.
     pub fn playlist_offset(&self, time: i64) -> i64 {
-        self.segments
-            .iter()
-            .map(|s| (s.wall_end_us.min(time) - s.wall_start_us.max(self.from)).max(0))
-            .sum()
+        let mut ticks = 0i128;
+        for fragment in &self.playback {
+            let start = media_us(ticks);
+            ticks += i128::from(fragment.duration_ticks);
+            let end = media_us(ticks);
+            if time < fragment.wall_start_us {
+                return start;
+            }
+            let within = time.saturating_sub(fragment.wall_start_us);
+            if within < end - start {
+                return start + within;
+            }
+        }
+        media_us(ticks)
     }
 
     /// The inverse of [`Model::playlist_offset`]: the wall-clock time at a
-    /// playlist position, or the window end when the position is past the
-    /// recorded span.
+    /// playlist position, or the last fragment's end past the recorded span.
     pub fn wall_time(&self, offset: i64) -> i64 {
-        let mut remaining = offset;
-        for s in &self.segments {
-            let start = s.wall_start_us.max(self.from);
-            let len = (s.wall_end_us.min(self.to) - start).max(0);
-            if remaining < len {
-                return start + remaining;
+        let mut ticks = 0i128;
+        let mut last_wall = self.to;
+        for fragment in &self.playback {
+            let start = media_us(ticks);
+            ticks += i128::from(fragment.duration_ticks);
+            let end = media_us(ticks);
+            if offset < end {
+                return fragment.wall_start_us.saturating_add(offset.max(0) - start);
             }
-            remaining -= len;
+            last_wall = fragment.wall_start_us.saturating_add(end - start);
         }
-        self.to
+        last_wall
     }
+}
+
+fn media_us(ticks: i128) -> i64 {
+    i64::try_from(ticks * 1_000_000 / 90_000).unwrap_or(i64::MAX)
 }
 
 /// The timeline widget.
@@ -86,15 +104,15 @@ impl Timeline {
         let click = gtk::GestureClick::new();
         click.connect_released({
             let model = Rc::clone(&model);
-            let area = area.clone();
+            let area = area.downgrade();
             move |_, _, x, _| {
+                let Some(area) = area.upgrade() else { return };
                 // The borrow ends before the callback runs: the callback moves
                 // the playhead, which borrows the model again.
                 let time = {
                     let model = model.borrow();
                     let width = f64::from(area.width()).max(1.0);
-                    let span = (model.to - model.from) as f64;
-                    model.from + (x.clamp(0.0, width) / width * span) as i64
+                    time_at_x(model.from, model.to, x, width)
                 };
                 debug!(x, time = %clock_label(time), "timeline click");
                 on_seek(time);
@@ -139,10 +157,11 @@ impl Timeline {
 impl Model {
     /// The event nearest to `time` within `within` microseconds.
     pub fn nearest_event(&self, time: i64, within: i64) -> Option<&EventRecord> {
+        let within = u64::try_from(within).ok()?;
         self.events
             .iter()
-            .min_by_key(|e| (e.nvr_time - time).abs())
-            .filter(|e| (e.nvr_time - time).abs() <= within)
+            .min_by_key(|event| event.nvr_time.abs_diff(time))
+            .filter(|event| event.nvr_time.abs_diff(time) <= within)
     }
 
     /// The nearest event as "kind at HH:MM:SS", with "(kept)" when retained.
@@ -165,9 +184,36 @@ impl Model {
     }
 }
 
+fn span_us(from: i64, to: i64) -> i128 {
+    (i128::from(to) - i128::from(from)).max(1)
+}
+
+fn x_at_time(from: i64, to: i64, time: i64, width: f64) -> f64 {
+    (i128::from(time) - i128::from(from)) as f64 / span_us(from, to) as f64 * width
+}
+
+fn time_at_x(from: i64, to: i64, x: f64, width: f64) -> i64 {
+    let width = width.max(1.0);
+    let span = (i128::from(to) - i128::from(from)).max(0);
+    let offset = (x.clamp(0.0, width) / width * span as f64) as i128;
+    i64::try_from(i128::from(from) + offset).unwrap_or(to)
+}
+
+fn tick_step(from: i64, to: i64) -> i128 {
+    let span = span_us(from, to);
+    let base = if span <= i128::from(2 * 3600 * US) {
+        i128::from(5 * 60 * US)
+    } else {
+        i128::from(3600 * US)
+    };
+    let base_ticks = span / base + i128::from(span % base != 0);
+    let multiple =
+        (base_ticks / MAX_TIMELINE_TICKS + i128::from(base_ticks % MAX_TIMELINE_TICKS != 0)).max(1);
+    base * multiple
+}
+
 fn draw(model: &Model, cr: &cairo::Context, width: f64, height: f64) {
-    let span = (model.to - model.from).max(1) as f64;
-    let x_of = |time: i64| (time - model.from) as f64 / span * width;
+    let x_of = |time: i64| x_at_time(model.from, model.to, time, width);
     cr.set_source_rgb(0.12, 0.12, 0.12);
     cr.rectangle(0.0, 0.0, width, height);
     let _ = cr.fill();
@@ -195,15 +241,12 @@ fn draw(model: &Model, cr: &cairo::Context, width: f64, height: f64) {
         let _ = cr.fill();
     }
     // Minute ticks when the window is short enough to show them, else hours.
-    let step = if model.to - model.from <= 2 * 3600 * US {
-        5 * 60 * US
-    } else {
-        3600 * US
-    };
     cr.set_source_rgb(0.5, 0.5, 0.5);
-    let mut tick = (model.from / step + 1) * step;
-    while tick < model.to {
-        let x = x_of(tick);
+    let step = tick_step(model.from, model.to);
+    let mut tick = (i128::from(model.from).div_euclid(step) + 1) * step;
+    while tick < i128::from(model.to) {
+        let x =
+            (tick - i128::from(model.from)) as f64 / span_us(model.from, model.to) as f64 * width;
         cr.rectangle(x, height * 0.85, 1.0, height * 0.15);
         let _ = cr.fill();
         tick += step;
@@ -252,6 +295,20 @@ mod tests {
             from: 100,
             to: 1000,
             segments: vec![segment(50, 300), segment(400, 600), segment(900, 1200)],
+            playback: vec![
+                PlaybackFragment {
+                    wall_start_us: 100,
+                    duration_ticks: 18,
+                },
+                PlaybackFragment {
+                    wall_start_us: 400,
+                    duration_ticks: 18,
+                },
+                PlaybackFragment {
+                    wall_start_us: 900,
+                    duration_ticks: 9,
+                },
+            ],
             ..Model::default()
         };
         assert_eq!(model.playlist_offset(100), 0);
@@ -264,6 +321,65 @@ mod tests {
         assert_eq!(model.wall_time(200), 400);
         assert_eq!(model.wall_time(450), 950);
         assert_eq!(model.wall_time(10_000), 1000);
+    }
+
+    #[test]
+    fn a_mid_gop_window_maps_to_the_complete_served_boundary_fragment() {
+        let model = Model {
+            from: 150_000,
+            to: 250_000,
+            segments: vec![segment(0, 1_000_000)],
+            playback: vec![PlaybackFragment {
+                wall_start_us: 100_000,
+                duration_ticks: 18_000,
+            }],
+            ..Model::default()
+        };
+        assert_eq!(model.wall_time(0), 100_000);
+        assert_eq!(model.playlist_offset(200_000), 100_000);
+        assert_eq!(model.wall_time(200_000), 300_000);
+        assert_eq!(model.playlist_offset(500_000), 200_000);
+    }
+
+    #[test]
+    fn fragment_timing_skips_gaps_inside_a_file_and_unavailable_files() {
+        let model = Model {
+            from: 0,
+            to: 10_000_000,
+            segments: vec![segment(0, 5_000_000), segment(7_000_000, 9_000_000)],
+            playback: vec![
+                PlaybackFragment {
+                    wall_start_us: 0,
+                    duration_ticks: 180_000,
+                },
+                PlaybackFragment {
+                    wall_start_us: 3_000_000,
+                    duration_ticks: 180_000,
+                },
+            ],
+            ..Model::default()
+        };
+        assert_eq!(model.playlist_offset(2_500_000), 2_000_000);
+        assert_eq!(model.wall_time(2_000_000), 3_000_000);
+        assert_eq!(model.playlist_offset(3_500_000), 2_500_000);
+        assert_eq!(model.playlist_offset(8_000_000), 4_000_000);
+        assert_eq!(model.wall_time(4_000_000), 5_000_000);
+    }
+
+    #[test]
+    fn cumulative_tick_conversion_avoids_per_fragment_rounding_drift() {
+        let count = 90_000;
+        let model = Model {
+            playback: (0..count)
+                .map(|i| PlaybackFragment {
+                    wall_start_us: media_us(i128::from(i) * 3001),
+                    duration_ticks: 3001,
+                })
+                .collect(),
+            ..Model::default()
+        };
+        assert_eq!(model.playlist_offset(i64::MAX), 3_001_000_000);
+        assert_eq!(model.wall_time(3_001_000_000), 3_001_000_000);
     }
 
     #[test]
@@ -301,5 +417,46 @@ mod tests {
             "{label}"
         );
         assert_eq!(model.nearest_event_label(30 * US, 5 * US), None);
+    }
+
+    #[test]
+    fn extreme_times_do_not_overflow_distance_or_geometry() {
+        let model = Model {
+            from: i64::MIN,
+            to: i64::MAX,
+            events: vec![EventRecord {
+                id: 1,
+                kind: crate::api::EventKind::Named("motion".into()),
+                nvr_time: i64::MIN,
+                retain_until_us: None,
+            }],
+            ..Model::default()
+        };
+        assert!(model.nearest_event(i64::MAX, i64::MAX).is_none());
+        assert_eq!(
+            model.nearest_event(i64::MIN, 0).map(|event| event.id),
+            Some(1)
+        );
+
+        let width = 1000.0;
+        assert_eq!(x_at_time(model.from, model.to, model.from, width), 0.0);
+        assert_eq!(x_at_time(model.from, model.to, model.to, width), width);
+        assert_eq!(time_at_x(model.from, model.to, 0.0, width), i64::MIN);
+        assert_eq!(time_at_x(model.from, model.to, width, width), i64::MAX);
+        assert!(x_at_time(model.from, model.to, 0, width).is_finite());
+        let step = tick_step(model.from, model.to);
+        let ticks = span_us(model.from, model.to) / step
+            + i128::from(span_us(model.from, model.to) % step != 0);
+        assert!(
+            ticks <= MAX_TIMELINE_TICKS,
+            "extreme window generated {ticks} ticks"
+        );
+    }
+
+    #[test]
+    fn reversed_or_empty_geometry_stays_bounded() {
+        assert_eq!(time_at_x(10, 10, 50.0, 100.0), 10);
+        assert_eq!(time_at_x(10, -10, 50.0, 100.0), 10);
+        assert!(x_at_time(10, -10, i64::MIN, 100.0).is_finite());
     }
 }

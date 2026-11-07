@@ -23,7 +23,7 @@ Where the sources conflict, the order of precedence is:
    (`.rust-reference/references/conventional-commits/content/v1.0.0/index.md`) for commit
    messages, with the house style in §9.
 6. Semantic Versioning 2.0.0 (`.rust-reference/references/semver/spec/v2.0.0.md`) for
-   versions, with the pre-1.0 policy in §9.
+   published versions, with the alpha policy in §9.
 
 ## 1. Enforcement
 
@@ -79,7 +79,7 @@ Where the sources conflict, the order of precedence is:
 
 ## 5. Types and APIs (API Guidelines C-NEWTYPE, C-COMMON-TRAITS, C-SERDE, C-GOOD-ERR, C-BUILDER, C-VALIDATE, C-STRUCT-PRIVATE, C-DEBUG)
 
-- Newtypes for units and identifiers (`WallUs`, `MediaTicks`, `CameraId`, `StreamId`);
+- Newtypes for units and identifiers (`WallUs`, `MediaTicks`, `CameraId`, `StreamKey`);
   never bare `i64` for a time or an id in a public signature.
 - Derive eagerly: `Debug` on every public type; `Clone`, `Copy`, `PartialEq`, `Eq`, `Hash`,
   `Default`, `PartialOrd`, `Ord` wherever semantically right; `Serialize`/`Deserialize` on
@@ -129,10 +129,11 @@ Where the sources conflict, the order of precedence is:
 
 ## 9. Commits, versions, and changes
 
-- Commit messages follow Conventional Commits 1.0.0: `type(scope)!: description`, with a
+- Commit messages follow Conventional Commits 1.0.0: `type(scope): description`, with a
   lowercase type and scope, an imperative description without a trailing period and under
-  72 characters, a body that explains the reason and what was measured, and a
-  `BREAKING CHANGE:` footer (with `!`) for an incompatible change. Types: `feat`, `fix`,
+  72 characters, and a body that explains the reason and what was measured. `!` and a
+  `BREAKING CHANGE:` footer describe incompatibility with a published compatibility promise;
+  differences only from unpublished alpha history do not use them. Types: `feat`, `fix`,
   `docs`, `refactor`, `perf`, `test`, `build`, `ci`, `style`, `chore`, `revert`. Scopes are
   crate names without the `iris-` prefix (`ingest`, `store`, `api`, `gui`, `replay`, `mp4`,
   `catalog`, `events`, `core`, `h265`) or an area (`docs`, `ci`, `tools`, `soak`).
@@ -140,10 +141,15 @@ Where the sources conflict, the order of precedence is:
   GitHub API (`gh api graphql`, `createCommitOnBranch`) so GitHub signs them.
   `iris-tools gh-commit -m HEADLINE --body TEXT` does this for the difference between
   `origin/<branch>` and a clean local `HEAD`.
-- Versions follow Semantic Versioning 2.0.0. Before 1.0.0: `0.y.(z+1)` for compatible
-  fixes, `0.(y+1).0` for new functionality or an incompatible change, breaking commits still
-  marked and their migration described in `CHANGELOG.md`. The compatibility surface is the
-  configuration file, the storage format (`docs/research/04-storage-format.md`), the HTTP
-  and WebSocket API, the command line, and the supported platform (Linux, x86-64 and
-  aarch64) and toolchain (`rust-version` in `Cargo.toml`).
+- Semantic Versioning governs published artifacts. The workspace remains version `0.1.0` while
+  the initial alpha is unreleased. Until `1.0.0`, exported Rust APIs, configuration,
+  command-line behavior, storage schemas and formats, HTTP and WebSocket protocols, supported
+  platforms, and toolchains carry no compatibility promise. Prefer direct improvements to
+  correctness, efficiency, readability, and simplicity over compatibility layers; update every
+  project caller, fixture, and document in the same change. Retain a migration only when it
+  protects useful operator data without compromising the design.
+- `CHANGELOG.md` records differences between published releases. Before the first release it
+  contains alpha status only, without `Added`, `Changed`, or `Fixed` sections. A published
+  `0.y.z` entry records the delivered behavior and any operator-data migration that remains
+  useful; `1.0.0` establishes the stable compatibility commitment and ordinary SemVer policy.
 - Behaviour changes update the affected document in `docs/` in the same change.

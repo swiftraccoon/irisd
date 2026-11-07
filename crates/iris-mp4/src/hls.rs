@@ -18,6 +18,8 @@ pub struct PlaylistOptions {
 }
 
 /// Builds a VOD media playlist.
+/// Records come from a validated sidecar or scan. Trailer exclusion emits one
+/// range per fragment; independence is declared only when every segment starts at sync.
 #[must_use]
 pub fn media_playlist(init_len: u32, records: &[IndexRecord], options: &PlaylistOptions) -> String {
     let per_segment = if options.include_trailers {
@@ -27,6 +29,7 @@ pub fn media_playlist(init_len: u32, records: &[IndexRecord], options: &Playlist
     };
     let mut segments: Vec<(u64, u64, u64)> = Vec::new(); // (offset, len, duration ticks)
     let mut current: Option<(u64, u64, u64, usize)> = None;
+    let mut independent = true;
     for r in records {
         let r_len = if options.include_trailers {
             u64::from(r.len)
@@ -34,7 +37,9 @@ pub fn media_playlist(init_len: u32, records: &[IndexRecord], options: &Playlist
             u64::from(r.len) - 24
         };
         match current.as_mut() {
-            Some((offset, len, dur, n)) if !(r.starts_with_sync() && *n >= per_segment) => {
+            Some((offset, len, dur, n))
+                if options.include_trailers && !(r.starts_with_sync() && *n >= per_segment) =>
+            {
                 *len = (r.offset + r_len) - *offset;
                 *dur += u64::from(r.duration);
                 *n += 1;
@@ -44,6 +49,7 @@ pub fn media_playlist(init_len: u32, records: &[IndexRecord], options: &Playlist
                     segments.push((o, l, d));
                 }
                 current = Some((r.offset, r_len, u64::from(r.duration), 1));
+                independent &= r.starts_with_sync();
             }
         }
     }
@@ -61,9 +67,10 @@ pub fn media_playlist(init_len: u32, records: &[IndexRecord], options: &Playlist
     let mut out = String::with_capacity(segments.len() * 64 + 256);
     out.push_str("#EXTM3U\n#EXT-X-VERSION:7\n");
     let _ = writeln!(out, "#EXT-X-TARGETDURATION:{target}");
-    out.push_str(
-        "#EXT-X-MEDIA-SEQUENCE:0\n#EXT-X-PLAYLIST-TYPE:VOD\n#EXT-X-INDEPENDENT-SEGMENTS\n",
-    );
+    out.push_str("#EXT-X-MEDIA-SEQUENCE:0\n#EXT-X-PLAYLIST-TYPE:VOD\n");
+    if independent {
+        out.push_str("#EXT-X-INDEPENDENT-SEGMENTS\n");
+    }
     let _ = writeln!(
         out,
         "#EXT-X-MAP:URI=\"{}\",BYTERANGE=\"{init_len}@0\"",
@@ -80,6 +87,7 @@ pub fn media_playlist(init_len: u32, records: &[IndexRecord], options: &Playlist
 }
 
 /// Builds a multivariant (master) playlist with one variant.
+/// Independence is declared by the media playlist when its segments all start at sync.
 #[must_use]
 pub fn master_playlist(
     media_playlist_uri: &str,
@@ -89,7 +97,7 @@ pub fn master_playlist(
     height: u16,
 ) -> String {
     format!(
-        "#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-INDEPENDENT-SEGMENTS\n#EXT-X-STREAM-INF:BANDWIDTH={bandwidth},CODECS=\"{codecs}\",RESOLUTION={width}x{height}\n{media_playlist_uri}\n"
+        "#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-STREAM-INF:BANDWIDTH={bandwidth},CODECS=\"{codecs}\",RESOLUTION={width}x{height}\n{media_playlist_uri}\n"
     )
 }
 
@@ -141,5 +149,46 @@ mod tests {
         let text = media_playlist(700, &records, &opts);
         assert!(text.contains("#EXT-X-BYTERANGE:976@700\n"));
         assert!(text.contains("#EXT-X-BYTERANGE:976@1700\n"));
+    }
+
+    #[test]
+    fn trailer_exclusion_keeps_continuations_separate_and_does_not_claim_independence() {
+        let records = [
+            record(700, 1000, true),
+            record(1700, 1000, false),
+            record(2700, 1000, false),
+            record(3700, 1000, true),
+        ];
+        let mut opts = PlaylistOptions {
+            media_uri: "a.mp4".into(),
+            fragments_per_segment: 3,
+            include_trailers: false,
+        };
+        let text = media_playlist(700, &records, &opts);
+        let ranges: Vec<_> = text
+            .lines()
+            .filter_map(|line| line.strip_prefix("#EXT-X-BYTERANGE:"))
+            .collect();
+        assert_eq!(ranges, ["976@700", "976@1700", "976@2700", "976@3700"]);
+        assert_eq!(text.matches("#EXTINF:2.00000,").count(), 4);
+        assert!(!text.contains("#EXT-X-INDEPENDENT-SEGMENTS"));
+        assert!(
+            !master_playlist("index.m3u8", "hvc1", 1, 16, 16)
+                .contains("#EXT-X-INDEPENDENT-SEGMENTS")
+        );
+        for (range, record) in ranges.iter().zip(&records) {
+            let (len, offset) = range.split_once('@').unwrap();
+            let start = offset.parse::<u64>().unwrap();
+            let end = start + len.parse::<u64>().unwrap();
+            assert_eq!(end, record.end() - 24);
+            for other in &records {
+                assert!(end <= other.end() - 24 || start >= other.end());
+            }
+        }
+        opts.include_trailers = true;
+        let included = media_playlist(700, &records, &opts);
+        assert!(included.contains("#EXT-X-BYTERANGE:3000@700\n"));
+        assert!(included.contains("#EXT-X-BYTERANGE:1000@3700\n"));
+        assert!(included.contains("#EXT-X-INDEPENDENT-SEGMENTS"));
     }
 }

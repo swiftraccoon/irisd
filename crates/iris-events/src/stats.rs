@@ -55,7 +55,7 @@ impl EventStats {
         self.messages.load(Ordering::Relaxed)
     }
 
-    /// Sessions re-established after an error or stall.
+    /// Failed-session retry or resubscription cycles entered so far.
     pub fn reconnects(&self) -> u64 {
         self.reconnects.load(Ordering::Relaxed)
     }
@@ -65,7 +65,7 @@ impl EventStats {
         self.renewals.load(Ordering::Relaxed)
     }
 
-    /// Errors inside a session, counted before the session ends or retries.
+    /// Failed sessions, counted once before each retry cycle.
     pub fn errors(&self) -> u64 {
         self.errors.load(Ordering::Relaxed)
     }

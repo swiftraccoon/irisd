@@ -1,0 +1,2278 @@
+use super::*;
+use crate::soap::XmlNode;
+
+fn parse(xml: &str) -> XmlNode {
+    XmlNode::parse(xml).unwrap()
+}
+
+mod capabilities {
+    use super::*;
+
+    /// Full response exercising every field defined in the ONVIF spec.
+    const FULL: &str = r#"<GetCapabilitiesResponse>
+          <Capabilities>
+            <Device>
+              <XAddr>http://192.168.1.1/onvif/device_service</XAddr>
+              <Network>
+                <IPFilter>false</IPFilter>
+                <ZeroConfiguration>true</ZeroConfiguration>
+                <IPVersion6>false</IPVersion6>
+                <DynDNS>false</DynDNS>
+              </Network>
+              <System>
+                <DiscoveryResolve>true</DiscoveryResolve>
+                <DiscoveryBye>true</DiscoveryBye>
+                <RemoteDiscovery>false</RemoteDiscovery>
+                <SystemBackup>true</SystemBackup>
+                <SystemLogging>true</SystemLogging>
+                <FirmwareUpgrade>true</FirmwareUpgrade>
+              </System>
+              <IO>
+                <InputConnectors>1</InputConnectors>
+                <RelayOutputs>2</RelayOutputs>
+              </IO>
+              <!-- The eight declared elements, then the two `Extension` levels.
+                   `TLS1.0` is deliberately `true` while its top-level siblings
+                   `TLS1.1` and `X.509Token` are `false`: a parser reading the
+                   extension members at the top level reports `tls_1_0` as
+                   `false`, so the nesting is observable rather than merely
+                   written down. Same for `RemoteUserHandling`, which is `true`
+                   two levels down while `SAMLToken` above it is `false`. -->
+              <Security>
+                <TLS1.1>false</TLS1.1>
+                <TLS1.2>true</TLS1.2>
+                <OnboardKeyGeneration>false</OnboardKeyGeneration>
+                <AccessPolicyConfig>false</AccessPolicyConfig>
+                <X.509Token>false</X.509Token>
+                <SAMLToken>false</SAMLToken>
+                <KerberosToken>true</KerberosToken>
+                <RELToken>false</RELToken>
+                <Extension>
+                  <TLS1.0>true</TLS1.0>
+                  <Extension>
+                    <Dot1X>true</Dot1X>
+                    <SupportedEAPMethod>13</SupportedEAPMethod>
+                    <SupportedEAPMethod>21</SupportedEAPMethod>
+                    <SupportedEAPMethod>25</SupportedEAPMethod>
+                    <RemoteUserHandling>true</RemoteUserHandling>
+                  </Extension>
+                </Extension>
+              </Security>
+            </Device>
+            <Media>
+              <XAddr>http://192.168.1.1/onvif/media_service</XAddr>
+              <StreamingCapabilities>
+                <RTPMulticast>false</RTPMulticast>
+                <RTP_TCP>true</RTP_TCP>
+                <RTP_RTSP_TCP>true</RTP_RTSP_TCP>
+              </StreamingCapabilities>
+              <Extension>
+                <ProfileCapabilities>
+                  <MaximumNumberOfProfiles>5</MaximumNumberOfProfiles>
+                </ProfileCapabilities>
+              </Extension>
+            </Media>
+            <PTZ>
+              <XAddr>http://192.168.1.1/onvif/ptz_service</XAddr>
+            </PTZ>
+            <Events>
+              <XAddr>http://192.168.1.1/onvif/events_service</XAddr>
+              <WSSubscriptionPolicySupport>true</WSSubscriptionPolicySupport>
+              <WSPullPointSupport>true</WSPullPointSupport>
+            </Events>
+            <Imaging>
+              <XAddr>http://192.168.1.1/onvif/imaging_service</XAddr>
+            </Imaging>
+            <Analytics>
+              <XAddr>http://192.168.1.1/onvif/analytics_service</XAddr>
+              <RuleSupport>true</RuleSupport>
+              <AnalyticsModuleSupport>true</AnalyticsModuleSupport>
+            </Analytics>
+            <Extension>
+              <DeviceIO>  <XAddr>http://192.168.1.1/onvif/deviceio_service</XAddr>  </DeviceIO>
+              <Recording> <XAddr>http://192.168.1.1/onvif/recording_service</XAddr> </Recording>
+              <Search>    <XAddr>http://192.168.1.1/onvif/search_service</XAddr>    </Search>
+              <Replay>    <XAddr>http://192.168.1.1/onvif/replay_service</XAddr>    </Replay>
+            </Extension>
+          </Capabilities>
+        </GetCapabilitiesResponse>"#;
+
+    // ── Service URLs ──────────────────────────────────────────────────────
+
+    #[test]
+    fn test_all_service_urls_parsed() {
+        let caps = Capabilities::from_xml(&parse(FULL)).unwrap();
+        assert_eq!(
+            caps.device.url.as_deref(),
+            Some("http://192.168.1.1/onvif/device_service")
+        );
+        assert_eq!(
+            caps.media.url.as_deref(),
+            Some("http://192.168.1.1/onvif/media_service")
+        );
+        assert_eq!(
+            caps.ptz.url.as_deref(),
+            Some("http://192.168.1.1/onvif/ptz_service")
+        );
+        assert_eq!(
+            caps.events.url.as_deref(),
+            Some("http://192.168.1.1/onvif/events_service")
+        );
+        assert_eq!(
+            caps.imaging.url.as_deref(),
+            Some("http://192.168.1.1/onvif/imaging_service")
+        );
+        assert_eq!(
+            caps.analytics.url.as_deref(),
+            Some("http://192.168.1.1/onvif/analytics_service")
+        );
+    }
+
+    #[test]
+    fn test_extension_service_urls_parsed() {
+        let caps = Capabilities::from_xml(&parse(FULL)).unwrap();
+        assert_eq!(
+            caps.device_io.url.as_deref(),
+            Some("http://192.168.1.1/onvif/deviceio_service")
+        );
+        assert_eq!(
+            caps.recording.url.as_deref(),
+            Some("http://192.168.1.1/onvif/recording_service")
+        );
+        assert_eq!(
+            caps.search.url.as_deref(),
+            Some("http://192.168.1.1/onvif/search_service")
+        );
+        assert_eq!(
+            caps.replay.url.as_deref(),
+            Some("http://192.168.1.1/onvif/replay_service")
+        );
+    }
+
+    // ── Device sub-capabilities ───────────────────────────────────────────
+
+    #[test]
+    fn test_device_network_capabilities() {
+        let caps = Capabilities::from_xml(&parse(FULL)).unwrap();
+        assert!(!caps.device.network.ip_filter);
+        assert!(caps.device.network.zero_configuration);
+        assert!(!caps.device.network.ip_version6);
+        assert!(!caps.device.network.dyn_dns);
+    }
+
+    #[test]
+    fn test_device_system_capabilities() {
+        let caps = Capabilities::from_xml(&parse(FULL)).unwrap();
+        assert!(caps.device.system.discovery_resolve);
+        assert!(caps.device.system.discovery_bye);
+        assert!(!caps.device.system.remote_discovery);
+        assert!(caps.device.system.system_backup);
+        assert!(caps.device.system.system_logging);
+        assert!(caps.device.system.firmware_upgrade);
+    }
+
+    #[test]
+    fn test_device_io_capabilities() {
+        let caps = Capabilities::from_xml(&parse(FULL)).unwrap();
+        assert_eq!(caps.device.io.input_connectors, Some(1));
+        assert_eq!(caps.device.io.relay_outputs, Some(2));
+    }
+
+    /// All eight declared elements plus the four the two `Extension` levels
+    /// add. `username_token` is gone: `tt:SecurityCapabilities` declares no
+    /// such element at any level — the name belongs to the service-level
+    /// `tds:SecurityCapabilities`, as an attribute, and
+    /// `device_service_capabilities_parses_all_four_children` covers it there.
+    #[test]
+    fn test_device_security_capabilities() {
+        let sec = &Capabilities::from_xml(&parse(FULL))
+            .unwrap()
+            .device
+            .security;
+
+        // The eight top-level members.
+        assert!(!sec.tls_1_1);
+        assert!(sec.tls_1_2);
+        assert!(!sec.onboard_key_generation);
+        assert!(!sec.access_policy_config);
+        assert!(!sec.x509_token);
+        assert!(!sec.saml_token);
+        assert!(sec.kerberos_token);
+        assert!(!sec.rel_token);
+
+        // `Extension` — `true` where every top-level sibling is `false`, so a
+        // parser reading this one level up cannot pass.
+        assert!(sec.tls_1_0);
+
+        // `Extension/Extension`.
+        assert!(sec.dot1x);
+        assert!(sec.remote_user_handling);
+        assert_eq!(sec.supported_eap_methods, [13, 21, 25]);
+    }
+
+    /// A device that sends the eight required members and neither `Extension`.
+    /// Legal, and the shape most cameras send — the four extension fields must
+    /// read `false` / empty without the eight above them being disturbed.
+    #[test]
+    fn test_device_security_without_extensions() {
+        let xml = r#"<GetCapabilitiesResponse>
+              <Capabilities>
+                <Device>
+                  <XAddr>http://192.168.1.1/onvif/device_service</XAddr>
+                  <Security>
+                    <TLS1.1>true</TLS1.1>
+                    <TLS1.2>true</TLS1.2>
+                    <OnboardKeyGeneration>true</OnboardKeyGeneration>
+                    <AccessPolicyConfig>false</AccessPolicyConfig>
+                    <X.509Token>false</X.509Token>
+                    <SAMLToken>false</SAMLToken>
+                    <KerberosToken>false</KerberosToken>
+                    <RELToken>false</RELToken>
+                  </Security>
+                </Device>
+              </Capabilities>
+            </GetCapabilitiesResponse>"#;
+        let sec = &Capabilities::from_xml(&parse(xml)).unwrap().device.security;
+        assert!(sec.tls_1_1);
+        assert!(sec.onboard_key_generation);
+        assert!(!sec.tls_1_0);
+        assert!(!sec.dot1x);
+        assert!(!sec.remote_user_handling);
+        assert!(sec.supported_eap_methods.is_empty());
+    }
+
+    // ── Media sub-capabilities ────────────────────────────────────────────
+
+    #[test]
+    fn test_media_streaming_capabilities() {
+        let caps = Capabilities::from_xml(&parse(FULL)).unwrap();
+        assert!(!caps.media.streaming.rtp_multicast);
+        assert!(caps.media.streaming.rtp_tcp);
+        assert!(caps.media.streaming.rtp_rtsp_tcp);
+    }
+
+    #[test]
+    fn test_media_max_profiles() {
+        let caps = Capabilities::from_xml(&parse(FULL)).unwrap();
+        assert_eq!(caps.media.max_profiles, Some(5));
+    }
+
+    // ── Events sub-capabilities ───────────────────────────────────────────
+
+    #[test]
+    fn test_events_capabilities() {
+        let caps = Capabilities::from_xml(&parse(FULL)).unwrap();
+        assert!(caps.events.ws_subscription_policy);
+        assert!(caps.events.ws_pull_point);
+    }
+
+    // ── Analytics sub-capabilities ────────────────────────────────────────
+
+    #[test]
+    fn test_analytics_capabilities() {
+        let caps = Capabilities::from_xml(&parse(FULL)).unwrap();
+        assert!(caps.analytics.rule_support);
+        assert!(caps.analytics.analytics_module_support);
+    }
+
+    // ── Absence / error cases ─────────────────────────────────────────────
+
+    #[test]
+    fn test_optional_services_absent_are_none() {
+        let xml = r#"<GetCapabilitiesResponse>
+              <Capabilities>
+                <Device><XAddr>http://192.168.1.1/onvif/device_service</XAddr></Device>
+                <Media> <XAddr>http://192.168.1.1/onvif/media_service</XAddr> </Media>
+              </Capabilities>
+            </GetCapabilitiesResponse>"#;
+        let caps = Capabilities::from_xml(&parse(xml)).unwrap();
+        assert!(caps.ptz.url.is_none());
+        assert!(caps.events.url.is_none());
+        assert!(caps.imaging.url.is_none());
+        assert!(caps.analytics.url.is_none());
+        assert!(caps.recording.url.is_none());
+    }
+
+    #[test]
+    fn test_absent_boolean_fields_default_to_false() {
+        let xml = r#"<GetCapabilitiesResponse>
+              <Capabilities>
+                <Device><XAddr>http://192.168.1.1/onvif/device_service</XAddr></Device>
+              </Capabilities>
+            </GetCapabilitiesResponse>"#;
+        let caps = Capabilities::from_xml(&parse(xml)).unwrap();
+        assert!(!caps.device.network.ip_filter);
+        assert!(!caps.device.system.firmware_upgrade);
+        assert!(!caps.device.security.tls_1_2);
+        assert!(!caps.media.streaming.rtp_tcp);
+        assert!(!caps.events.ws_pull_point);
+    }
+
+    #[test]
+    fn test_missing_capabilities_node_is_error() {
+        let err = Capabilities::from_xml(&parse("<GetCapabilitiesResponse/>")).unwrap_err();
+        assert!(matches!(
+            err,
+            OnvifError::Soap(SoapError::MissingField("Capabilities"))
+        ));
+    }
+}
+
+mod device_info {
+    use super::*;
+
+    const FULL: &str = r#"<GetDeviceInformationResponse>
+          <Manufacturer>Hikvision</Manufacturer>
+          <Model>DS-2CD2085G1-I</Model>
+          <FirmwareVersion>V5.6.1 build 190813</FirmwareVersion>
+          <SerialNumber>DS-2CD2085G1-I20190619AACH123456789</SerialNumber>
+          <HardwareId>0x00</HardwareId>
+        </GetDeviceInformationResponse>"#;
+
+    #[test]
+    fn test_all_fields_parsed() {
+        let info = DeviceInfo::from_xml(&parse(FULL)).unwrap();
+        assert_eq!(info.manufacturer, "Hikvision");
+        assert_eq!(info.model, "DS-2CD2085G1-I");
+        assert_eq!(info.firmware_version, "V5.6.1 build 190813");
+        assert_eq!(info.serial_number, "DS-2CD2085G1-I20190619AACH123456789");
+        assert_eq!(info.hardware_id, "0x00");
+    }
+
+    #[test]
+    fn test_absent_fields_default_to_empty_string() {
+        let info = DeviceInfo::from_xml(&parse("<GetDeviceInformationResponse/>")).unwrap();
+        assert_eq!(info.manufacturer, "");
+        assert_eq!(info.model, "");
+        assert_eq!(info.firmware_version, "");
+    }
+
+    #[test]
+    fn test_partial_response_fills_present_fields() {
+        let xml = r#"<GetDeviceInformationResponse>
+              <Manufacturer>Axis</Manufacturer>
+              <Model>P3245-V</Model>
+            </GetDeviceInformationResponse>"#;
+        let info = DeviceInfo::from_xml(&parse(xml)).unwrap();
+        assert_eq!(info.manufacturer, "Axis");
+        assert_eq!(info.model, "P3245-V");
+        assert_eq!(info.firmware_version, "");
+    }
+}
+
+mod media_profile {
+    use super::*;
+
+    const TWO_PROFILES: &str = r#"<GetProfilesResponse>
+          <Profiles token="Profile_1" fixed="true">
+            <Name>mainStream</Name>
+          </Profiles>
+          <Profiles token="Profile_2" fixed="false">
+            <Name>subStream</Name>
+          </Profiles>
+        </GetProfilesResponse>"#;
+
+    #[test]
+    fn test_two_profiles_returned() {
+        let profiles = MediaProfile::vec_from_xml(&parse(TWO_PROFILES)).unwrap();
+        assert_eq!(profiles.len(), 2);
+    }
+
+    #[test]
+    fn test_profile_fields() {
+        let profiles = MediaProfile::vec_from_xml(&parse(TWO_PROFILES)).unwrap();
+        assert_eq!(profiles[0].token, "Profile_1");
+        assert_eq!(profiles[0].name, "mainStream");
+        assert!(profiles[0].fixed);
+        assert_eq!(profiles[1].token, "Profile_2");
+        assert_eq!(profiles[1].name, "subStream");
+        assert!(!profiles[1].fixed);
+    }
+
+    #[test]
+    fn test_empty_response_returns_empty_vec() {
+        let profiles = MediaProfile::vec_from_xml(&parse("<GetProfilesResponse/>")).unwrap();
+        assert!(profiles.is_empty());
+    }
+
+    #[test]
+    fn test_fixed_absent_defaults_to_false() {
+        let xml = r#"<GetProfilesResponse>
+              <Profiles token="tok"><Name>noFixed</Name></Profiles>
+            </GetProfilesResponse>"#;
+        let profiles = MediaProfile::vec_from_xml(&parse(xml)).unwrap();
+        assert!(!profiles[0].fixed);
+    }
+}
+
+mod stream_uri {
+    use super::*;
+
+    const FULL: &str = r#"<GetStreamUriResponse>
+          <MediaUri>
+            <Uri>rtsp://192.168.1.1:554/Streaming/Channels/101</Uri>
+            <InvalidAfterConnect>false</InvalidAfterConnect>
+            <InvalidAfterReboot>false</InvalidAfterReboot>
+            <Timeout>PT0S</Timeout>
+          </MediaUri>
+        </GetStreamUriResponse>"#;
+
+    #[test]
+    fn test_all_fields_parsed() {
+        let uri = StreamUri::from_xml(&parse(FULL)).unwrap();
+        assert_eq!(uri.uri, "rtsp://192.168.1.1:554/Streaming/Channels/101");
+        assert!(!uri.invalid_after_connect);
+        assert!(!uri.invalid_after_reboot);
+        assert_eq!(uri.timeout, "PT0S");
+    }
+
+    #[test]
+    fn test_invalid_after_connect_and_reboot_true() {
+        let xml = r#"<GetStreamUriResponse>
+              <MediaUri>
+                <Uri>rtsp://192.168.1.1/stream</Uri>
+                <InvalidAfterConnect>true</InvalidAfterConnect>
+                <InvalidAfterReboot>true</InvalidAfterReboot>
+              </MediaUri>
+            </GetStreamUriResponse>"#;
+        let uri = StreamUri::from_xml(&parse(xml)).unwrap();
+        assert!(uri.invalid_after_connect);
+        assert!(uri.invalid_after_reboot);
+    }
+
+    #[test]
+    fn test_missing_media_uri_is_error() {
+        let err = StreamUri::from_xml(&parse("<GetStreamUriResponse/>")).unwrap_err();
+        assert!(matches!(
+            err,
+            OnvifError::Soap(SoapError::MissingField("MediaUri"))
+        ));
+    }
+
+    #[test]
+    fn test_missing_uri_element_is_error() {
+        let xml = "<GetStreamUriResponse><MediaUri/></GetStreamUriResponse>";
+        let err = StreamUri::from_xml(&parse(xml)).unwrap_err();
+        assert!(matches!(
+            err,
+            OnvifError::Soap(SoapError::MissingField("Uri"))
+        ));
+    }
+
+    #[test]
+    fn test_empty_uri_text_is_error() {
+        let xml = "<GetStreamUriResponse><MediaUri><Uri></Uri></MediaUri></GetStreamUriResponse>";
+        let err = StreamUri::from_xml(&parse(xml)).unwrap_err();
+        assert!(matches!(
+            err,
+            OnvifError::Soap(SoapError::MissingField("Uri"))
+        ));
+    }
+
+    #[test]
+    fn test_timeout_absent_defaults_to_empty() {
+        let xml = r#"<GetStreamUriResponse>
+              <MediaUri><Uri>rtsp://x/s</Uri></MediaUri>
+            </GetStreamUriResponse>"#;
+        let uri = StreamUri::from_xml(&parse(xml)).unwrap();
+        assert_eq!(uri.timeout, "");
+    }
+}
+
+mod system_date_time {
+    use super::*;
+
+    const FULL: &str = r#"<GetSystemDateAndTimeResponse>
+          <SystemDateAndTime>
+            <DateTimeType>NTP</DateTimeType>
+            <DaylightSavings>true</DaylightSavings>
+            <TimeZone><TZ>CST-8</TZ></TimeZone>
+            <UTCDateTime>
+              <Time><Hour>10</Hour><Minute>30</Minute><Second>45</Second></Time>
+              <Date><Year>2024</Year><Month>6</Month><Day>15</Day></Date>
+            </UTCDateTime>
+          </SystemDateAndTime>
+        </GetSystemDateAndTimeResponse>"#;
+
+    #[test]
+    fn test_utc_unix_correct() {
+        let dt = SystemDateTime::from_xml(&parse(FULL)).unwrap();
+        // 2024-06-15T10:30:45Z = 1_718_447_445
+        assert_eq!(dt.utc_unix, Some(1_718_447_445));
+    }
+
+    #[test]
+    fn test_daylight_savings_parsed() {
+        let dt = SystemDateTime::from_xml(&parse(FULL)).unwrap();
+        assert!(dt.daylight_savings);
+    }
+
+    #[test]
+    fn test_timezone_parsed() {
+        let dt = SystemDateTime::from_xml(&parse(FULL)).unwrap();
+        assert_eq!(dt.timezone, "CST-8");
+    }
+
+    #[test]
+    fn test_missing_utc_datetime_gives_none() {
+        let xml = r#"<GetSystemDateAndTimeResponse>
+              <SystemDateAndTime>
+                <DaylightSavings>false</DaylightSavings>
+              </SystemDateAndTime>
+            </GetSystemDateAndTimeResponse>"#;
+        let dt = SystemDateTime::from_xml(&parse(xml)).unwrap();
+        assert!(dt.utc_unix.is_none());
+    }
+
+    #[test]
+    fn test_missing_system_date_and_time_is_error() {
+        let err = SystemDateTime::from_xml(&parse("<GetSystemDateAndTimeResponse/>")).unwrap_err();
+        assert!(matches!(
+            err,
+            OnvifError::Soap(SoapError::MissingField("SystemDateAndTime"))
+        ));
+    }
+
+    #[test]
+    fn test_civil_to_unix_epoch() {
+        assert_eq!(civil_to_unix(1970, 1, 1, 0, 0, 0), 0);
+    }
+
+    #[test]
+    fn test_civil_to_unix_known_date() {
+        // 2024-01-01T00:00:00Z = 1_704_067_200
+        assert_eq!(civil_to_unix(2024, 1, 1, 0, 0, 0), 1_704_067_200);
+    }
+}
+
+mod snapshot_uri {
+    use super::*;
+
+    const FULL: &str = r#"<GetSnapshotUriResponse>
+          <MediaUri>
+            <Uri>http://192.168.1.1/onvif/snapshot?channel=1</Uri>
+            <InvalidAfterConnect>false</InvalidAfterConnect>
+            <InvalidAfterReboot>true</InvalidAfterReboot>
+            <Timeout>PT60S</Timeout>
+          </MediaUri>
+        </GetSnapshotUriResponse>"#;
+
+    #[test]
+    fn test_all_fields_parsed() {
+        let uri = SnapshotUri::from_xml(&parse(FULL)).unwrap();
+        assert_eq!(uri.uri, "http://192.168.1.1/onvif/snapshot?channel=1");
+        assert!(!uri.invalid_after_connect);
+        assert!(uri.invalid_after_reboot);
+        assert_eq!(uri.timeout, "PT60S");
+    }
+
+    #[test]
+    fn test_missing_media_uri_is_error() {
+        let err = SnapshotUri::from_xml(&parse("<GetSnapshotUriResponse/>")).unwrap_err();
+        assert!(matches!(
+            err,
+            OnvifError::Soap(SoapError::MissingField("MediaUri"))
+        ));
+    }
+
+    #[test]
+    fn test_empty_uri_is_error() {
+        let xml = "<GetSnapshotUriResponse><MediaUri><Uri/></MediaUri></GetSnapshotUriResponse>";
+        let err = SnapshotUri::from_xml(&parse(xml)).unwrap_err();
+        assert!(matches!(
+            err,
+            OnvifError::Soap(SoapError::MissingField("Uri"))
+        ));
+    }
+}
+
+mod ptz_preset {
+    use super::*;
+
+    const TWO_PRESETS: &str = r#"<GetPresetsResponse>
+          <Preset token="1">
+            <Name>Front Gate</Name>
+            <PTZPosition>
+              <PanTilt x="0.1" y="-0.2"/>
+              <Zoom x="0.5"/>
+            </PTZPosition>
+          </Preset>
+          <Preset token="2">
+            <Name>Parking Lot</Name>
+          </Preset>
+        </GetPresetsResponse>"#;
+
+    #[test]
+    fn test_two_presets_returned() {
+        let presets = PtzPreset::vec_from_xml(&parse(TWO_PRESETS)).unwrap();
+        assert_eq!(presets.len(), 2);
+    }
+
+    #[test]
+    fn test_preset_fields() {
+        let presets = PtzPreset::vec_from_xml(&parse(TWO_PRESETS)).unwrap();
+        assert_eq!(presets[0].token, "1");
+        assert_eq!(presets[0].name, "Front Gate");
+    }
+
+    #[test]
+    fn test_preset_position_parsed() {
+        let presets = PtzPreset::vec_from_xml(&parse(TWO_PRESETS)).unwrap();
+        let (pan, tilt) = presets[0].pan_tilt.unwrap();
+        assert!((pan - 0.1).abs() < 1e-5);
+        assert!((tilt - (-0.2)).abs() < 1e-5);
+        assert!((presets[0].zoom.unwrap() - 0.5).abs() < 1e-5);
+    }
+
+    #[test]
+    fn test_preset_without_position_is_none() {
+        let presets = PtzPreset::vec_from_xml(&parse(TWO_PRESETS)).unwrap();
+        assert!(presets[1].pan_tilt.is_none());
+        assert!(presets[1].zoom.is_none());
+    }
+
+    #[test]
+    fn test_empty_response_returns_empty_vec() {
+        let presets = PtzPreset::vec_from_xml(&parse("<GetPresetsResponse/>")).unwrap();
+        assert!(presets.is_empty());
+    }
+}
+
+// ── PtzConfiguration: the schema spelling, and the limits ────────────────────
+//
+// `onvif.xsd` spells the absolute pan/tilt space element
+// `DefaultAbsolutePantTiltPositionSpace` — `Pant`, double `t`. It is ONVIF's
+// own typo and it is normative. oxvif spelled it `PanTilt` on both sides, so
+// the field was `None` from every conformant device and `SetConfiguration`
+// carried an element no schema defines. `PanTiltLimits` / `ZoomLimits` were
+// read and never written, so a get → modify → set lost them and returned
+// `Ok(())`.
+//
+// It survived because the parser, the client unit fixture and the mock all
+// agreed with each other and with nothing else — the shape `CLAUDE.md`
+// describes under "Data nested in `Extension` levels".
+mod ptz_configuration {
+    use super::*;
+    use crate::types::{PtzConfiguration, PtzSpaceRange, PtzSpeed};
+
+    const PT_URI: &str = "http://www.onvif.org/ver10/tptz/PanTiltSpaces/PositionGenericSpace";
+    const Z_URI: &str = "http://www.onvif.org/ver10/tptz/ZoomSpaces/PositionGenericSpace";
+
+    /// What a conformant device sends: the `Pant` spelling, both limit blocks.
+    const SCHEMA_SPELLING: &str = r#"<PTZConfiguration token="PTZConfig_1">
+          <Name>cfg</Name>
+          <UseCount>2</UseCount>
+          <NodeToken>PTZNode_1</NodeToken>
+          <DefaultAbsolutePantTiltPositionSpace>http://www.onvif.org/ver10/tptz/PanTiltSpaces/PositionGenericSpace</DefaultAbsolutePantTiltPositionSpace>
+        </PTZConfiguration>"#;
+
+    /// What a vendor who "corrected" ONVIF's typo sends.
+    const CORRECTED_SPELLING: &str = r#"<PTZConfiguration token="PTZConfig_1">
+          <Name>cfg</Name>
+          <UseCount>2</UseCount>
+          <NodeToken>PTZNode_1</NodeToken>
+          <DefaultAbsolutePanTiltPositionSpace>http://www.onvif.org/ver10/tptz/PanTiltSpaces/PositionGenericSpace</DefaultAbsolutePanTiltPositionSpace>
+        </PTZConfiguration>"#;
+
+    #[test]
+    fn reads_the_schema_spelling() {
+        let cfg = PtzConfiguration::from_xml(&parse(SCHEMA_SPELLING)).unwrap();
+        assert_eq!(
+            cfg.default_abs_pan_tilt_space.as_deref(),
+            Some(PT_URI),
+            "DefaultAbsolutePantTiltPositionSpace (the onvif.xsd spelling) was not read"
+        );
+    }
+
+    #[test]
+    fn reads_the_corrected_spelling_too() {
+        let cfg = PtzConfiguration::from_xml(&parse(CORRECTED_SPELLING)).unwrap();
+        assert_eq!(
+            cfg.default_abs_pan_tilt_space.as_deref(),
+            Some(PT_URI),
+            "the lenient fallback to DefaultAbsolutePanTiltPositionSpace is gone"
+        );
+    }
+
+    #[test]
+    fn writes_only_the_schema_spelling() {
+        let cfg = PtzConfiguration::from_xml(&parse(CORRECTED_SPELLING)).unwrap();
+        let xml = cfg.to_xml_body().unwrap();
+        assert!(
+            xml.contains("<tt:DefaultAbsolutePantTiltPositionSpace>"),
+            "SetConfiguration must carry the onvif.xsd spelling, got: {xml}"
+        );
+        assert!(
+            !xml.contains("<tt:DefaultAbsolutePanTiltPositionSpace>"),
+            "the corrected spelling is an element no schema declares: {xml}"
+        );
+    }
+
+    fn full_config() -> PtzConfiguration {
+        PtzConfiguration {
+            token: "PTZConfig_1".into(),
+            name: "cfg".into(),
+            use_count: 2,
+            node_token: "PTZNode_1".into(),
+            default_ptz_timeout: Some("PT10S".into()),
+            default_abs_pan_tilt_space: Some(PT_URI.into()),
+            default_abs_zoom_space: Some(Z_URI.into()),
+            default_rel_pan_tilt_space: Some("urn:rel-pt".into()),
+            default_rel_zoom_space: Some("urn:rel-z".into()),
+            default_cont_pan_tilt_space: Some("urn:cont-pt".into()),
+            default_cont_zoom_space: Some("urn:cont-z".into()),
+            default_ptz_speed: Some(PtzSpeed {
+                pan_tilt: Some((0.25, 0.75)),
+                zoom: Some(0.5),
+            }),
+            pan_tilt_limits: Some(PtzSpaceRange {
+                uri: PT_URI.into(),
+                x_range: (-0.8, 0.9),
+                y_range: Some((-0.6, 0.7)),
+            }),
+            zoom_limits: Some(PtzSpaceRange {
+                uri: Z_URI.into(),
+                x_range: (0.1, 0.95),
+                y_range: None,
+            }),
+        }
+    }
+
+    /// The assertion that would have caught the *limits* defect: every field the
+    /// parser reads must survive being written and read back.
+    ///
+    /// It says nothing about the `Pant` spelling, and never could. 0.14.0 got
+    /// that element wrong on both sides, so the round trip agreed with itself;
+    /// and the reader accepts both spellings today, so regressing the writer
+    /// alone would leave this green too. `writes_only_the_schema_spelling` is
+    /// the one that pins it, by asserting the bytes.
+    #[test]
+    fn write_then_read_preserves_every_field() {
+        let emitted = full_config().to_xml_body().unwrap();
+        let re = PtzConfiguration::from_xml(&parse(
+            &emitted.replace("tptz:PTZConfiguration", "PTZConfiguration"),
+        ))
+        .unwrap();
+
+        assert_eq!(re.token, "PTZConfig_1");
+        assert_eq!(re.name, "cfg");
+        assert_eq!(re.use_count, 2);
+        assert_eq!(re.node_token, "PTZNode_1");
+        assert_eq!(re.default_ptz_timeout.as_deref(), Some("PT10S"));
+        assert_eq!(re.default_abs_pan_tilt_space.as_deref(), Some(PT_URI));
+        assert_eq!(re.default_abs_zoom_space.as_deref(), Some(Z_URI));
+        assert_eq!(re.default_rel_pan_tilt_space.as_deref(), Some("urn:rel-pt"));
+        assert_eq!(re.default_rel_zoom_space.as_deref(), Some("urn:rel-z"));
+        assert_eq!(
+            re.default_cont_pan_tilt_space.as_deref(),
+            Some("urn:cont-pt")
+        );
+        assert_eq!(re.default_cont_zoom_space.as_deref(), Some("urn:cont-z"));
+
+        let speed = re.default_ptz_speed.expect("DefaultPTZSpeed was dropped");
+        assert_eq!(speed.pan_tilt, Some((0.25, 0.75)));
+        assert_eq!(speed.zoom, Some(0.5));
+
+        let pt = re.pan_tilt_limits.expect("PanTiltLimits was dropped");
+        assert_eq!(pt.uri, PT_URI);
+        assert_eq!(pt.x_range, (-0.8, 0.9));
+        assert_eq!(pt.y_range, Some((-0.6, 0.7)));
+
+        let z = re.zoom_limits.expect("ZoomLimits was dropped");
+        assert_eq!(z.uri, Z_URI);
+        assert_eq!(z.x_range, (0.1, 0.95));
+    }
+
+    /// `ZoomLimits/Range` is a `tt:Space1DDescription` — no `YRange` exists in
+    /// it, so a `y_range` set on a zoom limit is dropped, not emitted.
+    #[test]
+    fn zoom_limits_never_carry_a_y_range() {
+        let mut cfg = full_config();
+        cfg.pan_tilt_limits = None;
+        cfg.zoom_limits = Some(PtzSpaceRange {
+            uri: Z_URI.into(),
+            x_range: (0.0, 1.0),
+            y_range: Some((-1.0, 1.0)),
+        });
+        let xml = cfg.to_xml_body().unwrap();
+        assert!(xml.contains("<tt:ZoomLimits>"), "ZoomLimits missing: {xml}");
+        assert!(
+            !xml.contains("<tt:YRange>"),
+            "Space1DDescription has no YRange: {xml}"
+        );
+    }
+
+    /// `PanTiltLimits/Range` is a `tt:Space2DDescription`, whose `YRange` is
+    /// required. Rather than emit it without one, the caller is told.
+    #[test]
+    fn pan_tilt_limits_without_a_y_range_is_refused() {
+        let mut cfg = full_config();
+        cfg.pan_tilt_limits = Some(PtzSpaceRange {
+            uri: PT_URI.into(),
+            x_range: (-1.0, 1.0),
+            y_range: None,
+        });
+        let err = cfg.to_xml_body().unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "invalid argument: PanTiltLimits/Range is a Space2DDescription and its YRange is \
+             required; this PtzSpaceRange has y_range: None"
+        );
+    }
+
+    /// The schema sequence puts the limits after `DefaultPTZTimeout` and
+    /// before `Extension`, with `PanTiltLimits` ahead of `ZoomLimits`.
+    #[test]
+    fn limits_follow_the_xsd_sequence() {
+        let xml = full_config().to_xml_body().unwrap();
+        let timeout = xml.find("<tt:DefaultPTZTimeout>").expect("timeout");
+        let pt = xml.find("<tt:PanTiltLimits>").expect("PanTiltLimits");
+        let z = xml.find("<tt:ZoomLimits>").expect("ZoomLimits");
+        assert!(timeout < pt, "PanTiltLimits must follow DefaultPTZTimeout");
+        assert!(pt < z, "PanTiltLimits must precede ZoomLimits");
+    }
+}
+
+mod video {
+    use super::*;
+
+    // ── VideoSource ───────────────────────────────────────────────────────
+
+    const TWO_SOURCES: &str = r#"<GetVideoSourcesResponse>
+          <VideoSources token="VideoSource_1">
+            <Framerate>25</Framerate>
+            <Resolution><Width>1920</Width><Height>1080</Height></Resolution>
+          </VideoSources>
+          <VideoSources token="VideoSource_2">
+            <Framerate>15</Framerate>
+            <Resolution><Width>1280</Width><Height>720</Height></Resolution>
+          </VideoSources>
+        </GetVideoSourcesResponse>"#;
+
+    #[test]
+    fn test_video_sources_count() {
+        let sources = VideoSource::vec_from_xml(&parse(TWO_SOURCES)).unwrap();
+        assert_eq!(sources.len(), 2);
+    }
+
+    #[test]
+    fn test_video_sources_fields() {
+        let sources = VideoSource::vec_from_xml(&parse(TWO_SOURCES)).unwrap();
+        assert_eq!(sources[0].token, "VideoSource_1");
+        assert!((sources[0].framerate - 25.0).abs() < 1e-5);
+        assert_eq!(
+            sources[0].resolution,
+            Resolution {
+                width: 1920,
+                height: 1080
+            }
+        );
+        assert_eq!(sources[1].token, "VideoSource_2");
+        assert_eq!(
+            sources[1].resolution,
+            Resolution {
+                width: 1280,
+                height: 720
+            }
+        );
+    }
+
+    // ── VideoSourceConfiguration ──────────────────────────────────────────
+
+    const VSC_XML: &str = r#"<Configuration token="VSC_1">
+          <Name>VideoSourceConfig</Name>
+          <UseCount>2</UseCount>
+          <SourceToken>VideoSource_1</SourceToken>
+          <Bounds x="0" y="0" width="1920" height="1080"/>
+        </Configuration>"#;
+
+    #[test]
+    fn test_video_source_configuration_from_xml() {
+        let cfg = VideoSourceConfiguration::from_xml(&parse(VSC_XML)).unwrap();
+        assert_eq!(cfg.token, "VSC_1");
+        assert_eq!(cfg.name, "VideoSourceConfig");
+        assert_eq!(cfg.use_count, 2);
+        assert_eq!(cfg.source_token, "VideoSource_1");
+        assert_eq!(cfg.bounds.x, 0);
+        assert_eq!(cfg.bounds.y, 0);
+        assert_eq!(cfg.bounds.width, 1920);
+        assert_eq!(cfg.bounds.height, 1080);
+    }
+
+    #[test]
+    fn test_video_source_configuration_to_xml_body_round_trip() {
+        let cfg = VideoSourceConfiguration {
+            token: "tok1".into(),
+            name: "MyCfg".into(),
+            use_count: 1,
+            source_token: "src1".into(),
+            bounds: SourceBounds {
+                x: 10,
+                y: 20,
+                width: 640,
+                height: 480,
+            },
+        };
+        let xml = cfg.to_xml_body();
+        assert!(xml.contains("token=\"tok1\""));
+        assert!(xml.contains("<tt:Name>MyCfg</tt:Name>"));
+        assert!(xml.contains("<tt:SourceToken>src1</tt:SourceToken>"));
+        assert!(xml.contains("x=\"10\""));
+        assert!(xml.contains("y=\"20\""));
+        assert!(xml.contains("width=\"640\""));
+        assert!(xml.contains("height=\"480\""));
+    }
+
+    // ── VideoSourceConfigurationOptions ───────────────────────────────────
+
+    const VSCO_XML: &str = r#"<GetVideoSourceConfigurationOptionsResponse>
+          <Options MaximumNumberOfProfiles="5">
+            <BoundsRange>
+              <XRange><Min>0</Min><Max>0</Max></XRange>
+              <YRange><Min>0</Min><Max>0</Max></YRange>
+              <WidthRange><Min>320</Min><Max>1920</Max></WidthRange>
+              <HeightRange><Min>240</Min><Max>1080</Max></HeightRange>
+            </BoundsRange>
+            <VideoSourceTokensAvailable>VideoSource_1</VideoSourceTokensAvailable>
+            <VideoSourceTokensAvailable>VideoSource_2</VideoSourceTokensAvailable>
+          </Options>
+        </GetVideoSourceConfigurationOptionsResponse>"#;
+
+    #[test]
+    fn test_video_source_configuration_options_from_xml() {
+        let opts = VideoSourceConfigurationOptions::from_xml(&parse(VSCO_XML)).unwrap();
+        assert_eq!(opts.max_limit, Some(5));
+        assert_eq!(opts.source_tokens.len(), 2);
+        assert_eq!(opts.source_tokens[0], "VideoSource_1");
+        let br = opts.bounds_range.unwrap();
+        assert_eq!(br.width_range.min, 320);
+        assert_eq!(br.width_range.max, 1920);
+        assert_eq!(br.height_range.min, 240);
+        assert_eq!(br.height_range.max, 1080);
+    }
+
+    // ── VideoEncoding ─────────────────────────────────────────────────────
+
+    #[test]
+    fn test_video_encoding_from_str() {
+        assert_eq!(VideoEncoding::from_str("JPEG"), VideoEncoding::Jpeg);
+        assert_eq!(VideoEncoding::from_str("H264"), VideoEncoding::H264);
+        assert_eq!(VideoEncoding::from_str("H265"), VideoEncoding::H265);
+        assert_eq!(VideoEncoding::from_str("H.265"), VideoEncoding::H265);
+        assert_eq!(
+            VideoEncoding::from_str("MPEG4"),
+            VideoEncoding::Other("MPEG4".into())
+        );
+    }
+
+    // ── VideoEncoderConfiguration ─────────────────────────────────────────
+
+    const VEC_XML: &str = r#"<Configuration token="VideoEncoder_1">
+          <Name>MainStream</Name>
+          <UseCount>1</UseCount>
+          <Encoding>H264</Encoding>
+          <Resolution><Width>1920</Width><Height>1080</Height></Resolution>
+          <Quality>5</Quality>
+          <RateControl>
+            <FrameRateLimit>25</FrameRateLimit>
+            <EncodingInterval>1</EncodingInterval>
+            <BitrateLimit>4096</BitrateLimit>
+          </RateControl>
+          <H264>
+            <GovLength>30</GovLength>
+            <H264Profile>Main</H264Profile>
+          </H264>
+        </Configuration>"#;
+
+    #[test]
+    fn test_video_encoder_configuration_from_xml() {
+        let cfg = VideoEncoderConfiguration::from_xml(&parse(VEC_XML)).unwrap();
+        assert_eq!(cfg.token, "VideoEncoder_1");
+        assert_eq!(cfg.name, "MainStream");
+        assert_eq!(cfg.use_count, 1);
+        assert_eq!(cfg.encoding, VideoEncoding::H264);
+        assert_eq!(
+            cfg.resolution,
+            Resolution {
+                width: 1920,
+                height: 1080
+            }
+        );
+        assert!((cfg.quality - 5.0).abs() < 1e-5);
+        let rc = cfg.rate_control.unwrap();
+        assert_eq!(rc.frame_rate_limit, 25);
+        assert_eq!(rc.encoding_interval, 1);
+        assert_eq!(rc.bitrate_limit, 4096);
+        let h264 = cfg.h264.unwrap();
+        assert_eq!(h264.gov_length, 30);
+        assert_eq!(h264.profile, "Main");
+        assert!(cfg.h265.is_none());
+    }
+
+    const TWO_VEC_XML: &str = r#"<GetVideoEncoderConfigurationsResponse>
+          <Configurations token="VideoEncoder_1">
+            <Name>MainStream</Name>
+            <UseCount>1</UseCount>
+            <Encoding>H264</Encoding>
+            <Resolution><Width>1920</Width><Height>1080</Height></Resolution>
+            <Quality>5</Quality>
+          </Configurations>
+          <Configurations token="VideoEncoder_2">
+            <Name>SubStream</Name>
+            <UseCount>1</UseCount>
+            <Encoding>JPEG</Encoding>
+            <Resolution><Width>640</Width><Height>480</Height></Resolution>
+            <Quality>3</Quality>
+          </Configurations>
+        </GetVideoEncoderConfigurationsResponse>"#;
+
+    #[test]
+    fn test_video_encoder_configuration_vec_from_xml() {
+        let cfgs = VideoEncoderConfiguration::vec_from_xml(&parse(TWO_VEC_XML)).unwrap();
+        assert_eq!(cfgs.len(), 2);
+        assert_eq!(cfgs[0].token, "VideoEncoder_1");
+        assert_eq!(cfgs[1].encoding, VideoEncoding::Jpeg);
+    }
+
+    #[test]
+    fn test_video_encoder_configuration_to_xml_body_round_trip() {
+        let cfg = VideoEncoderConfiguration {
+            token: "enc1".into(),
+            name: "Main".into(),
+            use_count: 1,
+            encoding: VideoEncoding::H264,
+            resolution: Resolution {
+                width: 1280,
+                height: 720,
+            },
+            quality: 4.0,
+            rate_control: Some(VideoRateControl {
+                frame_rate_limit: 30,
+                encoding_interval: 1,
+                bitrate_limit: 2048,
+            }),
+            h264: Some(H264Configuration {
+                gov_length: 25,
+                profile: "Baseline".into(),
+            }),
+            h265: None,
+            multicast: None,
+            session_timeout: Some("PT60S".into()),
+            guaranteed_frame_rate: Some(true),
+        };
+        let xml = cfg.to_xml_body();
+        assert!(xml.contains("token=\"enc1\""));
+        assert!(xml.contains("<tt:Encoding>H264</tt:Encoding>"));
+        assert!(xml.contains("<tt:Width>1280</tt:Width>"));
+        assert!(xml.contains("<tt:FrameRateLimit>30</tt:FrameRateLimit>"));
+        assert!(xml.contains("<tt:GovLength>25</tt:GovLength>"));
+        assert!(xml.contains("<tt:H264Profile>Baseline</tt:H264Profile>"));
+        // SessionTimeout is required by the schema and must be emitted.
+        assert!(xml.contains("<tt:SessionTimeout>PT60S</tt:SessionTimeout>"));
+        // GuaranteedFrameRate is an attribute, not a child element.
+        assert!(xml.contains("GuaranteedFrameRate=\"true\""));
+        assert!(!xml.contains("<tt:GuaranteedFrameRate>"));
+        // Quality must precede RateControl per the XSD sequence.
+        let q = xml.find("<tt:Quality>").unwrap();
+        let rc = xml.find("<tt:RateControl>").unwrap();
+        assert!(q < rc, "Quality must come before RateControl");
+    }
+
+    #[test]
+    fn test_ptz_configuration_to_xml_body_closes_optional_tags() {
+        let cfg = crate::types::PtzConfiguration {
+            token: "PTZCfg_1".into(),
+            name: "ptz".into(),
+            use_count: 1,
+            node_token: "Node_1".into(),
+            default_ptz_timeout: Some("PT5S".into()),
+            default_abs_pan_tilt_space: None,
+            default_abs_zoom_space: None,
+            default_rel_pan_tilt_space: None,
+            default_rel_zoom_space: None,
+            default_cont_pan_tilt_space: None,
+            default_cont_zoom_space: None,
+            default_ptz_speed: None,
+            pan_tilt_limits: None,
+            zoom_limits: None,
+        };
+        let xml = cfg.to_xml_body().unwrap();
+        // Optional string fields must close as </tt:Tag>, never the
+        // malformed <tt:/Tag> the opt_str helper used to emit.
+        assert!(xml.contains("<tt:DefaultPTZTimeout>PT5S</tt:DefaultPTZTimeout>"));
+        assert!(!xml.contains("<tt:/"));
+    }
+
+    // ── VideoEncoderConfigurationOptions ──────────────────────────────────
+
+    const VECO_XML: &str = r#"<GetVideoEncoderConfigurationOptionsResponse>
+          <Options>
+            <QualityRange><Min>1</Min><Max>10</Max></QualityRange>
+            <JPEG>
+              <ResolutionsAvailable><Width>1920</Width><Height>1080</Height></ResolutionsAvailable>
+              <ResolutionsAvailable><Width>1280</Width><Height>720</Height></ResolutionsAvailable>
+              <FrameRateRange><Min>1</Min><Max>30</Max></FrameRateRange>
+              <EncodingIntervalRange><Min>1</Min><Max>1</Max></EncodingIntervalRange>
+            </JPEG>
+            <H264>
+              <ResolutionsAvailable><Width>1920</Width><Height>1080</Height></ResolutionsAvailable>
+              <GovLengthRange><Min>1</Min><Max>150</Max></GovLengthRange>
+              <FrameRateRange><Min>1</Min><Max>30</Max></FrameRateRange>
+              <EncodingIntervalRange><Min>1</Min><Max>1</Max></EncodingIntervalRange>
+              <BitrateRange><Min>32</Min><Max>16384</Max></BitrateRange>
+              <H264ProfilesSupported>Baseline</H264ProfilesSupported>
+              <H264ProfilesSupported>Main</H264ProfilesSupported>
+              <H264ProfilesSupported>High</H264ProfilesSupported>
+            </H264>
+          </Options>
+        </GetVideoEncoderConfigurationOptionsResponse>"#;
+
+    #[test]
+    fn test_video_encoder_configuration_options_from_xml() {
+        let opts = VideoEncoderConfigurationOptions::from_xml(&parse(VECO_XML)).unwrap();
+        let qr = opts.quality_range.unwrap();
+        assert!((qr.min - 1.0).abs() < 1e-5);
+        assert!((qr.max - 10.0).abs() < 1e-5);
+        let jpeg = opts.jpeg.unwrap();
+        assert_eq!(jpeg.resolutions.len(), 2);
+        assert_eq!(
+            jpeg.resolutions[0],
+            Resolution {
+                width: 1920,
+                height: 1080
+            }
+        );
+        let fr = jpeg.frame_rate_range.unwrap();
+        assert_eq!(fr.min, 1);
+        assert_eq!(fr.max, 30);
+        let h264 = opts.h264.unwrap();
+        assert_eq!(h264.profiles.len(), 3);
+        assert_eq!(h264.profiles[0], "Baseline");
+        let br = h264.bitrate_range.unwrap();
+        assert_eq!(br.min, 32);
+        assert_eq!(br.max, 16384);
+        let glr = h264.gov_length_range.unwrap();
+        assert_eq!(glr.max, 150);
+        assert!(opts.h265.is_none());
+    }
+
+    // ── Codec blocks nested in the Media1 extension levels ────────────────
+    //
+    // Captured verbatim from a real two-sensor device (2026-07-28): the
+    // top-level `H264` carries no `BitrateRange`, and the device puts the
+    // whole block again — bitrate included — under `Extension`. Reading only
+    // the top-level node loses the bitrate range with no error and no empty
+    // field to notice: `bitrate_range` is simply `None`, which is exactly what
+    // a device that never advertised one would produce.
+
+    const VECO_EXTENSION_XML: &str = r#"<GetVideoEncoderConfigurationOptionsResponse>
+          <Options>
+            <QualityRange><Min>1</Min><Max>5</Max></QualityRange>
+            <JPEG>
+              <ResolutionsAvailable><Width>704</Width><Height>480</Height></ResolutionsAvailable>
+              <FrameRateRange><Min>1</Min><Max>25</Max></FrameRateRange>
+              <EncodingIntervalRange><Min>1</Min><Max>1</Max></EncodingIntervalRange>
+            </JPEG>
+            <H264>
+              <ResolutionsAvailable><Width>704</Width><Height>480</Height></ResolutionsAvailable>
+              <ResolutionsAvailable><Width>352</Width><Height>240</Height></ResolutionsAvailable>
+              <GovLengthRange><Min>1</Min><Max>1500</Max></GovLengthRange>
+              <FrameRateRange><Min>1</Min><Max>25</Max></FrameRateRange>
+              <EncodingIntervalRange><Min>1</Min><Max>1</Max></EncodingIntervalRange>
+              <H264ProfilesSupported>Baseline</H264ProfilesSupported>
+            </H264>
+            <Extension>
+              <JPEG>
+                <ResolutionsAvailable><Width>704</Width><Height>480</Height></ResolutionsAvailable>
+                <FrameRateRange><Min>1</Min><Max>25</Max></FrameRateRange>
+                <EncodingIntervalRange><Min>1</Min><Max>1</Max></EncodingIntervalRange>
+                <BitrateRange><Min>64</Min><Max>2048</Max></BitrateRange>
+              </JPEG>
+              <H264>
+                <ResolutionsAvailable><Width>704</Width><Height>480</Height></ResolutionsAvailable>
+                <ResolutionsAvailable><Width>352</Width><Height>240</Height></ResolutionsAvailable>
+                <GovLengthRange><Min>1</Min><Max>1500</Max></GovLengthRange>
+                <FrameRateRange><Min>1</Min><Max>25</Max></FrameRateRange>
+                <EncodingIntervalRange><Min>1</Min><Max>1</Max></EncodingIntervalRange>
+                <H264ProfilesSupported>Baseline</H264ProfilesSupported>
+                <H264ProfilesSupported>Main</H264ProfilesSupported>
+                <H264ProfilesSupported>High</H264ProfilesSupported>
+                <BitrateRange><Min>64</Min><Max>2048</Max></BitrateRange>
+              </H264>
+            </Extension>
+          </Options>
+        </GetVideoEncoderConfigurationOptionsResponse>"#;
+
+    #[test]
+    fn video_encoder_options_read_bitrate_from_the_extension_level() {
+        let opts = VideoEncoderConfigurationOptions::from_xml(&parse(VECO_EXTENSION_XML)).unwrap();
+
+        // The whole point: the top-level H264 has no BitrateRange, so this is
+        // `None` unless the parser descends into `Extension`.
+        let h264 = opts.h264.expect("H264 options");
+        let br = h264
+            .bitrate_range
+            .expect("bitrate range lives in Extension");
+        assert_eq!(br.min, 64);
+        assert_eq!(br.max, 2048);
+
+        // The extension copy is a superset, not a replacement — taking it must
+        // not cost the fields the top-level node also had. Three profiles here
+        // versus one at the top level pins that the deeper node won.
+        assert_eq!(h264.profiles, ["Baseline", "Main", "High"]);
+        assert_eq!(h264.resolutions.len(), 2);
+        assert_eq!(
+            h264.resolutions[0],
+            Resolution {
+                width: 704,
+                height: 480
+            }
+        );
+        assert_eq!(h264.gov_length_range.unwrap().max, 1500);
+
+        // Same treatment for JPEG.
+        let jpeg = opts.jpeg.expect("JPEG options");
+        assert_eq!(jpeg.frame_rate_range.unwrap().max, 25);
+    }
+
+    // Second extension level. `tt:H265Options` exists *only* at
+    // `Options/Extension/Extension/H265` — there is no schema-legal top-level
+    // H265 in Media1 at all, so before this parser descended two levels oxvif
+    // could never report H265 from Media1 on any device. Shape transcribed
+    // from onvif.xsd; the device the fixture above came from offers no H265.
+    const VECO_H265_XML: &str = r#"<GetVideoEncoderConfigurationOptionsResponse>
+          <Options>
+            <QualityRange><Min>1</Min><Max>5</Max></QualityRange>
+            <Extension>
+              <H264>
+                <ResolutionsAvailable><Width>1280</Width><Height>720</Height></ResolutionsAvailable>
+                <BitrateRange><Min>64</Min><Max>4096</Max></BitrateRange>
+              </H264>
+              <Extension>
+                <H265>
+                  <ResolutionsAvailable><Width>2592</Width><Height>1944</Height></ResolutionsAvailable>
+                  <ResolutionsAvailable><Width>1920</Width><Height>1080</Height></ResolutionsAvailable>
+                  <GovLengthRange><Min>1</Min><Max>250</Max></GovLengthRange>
+                  <BitrateRange><Min>128</Min><Max>8192</Max></BitrateRange>
+                  <H265ProfilesSupported>Main</H265ProfilesSupported>
+                </H265>
+              </Extension>
+            </Extension>
+          </Options>
+        </GetVideoEncoderConfigurationOptionsResponse>"#;
+
+    #[test]
+    fn video_encoder_options_read_h265_from_the_second_extension_level() {
+        let opts = VideoEncoderConfigurationOptions::from_xml(&parse(VECO_H265_XML)).unwrap();
+
+        let h265 = opts.h265.expect("H265 lives two extension levels down");
+        assert_eq!(
+            h265.resolutions[0],
+            Resolution {
+                width: 2592,
+                height: 1944
+            }
+        );
+        assert_eq!(h265.resolutions.len(), 2);
+        assert_eq!(h265.bitrate_range.unwrap().max, 8192);
+        assert_eq!(h265.profiles, ["Main"]);
+
+        // H264 one level up must still be found in the same response.
+        assert_eq!(opts.h264.unwrap().bitrate_range.unwrap().max, 4096);
+
+        // Nothing at the top level, and JPEG genuinely absent — not a fallback
+        // that quietly picked up the H264 node.
+        assert!(opts.jpeg.is_none());
+    }
+}
+
+mod media2 {
+    use super::*;
+
+    // ── MediaProfile2 ─────────────────────────────────────────────────────
+
+    const TWO_PROFILES2: &str = r#"<GetProfilesResponse>
+          <Profiles token="Profile_A" fixed="true">
+            <Name>mainStream</Name>
+            <Configurations>
+              <VideoSource token="VSC_1">
+                <SourceToken>VS_1</SourceToken>
+              </VideoSource>
+              <VideoEncoder token="VEC_1"/>
+            </Configurations>
+          </Profiles>
+          <Profiles token="Profile_B" fixed="false">
+            <Name>subStream</Name>
+            <Configurations>
+              <VideoSource token="VSC_1">
+                <SourceToken>VS_1</SourceToken>
+              </VideoSource>
+            </Configurations>
+          </Profiles>
+        </GetProfilesResponse>"#;
+
+    #[test]
+    fn test_media_profile2_vec_from_xml() {
+        let profiles = MediaProfile2::vec_from_xml(&parse(TWO_PROFILES2)).unwrap();
+        assert_eq!(profiles.len(), 2);
+        assert_eq!(profiles[0].token, "Profile_A");
+        assert_eq!(profiles[0].name, "mainStream");
+        assert!(profiles[0].fixed);
+        assert_eq!(
+            profiles[0].video_source_config_token.as_deref(),
+            Some("VSC_1")
+        );
+        assert_eq!(profiles[0].video_source_token.as_deref(), Some("VS_1"));
+        assert_eq!(profiles[0].video_encoder_token.as_deref(), Some("VEC_1"));
+        assert_eq!(profiles[1].token, "Profile_B");
+        assert_eq!(profiles[1].name, "subStream");
+        assert!(!profiles[1].fixed);
+        assert_eq!(
+            profiles[1].video_source_config_token.as_deref(),
+            Some("VSC_1")
+        );
+        assert_eq!(profiles[1].video_source_token.as_deref(), Some("VS_1"));
+        assert!(profiles[1].video_encoder_token.is_none());
+    }
+
+    // ── VideoEncoderConfiguration2 ────────────────────────────────────────
+
+    /// `GovLength` and `Profile` are attributes — `tt:VideoEncoder2Configuration`
+    /// declares them as `xs:attribute`, not as members of its sequence.
+    const H265_CONFIG: &str = r#"<Configurations token="VEC_H265" GovLength="60" Profile="Main">
+          <Name>H265Stream</Name>
+          <UseCount>1</UseCount>
+          <Encoding>H265</Encoding>
+          <Resolution><Width>3840</Width><Height>2160</Height></Resolution>
+          <Quality>7</Quality>
+          <RateControl>
+            <FrameRateLimit>30</FrameRateLimit>
+            <BitrateLimit>8192</BitrateLimit>
+          </RateControl>
+        </Configurations>"#;
+
+    /// The pre-0.15 shape: the same two names as child elements. A device does
+    /// not send this, and neither does the mock — parsing it must yield `None`
+    /// for both rather than quietly accepting the old form, or every assertion
+    /// on the fixture above would hold for a parser that reads either.
+    const H265_CONFIG_ELEMENT_FORM: &str = r#"<Configurations token="VEC_H265">
+          <Name>H265Stream</Name>
+          <UseCount>1</UseCount>
+          <Encoding>H265</Encoding>
+          <Resolution><Width>3840</Width><Height>2160</Height></Resolution>
+          <Quality>7</Quality>
+          <GovLength>60</GovLength>
+          <Profile>Main</Profile>
+        </Configurations>"#;
+
+    #[test]
+    fn test_video_encoder_configuration2_ignores_the_element_form() {
+        let cfg = VideoEncoderConfiguration2::from_xml(&parse(H265_CONFIG_ELEMENT_FORM)).unwrap();
+        assert_eq!(cfg.token, "VEC_H265");
+        assert_eq!(cfg.name, "H265Stream");
+        assert_eq!(cfg.gov_length, None);
+        assert_eq!(cfg.profile, None);
+    }
+
+    #[test]
+    fn test_video_encoder_configuration2_from_xml_h265() {
+        let cfg = VideoEncoderConfiguration2::from_xml(&parse(H265_CONFIG)).unwrap();
+        assert_eq!(cfg.token, "VEC_H265");
+        assert_eq!(cfg.name, "H265Stream");
+        assert_eq!(cfg.encoding, VideoEncoding::H265);
+        assert_eq!(
+            cfg.resolution,
+            Resolution {
+                width: 3840,
+                height: 2160
+            }
+        );
+        assert!((cfg.quality - 7.0).abs() < 1e-5);
+        let rc = cfg.rate_control.unwrap();
+        assert_eq!(rc.frame_rate_limit, 30.0);
+        assert_eq!(rc.bitrate_limit, 8192);
+        assert_eq!(cfg.gov_length, Some(60));
+        assert_eq!(cfg.profile.as_deref(), Some("Main"));
+    }
+
+    #[test]
+    fn test_video_encoder_configuration2_to_xml_body() {
+        let cfg = VideoEncoderConfiguration2 {
+            token: "enc2".into(),
+            name: "H265Main".into(),
+            use_count: 1,
+            encoding: VideoEncoding::H265,
+            resolution: Resolution {
+                width: 1920,
+                height: 1080,
+            },
+            quality: 6.0,
+            rate_control: Some(VideoRateControl2 {
+                frame_rate_limit: 25.0,
+                bitrate_limit: 4096,
+            }),
+            gov_length: Some(50),
+            profile: Some("Main".into()),
+        };
+        let xml = cfg.to_xml_body().unwrap();
+        assert!(xml.contains("token=\"enc2\""));
+        assert!(xml.contains("<tt:Encoding>H265</tt:Encoding>"));
+        assert!(xml.contains("<tt:Width>1920</tt:Width>"));
+        assert!(xml.contains("<tt:FrameRateLimit>25</tt:FrameRateLimit>"));
+        assert!(xml.contains("<tt:BitrateLimit>4096</tt:BitrateLimit>"));
+        // Attributes of the configuration element, not children of it.
+        assert!(xml.contains(r#" GovLength="50""#));
+        assert!(xml.contains(r#" Profile="Main""#));
+        assert!(!xml.contains("<tt:GovLength>"));
+        assert!(!xml.contains("<tt:Profile>"));
+        // No EncodingInterval (Media2 only has FrameRateLimit + BitrateLimit)
+        assert!(!xml.contains("EncodingInterval"));
+    }
+
+    /// `None` must omit the attribute, not write `GovLength=""` — both are
+    /// `use="optional"` and an empty `xs:int` is not a legal lexical value.
+    #[test]
+    fn test_video_encoder_configuration2_to_xml_body_omits_absent_attributes() {
+        let cfg = VideoEncoderConfiguration2 {
+            token: "enc2".into(),
+            name: "Plain".into(),
+            use_count: 1,
+            encoding: VideoEncoding::H264,
+            resolution: Resolution {
+                width: 640,
+                height: 480,
+            },
+            quality: 3.0,
+            rate_control: None,
+            gov_length: None,
+            profile: None,
+        };
+        let xml = cfg.to_xml_body().unwrap();
+        assert!(xml.contains(r#"<tr2:Configuration token="enc2">"#));
+        assert!(!xml.contains("GovLength"));
+        assert!(!xml.contains("Profile"));
+    }
+
+    // ── VideoEncoderConfigurationOptions2 ────────────────────────────────
+
+    // `GovLengthRange`, `FrameRatesSupported` and `ProfilesSupported` are
+    // `xs:attribute`s of `tt:VideoEncoder2ConfigurationOptions`, the last two
+    // `xs:list`-typed so one attribute carries the whole list. `12.5` is in the
+    // H264 rates on purpose: a parser reading integers drops it and the length
+    // assertion below goes red.
+    const OPTIONS2_XML: &str = r#"<GetVideoEncoderConfigurationOptionsResponse>
+          <Options GovLengthRange="1 150" FrameRatesSupported="30 25 12.5" ProfilesSupported="Baseline Main High">
+            <Encoding>H264</Encoding>
+            <QualityRange><Min>1</Min><Max>10</Max></QualityRange>
+            <ResolutionsAvailable><Width>1920</Width><Height>1080</Height></ResolutionsAvailable>
+            <ResolutionsAvailable><Width>1280</Width><Height>720</Height></ResolutionsAvailable>
+            <BitrateRange><Min>32</Min><Max>16384</Max></BitrateRange>
+          </Options>
+          <Options GovLengthRange="2 200" FrameRatesSupported="60" ProfilesSupported="Main Main10">
+            <Encoding>H265</Encoding>
+            <QualityRange><Min>1</Min><Max>10</Max></QualityRange>
+            <ResolutionsAvailable><Width>3840</Width><Height>2160</Height></ResolutionsAvailable>
+            <BitrateRange><Min>64</Min><Max>32768</Max></BitrateRange>
+          </Options>
+        </GetVideoEncoderConfigurationOptionsResponse>"#;
+
+    #[test]
+    fn test_video_encoder_configuration_options2_from_xml() {
+        let opts = VideoEncoderConfigurationOptions2::from_xml(&parse(OPTIONS2_XML)).unwrap();
+        assert_eq!(opts.options.len(), 2);
+
+        let h264 = &opts.options[0];
+        assert_eq!(h264.encoding, VideoEncoding::H264);
+        let qr = h264.quality_range.unwrap();
+        assert!((qr.min - 1.0).abs() < 1e-5);
+        assert!((qr.max - 10.0).abs() < 1e-5);
+        assert_eq!(h264.resolutions.len(), 2);
+        assert_eq!(h264.profiles, ["Baseline", "Main", "High"]);
+        let br = h264.bitrate_range.unwrap();
+        assert_eq!(br.max, 16384);
+        let glr = h264.gov_length_range.unwrap();
+        assert_eq!((glr.min, glr.max), (1, 150));
+        assert_eq!(h264.frame_rates.len(), 3, "12.5 must survive the parse");
+        assert!((h264.frame_rates[0] - 30.0).abs() < 1e-5);
+        assert!((h264.frame_rates[2] - 12.5).abs() < 1e-5);
+
+        let h265 = &opts.options[1];
+        assert_eq!(h265.encoding, VideoEncoding::H265);
+        assert_eq!(h265.resolutions.len(), 1);
+        assert_eq!(
+            h265.resolutions[0],
+            Resolution {
+                width: 3840,
+                height: 2160
+            }
+        );
+        assert_eq!(h265.profiles, ["Main", "Main10"]);
+        let glr = h265.gov_length_range.unwrap();
+        assert_eq!((glr.min, glr.max), (2, 200));
+        assert_eq!(h265.frame_rates.len(), 1);
+        assert!((h265.frame_rates[0] - 60.0).abs() < 1e-5);
+    }
+
+    /// The two list attributes and the range attribute are each independently
+    /// absent-able, and a `tt:IntList` that is not exactly two values is not a
+    /// range. Without this, nothing distinguishes "the device did not say" from
+    /// "the parser read the wrong place".
+    #[test]
+    fn test_video_encoder_options2_absent_and_malformed_attributes() {
+        const XML: &str = r#"<GetVideoEncoderConfigurationOptionsResponse>
+              <Options>
+                <Encoding>H264</Encoding>
+                <BitrateRange><Min>32</Min><Max>16384</Max></BitrateRange>
+              </Options>
+              <Options GovLengthRange="1 2 3" ProfilesSupported="Main">
+                <Encoding>H265</Encoding>
+                <BitrateRange><Min>64</Min><Max>32768</Max></BitrateRange>
+              </Options>
+            </GetVideoEncoderConfigurationOptionsResponse>"#;
+
+        let opts = VideoEncoderConfigurationOptions2::from_xml(&parse(XML)).unwrap();
+
+        let bare = &opts.options[0];
+        assert_eq!(bare.gov_length_range, None);
+        assert!(bare.profiles.is_empty());
+        assert!(bare.frame_rates.is_empty());
+        // The one element it did carry still parses, so "absent" above is about
+        // the attributes and not about the whole entry being skipped.
+        assert_eq!(bare.bitrate_range.unwrap().max, 16384);
+
+        let odd = &opts.options[1];
+        assert_eq!(
+            odd.gov_length_range, None,
+            "three values are not a lower/upper pair"
+        );
+        assert_eq!(odd.profiles, ["Main"]);
+    }
+
+    // ── VideoEncoderInstances ─────────────────────────────────────────────
+
+    /// The repeated wrapper is **`Codec`**; `Encoding` is a child *of* it.
+    ///
+    /// This fixture named the wrapper `Encoding` until 0.15.0, matching a
+    /// parser that iterated `children_named("Encoding")` — so it could not fail
+    /// for the reason it was written, and `encodings` was empty against every
+    /// conformant device. The two levels sharing a name is exactly what hid it:
+    /// `XmlNode` strips namespaces, and `Encoding` inside `Encoding` reads as
+    /// plausible.
+    ///
+    /// `Total` also goes **last**: `tr2:EncoderInstanceInfo` declares `Codec`
+    /// then `Total`.
+    const INSTANCES_XML: &str = r#"<GetVideoEncoderInstancesResponse>
+          <Info>
+            <Codec>
+              <Encoding>H264</Encoding>
+              <Number>2</Number>
+            </Codec>
+            <Codec>
+              <Encoding>H265</Encoding>
+              <Number>2</Number>
+            </Codec>
+            <Total>4</Total>
+          </Info>
+        </GetVideoEncoderInstancesResponse>"#;
+
+    #[test]
+    fn test_video_encoder_instances_from_xml() {
+        let inst = VideoEncoderInstances::from_xml(&parse(INSTANCES_XML)).unwrap();
+        assert_eq!(inst.total, 4);
+        assert_eq!(inst.encodings.len(), 2);
+        assert_eq!(inst.encodings[0].encoding, VideoEncoding::H264);
+        assert_eq!(inst.encodings[0].number, 2);
+        assert_eq!(inst.encodings[1].encoding, VideoEncoding::H265);
+        assert_eq!(inst.encodings[1].number, 2);
+    }
+}
+
+// ── ImagingSettings ───────────────────────────────────────────────────────
+
+mod imaging {
+    use super::*;
+    use crate::types::ImagingSettings;
+
+    const FULL_XML: &str = r#"<GetImagingSettingsResponse>
+        <ImagingSettings>
+          <Brightness>50.0</Brightness>
+          <ColorSaturation>60.0</ColorSaturation>
+          <Contrast>40.0</Contrast>
+          <Sharpness>30.0</Sharpness>
+          <IrCutFilter>AUTO</IrCutFilter>
+          <WhiteBalance>
+            <Mode>MANUAL</Mode>
+            <CrGain>1.25</CrGain>
+            <CbGain>0.75</CbGain>
+          </WhiteBalance>
+          <Exposure>
+            <Mode>MANUAL</Mode>
+            <Priority>FrameRate</Priority>
+            <ExposureTime>0.04</ExposureTime>
+            <Gain>6.0</Gain>
+            <Iris>2.8</Iris>
+          </Exposure>
+          <BacklightCompensation><Mode>OFF</Mode></BacklightCompensation>
+          <Focus>
+            <AutoFocusMode>MANUAL</AutoFocusMode>
+            <DefaultSpeed>1.0</DefaultSpeed>
+            <NearLimit>0.5</NearLimit>
+            <FarLimit>3000.0</FarLimit>
+          </Focus>
+          <WideDynamicRange><Mode>ON</Mode><Level>80.0</Level></WideDynamicRange>
+        </ImagingSettings>
+      </GetImagingSettingsResponse>"#;
+
+    #[test]
+    fn parses_manual_exposure_white_balance_focus_depth() {
+        let s = ImagingSettings::from_xml(&parse(FULL_XML)).unwrap();
+        // White balance manual gains
+        assert_eq!(s.white_balance_mode.as_deref(), Some("MANUAL"));
+        assert_eq!(s.wb_cr_gain, Some(1.25));
+        assert_eq!(s.wb_cb_gain, Some(0.75));
+        // Exposure manual fields
+        assert_eq!(s.exposure_mode.as_deref(), Some("MANUAL"));
+        assert_eq!(s.exposure_priority.as_deref(), Some("FrameRate"));
+        assert_eq!(s.exposure_time, Some(0.04));
+        assert_eq!(s.exposure_gain, Some(6.0));
+        assert_eq!(s.exposure_iris, Some(2.8));
+        // Focus limits
+        assert_eq!(s.focus_mode.as_deref(), Some("MANUAL"));
+        assert_eq!(s.focus_default_speed, Some(1.0));
+        assert_eq!(s.focus_near_limit, Some(0.5));
+        assert_eq!(s.focus_far_limit, Some(3000.0));
+    }
+
+    #[test]
+    fn to_xml_body_emits_new_fields_in_xsd_order() {
+        let s = ImagingSettings {
+            brightness: Some(50.0),
+            white_balance_mode: Some("MANUAL".into()),
+            wb_cr_gain: Some(1.25),
+            wb_cb_gain: Some(0.75),
+            exposure_mode: Some("MANUAL".into()),
+            exposure_priority: Some("FrameRate".into()),
+            exposure_time: Some(0.04),
+            exposure_gain: Some(6.0),
+            exposure_iris: Some(2.8),
+            focus_mode: Some("MANUAL".into()),
+            focus_default_speed: Some(1.0),
+            focus_near_limit: Some(0.5),
+            focus_far_limit: Some(3000.0),
+            ..Default::default()
+        };
+        let xml = s.to_xml_body();
+
+        // Each new field is emitted.
+        assert!(xml.contains("<tt:CrGain>1.25</tt:CrGain>"));
+        assert!(xml.contains("<tt:CbGain>0.75</tt:CbGain>"));
+        assert!(xml.contains("<tt:Priority>FrameRate</tt:Priority>"));
+        assert!(xml.contains("<tt:ExposureTime>0.04</tt:ExposureTime>"));
+        assert!(xml.contains("<tt:Gain>6</tt:Gain>"));
+        assert!(xml.contains("<tt:Iris>2.8</tt:Iris>"));
+        assert!(xml.contains("<tt:NearLimit>0.5</tt:NearLimit>"));
+        assert!(xml.contains("<tt:FarLimit>3000</tt:FarLimit>"));
+
+        // XSD sequence inside Exposure: Mode, Priority, ExposureTime, Gain, Iris.
+        let exp_start = xml.find("<tt:Exposure>").expect("exposure block");
+        let exp_end = xml[exp_start..].find("</tt:Exposure>").unwrap() + exp_start;
+        let exp = &xml[exp_start..exp_end];
+        let order = [
+            "<tt:Mode>",
+            "<tt:Priority>",
+            "<tt:ExposureTime>",
+            "<tt:Gain>",
+            "<tt:Iris>",
+        ];
+        let mut last = 0;
+        for tag in order {
+            let pos = exp.find(tag).unwrap_or_else(|| panic!("missing {tag}"));
+            assert!(pos >= last, "{tag} out of XSD order in {exp}");
+            last = pos;
+        }
+
+        // XSD sequence inside WhiteBalance: Mode, CrGain, CbGain.
+        let wb_start = xml.find("<tt:WhiteBalance>").expect("wb block");
+        let wb_end = xml[wb_start..].find("</tt:WhiteBalance>").unwrap() + wb_start;
+        let wb = &xml[wb_start..wb_end];
+        assert!(wb.find("<tt:Mode>").unwrap() < wb.find("<tt:CrGain>").unwrap());
+        assert!(wb.find("<tt:CrGain>").unwrap() < wb.find("<tt:CbGain>").unwrap());
+
+        // XSD sequence inside Focus: AutoFocusMode, DefaultSpeed, NearLimit, FarLimit.
+        let focus_start = xml.find("<tt:Focus>").expect("focus block");
+        let focus_end = xml[focus_start..].find("</tt:Focus>").unwrap() + focus_start;
+        let focus = &xml[focus_start..focus_end];
+        let f_order = [
+            "<tt:AutoFocusMode>",
+            "<tt:DefaultSpeed>",
+            "<tt:NearLimit>",
+            "<tt:FarLimit>",
+        ];
+        let mut last = 0;
+        for tag in f_order {
+            let pos = focus
+                .find(tag)
+                .unwrap_or_else(|| panic!("missing {tag} in focus"));
+            assert!(pos >= last, "{tag} out of XSD order in {focus}");
+            last = pos;
+        }
+    }
+
+    #[test]
+    fn read_write_round_trip_preserves_new_fields() {
+        let parsed = ImagingSettings::from_xml(&parse(FULL_XML)).unwrap();
+        let emitted = parsed.to_xml_body();
+        // Round-trip the emitted body back into the response shape and re-parse.
+        let wrapped = format!(
+            "<GetImagingSettingsResponse><ImagingSettings>{}</ImagingSettings></GetImagingSettingsResponse>",
+            // strip the timg-prefixed outer element so we can re-wrap with bare names
+            emitted
+                .trim_start_matches("<timg:ImagingSettings>")
+                .trim_end_matches("</timg:ImagingSettings>"),
+        );
+        let re_parsed = ImagingSettings::from_xml(&parse(&wrapped)).unwrap();
+        assert_eq!(re_parsed.wb_cr_gain, Some(1.25));
+        assert_eq!(re_parsed.exposure_priority.as_deref(), Some("FrameRate"));
+        assert_eq!(re_parsed.exposure_time, Some(0.04));
+        assert_eq!(re_parsed.focus_near_limit, Some(0.5));
+        assert_eq!(re_parsed.focus_far_limit, Some(3000.0));
+    }
+}
+
+// ── xml_escape ────────────────────────────────────────────────────────────
+
+mod xml_escape_tests {
+    use super::*;
+    use std::borrow::Cow;
+
+    #[test]
+    fn test_xml_escape_borrows_when_no_special_chars() {
+        let result = xml_escape("Profile_1");
+        assert!(
+            matches!(result, Cow::Borrowed(_)),
+            "should borrow when no escaping needed"
+        );
+        assert_eq!(result, "Profile_1");
+    }
+
+    #[test]
+    fn test_xml_escape_escapes_all_five_entities() {
+        let result = xml_escape(r#"a&b<c>d"e'f"#);
+        assert_eq!(result, "a&amp;b&lt;c&gt;d&quot;e&apos;f");
+        assert!(matches!(result, Cow::Owned(_)));
+    }
+
+    #[test]
+    fn test_xml_escape_empty_string() {
+        let result = xml_escape("");
+        assert!(matches!(result, Cow::Borrowed(_)));
+        assert_eq!(result, "");
+    }
+
+    #[test]
+    fn xml_escape_preserves_whitespace_in_text_and_attributes() {
+        for (literal, expected) in [
+            ("a\rb", "a&#13;b"),
+            ("a\nb", "a&#10;b"),
+            ("a\tb", "a&#9;b"),
+            ("a\r\n\tb", "a&#13;&#10;&#9;b"),
+            (
+                "中文 &\r\n\t\"'<> end",
+                "中文 &amp;&#13;&#10;&#9;&quot;&apos;&lt;&gt; end",
+            ),
+        ] {
+            let escaped = xml_escape(literal);
+            assert_eq!(
+                escaped, expected,
+                "wire representation must preserve data whitespace"
+            );
+            assert!(matches!(escaped, Cow::Owned(_)));
+            let xml = format!("<Value v=\"{escaped}\">{escaped}</Value>");
+            let parsed = crate::soap::XmlNode::parse(&xml).unwrap();
+            assert_eq!(parsed.attr("v"), Some(literal));
+            assert_eq!(parsed.text(), literal);
+        }
+    }
+
+    #[test]
+    fn test_xml_escape_only_special_chars() {
+        assert_eq!(xml_escape("&"), "&amp;");
+        assert_eq!(xml_escape("<"), "&lt;");
+        assert_eq!(xml_escape(">"), "&gt;");
+        assert_eq!(xml_escape("\""), "&quot;");
+        assert_eq!(xml_escape("'"), "&apos;");
+    }
+
+    #[test]
+    fn test_xml_escape_typical_values_are_borrowed() {
+        // Tokens, ISO durations, numeric strings — all common ONVIF values
+        for val in &["PT60S", "Profile_1", "192.168.1.100", "1920", "true"] {
+            assert!(
+                matches!(xml_escape(val), Cow::Borrowed(_)),
+                "typical ONVIF value '{val}' should not allocate"
+            );
+        }
+    }
+}
+
+#[cfg(feature = "serde")]
+mod serde_support {
+    use super::*;
+
+    /// Response types serialize with Rust-native snake_case field names and
+    /// survive a JSON roundtrip — the shape the `serde` feature promises to
+    /// downstream REST/NVR code.
+    #[test]
+    fn ptz_preset_json_roundtrip() {
+        let presets = PtzPreset::vec_from_xml(&parse(
+            r#"<GetPresetsResponse>
+                <Preset token="Preset_1"><Name>Front &lt;door&gt;</Name>
+                    <PTZPosition><PanTilt x="0.5" y="-0.25"/><Zoom x="0.75"/></PTZPosition>
+                </Preset>
+                <Preset token="p2"><Name>Gate</Name></Preset>
+            </GetPresetsResponse>"#,
+        ))
+        .unwrap();
+        assert_eq!(presets.len(), 2);
+        for (preset, token, name, pan_tilt, zoom, expected) in [
+            (
+                &presets[0],
+                "Preset_1",
+                "Front <door>",
+                Some((0.5, -0.25)),
+                Some(0.75),
+                serde_json::json!({"token": "Preset_1", "name": "Front <door>", "pan_tilt": [0.5, -0.25], "zoom": 0.75}),
+            ),
+            (
+                &presets[1],
+                "p2",
+                "Gate",
+                None,
+                None,
+                serde_json::json!({"token": "p2", "name": "Gate", "pan_tilt": null, "zoom": null}),
+            ),
+        ] {
+            let json = serde_json::to_string(preset).unwrap();
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&json).unwrap(),
+                expected
+            );
+            let back: PtzPreset = serde_json::from_str(&json).unwrap();
+            assert_eq!(back.token, token);
+            assert_eq!(back.name, name);
+            assert_eq!(back.pan_tilt, pan_tilt);
+            assert_eq!(back.zoom, zoom);
+            assert_eq!(json, serde_json::to_string(&back).unwrap());
+        }
+    }
+
+    /// The exact pattern the issue asked for: return `Json(response)` straight
+    /// from an axum handler. Drives a real `axum::Json` through `IntoResponse`
+    /// and inspects the emitted HTTP body — proof that a REST handler needs no
+    /// hand-cloned parallel structs.
+    #[tokio::test]
+    async fn axum_json_response_body_is_the_serialized_type() {
+        use axum::response::IntoResponse;
+
+        let presets = vec![PtzPreset {
+            token: "Preset_1".to_string(),
+            name: "Front door".to_string(),
+            pan_tilt: Some((0.5, -0.25)),
+            zoom: Some(0.75),
+        }];
+
+        let response = axum::Json(presets).into_response();
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json = String::from_utf8(body.to_vec()).unwrap();
+        assert!(json.starts_with('['), "Vec → JSON array; body was: {json}");
+        assert!(json.contains("\"token\":\"Preset_1\""), "body was: {json}");
+        assert!(
+            json.contains("\"pan_tilt\":[0.5,-0.25]"),
+            "body was: {json}"
+        );
+    }
+}
+
+// ── NET 2 (types layer): encoding serialisation ───────────────────────────────
+//
+// Stage 1b will wrap the `Encoding` element's value in `xml_escape()`. For a
+// well-known variant (`H264`, `G711`) that must be a no-op, so these tests pin
+// the whole `to_xml_body()` output byte-for-byte: after the change every string
+// below must still compare equal.
+mod encoding_serialisation {
+    use super::*;
+
+    fn video_cfg(encoding: VideoEncoding) -> VideoEncoderConfiguration {
+        VideoEncoderConfiguration {
+            token: "VEC_1".into(),
+            name: "Main".into(),
+            use_count: 1,
+            encoding,
+            resolution: Resolution {
+                width: 1280,
+                height: 720,
+            },
+            quality: 4.0,
+            rate_control: None,
+            h264: None,
+            h265: None,
+            multicast: None,
+            session_timeout: None,
+            guaranteed_frame_rate: None,
+        }
+    }
+
+    fn video_cfg2(encoding: VideoEncoding) -> VideoEncoderConfiguration2 {
+        VideoEncoderConfiguration2 {
+            token: "VEC_1".into(),
+            name: "Main".into(),
+            use_count: 1,
+            encoding,
+            resolution: Resolution {
+                width: 1280,
+                height: 720,
+            },
+            quality: 4.0,
+            rate_control: None,
+            gov_length: None,
+            profile: None,
+        }
+    }
+
+    fn audio_cfg(encoding: AudioEncoding) -> AudioEncoderConfiguration {
+        AudioEncoderConfiguration {
+            token: "AEC_1".into(),
+            name: "Audio".into(),
+            use_count: 1,
+            encoding,
+            bitrate: 64,
+            sample_rate: 8,
+            multicast: None,
+            session_timeout: None,
+            channels: None,
+        }
+    }
+
+    /// The same configuration with the members a **Media1** device is obliged
+    /// to send. `Multicast` and `SessionTimeout` are required by
+    /// `tt:AudioEncoderConfiguration`, and the two services sequence them
+    /// differently, so the minimal fixture above cannot show either fact.
+    fn audio_cfg_full() -> AudioEncoderConfiguration {
+        AudioEncoderConfiguration {
+            multicast: Some(MulticastConfiguration {
+                address: "239.0.0.7".into(),
+                port: 40004,
+                ttl: 4,
+                auto_start: false,
+            }),
+            session_timeout: Some("PT60S".into()),
+            channels: Some(2),
+            ..audio_cfg(AudioEncoding::Aac)
+        }
+    }
+
+    #[test]
+    fn video_encoding_h264_serialises_to_plain_h264_element() {
+        let body = video_cfg(VideoEncoding::H264).to_xml_body();
+        assert!(
+            body.contains("<tt:Encoding>H264</tt:Encoding>"),
+            "body was: {body}"
+        );
+        assert_eq!(
+            body,
+            concat!(
+                r#"<trt:Configuration token="VEC_1">"#,
+                "<tt:Name>Main</tt:Name>",
+                "<tt:UseCount>1</tt:UseCount>",
+                "<tt:Encoding>H264</tt:Encoding>",
+                "<tt:Resolution><tt:Width>1280</tt:Width><tt:Height>720</tt:Height></tt:Resolution>",
+                "<tt:Quality>4</tt:Quality>",
+                "</trt:Configuration>",
+            )
+        );
+    }
+
+    #[test]
+    fn video_encoding_h264_serialises_identically_in_media2() {
+        let body = video_cfg2(VideoEncoding::H264).to_xml_body().unwrap();
+        assert!(
+            body.contains("<tt:Encoding>H264</tt:Encoding>"),
+            "body was: {body}"
+        );
+        assert_eq!(
+            body,
+            concat!(
+                r#"<tr2:Configuration token="VEC_1">"#,
+                "<tt:Name>Main</tt:Name>",
+                "<tt:UseCount>1</tt:UseCount>",
+                "<tt:Encoding>H264</tt:Encoding>",
+                "<tt:Resolution><tt:Width>1280</tt:Width><tt:Height>720</tt:Height></tt:Resolution>",
+                "<tt:Quality>4</tt:Quality>",
+                "</tr2:Configuration>",
+            )
+        );
+    }
+
+    #[test]
+    fn audio_encoding_g711_serialises_to_plain_g711_element() {
+        let body = audio_cfg(AudioEncoding::G711).to_xml_body();
+        assert!(
+            body.contains("<tt:Encoding>G711</tt:Encoding>"),
+            "body was: {body}"
+        );
+        assert_eq!(
+            body,
+            concat!(
+                r#"<trt:Configuration token="AEC_1">"#,
+                "<tt:Name>Audio</tt:Name>",
+                "<tt:UseCount>1</tt:UseCount>",
+                "<tt:Encoding>G711</tt:Encoding>",
+                "<tt:Bitrate>64</tt:Bitrate>",
+                "<tt:SampleRate>8</tt:SampleRate>",
+                "</trt:Configuration>",
+            )
+        );
+    }
+
+    /// FREEZE (Media1): the audio serialiser reached by
+    /// `set_audio_encoder_configuration` must keep emitting `trt:`.
+    /// Stage 1b adds a separate Media2 serialiser and must not disturb this one.
+    #[test]
+    fn audio_media1_serialiser_still_emits_trt_configuration() {
+        let body = audio_cfg(AudioEncoding::G711).to_xml_body();
+        assert!(
+            body.starts_with(r#"<trt:Configuration token="AEC_1">"#),
+            "Media1 audio serialiser must open with trt:Configuration; body was: {body}"
+        );
+        assert!(
+            body.ends_with("</trt:Configuration>"),
+            "Media1 audio serialiser must close with trt:Configuration; body was: {body}"
+        );
+        assert!(
+            !body.contains("tr2:"),
+            "Media1 audio serialiser must never emit a tr2: prefix; body was: {body}"
+        );
+    }
+
+    /// D3: Media2 needs its own serialiser emitting `<tr2:Configuration>`,
+    /// byte-identical to the Media1 form apart from the wrapper prefix.
+    #[test]
+    fn audio_media2_serialiser_emits_tr2_configuration() {
+        let body = audio_cfg(AudioEncoding::G711).to_xml_body_media2();
+        assert_eq!(
+            body,
+            concat!(
+                r#"<tr2:Configuration token="AEC_1">"#,
+                "<tt:Name>Audio</tt:Name>",
+                "<tt:UseCount>1</tt:UseCount>",
+                "<tt:Encoding>G711</tt:Encoding>",
+                "<tt:Bitrate>64</tt:Bitrate>",
+                "<tt:SampleRate>8</tt:SampleRate>",
+                "</tr2:Configuration>",
+            )
+        );
+        assert!(
+            !body.contains("trt:"),
+            "Media2 audio serialiser must never emit a trt: prefix; body was: {body}"
+        );
+    }
+
+    /// With no optional member set, the two audio serialisers differ *only* in
+    /// the wrapper prefix.
+    #[test]
+    fn audio_media1_and_media2_differ_only_in_the_wrapper_prefix() {
+        let cfg = audio_cfg(AudioEncoding::G726);
+        assert_eq!(
+            cfg.to_xml_body().replace("trt:Configuration", "NS"),
+            cfg.to_xml_body_media2().replace("tr2:Configuration", "NS"),
+        );
+    }
+
+    /// …and with them set they differ in **more** than the prefix, because the
+    /// two schema types are not the same type.
+    ///
+    /// `tt:AudioEncoderConfiguration` (Media1) sequences
+    /// `Encoding, Bitrate, SampleRate, Multicast, SessionTimeout`;
+    /// `tt:AudioEncoder2Configuration` (Media2) sequences
+    /// `Encoding, Multicast, Bitrate, SampleRate` and has **no**
+    /// `SessionTimeout` member at all. The test above asserted "identical apart
+    /// from the prefix" and passed only because the fixture set neither.
+    #[test]
+    fn audio_media1_and_media2_sequence_multicast_differently() {
+        let cfg = audio_cfg_full();
+        let m1 = cfg.to_xml_body();
+        let m2 = cfg.to_xml_body_media2();
+
+        // Media1: Multicast after SampleRate. Media2: before Bitrate.
+        let pos = |b: &str, tag: &str| b.find(tag).unwrap_or_else(|| panic!("{tag} in {b}"));
+        assert!(
+            pos(&m1, "<tt:Multicast>") > pos(&m1, "<tt:SampleRate>"),
+            "{m1}"
+        );
+        assert!(
+            pos(&m2, "<tt:Multicast>") < pos(&m2, "<tt:Bitrate>"),
+            "{m2}"
+        );
+
+        assert!(
+            m1.contains("<tt:SessionTimeout>PT60S</tt:SessionTimeout>"),
+            "{m1}"
+        );
+        assert!(
+            !m2.contains("SessionTimeout"),
+            "AudioEncoder2Configuration has no SessionTimeout member: {m2}"
+        );
+
+        // The vendor `Channels` extension goes last on both, where the type's
+        // trailing `<xs:any>` admits it — never mid-sequence, which is where it
+        // was emitted until 0.15.
+        assert!(
+            m1.ends_with("<tt:Channels>2</tt:Channels></trt:Configuration>"),
+            "{m1}"
+        );
+        assert!(
+            m2.ends_with("<tt:Channels>2</tt:Channels></tr2:Configuration>"),
+            "{m2}"
+        );
+
+        assert_ne!(
+            m1.replace("trt:Configuration", "NS"),
+            m2.replace("tr2:Configuration", "NS"),
+        );
+    }
+
+    /// A configuration the device sent no `Channels` for emits none.
+    #[test]
+    fn audio_channels_absent_emits_no_element() {
+        let body = audio_cfg(AudioEncoding::G711).to_xml_body();
+        assert!(!body.contains("Channels"), "body was: {body}");
+    }
+
+    // ── D4: `xml_escape` must not be bypassed via `Display` ───────────────
+    //
+    // `VideoEncoding::Other(String)` / `AudioEncoding::Other(String)` carry the
+    // device's raw string. `to_xml_body()` interpolates the enum through
+    // `Display`, so the value reaches the wire unescaped unless the serialiser
+    // escapes `as_str()` explicitly. A `grep xml_escape` audit cannot see this.
+
+    /// The raw device-echoed encoding, and what it must look like on the wire.
+    const HOSTILE_ENCODING: &str = "a&b<c\"d";
+    const HOSTILE_ENCODING_ESCAPED: &str = "a&amp;b&lt;c&quot;d";
+
+    #[test]
+    fn hostile_encoding_reaches_display_unescaped() {
+        // Guards the premise of the four site tests below: the value really does
+        // contain XML metacharacters when read back through `as_str`/`Display`.
+        let enc = VideoEncoding::Other(HOSTILE_ENCODING.into());
+        assert_eq!(enc.as_str(), HOSTILE_ENCODING);
+        assert_eq!(enc.to_string(), HOSTILE_ENCODING);
+        let enc = AudioEncoding::Other(HOSTILE_ENCODING.into());
+        assert_eq!(enc.as_str(), HOSTILE_ENCODING);
+        assert_eq!(enc.to_string(), HOSTILE_ENCODING);
+    }
+
+    /// Site 1 — `VideoEncoderConfiguration::to_xml_body()` (`src/types/video.rs`).
+    #[test]
+    fn video_encoding_other_is_escaped_in_media1_body() {
+        let body = video_cfg(VideoEncoding::Other(HOSTILE_ENCODING.into())).to_xml_body();
+        assert_eq!(
+            body,
+            format!(
+                concat!(
+                    r#"<trt:Configuration token="VEC_1">"#,
+                    "<tt:Name>Main</tt:Name>",
+                    "<tt:UseCount>1</tt:UseCount>",
+                    "<tt:Encoding>{}</tt:Encoding>",
+                    "<tt:Resolution><tt:Width>1280</tt:Width><tt:Height>720</tt:Height></tt:Resolution>",
+                    "<tt:Quality>4</tt:Quality>",
+                    "</trt:Configuration>",
+                ),
+                HOSTILE_ENCODING_ESCAPED
+            )
+        );
+    }
+
+    /// Site 2 — `VideoEncoderConfiguration2::to_xml_body()` (`src/types/video.rs`).
+    #[test]
+    fn video_encoding_other_is_escaped_in_media2_body() {
+        let body = video_cfg2(VideoEncoding::Other(HOSTILE_ENCODING.into()))
+            .to_xml_body()
+            .unwrap();
+        assert_eq!(
+            body,
+            format!(
+                concat!(
+                    r#"<tr2:Configuration token="VEC_1">"#,
+                    "<tt:Name>Main</tt:Name>",
+                    "<tt:UseCount>1</tt:UseCount>",
+                    "<tt:Encoding>{}</tt:Encoding>",
+                    "<tt:Resolution><tt:Width>1280</tt:Width><tt:Height>720</tt:Height></tt:Resolution>",
+                    "<tt:Quality>4</tt:Quality>",
+                    "</tr2:Configuration>",
+                ),
+                HOSTILE_ENCODING_ESCAPED
+            )
+        );
+    }
+
+    /// Site 3 — `AudioEncoderConfiguration::to_xml_body()` (`src/types/audio.rs`).
+    #[test]
+    fn audio_encoding_other_is_escaped_in_media1_body() {
+        let body = audio_cfg(AudioEncoding::Other(HOSTILE_ENCODING.into())).to_xml_body();
+        assert_eq!(
+            body,
+            format!(
+                concat!(
+                    r#"<trt:Configuration token="AEC_1">"#,
+                    "<tt:Name>Audio</tt:Name>",
+                    "<tt:UseCount>1</tt:UseCount>",
+                    "<tt:Encoding>{}</tt:Encoding>",
+                    "<tt:Bitrate>64</tt:Bitrate>",
+                    "<tt:SampleRate>8</tt:SampleRate>",
+                    "</trt:Configuration>",
+                ),
+                HOSTILE_ENCODING_ESCAPED
+            )
+        );
+    }
+
+    /// Site 4 — the Media2 audio serialiser D3 adds: it must be escaped from
+    /// the day it is written, not inherit the hole.
+    #[test]
+    fn audio_encoding_other_is_escaped_in_media2_body() {
+        let body = audio_cfg(AudioEncoding::Other(HOSTILE_ENCODING.into())).to_xml_body_media2();
+        assert_eq!(
+            body,
+            format!(
+                concat!(
+                    r#"<tr2:Configuration token="AEC_1">"#,
+                    "<tt:Name>Audio</tt:Name>",
+                    "<tt:UseCount>1</tt:UseCount>",
+                    "<tt:Encoding>{}</tt:Encoding>",
+                    "<tt:Bitrate>64</tt:Bitrate>",
+                    "<tt:SampleRate>8</tt:SampleRate>",
+                    "</tr2:Configuration>",
+                ),
+                HOSTILE_ENCODING_ESCAPED
+            )
+        );
+    }
+
+    /// The wire strings the `Encoding` element is built from. `Display` is what
+    /// `to_xml_body()` actually interpolates, so both must stay in step.
+    #[test]
+    fn well_known_encodings_have_stable_wire_strings() {
+        assert_eq!(VideoEncoding::H264.as_str(), "H264");
+        assert_eq!(VideoEncoding::H264.to_string(), "H264");
+        assert_eq!(VideoEncoding::H265.as_str(), "H265");
+        assert_eq!(VideoEncoding::Jpeg.as_str(), "JPEG");
+        assert_eq!(AudioEncoding::G711.as_str(), "G711");
+        assert_eq!(AudioEncoding::G711.to_string(), "G711");
+        assert_eq!(AudioEncoding::G726.as_str(), "G726");
+        assert_eq!(AudioEncoding::Aac.as_str(), "AAC");
+    }
+}

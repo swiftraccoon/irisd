@@ -8,11 +8,26 @@ Scope: this crate only. Read the root `AGENTS.md` first.
   `qtdemux`. Changing the live feed format is an API change (`crates/iris-api`,
   `docs/research/07-architecture.md §5`), not a viewer change.
 - GTK widgets are touched only from the main loop (`glib::spawn_future_local`); GStreamer
-  objects may be driven from the runtime threads (`tile::Source` is `Clone + Send`).
+  objects may be driven from the runtime threads (`tile::Source` is `Send`, with one producer).
+- `Source::push` rejects a payload before copying if queued plus incoming bytes exceed
+  16 MiB. Keep `appsrc` nonblocking: a rejection fails the session, restarts the branch,
+  and reconnects from init plus sync; dropping arbitrary byte chunks corrupts decoding.
+- Playback mapping uses the VOD playlist's exact `#IRIS-FRAGMENT` timing, including whole
+  boundary GOPs and intra-file gaps. Accumulate 90 kHz ticks before converting to microseconds.
+  Fetch the playlist once: the same selection feeds both the mapping and GStreamer.
+  Resolve media and init references against the fetched response URL, preserving queries.
+- A playback snapshot serves only its immutable playlist on IPv4 loopback behind a
+  256-bit OS-random capability path. Its token-bearing body and capability stay out of
+  logs and temporary files. Closing, replacing, or failing playback drops the snapshot
+  listener; cancel pending loads without blocking the GTK main loop. Snapshots do not pin
+  media files against retention, so missing media can fail playback.
+  Bus errors defer cleanup until their callback returns; an error from a replaced player
+  must not close its replacement.
 - Only the visible view decodes. Any new view stops the pipelines it hides (`Tile::stop`)
   and starts what it shows (`Tile::start`); a feed task outliving its tile is a bug.
-- The token never appears in logs or window titles; it travels as the `token` query parameter
-  of the WebSocket URL because the API accepts it there.
+- The root bearer never appears in URLs, logs, or window titles. Initial VOD and WebSocket
+  requests send it in `Authorization`; playlist media references carry scoped capabilities
+  bounded to the selected playback horizon instead.
 
 ## Where things are
 
@@ -22,6 +37,7 @@ Scope: this crate only. Read the root `AGENTS.md` first.
 - `src/live.rs` — the per-tile WebSocket feed and reconnection.
 - `src/timeline.rs` — the timeline widget and the playlist-time mapping.
 - `src/playback.rs` — the playback view over `playbin3`, with the thumbnail strip.
+- `src/snapshot.rs` — the private immutable playlist endpoint, owned by a running player.
 - `src/thumbs.rs` — keyframe decoding to an image, off the main loop.
 - `src/stage.rs` — the shared live pipeline, its bus watch, branch add, restart, remove.
 - `src/tile.rs` — the widgets, the branch lifecycle (`start`, `stop`), readiness, restarts.
@@ -32,6 +48,8 @@ Scope: this crate only. Read the root `AGENTS.md` first.
 cargo fmt -p iris-gui
 cargo clippy -p iris-gui --all-targets -- -D warnings
 cargo test -p iris-gui
+cargo test -p iris-gui --bin iris-gui -- --ignored --test-threads=1  # run under xvfb-run
+cargo test -p iris-gui --test playback_snapshot -- --ignored  # ffmpeg/libx264 + Xvfb + HLS/H.264 plugins
 RUSTDOCFLAGS="-D warnings" cargo doc -p iris-gui --no-deps
 cargo build --release -p iris-gui
 IRISD_TOKEN=... timeout 45 xvfb-run -a target/release/iris-gui --api http://127.0.0.1:8554   # grid smoke run
@@ -81,8 +99,8 @@ smoke run needs a daemon with at least one camera and `xorg-x11-server-Xvfb` or 
 - The API serialises an event kind either as a string or as `{"other": "..."}`;
   `api::EventKind` is untagged for that reason, and a listing with one vendor code in it
   fails to decode otherwise.
-- The playback view holds its widgets in an `Rc`; the position timer and the timeline's
-  seek callback hold `Weak` references so dropping the view stops them.
+- The playback view holds its widgets in an `Rc`; button callbacks, the position timer,
+  and the timeline's seek callback hold `Weak` references so dropping the view stops them.
 - Thumbnails decode in `spawn_blocking` tasks (one short pipeline each) and reach the main
   loop as RGB images; the texture is created there. A slot whose time falls in a gap stays
   empty rather than showing a neighbouring frame.

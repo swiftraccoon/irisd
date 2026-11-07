@@ -11,17 +11,17 @@ open question.
 | Area | Decision | Doc |
 |---|---|---|
 | Language | Rust, no C core; `panic=abort`, fuzzed parsers, `cargo audit/deny` | 03 |
-| Runtime | tokio `current_thread` (opt-in 2 workers); one blocking writer thread per disk; one SQLite thread; no io_uring | 03, 07 |
+| Runtime | tokio `current_thread` (opt-in 2 workers); one blocking writer thread per configured root; one SQLite thread; no io_uring | 03, 07 |
 | RTSP | retina 0.4.21 with feature `h265`, TCP interleaved, length-prefixed frames, 15 s setup timeout, 30 s inactivity timeout, TEARDOWN on every exit, backoff reconnect | 05 |
 | Socket reads | timer-driven, 20 ms shared tick: drain without arming a wake-up, then sleep; plus `SO_RCVLOWAT` 32 KiB after `PLAY` through a patched retina (`third_party/`); together −53 % CPU against packet-driven reads; `0` restores either default | 05 §1, 12 |
 | Timing | NVR clock is the authority; RTP for relative timing through a CFR regulariser; per-run wall offset via least-delayed frame with ≤ 500 ppm correction; RTCP SR diagnostic only | 04 §7, 01 §5 |
 | On-disk | CMAF-style fMP4 (`hvc1`), one fragment per GOP (cap 2 s), `prft` + 24-byte CRC trailer per fragment, one file per elementary stream, rotate at 1 h / 1 GiB / parameter change / new run, sidecar fragment index | 04 |
 | Catalog | SQLite WAL on SSD, segment/run/event rows only (no per-fragment rows) | 04 §6 |
-| I/O | preallocate 256 MiB ahead, one `pwritev` per fragment, `fdatasync` every 5 s staggered, bounded writer queue, whole-file retention by free space, size quota, and age, scan-based recovery | 04 §8–9 |
+| I/O | preallocate 256 MiB ahead, one `pwritev` per fragment, `fdatasync` every 5 s staggered, bounded writer queue, whole-file retention with durable deletion intent, sidecar-tail recovery with full-scan fallback | 04 §8–9 |
 | Serving | WebSocket per-frame fragments for live; HLS/LL-HLS as byte ranges; MP4 export assembled with `elst`; keyframe resource for client-side thumbnails; no transcoding anywhere | 04 §10, 06 |
-| Events | Dahua CGI push feed → ONVIF PullPoint (`oxvif`) → ONVIF metadata track; no server-side detection in v1 | 05 §3 |
-| Camera policy | H.265, smart codec off, GOP ≤ 2× fps, CBR, AAC audio, NTP to the NVR; the third stream serves as the secondary stream on the family whose sub stream stops beside a second session (01 §5b, 11), otherwise it is disabled | 05 §4 |
-| iOS | `AVSampleBufferDisplayLayer` over WebSocket for live; `AVPlayer` + HLS for playback/AirPlay | 06 §2 |
+| Events | Dahua CGI push feed and ONVIF PullPoint (`oxvif`); no metadata-track subscription or server-side detection in the 0.1 alpha | 05 §3 |
+| Camera policy | Operators supply H.265 video with smart codec off, GOP ≤ 2× fps, CBR, and NTP; the third stream serves as the secondary stream on the family whose sub stream stops beside a second session (01 §5b, 11) | 05 §4 |
+| Planned iOS client | `AVSampleBufferDisplayLayer` over WebSocket for live; `AVPlayer` + HLS for playback/AirPlay | 06 §2 |
 | Linux GUI | gtk4-rs + gstreamer-rs (`gst-plugin-gtk4` as a crate), `vah265dec`/`nvh265dec` | 06 §3 |
 
 ## Key measured facts about the test camera (01)
@@ -65,6 +65,5 @@ open question.
 
 1. AVFoundation playback of byte-range segments spanning several on-disk fragments (phase 1).
 2. `prft` flag semantics and tool acceptance (phase 1).
-3. Camera backpressure tolerance and real-event validation on all three event sources (phase 1–2).
+3. Camera backpressure tolerance and metadata-track feasibility (phase 5).
 4. ext4 vs XFS under 12 writers over weeks (phase 2 soak).
-5. Fragment cap default: 2 s vs 0.5 s (phase 1 measurements).

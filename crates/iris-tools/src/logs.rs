@@ -1,25 +1,87 @@
-//! Parsing of the daemon's log lines: ANSI colour stripped, the timestamp
-//! and level split off, and `key=value` pairs read.
+//! Parsing of the daemon's log lines: terminal controls removed, the
+//! timestamp and level split off, and `key=value` pairs read.
 
 use std::collections::BTreeMap;
 
-/// Removes ANSI SGR colour sequences.
+/// Removes complete ECMA-48 escape strings and makes the remaining text safe
+/// to print to a terminal.  In particular, an unterminated control string can
+/// never consume printable text that follows it.
 pub fn strip_ansi(line: &str) -> String {
     let mut out = String::with_capacity(line.len());
-    let mut chars = line.chars().peekable();
-    while let Some(c) = chars.next() {
-        if c == '\x1b' && chars.peek() == Some(&'[') {
-            chars.next();
-            for d in chars.by_ref() {
-                if d == 'm' {
-                    break;
+    let bytes = line.as_bytes();
+    let mut index = 0usize;
+    while index < bytes.len() {
+        let c = line[index..]
+            .chars()
+            .next()
+            .expect("index is on a character boundary");
+        if c == '\x1b' {
+            let next = index + 1;
+            let complete = match bytes.get(next).copied() {
+                Some(b'[') => bytes[next + 1..]
+                    .iter()
+                    .take(4_096)
+                    .position(|byte| (b'@'..=b'~').contains(byte))
+                    .map(|offset| next + 2 + offset),
+                Some(b']' | b'P' | b'X' | b'^' | b'_') => {
+                    let end = (next + 1)..bytes.len().min(next + 1 + 4_096);
+                    let mut cursor = end.start;
+                    let mut complete = None;
+                    while cursor < end.end {
+                        if bytes[cursor] == b'\x07' {
+                            complete = Some(cursor + 1);
+                            break;
+                        }
+                        if bytes[cursor] == b'\x1b' && bytes.get(cursor + 1) == Some(&b'\\') {
+                            complete = Some(cursor + 2);
+                            break;
+                        }
+                        cursor += 1;
+                    }
+                    complete
                 }
+                Some(_) => Some(next + 1),
+                None => None,
+            };
+            if let Some(end) = complete {
+                index = end;
+                continue;
             }
+        }
+        if c.is_control() || is_bidi_control(c) {
+            use std::fmt::Write as _;
+            let _ = write!(out, "\\u{{{:x}}}", c as u32);
+        } else {
+            out.push(c);
+        }
+        index += c.len_utf8();
+    }
+    out
+}
+
+/// Escapes untrusted text without interpreting any of it as terminal control.
+pub fn terminal_safe(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        if c.is_control() || is_bidi_control(c) {
+            use std::fmt::Write as _;
+            let _ = write!(out, "\\u{{{:x}}}", c as u32);
         } else {
             out.push(c);
         }
     }
     out
+}
+
+fn is_bidi_control(c: char) -> bool {
+    matches!(
+        c,
+        '\u{061c}'
+            | '\u{200e}'
+            | '\u{200f}'
+            | '\u{202a}'..='\u{202e}'
+            | '\u{2066}'..='\u{2069}'
+    )
 }
 
 /// A log line split into its timestamp, level, and the rest.
@@ -55,8 +117,9 @@ pub fn kv(text: &str) -> BTreeMap<String, String> {
     let mut rest = text;
     while let Some(eq) = rest.find('=') {
         let key_start = rest[..eq]
-            .rfind(|c: char| !(c.is_alphanumeric() || c == '_'))
-            .map_or(0, |i| i + 1);
+            .char_indices()
+            .rfind(|(_, c)| !(c.is_ascii_alphanumeric() || *c == '_'))
+            .map_or(0, |(i, c)| i + c.len_utf8());
         let key = &rest[key_start..eq];
         let after = &rest[eq + 1..];
         let (value, consumed) = if let Some(q) = after.strip_prefix('"') {
@@ -74,9 +137,22 @@ pub fn kv(text: &str) -> BTreeMap<String, String> {
     out
 }
 
+/// Reads the root identity from the daemon's root statistics row. Paths may
+/// contain whitespace, so the following fixed field delimits the value.
+pub fn root_identity(text: &str) -> Option<String> {
+    let value = text.strip_prefix("root root=")?;
+    value
+        .rsplit_once(" free_gib=")
+        .map(|(root, _)| root.to_owned())
+        .filter(|root| !root.is_empty())
+}
+
 /// A numeric field, if present and numeric.
 pub fn number(fields: &BTreeMap<String, String>, key: &str) -> Option<f64> {
-    fields.get(key).and_then(|v| v.parse::<f64>().ok())
+    fields
+        .get(key)
+        .and_then(|v| v.parse::<f64>().ok())
+        .filter(|v| v.is_finite())
 }
 
 /// `-` for a missing value, else the value to `digits` decimals.
@@ -133,7 +209,7 @@ pub fn rates(rows: &[(f64, BTreeMap<String, String>)]) -> Vec<f64> {
             let (t1, b) = &w[1];
             let fa = number(a, "frames")?;
             let fb = number(b, "frames")?;
-            (t1 > t0).then(|| (fb - fa) / (t1 - t0))
+            (t1 > t0 && fb >= fa).then(|| (fb - fa) / (t1 - t0))
         })
         .collect()
 }
@@ -165,5 +241,33 @@ mod tests {
         assert_eq!(median(&[1.0, 2.0, 3.0, 4.0]), Some(2.5));
         assert_eq!(growth(&[1.0, 3.0, 2.0, 5.0]), 5.0);
         assert_eq!(mean(&[]), None);
+    }
+
+    #[test]
+    fn terminal_controls_and_unicode_delimiters_are_safe() {
+        let cleaned =
+            strip_ansi("\x1b[2m2026-11-02T01:45:23Z\x1b[0m INFO x note=ok\x1b]52;c;bad\x07 tail");
+        assert_eq!(cleaned, "2026-11-02T01:45:23Z INFO x note=ok tail");
+        assert_eq!(
+            strip_ansi("left\x1b]unterminated right"),
+            "left\\u{1b}]unterminated right"
+        );
+        assert_eq!(
+            terminal_safe("a\r\x1b[31m\u{202e}b"),
+            "a\\u{d}\\u{1b}[31m\\u{202e}b"
+        );
+        assert_eq!(kv("x 🦀key=value")["key"], "value");
+        assert_eq!(
+            root_identity("root root=/srv/camera archive free_gib=10 free_pct=20"),
+            Some("/srv/camera archive".into())
+        );
+        assert_eq!(
+            root_identity("root root=/srv/\"camera\" free_gib=old free_gib=10 free_pct=20"),
+            Some("/srv/\"camera\" free_gib=old".into())
+        );
+        assert_eq!(
+            number(&BTreeMap::from([("x".into(), "NaN".into())]), "x"),
+            None
+        );
     }
 }

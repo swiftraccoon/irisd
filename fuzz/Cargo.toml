@@ -13,8 +13,20 @@ libfuzzer-sys = "0.4"
 iris-h265 = { path = "../crates/iris-h265" }
 iris-mp4 = { path = "../crates/iris-mp4" }
 iris-core = { path = "../crates/iris-core" }
-iris-events = { path = "../crates/iris-events" }
+iris-events = { path = "../crates/iris-events", features = ["fuzzing"] }
 iris-replay = { path = "../crates/iris-replay" }
+iris-tools = { path = "../crates/iris-tools" }
+oxvif = "0.17"
+
+[patch.crates-io]
+oxvif = { path = "../third_party/oxvif" }
+
+[[bin]]
+name = "api_time"
+path = "fuzz_targets/api_time.rs"
+test = false
+doc = false
+bench = false
 
 [[bin]]
 name = "scan"
@@ -73,6 +85,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "onvif_soap"
+path = "fuzz_targets/onvif_soap.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "trailer"
 path = "fuzz_targets/trailer.rs"
 test = false
@@ -89,6 +108,13 @@ bench = false
 [[bin]]
 name = "export_rebase"
 path = "fuzz_targets/export_rebase.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "tools_protocol"
+path = "fuzz_targets/tools_protocol.rs"
 test = false
 doc = false
 bench = false

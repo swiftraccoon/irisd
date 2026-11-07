@@ -32,7 +32,14 @@
    sudo install -d -m 750 -o irisd -g irisd /srv/irisd/video
    ```
 
-   If the root is elsewhere, change `ReadWritePaths=` in the unit to match.
+   If the root is elsewhere, change `ReadWritePaths=` in the unit to name that exact
+   configured root. Add one entry for each configured root rather than granting a parent
+   directory.
+
+   Catalog schema 9 upgrades require an operator-installed `.irisd-root-id` for every
+   pre-identity recording root. Verify the intended storage is mounted and follow the durable
+   marker procedure in [`04-storage-format.md` §3](../docs/research/04-storage-format.md#3-file-layout)
+   before starting the upgraded daemon.
 
 5. Install and start the unit:
 
@@ -46,6 +53,11 @@
 `systemd-analyze security irisd` reports the hardening score. The daemon pings the
 watchdog only while every camera stream makes progress, so a wedged daemon is restarted
 within `WatchdogSec`. Logs go to the journal: `journalctl -u irisd -f`.
+
+The unit deliberately leaves `RestrictSUIDSGID` disabled. That systemd filter rejects
+`openat2`, which the daemon requires for no-follow, beneath-root path resolution.
+`NoNewPrivileges`, the empty capability set, `ProtectSystem=strict`, and Landlock retain the
+service's privilege and filesystem boundaries.
 
 The daemon also applies a Landlock sandbox on top of the unit's restrictions: it can read
 its configuration directory, `/etc`, and `/proc`, read and write the recording roots and the

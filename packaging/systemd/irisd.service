@@ -7,7 +7,6 @@
 
 [Unit]
 Description=irisd network video recorder
-Documentation=file:///usr/local/share/doc/irisd/README.md
 After=network-online.target
 Wants=network-online.target
 
@@ -25,6 +24,7 @@ Group=irisd
 UMask=0077
 StateDirectory=irisd
 ConfigurationDirectory=irisd
+ConfigurationDirectoryMode=0750
 # The recording root (storage.video_roots). Replace with the real path.
 ReadWritePaths=/srv/irisd/video
 
@@ -44,7 +44,10 @@ ProcSubset=pid
 NoNewPrivileges=yes
 RestrictNamespaces=yes
 RestrictRealtime=yes
-RestrictSUIDSGID=yes
+# systemd's RestrictSUIDSGID filter rejects openat2, which irisd uses for
+# no-follow, beneath-root file resolution. NoNewPrivileges and the empty
+# capability set preserve the privilege boundary.
+RestrictSUIDSGID=no
 LockPersonality=yes
 MemoryDenyWriteExecute=yes
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX

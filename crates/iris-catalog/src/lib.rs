@@ -4,8 +4,10 @@
 //! block (the store's writer thread, ingest tasks, event feeds) send
 //! fire-and-forget [`Change`]s with [`CatalogHandle::notify`]; everything else
 //! uses the async query methods, which run on the catalog thread and reply
-//! through a oneshot channel. Commands are applied in the order they were
-//! sent, so a query issued after a notification observes it.
+//! through a oneshot channel. The single ordering domain is bounded by command
+//! count and estimated owned input, with reserved segment-lifecycle capacity.
+//! Commands are applied in send order, so a query issued after an admitted
+//! notification observes it.
 //!
 //! # Types
 //!
@@ -14,19 +16,43 @@
 //! - [`Change`]: what the store's observer and the event feeds report,
 //!   batched into one transaction per 100 ms (or 1,000 changes, or the next
 //!   query).
-//! - [`SegmentRow`], [`EventRow`], [`CameraRow`], [`NewSegment`]: the rows;
-//!   [`SegmentId`] and [`EventId`] their keys; [`TimeRange`] a half-open wall
-//!   range.
+//! - [`SegmentRow`], [`EventRow`], [`EventProtection`], [`RetentionPage`],
+//!   [`CameraRow`], [`NewSegment`]: rows and retention projections;
+//!   [`SegmentId`] and [`EventId`] their keys; [`EventCursor`] and
+//!   [`EventProtectionCursor`] the listing and active-protection
+//!   continuations; [`DeleteMarkResult`] the conditional-deletion outcome;
+//!   [`TimeRange`] a half-open wall range.
 //! - [`CatalogStats`] and [`CatalogMetrics`]: aggregate counts and the thread's
-//!   latency histograms.
-//! - [`CatalogError`]: SQLite, I/O, not found, closed.
+//!   latency, queue, overload, event-state, database, and WAL measurements.
+//! - [`CatalogError`]: SQLite, I/O, corruption, unsupported schema, overload,
+//!   capacity, not found, and closed errors.
 //!
 //! # Invariants
 //!
 //! - One row per recording file, none per fragment; a file's byte ranges come
 //!   from its sidecar index, not from here.
-//! - WAL mode with `synchronous = NORMAL`: a crash loses at most the batches
-//!   not yet checkpointed, never the schema.
+//! - Retention commits deletion intent before filesystem mutation. Those rows
+//!   are hidden from ordinary queries and remain available to startup until
+//!   durable pair removal permits deleting the row.
+//! - Conditional deletion checks active retained-event overlap and updates
+//!   deletion intent in one FULL-synchronous transaction.
+//! - Event listings have aggregate row and owned-byte limits and use stable
+//!   `(time, id)` cursors. Protection pages use `(retain_until, id)`. Event
+//!   lifecycle maintenance scans bounded inactive batches by recording horizon,
+//!   age, row count, and logical string bytes and carries its scan cursor even
+//!   when a page deletes nothing;
+//!   active retention marks are preserved and separately capacity-limited.
+//!   Event admission that cannot fit after a bounded pruning step is omitted
+//!   from an async batch or returns [`CatalogError::EventStorageLimit`] from a
+//!   direct insertion without rolling back segment lifecycle changes.
+//! - Database open refuses a schema version above the supported value before
+//!   persistent pragmas or writes. Persisted values use checked decoding and
+//!   corruption is returned to the caller.
+//! - WAL mode with `synchronous = NORMAL`: a process crash preserves committed
+//!   WAL transactions. A system or power loss can lose recently committed
+//!   ordinary batches; deletion intent uses a scoped FULL commit. Temporary
+//!   query state stays in memory so the catalog needs no sandbox-external temp
+//!   directory.
 //! - A failed batch is counted and dropped; the next batch starts clean.
 //!
 //! # Example
@@ -50,9 +76,11 @@ mod handle;
 mod metrics;
 mod types;
 
+pub use db::{CatalogRootExpectation, CatalogRootRegistry};
 pub use handle::CatalogHandle;
 pub use metrics::CatalogMetrics;
 pub use types::{
-    CameraRow, CatalogError, CatalogStats, Change, EventId, EventRow, NewSegment, SegmentId,
+    CameraRow, CatalogError, CatalogStats, Change, DeleteMarkResult, EventCursor, EventId,
+    EventProtection, EventProtectionCursor, EventRow, NewSegment, RetentionPage, SegmentId,
     SegmentRow, TimeRange,
 };

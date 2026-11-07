@@ -147,12 +147,11 @@ deleted 91 sealed segments (36 GB) while fourteen streams kept recording, and th
 removed one more file as new data arrived; the root settled at 20 GB. In steady state at
 ≈ 84 Mbps the quota deletes about one 1 GiB file per minute.
 
-## Not yet done
+## Remaining phase-2 evidence
 
-- Seven-day soak as the packaged systemd service, including retention by free space and the
-  ext4 versus XFS question (`08-roadmap.md` phase-2 exit criteria).
-- AVPlayer and `mediastreamvalidator` against the daemon's playlists; ONVIF PullPoint against
-  hardware; fuzz targets for the phase-2 parsers.
+- One uninterrupted seven-day packaged-service window with every acceptance criterion clean.
+- The ext4 versus XFS comparison (`08-roadmap.md` phase-2 exit criteria).
+- AVPlayer and `mediastreamvalidator` against the daemon's playlists.
 
 ## Serving checks against the running service (2026-11-01, soak day one)
 
@@ -193,6 +192,44 @@ Conclusions: the record path is stable over a day at this load with no recorder-
 stall, drop beyond the fixed rotation case, or reconnect; the HDD is the bottleneck for
 fsync and for the catalog, which is why the second window runs with the catalog on an SSD
 (the design's placement) and why staggered per-stream syncs remain on the list.
+
+## Soak, second window (2026-11-02 to 2026-11-07, 134.5 h)
+
+The packaged service recorded seven cameras and fourteen streams with the catalog on an SSD
+and a 200 GiB quota on the ext4 recording root. The service instance stopped cleanly after
+134.5 hours, short of the 168-hour criterion. `iris-tools soak-report` over that instance:
+
+| Item | Value |
+|---|---|
+| Process | 4.86 % of one core mean (user 2.38, system 2.48), loop lag max 4 ms; RSS 57.0–211.9 MiB with the final-hour mean 139.2 MiB; 78 self-checks passed, 0 failed |
+| Writer | 3,398,635 fragments, 5,225 GiB of file growth, 5,329 files, 0 dropped fragments, 0 write errors; 293 writes or syncs over 1 s, sync max 6.1 s, queue peak 104 fragments / 159.6 MiB |
+| Catalog | 0 failed batches; transaction p99 max 50 ms, event commit p99 max 500 ms; final 448,403 events and 54.8 MiB database |
+| Retention | 5,286 successful passes, 5,349 files and 5,225 GiB removed; pass max 989 ms; resident catalogued media stayed at 199–200 GiB |
+| Host | write amplification 1.0032, container overhead 1.0004, no NIC errors, NTP offset at most 0.735 ms |
+
+One camera became unreachable for about six minutes near the end: its two streams produced seven
+reconnect gaps totaling about 11.5 minutes of stream-time, its event feed recorded twelve failed
+sessions, and the watchdog was withheld once. The other twelve streams and six event feeds had no
+reconnect. The window therefore established multi-day writer, catalog, retention, and self-check
+behavior but did not satisfy the uninterrupted seven-day exit criterion. The ten parser fuzz
+targets also ran for 86,401 seconds each; no artifact appeared after the five earlier findings had
+regression fixes.
+
+## Failed diagnostic window (2026-11-07)
+
+A restart on the consolidated hardening build initially held fourteen streams and seven feeds
+with zero writer drops/errors, 2.76 % of one core mean, and 56.8–64.0 MiB RSS. After event
+maintenance pruned exactly 25,000 legacy rows, a bounded materialized SQLite query spilled its
+temporary B-tree into `/var/tmp`. The service sandbox denied that ambient path. Every retention
+pass then failed, catalogued media reached 205.26 GiB against the 200 GiB quota, and later catalog
+batches failed as well while basic HTTP health checks continued to pass.
+
+That window is not soak evidence. The catalog connection now sets `temp_store=MEMORY`, which keeps
+the already-bounded temporary query state inside the process. The acceptance report and sampled
+Prometheus counters also include catalog failures/rejections, retention failures, reconciliation,
+watchdog/self-check state, stream/feed disconnections, and API problems. A replacement window must
+advance beyond the 25,000-pruned-row trigger, complete several later retention passes, restore the
+quota, and keep those counters at zero before its seven-day clock begins.
 
 ## Low-latency HLS against a replayed camera (2026-11-02)
 

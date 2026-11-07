@@ -18,10 +18,15 @@ clap = { workspace = true }
 hex = { workspace = true }
 md-5 = { workspace = true }
 reqwest = { workspace = true }
-rustix = { workspace = true, features = ["param", "process"] }
+rustix = { workspace = true, features = ["fs", "param", "process"] }
+serde = { workspace = true }
 serde_json = { workspace = true }
 sha1 = "0.10"
 tokio = { workspace = true, features = ["rt-multi-thread", "process"] }
+toml = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
 
 [lints]
 workspace = true

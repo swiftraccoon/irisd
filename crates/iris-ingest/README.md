@@ -28,7 +28,7 @@ and the timing model, and it is the only place that talks to cameras.
   regulariser, usable on its own (the replay regression test drives it from a recorded
   sidecar).
 - `assembler::FragmentAssembler` and `assembler::Frame` — fragment assembly at random access
-  points or at the cap, with the running payload checksum and hold accounting.
+  points or at the cap, with byte and frame limits and hold accounting.
 
 ## How it is used
 
@@ -52,25 +52,47 @@ tokio::spawn(run_stream(source, IngestOptions::default(), sink, Arc::clone(&stat
 
 `run_stream` never returns an error: a failed or ended session is logged, counted in
 `StreamStats::reconnects`, and retried. Cancelling the token flushes the pending fragment
-and tears the session down with `TEARDOWN`.
+and tears the session down with `TEARDOWN`. After a session is established, cancellation,
+inactivity, EOF, demux failure, and frame or clock errors all finalize complete pending
+access units exactly once before reconnect or shutdown.
 
 ## Invariants and limits
 
 - **Timing.** The NVR clock is the authority; RTP timestamps give relative timing through
   the regulariser, which assigns the nominal frame duration, corrects by at most 1 % per
   fragment, renders camera-dropped frames as frame-long holds, re-times the stream to its delivered
-  rate after warm-up when the typical fragment runs more than 1 % off the declared rate (or
+  rate after warm-up when the median fragment runs more than 1 % off the declared rate (or
   holes exceed 5 % of camera time), and snaps to the camera timeline when the error exceeds the tolerance
-  (500 ms). Fixed by `docs/research/04-storage-format.md §7` and
-  `05-ingest-events.md §2`; the constants live at the top of `src/regularize.rs`.
+  (500 ms). A parameter-set epoch carrying a different valid frame rate starts a fresh
+  timing estimate at that rate while preserving decode-time continuity and cumulative
+  diagnostics; an unchanged, absent, or invalid rate preserves the estimator. Fixed by
+  `docs/research/04-storage-format.md §7` and `05-ingest-events.md §2`; the constants live
+  at the top of `src/regularize.rs`.
 - **Fragments.** A fragment opens at a sync frame and closes at the next sync frame, at a
-  parameter-set change, or once the camera timeline exceeds the cap by a quarter (default cap 2 s).
+  parameter-set change, or once camera time, receipt time, or nominal sample time exceeds
+  the cap by a quarter (default cap 2 s). Each pending fragment is also bounded at 4,096
+  frames and 64 MiB of payload, so stalled RTP timestamps cannot grow it indefinitely.
+  The patched H.265 depacketizer independently limits both pinned payload and projected
+  frame output to 64 MiB while an access unit is assembled; exceeding either limit ends
+  the session with a controlled error before the frame allocation. The assembler retains
+  its 64 MiB check as defense in depth: an oversized frame closes retained frames with
+  nominal durations and is discarded. Recording resumes at the next sync frame in a
+  separate run at decode time zero, leaving the discarded interval as a gap in wall time.
+  The regulariser retains its rate estimate.
   Frames before the first sync frame are dropped. A discontinuity restarts the decode
   timeline at zero and starts a new run (`04 §7`, `05 §2`).
 - **Sessions.** TCP interleaved only; 15 s setup timeout on DESCRIBE, SETUP, and PLAY;
-  30 s inactivity timeout; `TEARDOWN` on every exit; timestamp jumps over 10 s end the
-  session; backoff 1 s doubling to 30 s with ±20 % jitter, reset after a 60 s healthy
-  session (`05 §1`).
+  30 s inactivity timeout; `TEARDOWN` on every exit; RTSP control messages are limited to
+  1 MiB for head and body together; timestamp jumps over 10 s end the session; backoff 1 s
+  doubling to 30 s with deterministic ±20 % jitter from stream identity and retry attempt,
+  reset after a 60 s healthy session (`05 §1`).
+- **Wall placement and recorder clock.** Receive instants use fresh realtime/monotonic
+  correlations. Finalized frame durations feed a per-run least-delay wall-minus-media
+  anchor: lower-delay observations take effect immediately, upward movement is limited to
+  500 ppm, and each sealed fragment is placed from that anchor plus its decode start. Raw
+  receipt times still enforce the fragment cap. A change over 2 s in the recorder clock
+  offset flushes the pending fragment and ends the session, so reconnect starts a separate
+  run and anchor.
 - **Socket reads.** With `read_interval` set, a session drains the demuxer without arming a
   wake-up and waits for the next tick of the shared `ReadTicker` (one timer task for every
   stream; the caller creates it once per runtime and passes it in `IngestOptions::ticker`,
@@ -80,24 +102,35 @@ and tears the session down with `TEARDOWN`.
   kernel reports the socket readable once per that many bytes (`05 §1`,
   `12-ingest-cost.md §3–4`).
 - **Sinks never block.** The sink is called on the ingest task; a rejected fragment is
-  dropped and counted, never awaited (`04 §8`).
+  dropped and counted, never awaited. The first rejection in a loss epoch records one gap
+  and ends recording continuity. A sync frame already pending is retained; otherwise
+  dependent recording frames are discarded until the next sync frame, which begins a run
+  at decode time zero. Live publication continues throughout (`04 §8`).
 - **Live ring.** Frames are published with provisional durations before the fragment
-  closes; a lagged subscriber resynchronises at the next sync frame
+  closes. The fast-start cache retains at most 600 frames and 64 MiB of payload from the
+  most recent sync frame; crossing either limit abandons that run until a later fitting sync.
+  Subscriber fan-out retains each frame once, bounded by the configured frame capacity
+  and 64 MiB of payload per stream, and retains no fan-out payload without subscribers.
+  Overflow reports lag and delivery resumes at the next sync frame
   (`docs/design/phase2-interfaces.md`).
 
 ## Tests and measurements
 
 - Unit tests in `src/regularize.rs` (jitter, drift, gaps, backwards timelines, wrong
   declared rates, passthrough), `src/assembler.rs` (first-sync drop, cap splits,
-  discontinuities, parameter-set changes, hold accounting), `src/session.rs` (declared-rate
-  parsing, wall-clock mapping, the shared tick), `src/stats.rs`, and `src/live.rs`.
+  discontinuities, oversized-frame gaps, parameter-set changes, hold accounting),
+  `src/session.rs` (declared-rate parsing, injected realtime steps, wall-clock mapping, the
+  shared tick), `src/stats.rs`, and `src/live.rs`.
 - `tests/replay.rs` replays the camera timeline of a real ten-minute recording (the sidecar
   in `tests/data/`) through the regulariser and checks that it stays locked without snaps.
 - `tests/replay_server.rs` records from the `iris-replay` server in both read modes
   (packet-driven and timer-driven), checks that the fragments carry the served frames,
   and makes a replayed camera stall so the timer-driven session's inactivity timeout,
-  teardown, and reconnect run on a detached socket; it
-  byte for byte, with sender reports observed. No hardware is involved.
+  teardown, and reconnect run on a detached socket. Cancellation checks account for every
+  received frame and clear connection state in both read modes. No hardware is involved.
+- `tests/adversarial_rtsp.rs` uses bounded loopback peers in both read modes to cover
+  terminal tail flushes, transport-backlog wall placement, RTSP and H.265 allocation
+  limits, reconnect recovery, and recording continuity after sink rejection.
 - Measurements: `docs/research/11-multi-camera-results.md` (six and seven live cameras) and
   `docs/research/12-ingest-cost.md` (CPU per megabit, the read policy, the low-water mark).
 

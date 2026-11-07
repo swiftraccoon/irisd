@@ -23,8 +23,11 @@
 //! - [`EventSink::publish`] runs on the receive loop and must not block.
 //! - The ONVIF pull timeout stays under the 10 s that the HTTP transport
 //!   applies to every request, and subscriptions are renewed before they
-//!   expire; WS-Security tokens fall back to host time for cameras that
-//!   misreport UTC.
+//!   expire from the lifetime the camera granted; WS-Security tokens fall back
+//!   to host time only for structured clock-authentication faults from cameras
+//!   that misreport UTC.
+//! - Camera-advertised ONVIF URLs stay on the configured origin. Authenticated
+//!   SOAP does not follow redirects and has byte and XML-structure limits.
 //! - Credentials never reach logs, URLs, or errors.
 //!
 //! # Example
@@ -49,6 +52,7 @@ mod feed;
 pub mod multipart;
 pub mod onvif;
 mod stats;
+mod transport;
 
 pub use endpoint::{CameraEndpoint, EventSink};
 pub use feed::run_dahua_cgi;

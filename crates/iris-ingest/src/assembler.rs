@@ -10,6 +10,40 @@ use iris_mp4::init::SampleEntry;
 use crate::regularize::Regularizer;
 use crate::source::IngestOptions;
 
+/// Bounds independent of the camera's timestamp and declared frame rate.
+const MAX_PENDING_FRAMES: usize = 4_096;
+const MAX_PENDING_BYTES: usize = 64 * 1_024 * 1_024;
+/// Maximum upward movement of the wall-minus-media anchor, in parts per million.
+const WALL_ANCHOR_UPWARD_PPM: i64 = 500;
+
+#[derive(Debug)]
+struct WallAnchor {
+    offset_us: i64,
+    media_ticks: u64,
+}
+
+impl WallAnchor {
+    fn update(&mut self, candidate_us: i64, media_ticks: u64) {
+        if candidate_us <= self.offset_us {
+            self.offset_us = candidate_us;
+        } else {
+            let elapsed_ticks = media_ticks.saturating_sub(self.media_ticks);
+            let elapsed_us = ticks_to_micros(elapsed_ticks);
+            let allowed = elapsed_us.saturating_mul(WALL_ANCHOR_UPWARD_PPM) / 1_000_000;
+            self.offset_us = self.offset_us.saturating_add(allowed).min(candidate_us);
+        }
+        self.media_ticks = media_ticks;
+    }
+
+    fn wall_at(&self, media_ticks: u64) -> WallUs {
+        WallUs::new(self.offset_us.saturating_add(ticks_to_micros(media_ticks)))
+    }
+}
+
+fn ticks_to_micros(ticks: u64) -> i64 {
+    i64::try_from(ticks.saturating_mul(100) / 9).unwrap_or(i64::MAX)
+}
+
 /// One received access unit.
 #[derive(Clone, Debug)]
 pub struct Frame {
@@ -28,8 +62,9 @@ pub struct Frame {
 /// Builds fragments from frames.
 ///
 /// A fragment opens at a sync frame and closes at the next sync frame, at a
-/// frame carrying new parameters, or once it spans `max_fragment` ticks of
-/// camera time. Its durations are assigned when it closes, because the last
+/// frame carrying new parameters, or when camera, receipt, or nominal sample
+/// time reaches the cap plus a quarter. Pending payload is limited to 64 MiB
+/// and 4,096 frames. Its durations are assigned when it closes, because the last
 /// frame's duration is only known from the first timestamp of the next
 /// fragment. Call [`FragmentAssembler::flush`] before
 /// [`FragmentAssembler::mark_discontinuity`] when a session ends.
@@ -39,8 +74,10 @@ pub struct FragmentAssembler {
     regularizer: Regularizer,
     sample_entry: Arc<SampleEntry>,
     pending: Vec<Frame>,
+    pending_bytes: usize,
     pending_entry: Arc<SampleEntry>,
     decode_time: u64,
+    wall_anchor: Option<WallAnchor>,
     new_run: bool,
     started: bool,
     snaps: u64,
@@ -63,7 +100,9 @@ impl FragmentAssembler {
             pending_entry: Arc::clone(&sample_entry),
             sample_entry,
             pending: Vec::new(),
+            pending_bytes: 0,
             decode_time: 0,
+            wall_anchor: None,
             new_run: true,
             started: false,
             snaps: 0,
@@ -76,6 +115,11 @@ impl FragmentAssembler {
     /// Sets the codec configuration for frames pushed from now on.
     pub fn set_sample_entry(&mut self, entry: Arc<SampleEntry>) {
         self.sample_entry = entry;
+    }
+
+    /// Starts a fresh timing epoch at `nominal` without changing the recording timeline.
+    pub(crate) fn retarget_timing(&mut self, nominal: u32) {
+        self.regularizer.retarget(nominal);
     }
 
     /// Number of fragments whose timing was snapped to the camera timeline.
@@ -130,7 +174,18 @@ impl FragmentAssembler {
     }
 
     /// Adds a frame; returns the fragment it completed, if any.
+    ///
+    /// A frame larger than 64 MiB flushes any pending fragment and is dropped.
+    /// Frames after that are ignored until the next sync frame, which starts
+    /// a separate run with its decode timeline at zero.
     pub fn push(&mut self, frame: Frame) -> Option<Fragment> {
+        if frame.data.len() > MAX_PENDING_BYTES {
+            // An oversized access unit cannot fit the assembly budget. Resume
+            // at a sync frame because later frames may reference the dropped one.
+            let completed = self.flush();
+            self.mark_discontinuity();
+            return completed;
+        }
         if !self.started {
             if !frame.is_sync {
                 return None;
@@ -141,15 +196,26 @@ impl FragmentAssembler {
         if let Some(first) = self.pending.first() {
             // A GOP may exceed the cap by a quarter before it is split, so that
             // timestamp jitter never splits a GOP whose nominal length equals the cap.
-            let reached_cap =
-                frame.raw_ts - first.raw_ts >= self.max_fragment + self.max_fragment / 4;
-            if frame.is_sync || frame.new_params || reached_cap {
+            let cap = self.max_fragment.saturating_add(self.max_fragment / 4);
+            let reached_cap = frame.raw_ts.saturating_sub(first.raw_ts) >= cap;
+            // A frozen or backwards RTP clock cannot disable the cap. Receipt
+            // time and nominal sample time bound ordinary long GOPs; hard byte
+            // and frame limits also cover bogus rate hints or receipt times.
+            let nominal_span =
+                (self.pending.len() as u64).saturating_mul(u64::from(self.nominal()));
+            let received_span = frame.wall.micros_since(first.wall);
+            let reached_budget = nominal_span >= u64::try_from(cap).unwrap_or(u64::MAX)
+                || received_span >= cap.saturating_mul(100) / 9
+                || self.pending.len() >= MAX_PENDING_FRAMES
+                || self.pending_bytes.saturating_add(frame.data.len()) > MAX_PENDING_BYTES;
+            if frame.is_sync || frame.new_params || reached_cap || reached_budget {
                 completed = Some(self.close(frame.raw_ts));
             }
         }
         if self.pending.is_empty() {
             self.pending_entry = Arc::clone(&self.sample_entry);
         }
+        self.pending_bytes += frame.data.len();
         self.pending.push(frame);
         completed
     }
@@ -159,9 +225,27 @@ impl FragmentAssembler {
     /// Any pending frames are discarded; flush first to keep them.
     pub fn mark_discontinuity(&mut self) {
         self.pending.clear();
+        self.pending_bytes = 0;
         self.decode_time = 0;
+        self.wall_anchor = None;
         self.new_run = true;
         self.started = false;
+    }
+
+    /// Ends recording continuity after the sink rejected a closed fragment.
+    ///
+    /// The first frame of the next fragment has already been pushed. Keep it
+    /// only when it is a sync frame that can start an independent run.
+    pub(crate) fn mark_sink_rejection(&mut self) {
+        let keep_sync = self.pending.first().is_some_and(|frame| frame.is_sync);
+        if !keep_sync {
+            self.pending.clear();
+            self.pending_bytes = 0;
+        }
+        self.decode_time = 0;
+        self.wall_anchor = None;
+        self.new_run = true;
+        self.started = keep_sync;
     }
 
     /// Closes the pending fragment with nominal durations.
@@ -174,6 +258,7 @@ impl FragmentAssembler {
 
     fn close(&mut self, next_raw: i64) -> Fragment {
         let frames = std::mem::take(&mut self.pending);
+        self.pending_bytes = 0;
         let raw: Vec<i64> = frames.iter().map(|f| f.raw_ts).collect();
         let assignment = self.regularizer.assign(&raw, next_raw);
         if assignment.snapped {
@@ -183,8 +268,23 @@ impl FragmentAssembler {
         self.hold_ticks += u64::try_from(assignment.hold_ticks).unwrap_or(0);
         self.last_hold_ticks = assignment.hold_ticks;
         let first = &frames[0];
-        let wall = first.wall;
         let raw_rtp = (first.raw_ts & 0xffff_ffff) as u32;
+        let mut media_ticks = self.decode_time;
+        let mut anchor_candidate = i64::MAX;
+        for (frame, duration) in frames.iter().zip(&assignment.durations) {
+            let candidate = frame
+                .wall
+                .get()
+                .saturating_sub(ticks_to_micros(media_ticks));
+            anchor_candidate = anchor_candidate.min(candidate);
+            media_ticks = media_ticks.saturating_add(u64::from(*duration));
+        }
+        let anchor = self.wall_anchor.get_or_insert(WallAnchor {
+            offset_us: anchor_candidate,
+            media_ticks,
+        });
+        anchor.update(anchor_candidate, media_ticks);
+        let wall = anchor.wall_at(self.decode_time);
         let samples: Vec<Sample> = frames
             .into_iter()
             .zip(assignment.durations)
@@ -261,7 +361,13 @@ mod tests {
         assert!(fragment.new_run);
         assert!(fragment.starts_with_sync());
         assert_eq!(fragment.decode_time, 0);
-        assert_eq!(fragment.wall, WallUs::new(1_000_000 + 2 * 33_333));
+        assert!(
+            fragment
+                .wall
+                .micros_since(WallUs::new(1_000_000 + 2 * 33_333))
+                .abs()
+                <= 100
+        );
         assert_eq!(fragment.raw_rtp, (5_000 + 2 * 3000) as u32);
         assert!(fragment.samples.iter().all(|s| s.duration == 3000));
         assert_eq!(fragment.duration(), 60 * 3000);
@@ -274,6 +380,126 @@ mod tests {
         assert!(!second.new_run);
         assert_eq!(second.decode_time, 60 * 3000);
         assert_eq!(a.snap_count(), 0);
+    }
+
+    #[test]
+    fn frozen_rtp_without_sync_frames_still_closes_fragments() {
+        let mut a = assembler();
+        let mut completed = 0;
+        for index in 0..1_000 {
+            let mut incoming = frame(index, index == 0);
+            incoming.raw_ts = 5_000;
+            if let Some(fragment) = a.push(incoming) {
+                assert!(fragment.samples.len() <= 75);
+                completed += 1;
+            }
+        }
+        assert!(
+            completed > 0,
+            "frozen RTP must not retain every received frame"
+        );
+        assert!(a.pending.len() <= 75);
+    }
+
+    #[test]
+    fn assembly_has_a_frame_limit_independent_of_all_clocks() {
+        let options = IngestOptions {
+            max_fragment: MediaTicks::new(i64::MAX),
+            ..IngestOptions::default()
+        };
+        let regularizer = Regularizer::new(
+            TimestampMode::Regularize,
+            Some(1),
+            MediaTicks::from_millis(500),
+        );
+        let mut a = FragmentAssembler::new(&options, regularizer, entry());
+        for index in 0..MAX_PENDING_FRAMES {
+            let mut incoming = frame(0, index == 0);
+            incoming.raw_ts = 0;
+            assert!(a.push(incoming).is_none());
+        }
+        let fragment = a
+            .push(frame(0, false))
+            .expect("hard frame budget closes the fragment");
+        assert_eq!(fragment.samples.len(), MAX_PENDING_FRAMES);
+        assert_eq!(a.pending.len(), 1);
+    }
+
+    #[test]
+    fn assembly_has_a_byte_limit_and_drops_oversized_access_units() {
+        let mut a = assembler();
+        let data = Bytes::from(vec![0; MAX_PENDING_BYTES / 2]);
+        for index in 0..2 {
+            let mut incoming = frame(index, index == 0);
+            incoming.data = data.clone();
+            assert!(a.push(incoming).is_none());
+        }
+        let fragment = a
+            .push(frame(2, false))
+            .expect("byte budget closes the fragment");
+        assert_eq!(fragment.payload_len(), MAX_PENDING_BYTES as u64);
+        assert!(a.pending_bytes < MAX_PENDING_BYTES);
+        let mut oversized = frame(3, false);
+        oversized.data = Bytes::from(vec![0; MAX_PENDING_BYTES + 1]);
+        assert!(a.push(oversized).is_some());
+        assert_eq!(a.pending_bytes, 0);
+        assert!(a.push(frame(4, false)).is_none());
+        assert!(a.last_provisional_decode_time().is_none());
+        assert!(a.push(frame(5, true)).is_none());
+        assert!(a.last_provisional_decode_time().is_some());
+    }
+
+    #[test]
+    fn oversized_access_unit_preserves_pending_frames_and_starts_a_separate_run() {
+        for is_sync in [false, true] {
+            let mut a = assembler();
+            for index in 0..10 {
+                assert!(a.push(frame(index, index == 0)).is_none());
+            }
+            let mut oversized = frame(10, is_sync);
+            oversized.data = Bytes::from(vec![0; MAX_PENDING_BYTES + 1]);
+            let completed = a.push(oversized).expect("keeps frames before the loss");
+            assert_eq!(completed.samples.len(), 10);
+            assert!(
+                completed
+                    .samples
+                    .iter()
+                    .all(|sample| sample.duration == 3000)
+            );
+            assert_eq!(completed.duration(), 30_000);
+            assert_eq!(completed.decode_time, 0);
+            assert!(completed.wall.micros_since(frame(0, true).wall).abs() <= 100);
+            assert!(completed.new_run);
+            assert_eq!(a.pending_bytes, 0);
+            assert!(a.last_provisional_decode_time().is_none());
+            for index in 11..60 {
+                assert!(a.push(frame(index, false)).is_none());
+                assert!(a.last_provisional_decode_time().is_none());
+            }
+            for index in 60..120 {
+                assert!(a.push(frame(index, index == 60)).is_none());
+            }
+            let resumed = a.push(frame(120, true)).expect("closes the resumed GOP");
+            assert!(
+                resumed.new_run,
+                "discarded frames must leave a run boundary"
+            );
+            assert_eq!(resumed.decode_time, 0);
+            assert_eq!(resumed.samples.len(), 60);
+            assert!(resumed.starts_with_sync());
+            assert!(resumed.wall.micros_since(frame(60, true).wall).abs() <= 100);
+            assert_eq!(resumed.raw_rtp, frame(60, true).raw_ts as u32);
+            assert_eq!(resumed.duration(), 180_000);
+            let preceding_end = completed.wall.get() + 333_333;
+            assert!(resumed.wall.get() > preceding_end);
+            assert_eq!((a.holes(), a.hold_ticks(), a.snap_count()), (0, 0, 0));
+            for index in 121..180 {
+                assert!(a.push(frame(index, false)).is_none());
+            }
+            let following = a.push(frame(180, true)).expect("closes the following GOP");
+            assert!(!following.new_run);
+            assert_eq!(following.decode_time, resumed.duration());
+        }
     }
 
     #[test]
@@ -362,5 +588,94 @@ mod tests {
         assert_eq!(old.sample_entry.hash, entry().hash);
         let next = a.push(frame(3, true)).unwrap();
         assert_eq!(next.sample_entry.hash, new_entry.hash);
+    }
+
+    #[test]
+    fn sink_rejection_discards_dependent_frames_until_sync() {
+        let mut a = assembler();
+        assert!(a.push(frame(0, true)).is_none());
+        for index in 1..75 {
+            assert!(a.push(frame(index, false)).is_none());
+        }
+        let rejected = a.push(frame(75, false)).expect("cap split");
+        assert!(rejected.starts_with_sync());
+        assert!(!a.pending[0].is_sync);
+
+        a.mark_sink_rejection();
+        assert!(a.pending.is_empty());
+        assert!(a.push(frame(76, false)).is_none());
+        assert!(a.pending.is_empty());
+        assert!(a.push(frame(77, true)).is_none());
+        let resumed = a.push(frame(78, true)).expect("resumed run");
+        assert!(resumed.starts_with_sync());
+        assert!(resumed.new_run);
+        assert_eq!(resumed.decode_time, 0);
+    }
+
+    #[test]
+    fn sink_rejection_keeps_an_already_pending_sync_frame() {
+        let mut a = assembler();
+        for index in 0..60 {
+            assert!(a.push(frame(index, index == 0)).is_none());
+        }
+        let rejected = a.push(frame(60, true)).expect("sync boundary");
+        assert!(rejected.starts_with_sync());
+        a.mark_sink_rejection();
+        assert_eq!(a.pending.len(), 1);
+        assert!(a.pending[0].is_sync);
+        for index in 61..120 {
+            assert!(a.push(frame(index, false)).is_none());
+        }
+        let resumed = a.push(frame(120, true)).expect("resumed run");
+        assert_eq!(resumed.samples.len(), 60);
+        assert!(resumed.starts_with_sync());
+        assert!(resumed.new_run);
+        assert_eq!(resumed.decode_time, 0);
+    }
+
+    #[test]
+    fn wall_anchor_adopts_lower_delay_and_clamps_upward_motion() {
+        let mut anchor = WallAnchor {
+            offset_us: 1_000_000,
+            media_ticks: 90_000,
+        };
+        anchor.update(2_000_000, 180_000);
+        assert_eq!(anchor.offset_us, 1_000_500);
+        anchor.update(900_000, 270_000);
+        assert_eq!(anchor.offset_us, 900_000);
+    }
+
+    #[test]
+    fn wall_anchor_keeps_transport_backlog_out_of_fragment_placement() {
+        let mut a = assembler();
+        assert!(a.push(frame(0, true)).is_none());
+        assert!(a.push(frame(1, false)).is_none());
+        let mut boundary = frame(2, true);
+        boundary.wall = WallUs::new(2_000_000);
+        let first = a.push(boundary).expect("first fragment");
+
+        let mut delayed = frame(3, false);
+        delayed.wall = WallUs::new(2_000_100);
+        assert!(a.push(delayed).is_none());
+        let mut next = frame(4, true);
+        next.wall = WallUs::new(2_000_200);
+        let second = a.push(next).expect("delayed fragment");
+        let expected_us = i64::try_from(first.duration()).unwrap() * 100 / 9;
+        assert!(
+            (second.wall.micros_since(first.wall) - expected_us).abs() <= 100,
+            "first={} second={}",
+            first.wall,
+            second.wall
+        );
+    }
+
+    #[test]
+    fn discontinuity_resets_the_wall_anchor() {
+        let mut a = assembler();
+        a.push(frame(0, true));
+        a.push(frame(1, true)).expect("fragment");
+        assert!(a.wall_anchor.is_some());
+        a.mark_discontinuity();
+        assert!(a.wall_anchor.is_none());
     }
 }

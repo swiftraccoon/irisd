@@ -16,6 +16,9 @@ use super::msg::{
 use super::table::is_tchar;
 use crate::inputs::Input;
 
+/// Maximum head-plus-body bytes accepted for one production RTSP control message.
+pub(crate) const MAX_CONTROL_MESSAGE_BYTES: usize = 1024 * 1024;
+
 /// Error detail carried by [`FeedError::Invalid`].
 #[derive(Debug, Default, derive_more::Error)]
 pub struct Invalid {
@@ -206,6 +209,17 @@ impl Parser {
         self.stream_pos
     }
 
+    /// Maximum unparsed bytes needed before the current message must decode or fail.
+    pub(crate) fn max_buffered_bytes(&self) -> usize {
+        match &self.state {
+            ParserState::Idle => self.max_message_size,
+            ParserState::Head { head_bytes, .. } => {
+                self.max_message_size.saturating_sub(*head_bytes)
+            }
+            ParserState::Body(_, body_len) => *body_len,
+        }
+    }
+
     /// Parses the next message from `input`.
     ///
     /// Returns `Ok(Some(...))` when a complete message has been parsed.
@@ -235,6 +249,7 @@ impl Parser {
         loop {
             match std::mem::take(&mut self.state) {
                 ParserState::Idle => {
+                    ensure_first_line_fits(input, self.max_message_size)?;
                     let checkpoint = *input;
                     let before = input.len();
                     match parse_head(input) {
@@ -267,6 +282,7 @@ impl Parser {
                     };
                     let checkpoint = *input;
                     let before = input.len();
+                    ensure_header_line_fits(input, head_bytes, self.max_message_size, context)?;
                     match parse_header_line(input) {
                         Ok(Some((name, value))) => {
                             head_bytes += before - input.len();
@@ -318,6 +334,80 @@ impl Parser {
                 }
             }
         }
+    }
+}
+
+fn ensure_first_line_fits<'i, I: Input<'i>>(
+    input: &I,
+    max_message_size: usize,
+) -> Result<(), FeedError> {
+    let mut offset = 0usize;
+    while offset < input.len() && input.byte_at(offset) == b'\r' {
+        if offset + 1 >= input.len() {
+            return ensure_incomplete_line_fits(input.len(), max_message_size, "first-line");
+        }
+        if input.byte_at(offset + 1) != b'\n' {
+            return Ok(());
+        }
+        offset += 2;
+    }
+    if offset < input.len() && input.byte_at(offset) == b'$' {
+        return Ok(());
+    }
+    let mut line = *input;
+    line.advance(offset);
+    ensure_line_fits(&line, offset, max_message_size, "first-line")
+}
+
+fn ensure_header_line_fits<'i, I: Input<'i>>(
+    input: &I,
+    head_bytes: usize,
+    max_message_size: usize,
+    context: &'static str,
+) -> Result<(), FeedError> {
+    ensure_line_fits(input, head_bytes, max_message_size, context)
+}
+
+fn ensure_line_fits<'i, I: Input<'i>>(
+    input: &I,
+    bytes_before_line: usize,
+    max_message_size: usize,
+    context: &'static str,
+) -> Result<(), FeedError> {
+    let delimiter = (0..input.len()).find(|&index| matches!(input.byte_at(index), b'\r' | b'\n'));
+    if let Some(index) = delimiter {
+        let line_bytes = if input.byte_at(index) == b'\r'
+            && index + 1 < input.len()
+            && input.byte_at(index + 1) == b'\n'
+        {
+            index + 2
+        } else {
+            index + 1
+        };
+        let total = bytes_before_line.checked_add(line_bytes);
+        if total.is_none_or(|total| total > max_message_size) {
+            return Err(invalid("message-too-large").context(context));
+        }
+        Ok(())
+    } else {
+        let buffered = bytes_before_line.checked_add(input.len());
+        if buffered.is_none_or(|total| total >= max_message_size) {
+            Err(invalid("message-too-large").context(context))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+fn ensure_incomplete_line_fits(
+    buffered: usize,
+    max_message_size: usize,
+    context: &'static str,
+) -> Result<(), FeedError> {
+    if buffered >= max_message_size {
+        Err(invalid("message-too-large").context(context))
+    } else {
+        Ok(())
     }
 }
 
@@ -818,6 +908,55 @@ pub(crate) mod tests {
             panic!("expected Invalid, got {err:?}");
         };
         assert_eq!(inv.context, ["message-too-large", "request"]);
+    }
+
+    #[test]
+    fn max_message_size_rejects_an_unterminated_first_line_incrementally() {
+        let data = vec![b'A'; 64];
+        let mut input = Split::new(&data, &[]);
+        let error = Parser::builder()
+            .max_message_size(64)
+            .build()
+            .feed(&mut input)
+            .unwrap_err();
+        let FeedError::Invalid(invalid) = error else {
+            panic!("expected Invalid");
+        };
+        assert_eq!(invalid.context, ["message-too-large", "first-line"]);
+    }
+
+    #[test]
+    fn max_message_size_rejects_a_fragmented_header_before_allocating_it() {
+        let first = b"RTSP/1.0 200 OK\r\n";
+        let mut parser = Parser::builder().max_message_size(64).build();
+        let mut input = Split::new(first, &[]);
+        assert!(matches!(
+            parser.feed(&mut input),
+            Err(FeedError::Incomplete(_))
+        ));
+        let header = vec![b'x'; 64 - first.len()];
+        let mut input = Split::new(&header, &[]);
+        let error = parser.feed(&mut input).unwrap_err();
+        let FeedError::Invalid(invalid) = error else {
+            panic!("expected Invalid");
+        };
+        assert_eq!(invalid.context, ["message-too-large", "response"]);
+        assert!(invalid.to_string().len() < 256);
+    }
+
+    #[test]
+    fn max_message_size_rejects_declared_body_before_body_bytes() {
+        let data = b"RTSP/1.0 200 OK\r\nContent-Length: 100\r\n\r\n";
+        let mut input = Split::new(data, &[]);
+        let error = Parser::builder()
+            .max_message_size(data.len() + 99)
+            .build()
+            .feed(&mut input)
+            .unwrap_err();
+        let FeedError::Invalid(invalid) = error else {
+            panic!("expected Invalid");
+        };
+        assert_eq!(invalid.context, ["message-too-large", "response"]);
     }
 
     #[test]
