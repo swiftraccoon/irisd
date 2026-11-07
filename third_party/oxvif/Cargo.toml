@@ -1,0 +1,57 @@
+[package]
+name = "oxvif"
+version = "0.17.0"
+edition = "2024"
+rust-version = "1.88"
+description = "Async Rust client library for the ONVIF IP camera protocol"
+license = "MIT"
+repository = "https://github.com/smiti1642/oxvif"
+
+[features]
+health = ["dep:serde", "dep:serde_json", "dep:digest_auth"]
+metamorph = ["mock", "serde", "dep:serde_json"]
+metamorph-server = ["metamorph", "mock-server"]
+mock = ["dep:serde"]
+mock-server = ["mock", "dep:axum", "tokio/rt-multi-thread"]
+serde = ["dep:serde"]
+
+[lib]
+name = "oxvif"
+path = "src/lib.rs"
+
+[dependencies]
+async-stream = "0.3"
+async-trait = "0.1"
+axum = { version = "0.8", optional = true }
+base64 = { version = "0.23", default-features = false, features = ["std"] }
+digest_auth = { version = "0.3", optional = true }
+diqwest = "3.2"
+futures-core = "0.3"
+if-addrs = "0.15"
+quick-xml = "0.42"
+rand = "0.10.1"
+reqwest = { version = "0.13.2", default-features = false, features = ["rustls"] }
+serde = { version = "1", features = ["derive"], optional = true }
+serde_json = { version = "1", optional = true }
+sha1 = "0.11"
+socket2 = "0.6"
+thiserror = "2"
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "net", "time", "sync"] }
+tracing = "0.1"
+
+[dev-dependencies]
+axum = "0.8"
+dirs = "6"
+dotenvy = "0.15"
+fs2 = "0.4"
+futures = "0.3"
+mockito = "1"
+quick-xml = { version = "0.42", features = ["encoding"] }
+rcgen = "0.14.10"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "test-util", "io-util", "signal"] }
+tokio-rustls = "0.26"
+toml = "1"
+
+[workspace]

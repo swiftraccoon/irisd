@@ -80,7 +80,9 @@ impl Connection {
                 peer_addr,
                 established_wall,
             },
-            parser: crate::rtsp::parse::Parser::default(),
+            parser: crate::rtsp::parse::Parser::builder()
+                .max_message_size(crate::rtsp::parse::MAX_CONTROL_MESSAGE_BYTES)
+                .build(),
             read_buf: MarkBuf::new(DEFAULT_READ_CAPACITY),
             write_buf: Vec::new(),
         })
@@ -96,7 +98,8 @@ impl Connection {
     /// packet. Only meaningful once data flows continuously (after `PLAY`);
     /// set earlier, small RTSP responses would never trigger readiness.
     pub(crate) fn set_recv_low_water(&self, bytes: u32) -> std::io::Result<()> {
-        let value = libc::c_int::try_from(bytes).map_err(|_| std::io::Error::other("value too large"))?;
+        let value =
+            libc::c_int::try_from(bytes).map_err(|_| std::io::Error::other("value too large"))?;
         // SAFETY: `fd` is a valid, open socket owned by `self.stream` for the
         // duration of the call, and `value` outlives the call.
         let rc = unsafe {
@@ -291,10 +294,26 @@ impl Stream for Connection {
                     std::task::Poll::Pending => return std::task::Poll::Pending,
                 }
             }
-            let (first, second) = this.read_buf.spare_capacity(4096);
+            let buffered = this.read_buf.unparsed_len();
+            let remaining = this.parser.max_buffered_bytes().saturating_sub(buffered);
+            if remaining == 0 {
+                let error = CodecError::ParseError {
+                    description: "RTSP control message exceeds 1 MiB".to_owned(),
+                    pos: this.parser.stream_pos() + buffered as u64,
+                };
+                return std::task::Poll::Ready(Some(Err(codec_err_to_error(
+                    &this.ctx,
+                    &this.parser,
+                    &this.read_buf,
+                    error,
+                ))));
+            }
+            let (first, second) = this.read_buf.spare_capacity(remaining.min(4096));
+            let first_len = first.len().min(remaining);
+            let second_len = second.len().min(remaining - first_len);
             let mut bufs = [
-                std::io::IoSliceMut::new(first),
-                std::io::IoSliceMut::new(second),
+                std::io::IoSliceMut::new(&mut first[..first_len]),
+                std::io::IoSliceMut::new(&mut second[..second_len]),
             ];
             let offered = bufs[0].len() + bufs[1].len();
             let read = match &mut this.stream {
@@ -405,8 +424,12 @@ impl Sink<OwnedMessage> for Connection {
         while !this.write_buf.is_empty() {
             let written = match &mut this.stream {
                 Io::Reactor(stream) => std::pin::Pin::new(stream).poll_write(cx, &this.write_buf),
-                Io::Detached(stream) => std::task::Poll::Ready(blocking_write(stream, &this.write_buf)),
-                Io::Detaching => std::task::Poll::Ready(Err(std::io::Error::other("connection is detaching"))),
+                Io::Detached(stream) => {
+                    std::task::Poll::Ready(blocking_write(stream, &this.write_buf))
+                }
+                Io::Detaching => {
+                    std::task::Poll::Ready(Err(std::io::Error::other("connection is detaching")))
+                }
             };
             match written {
                 std::task::Poll::Ready(Ok(n)) => {
@@ -446,7 +469,9 @@ impl Sink<OwnedMessage> for Connection {
         let this = &mut *self;
         let shut = match &mut this.stream {
             Io::Reactor(stream) => std::pin::Pin::new(stream).poll_shutdown(cx),
-            Io::Detached(stream) => std::task::Poll::Ready(stream.shutdown(std::net::Shutdown::Write)),
+            Io::Detached(stream) => {
+                std::task::Poll::Ready(stream.shutdown(std::net::Shutdown::Write))
+            }
             Io::Detaching => std::task::Poll::Ready(Ok(())),
         };
         match shut {
@@ -492,6 +517,12 @@ impl UdpPair {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
+    use futures::StreamExt as _;
+    use tokio::io::AsyncWriteExt as _;
+    use tokio::net::TcpListener;
+
     use super::*;
 
     #[test]
@@ -528,5 +559,41 @@ mod tests {
         assert!(matches!(msg.msg, crate::rtsp::msg::Message::Response(_)));
         assert_eq!(msg.body_len, 0);
         assert_eq!(read_buf.unparsed_len(), 0);
+    }
+
+    #[tokio::test]
+    async fn production_limit_accepts_an_exact_control_message() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut body_len = crate::rtsp::parse::MAX_CONTROL_MESSAGE_BYTES;
+            let head = loop {
+                let head =
+                    format!("RTSP/1.0 200 OK\r\nCSeq: 1\r\nContent-Length: {body_len}\r\n\r\n");
+                let adjusted = crate::rtsp::parse::MAX_CONTROL_MESSAGE_BYTES - head.len();
+                if adjusted == body_len {
+                    break head;
+                }
+                body_len = adjusted;
+            };
+            socket.write_all(head.as_bytes()).await.unwrap();
+            socket.write_all(&vec![b'x'; body_len]).await.unwrap();
+            body_len
+        });
+
+        let stream = TcpStream::connect(address).await.unwrap();
+        let mut connection = Connection::from_stream(stream).unwrap();
+        let message = tokio::time::timeout(Duration::from_secs(2), connection.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let body_len = server.await.unwrap();
+        assert_eq!(message.body_len as usize, body_len);
+        assert_eq!(
+            connection.parser.stream_pos() as usize,
+            crate::rtsp::parse::MAX_CONTROL_MESSAGE_BYTES
+        );
     }
 }

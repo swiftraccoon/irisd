@@ -41,6 +41,10 @@ point and `strip_parameter_sets` before the frame becomes a sample.
 - Access units are 4-byte big-endian length-prefixed NAL units, the `hvc1` sample format;
   Annex B start codes never appear on disk (`docs/research/04-storage-format.md §4`).
 - A NAL unit is at least two bytes (its header); shorter units are a `FramingError`.
+- Classification preserves the six-bit type code. Types 0..=31, including reserved types
+  24..=31, are VCL; only types 16..=23 are IRAP.
+- A truncation error points to the start of its length prefix, including when only one to
+  three prefix bytes remain. The iterator yields the error once and then stays exhausted.
 - Parameter sets (VPS, SPS, PPS) live only in `hvcC`; the recorder strips in-band copies
   and seals a file when they change (`04 §4`, `05-ingest-events.md §2`).
 - Every function accepts arbitrary bytes without panicking; the fuzz target
@@ -48,8 +52,9 @@ point and `strip_parameter_sets` before the frame becomes a sample.
 
 ## Tests and measurements
 
-Unit tests cover type classification, stripping with slices kept, and truncation
-reporting; the crate-level doctest exercises `nal_type`. The fuzz target `access_unit`
+Unit tests cover all 256 first-header bytes, stripping with slices kept, partial-prefix
+offsets and truncation/short-header termination; the crate-level doctest exercises `nal_type`.
+The fuzz target `access_unit`
 feeds arbitrary bytes through the walkers. The elementary-stream facts the helpers rely on
 (FU-only packetisation, parameter sets before every IDR, no AUD) are measured in
 `docs/research/01-camera-probe.md §3`.

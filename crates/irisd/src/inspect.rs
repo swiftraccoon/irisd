@@ -5,10 +5,10 @@ use std::fs::File;
 use std::io::BufReader;
 use std::path::PathBuf;
 
-use anyhow::Context;
+use anyhow::{Context, bail};
 use clap::Args as ClapArgs;
-use iris_core::time::{MediaTicks, TIMESCALE};
-use iris_mp4::index::read_index;
+use iris_core::time::TIMESCALE;
+use iris_mp4::index::{MAX_PERSISTED_INDEX_RECORDS, read_index_bounded};
 use iris_mp4::reader::{FragmentInfo, ScanOptions, scan};
 use iris_store::layout::index_path;
 
@@ -53,7 +53,7 @@ pub fn run(args: &Args) -> anyhow::Result<()> {
     println!("crc verified:       {}", args.verify);
 
     if let (Some(first), Some(last)) = (fragments.first(), fragments.last()) {
-        report_timing(fragments, first, last, report.valid_len);
+        report_timing(fragments, first, last, report.valid_len)?;
     }
     match &report.stop {
         Some(stop) => println!("scan stopped:       {stop:?}"),
@@ -71,9 +71,14 @@ fn report_timing(
     first: &FragmentInfo,
     last: &FragmentInfo,
     valid_len: u64,
-) {
-    let end_time = last.decode_time + u64::from(last.duration);
-    let total_ticks = end_time.saturating_sub(first.decode_time);
+) -> anyhow::Result<()> {
+    let end_time = last
+        .decode_time
+        .checked_add(u64::from(last.duration))
+        .context("invalid media timeline: final decode-time end overflows u64")?;
+    let total_ticks = end_time
+        .checked_sub(first.decode_time)
+        .context("invalid media timeline: final end precedes first decode time")?;
     let total_secs = total_ticks as f64 / f64::from(TIMESCALE);
     println!(
         "decode time:        {} .. {} ticks ({total_secs:.3} s)",
@@ -111,8 +116,16 @@ fn report_timing(
         .count();
     let decode_gaps = fragments
         .windows(2)
-        .filter(|w| w[1].decode_time != w[0].decode_time + u64::from(w[0].duration))
+        .filter(|w| {
+            w[0].decode_time.checked_add(u64::from(w[0].duration)) != Some(w[1].decode_time)
+        })
         .count();
+    if fragments
+        .windows(2)
+        .any(|window| window[1].decode_time < window[0].decode_time)
+    {
+        bail!("invalid media timeline: decode time decreases between fragments");
+    }
     println!("sequence gaps:      {sequence_gaps}");
     println!("decode-time gaps:   {decode_gaps}");
     let sync_starts = fragments.iter().filter(|f| f.starts_with_sync).count();
@@ -138,16 +151,33 @@ fn report_timing(
 
     match (first.wall, last.wall) {
         (Some(first_wall), Some(last_wall)) => {
-            let wall_delta = last_wall.micros_since(first_wall);
-            let media_delta =
-                MediaTicks::new((last.decode_time - first.decode_time) as i64).as_micros();
+            let wall_delta = last_wall
+                .get()
+                .checked_sub(first_wall.get())
+                .context("invalid media timeline: wall-clock delta overflows i64")?;
+            let media_ticks = last
+                .decode_time
+                .checked_sub(first.decode_time)
+                .context("invalid media timeline: final decode time precedes first")?;
+            let media_ticks = i64::try_from(media_ticks)
+                .context("invalid media timeline: decode-time delta exceeds i64")?;
+            let media_delta = checked_ticks_to_micros(media_ticks)
+                .context("invalid media timeline: media delta in microseconds exceeds i64")?;
+            let drift = wall_delta
+                .checked_sub(media_delta)
+                .context("invalid media timeline: wall/media drift overflows i64")?;
             println!(
                 "wall clock:         {first_wall} .. {last_wall}; drift vs media time {:+.1} ms",
-                (wall_delta - media_delta) as f64 / 1000.0
+                drift as f64 / 1000.0
             );
         }
         _ => println!("wall clock:         no prft boxes"),
     }
+    Ok(())
+}
+
+fn checked_ticks_to_micros(ticks: i64) -> Option<i64> {
+    i64::try_from(i128::from(ticks).checked_mul(100)?.div_euclid(9)).ok()
 }
 
 fn report_sidecar(args: &Args, fragments: &[FragmentInfo]) {
@@ -156,7 +186,7 @@ fn report_sidecar(args: &Args, fragments: &[FragmentInfo]) {
         println!("sidecar index:      none at {}", path.display());
         return;
     }
-    match read_index(&path) {
+    match read_index_bounded(&path, MAX_PERSISTED_INDEX_RECORDS) {
         Ok((header, records)) => {
             let offsets_agree = records.len() == fragments.len()
                 && records.iter().zip(fragments).all(|(r, f)| {
@@ -193,5 +223,82 @@ fn print_fragments(fragments: &[FragmentInfo]) {
             if f.starts_with_sync { "yes" } else { "no" },
             f.wall.map_or_else(|| "-".to_owned(), |w| w.to_string())
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use iris_core::time::WallUs;
+
+    fn fragment(decode_time: u64, duration: u32, wall: Option<WallUs>) -> FragmentInfo {
+        FragmentInfo {
+            offset: 700,
+            len: 100,
+            payload_offset: 740,
+            sequence: 1,
+            decode_time,
+            duration,
+            sample_count: 1,
+            starts_with_sync: true,
+            wall,
+            sample_durations: vec![duration],
+            sample_sizes: vec![1],
+        }
+    }
+
+    #[test]
+    fn timing_report_rejects_maximum_decreasing_and_unrepresentable_deltas() {
+        let maximum = fragment(u64::MAX, 1, None);
+        let error =
+            report_timing(std::slice::from_ref(&maximum), &maximum, &maximum, 800).unwrap_err();
+        assert!(error.to_string().contains("overflows u64"), "{error:#}");
+
+        let decreasing = [fragment(3_000, 1, None), fragment(0, 1, None)];
+        let error = report_timing(&decreasing, &decreasing[0], &decreasing[1], 900).unwrap_err();
+        assert!(
+            error.to_string().contains("precedes first decode time"),
+            "{error:#}"
+        );
+
+        let too_wide = [
+            fragment(0, 1, Some(WallUs::new(0))),
+            fragment(i64::MAX as u64 + 1, 0, Some(WallUs::new(0))),
+        ];
+        let error = report_timing(&too_wide, &too_wide[0], &too_wide[1], 900).unwrap_err();
+        assert!(error.to_string().contains("exceeds i64"), "{error:#}");
+    }
+
+    #[test]
+    fn timing_report_accepts_the_largest_convertible_delta_and_ordinary_media() {
+        let largest_convertible = u64::try_from(i128::from(i64::MAX) * 9 / 100).unwrap();
+        let boundary = [
+            fragment(0, 1, Some(WallUs::new(0))),
+            fragment(largest_convertible, 0, Some(WallUs::new(i64::MAX))),
+        ];
+        report_timing(&boundary, &boundary[0], &boundary[1], 900).unwrap();
+
+        let ordinary = [
+            fragment(90_000, 90_000, Some(WallUs::new(1_000_000))),
+            fragment(180_000, 90_000, Some(WallUs::new(2_000_000))),
+        ];
+        report_timing(&ordinary, &ordinary[0], &ordinary[1], 900).unwrap();
+    }
+
+    #[test]
+    fn oversized_sidecar_is_reported_without_loading_past_the_shared_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let media = dir.path().join("recording.mp4");
+        let sidecar = File::create(media.with_extension("idx")).unwrap();
+        let oversized = iris_mp4::index::HEADER_LEN
+            + MAX_PERSISTED_INDEX_RECORDS * iris_mp4::index::RECORD_LEN
+            + iris_mp4::index::RECORD_LEN;
+        sidecar.set_len(u64::try_from(oversized).unwrap()).unwrap();
+        let args = Args {
+            file: media,
+            verify: false,
+            samples: false,
+        };
+        report_sidecar(&args, &[]);
     }
 }

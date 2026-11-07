@@ -44,7 +44,7 @@ irisd must therefore measure its own numbers (07 §7) rather than compare agains
 | Consumer falls behind → camera drops session | Moonfire "Stream ended" / "getting next packet took…"; Frigate 10 s socket timeout | irisd: bounded writer queue, drop whole fragments with a logged gap, reconnect with backoff |
 | RTCP SR absent, late, or wrong clock | Moonfire uses SR start only if within 5 s of local; retina drops unknown-SSRC RTCP | irisd: SRs diagnostic only |
 | NVR clock steps (no RTC on SBCs) | Moonfire: unhandled (wrong until restart) | irisd: monotonic vs realtime watchdog → new run |
-| B-frames | Moonfire rejects (pts not monotonic); SentryShot forked retina for DTS | irisd v1: passthrough mode with `ctts`-style composition offsets deferred; Dahua/Hik IPCs emit P-only streams |
+| B-frames | Moonfire rejects (pts not monotonic); SentryShot forked retina for DTS | irisd 0.1 alpha: passthrough mode with `ctts`-style composition offsets deferred; Dahua/Hik IPCs emit P-only streams |
 
 ## 4. Lessons adopted
 

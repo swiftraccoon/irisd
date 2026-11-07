@@ -1,5 +1,6 @@
 //! HTTP Digest authentication (RFC 7616, MD5 and MD5-sess, `qop=auth`).
 
+use std::fmt;
 use std::fmt::Write as _;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -121,12 +122,24 @@ pub fn compute_response(
 
 /// Digest state for one camera: credentials, the current challenge, and the
 /// nonce count.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct DigestAuth {
     username: String,
     password: String,
     challenge: Option<Challenge>,
     nonce_count: u32,
+}
+
+impl fmt::Debug for DigestAuth {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("DigestAuth")
+            .field("username", &"<redacted>")
+            .field("password", &"<redacted>")
+            .field("has_challenge", &self.challenge.is_some())
+            .field("nonce_count", &self.nonce_count)
+            .finish()
+    }
 }
 
 impl DigestAuth {
@@ -278,5 +291,31 @@ mod tests {
         let header = auth.authorization("GET", "/dir/index.html").unwrap();
         assert!(header.contains("response=\"670fd8c2df070c60b045671b8b24ff02\""));
         assert!(!header.contains("qop="));
+    }
+
+    #[test]
+    fn debug_redacts_credentials_and_challenge() {
+        let mut auth = DigestAuth::new("distinctive-user", "distinctive-password");
+        auth.set_challenge(
+            parse_challenge("Digest realm=\"distinctive-realm\", nonce=\"distinctive-nonce\"")
+                .unwrap(),
+        );
+        let _ = auth
+            .authorization_with("GET", "/", "distinctive-cnonce")
+            .unwrap();
+        for rendered in [format!("{auth:?}"), format!("{auth:#?}")] {
+            assert!(rendered.contains("<redacted>"));
+            assert!(rendered.contains("has_challenge: true"));
+            assert!(rendered.contains("nonce_count: 1"));
+            for marker in [
+                "distinctive-user",
+                "distinctive-password",
+                "distinctive-realm",
+                "distinctive-nonce",
+                "distinctive-cnonce",
+            ] {
+                assert!(!rendered.contains(marker), "debug leaked {marker}");
+            }
+        }
     }
 }

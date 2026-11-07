@@ -9,11 +9,12 @@ publish.workspace = true
 
 [dependencies]
 bytes = { workspace = true }
+getrandom = { workspace = true }
+iris-core = { workspace = true }
+iris-mp4 = { workspace = true }
 rustix = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
-iris-core = { workspace = true }
-iris-mp4 = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

@@ -5,11 +5,13 @@
 # Addresses below use the RFC 5737 documentation range.
 
 [storage]
-# Directories that receive recordings; the first one is used.
+# Directories that receive recordings; the first eligible root is used, with later roots as
+# ordered failover targets.
 video_roots = ["/srv/irisd/video"]
 # Catalog database and other small state (an SSD is ideal).
 state_dir = "/var/lib/irisd"
 # Retention deletes the oldest sealed recordings while a root has less free space than this.
+# Range: 0..=100; zero disables the free-space floor.
 min_free_percent = 5
 # Optional cap on the catalogued recordings in GiB, for a disk shared with other data; the
 # oldest sealed recordings go first. Unset means free space and age limits alone apply.
@@ -17,7 +19,16 @@ min_free_percent = 5
 # Power-loss window: open files are flushed this often (milliseconds).
 sync_interval_ms = 5000
 # Longest fragment; a GOP longer than this (plus a quarter of slack) is split.
+# Range: 1..=60000.
 max_fragment_ms = 2000
+# Space reserved ahead of each file's written length (bytes).
+preallocate_bytes = 268435456
+# Seal at the next sync fragment after either limit is reached.
+rotate_bytes = 1073741824
+rotate_secs = 3600
+# Complete fragments queued per stream before the writer records a gap. Range: 0..=4096;
+# zero retains one queue slot so a configured stream can still make progress.
+max_queued_fragments = 32
 
 [ingest]
 # How often camera sockets are read, in milliseconds. Packets accumulate between reads so one
@@ -50,9 +61,11 @@ rtsp_url = "rtsp://192.0.2.10:554/cam/realmonitor?channel=1&subtype=0&unicast=tr
 sub_url  = "rtsp://192.0.2.10:554/cam/realmonitor?channel=1&subtype=1&unicast=true&proto=Onvif"
 username = "user"
 password = "secret"
-vendor = "dahua"            # enables vendor-specific event feeds and provisioning checks
+vendor = "dahua"            # optional vendor label returned by the API and stored in the catalog
 http_port = 80              # vendor CGI and ONVIF port
-record = ["main", "sub"]
-audio = false               # only if the camera stream is AAC
-retention_days = 21         # delete this camera's recordings after this many days
-events = ["dahua_cgi"]      # event sources: dahua_cgi, onvif_pull_point
+https = false               # use HTTPS for CGI and ONVIF
+tls_verify = true           # verify camera TLS certificates; false permits self-signed devices
+record = ["main", "sub"]    # supported video kinds; each may appear only once per camera
+timestamp_mode = "regularize" # regularize camera jitter, or "passthrough" for diagnostics
+retention_days = 21         # range 0..=106751991; delete after this many days
+events = ["dahua_cgi"]      # distinct event sources: dahua_cgi, onvif_pull_point

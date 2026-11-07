@@ -6,7 +6,10 @@ use std::sync::Arc;
 use bytes::Bytes;
 use tempfile::TempDir;
 
-use iris_catalog::{CatalogError, CatalogHandle, Change, EventId, NewSegment, TimeRange};
+use iris_catalog::{
+    CatalogError, CatalogHandle, Change, EventCursor, EventId, EventProtectionCursor, NewSegment,
+    TimeRange,
+};
 use iris_core::event::{Event, EventKind, EventSource, EventState};
 use iris_core::id::{CameraId, StreamKey, StreamKind};
 use iris_core::time::WallUs;
@@ -61,6 +64,40 @@ fn event(camera: &str, nvr_time: i64, kind: EventKind) -> Event {
         camera_time: Some(WallUs::new(nvr_time - 500)),
         data: Some("{\"Region\":[0]}".into()),
     }
+}
+
+fn json_string_with_encoded_len(len: usize) -> String {
+    assert!(len >= 2, "a JSON string needs two quote bytes");
+    format!("\"{}\"", "x".repeat(len - 2))
+}
+
+#[tokio::test]
+async fn sealed_pagination_preserves_equal_start_times_after_notifications() {
+    let (_dir, catalog) = open();
+    for name in ["first", "second", "third"] {
+        let path = format!("/video/{name}.mp4");
+        catalog.notify(opened(&path, 1_000_000));
+        catalog.notify(Change::SegmentSealed {
+            path: path.into(),
+            len: 1_000,
+            fragments: 1,
+            wall_end: WallUs::new(2_000_000),
+            media_end: 90_000,
+        });
+    }
+    let first = catalog.oldest_sealed(1).await.unwrap().remove(0);
+    let remaining = catalog
+        .oldest_sealed_after((first.wall_start, first.id), 2)
+        .await
+        .unwrap();
+    assert_eq!(remaining.len(), 2);
+    assert!(
+        remaining
+            .iter()
+            .all(|row| row.wall_start == first.wall_start)
+    );
+    assert!(first.id < remaining[0].id && remaining[0].id < remaining[1].id);
+    catalog.shutdown();
 }
 
 #[tokio::test]
@@ -178,6 +215,34 @@ async fn segment_lifecycle_is_observed_in_order() {
         .await
         .unwrap();
     assert_eq!(after.len(), 0, "range starting at the end excludes it");
+    catalog.shutdown();
+}
+
+#[tokio::test]
+async fn segment_limit_is_applied_in_start_order() {
+    let (_dir, catalog) = open();
+    for (path, start) in [
+        ("/v/third.mp4", 3_000_000),
+        ("/v/first.mp4", 1_000_000),
+        ("/v/second.mp4", 2_000_000),
+    ] {
+        catalog.notify(opened(path, start));
+    }
+
+    let rows = catalog
+        .segments_limited(
+            &key(),
+            TimeRange {
+                from: WallUs::new(0),
+                to: WallUs::new(4_000_000),
+            },
+            2,
+        )
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].path, PathBuf::from("/v/first.mp4"));
+    assert_eq!(rows[1].path, PathBuf::from("/v/second.mp4"));
     catalog.shutdown();
 }
 
@@ -333,10 +398,327 @@ async fn events_filter_by_camera_range_and_limit() {
 }
 
 #[tokio::test]
+async fn event_pages_cross_an_equal_timestamp_group() {
+    let (_dir, catalog) = open();
+    for kind in [EventKind::Motion, EventKind::Human, EventKind::Vehicle] {
+        catalog
+            .insert_event(&event("cam1", 1_000, kind))
+            .await
+            .unwrap();
+    }
+    let range = TimeRange {
+        from: WallUs::new(0),
+        to: WallUs::new(2_000),
+    };
+    let first = catalog.events_after(None, range, None, 2).await.unwrap();
+    assert_eq!(first.len(), 2);
+    let cursor = EventCursor {
+        time: first[1].event.nvr_time,
+        id: first[1].id,
+    };
+    let second = catalog
+        .events_after(None, range, Some(cursor), 2)
+        .await
+        .unwrap();
+    assert_eq!(second.len(), 1);
+    assert_eq!(second[0].event.nvr_time, WallUs::new(1_000));
+    assert!(first[1].id < second[0].id);
+    catalog.shutdown();
+}
+
+#[tokio::test]
+async fn every_other_kind_round_trips_without_aliasing_builtins() {
+    let (_dir, catalog) = open();
+    let codes = [
+        "motion",
+        "human",
+        "vehicle",
+        "line_cross",
+        "intrusion",
+        "tamper",
+        "audio",
+        "face",
+        "video_loss",
+        "time_change",
+        "disconnect",
+        "VideoAbnormalDetection",
+        "温度/高",
+        "other",
+        "",
+    ];
+    for (index, code) in codes.iter().enumerate() {
+        catalog
+            .insert_event(&event(
+                "cam1",
+                i64::try_from(index).unwrap() + 1,
+                EventKind::Other((*code).to_owned()),
+            ))
+            .await
+            .unwrap();
+    }
+    let rows = catalog
+        .events(
+            None,
+            TimeRange {
+                from: WallUs::new(0),
+                to: WallUs::new(100),
+            },
+            100,
+        )
+        .await
+        .unwrap();
+    let actual: Vec<EventKind> = rows.into_iter().map(|row| row.event.kind).collect();
+    let expected: Vec<EventKind> = codes
+        .iter()
+        .map(|code| EventKind::Other((*code).to_owned()))
+        .collect();
+    assert_eq!(actual, expected);
+    catalog.shutdown();
+}
+
+#[tokio::test]
+async fn malformed_persisted_values_fail_closed() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("catalog.db");
+    let catalog = CatalogHandle::open(&path).unwrap();
+    catalog.notify(opened("/v/corrupt.mp4", 1_000));
+    catalog.notify(Change::SegmentSealed {
+        path: PathBuf::from("/v/corrupt.mp4"),
+        len: 100,
+        fragments: 1,
+        wall_end: WallUs::new(2_000),
+        media_end: 90_000,
+    });
+    let segment = catalog
+        .segment_by_path(&PathBuf::from("/v/corrupt.mp4"))
+        .await
+        .unwrap()
+        .unwrap();
+    let event_id = catalog
+        .insert_event(&event("cam1", 1_500, EventKind::Motion))
+        .await
+        .unwrap();
+    catalog.shutdown();
+
+    {
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute(
+            "UPDATE segment SET init_len = -1, discontinuity = 2 WHERE id = ?1",
+            [segment.id.0],
+        )
+        .unwrap();
+    }
+    let catalog = CatalogHandle::open(&path).unwrap();
+    assert!(matches!(
+        catalog.segment(segment.id).await,
+        Err(CatalogError::Corrupt(_))
+    ));
+    catalog.shutdown();
+
+    {
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute(
+            "UPDATE segment SET init_len = 768, discontinuity = 1, deleting = 2 WHERE id = ?1",
+            [segment.id.0],
+        )
+        .unwrap();
+    }
+    assert!(matches!(
+        CatalogHandle::open(&path),
+        Err(CatalogError::Corrupt(_))
+    ));
+
+    {
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute(
+            "UPDATE segment SET deleting = 0 WHERE id = ?1",
+            [segment.id.0],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE event SET source = 'invalid', state = 'invalid' WHERE id = ?1",
+            [event_id.0],
+        )
+        .unwrap();
+    }
+    let catalog = CatalogHandle::open(&path).unwrap();
+    assert!(matches!(
+        catalog
+            .events(
+                None,
+                TimeRange {
+                    from: WallUs::new(0),
+                    to: WallUs::new(10_000),
+                },
+                10,
+            )
+            .await,
+        Err(CatalogError::Corrupt(_))
+    ));
+    catalog.shutdown();
+}
+
+#[tokio::test]
+async fn deleting_domain_is_validated_before_state_filtered_queries() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("catalog.db");
+    let catalog = CatalogHandle::open(&path).unwrap();
+    catalog.notify(opened("/v/writing.mp4", 1_000));
+    catalog.notify(opened("/v/sealed.mp4", 2_000));
+    catalog.notify(Change::SegmentSealed {
+        path: PathBuf::from("/v/sealed.mp4"),
+        len: 100,
+        fragments: 1,
+        wall_end: WallUs::new(3_000),
+        media_end: 90_000,
+    });
+    assert_eq!(catalog.writing_segments().await.unwrap().len(), 1);
+    assert_eq!(catalog.oldest_sealed(10).await.unwrap().len(), 1);
+    catalog.shutdown();
+
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    conn.execute("UPDATE segment SET deleting = 2", []).unwrap();
+    conn.pragma_update(None, "journal_mode", "DELETE").unwrap();
+    drop(conn);
+    assert!(matches!(
+        CatalogHandle::open(&path),
+        Err(CatalogError::Corrupt(_))
+    ));
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    let journal_mode: String = conn
+        .pragma_query_value(None, "journal_mode", |row| row.get(0))
+        .unwrap();
+    assert_eq!(journal_mode, "delete");
+}
+
+#[tokio::test]
+async fn sealed_domain_is_validated_before_state_filtered_queries() {
+    let dir = tempfile::tempdir().unwrap();
+    let invalid = [
+        ("integer", rusqlite::types::Value::Integer(2)),
+        ("real", rusqlite::types::Value::Real(0.5)),
+        ("text", rusqlite::types::Value::Text("invalid".to_owned())),
+        ("blob", rusqlite::types::Value::Blob(vec![0xff])),
+    ];
+    for (name, value) in invalid {
+        let path = dir.path().join(format!("sealed-{name}.db"));
+        let catalog = CatalogHandle::open(&path).unwrap();
+        catalog.notify(opened("/v/writing.mp4", 1_000));
+        catalog.notify(opened("/v/sealed.mp4", 2_000));
+        catalog.notify(Change::SegmentSealed {
+            path: PathBuf::from("/v/sealed.mp4"),
+            len: 100,
+            fragments: 1,
+            wall_end: WallUs::new(3_000),
+            media_end: 90_000,
+        });
+        assert_eq!(catalog.writing_segments().await.unwrap().len(), 1);
+        assert_eq!(catalog.oldest_sealed(10).await.unwrap().len(), 1);
+        catalog.shutdown();
+
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute("UPDATE segment SET sealed = ?1", [value])
+            .unwrap();
+        conn.pragma_update(None, "journal_mode", "DELETE").unwrap();
+        drop(conn);
+        assert!(matches!(
+            CatalogHandle::open(&path),
+            Err(CatalogError::Corrupt(_))
+        ));
+        let wal = PathBuf::from(format!("{}-wal", path.to_string_lossy()));
+        assert!(!wal.exists(), "{name} corruption created a WAL file");
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        let journal_mode: String = conn
+            .pragma_query_value(None, "journal_mode", |row| row.get(0))
+            .unwrap();
+        assert_eq!(journal_mode, "delete", "{name}");
+    }
+}
+
+#[tokio::test]
+async fn malformed_segment_aggregate_values_are_corruption() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("catalog.db");
+    let catalog = CatalogHandle::open(&path).unwrap();
+    catalog.notify(opened("/v/corrupt-aggregate.mp4", 1_000));
+    catalog.notify(Change::SegmentSealed {
+        path: PathBuf::from("/v/corrupt-aggregate.mp4"),
+        len: 100,
+        fragments: 1,
+        wall_end: WallUs::new(2_000),
+        media_end: 90_000,
+    });
+    let segment = catalog
+        .segment_by_path(&PathBuf::from("/v/corrupt-aggregate.mp4"))
+        .await
+        .unwrap()
+        .unwrap();
+    catalog.shutdown();
+    {
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch("PRAGMA ignore_check_constraints = ON;")
+            .unwrap();
+        conn.execute(
+            "UPDATE segment SET bytes = 'bad' WHERE id = ?1",
+            [segment.id.0],
+        )
+        .unwrap();
+    }
+    let catalog = CatalogHandle::open(&path).unwrap();
+    assert!(matches!(
+        catalog.total_bytes().await,
+        Err(CatalogError::Corrupt(_))
+    ));
+    assert!(matches!(
+        catalog.stats().await,
+        Err(CatalogError::Corrupt(_))
+    ));
+    catalog.shutdown();
+}
+
+#[tokio::test]
+async fn malformed_catalog_state_values_are_corruption() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("catalog.db");
+    let catalog = CatalogHandle::open(&path).unwrap();
+    catalog
+        .insert_event(&event("cam1", 1_500, EventKind::Motion))
+        .await
+        .unwrap();
+    catalog.shutdown();
+
+    {
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch("PRAGMA ignore_check_constraints = ON;")
+            .unwrap();
+        conn.execute(
+            "UPDATE catalog_state SET event_rows = 'bad' WHERE singleton = 1",
+            [],
+        )
+        .unwrap();
+    }
+    let catalog = CatalogHandle::open(&path).unwrap();
+    assert!(matches!(
+        catalog.stats().await,
+        Err(CatalogError::Corrupt(_))
+    ));
+    assert!(matches!(
+        catalog
+            .insert_event(&event("cam1", 2_000, EventKind::Motion))
+            .await,
+        Err(CatalogError::Corrupt(_))
+    ));
+    catalog.shutdown();
+}
+
+#[tokio::test]
 async fn event_data_is_bounded() {
     let (_dir, catalog) = open();
     let mut big = event("cam1", 1, EventKind::Motion);
-    big.data = Some("x".repeat(iris_core::event::MAX_EVENT_DATA_LEN + 10));
+    big.data = Some(json_string_with_encoded_len(
+        iris_core::event::MAX_EVENT_DATA_LEN + 10,
+    ));
+    big.kind = EventKind::Other("温".repeat(iris_core::event::MAX_EVENT_KIND_LEN));
     catalog.insert_event(&big).await.unwrap();
     let rows = catalog
         .events(
@@ -349,10 +731,83 @@ async fn event_data_is_bounded() {
         )
         .await
         .unwrap();
-    assert_eq!(
-        rows[0].event.data.as_ref().map(String::len),
-        Some(iris_core::event::MAX_EVENT_DATA_LEN)
+    assert_eq!(rows[0].event.data.as_deref(), Some(r#"{"truncated":true}"#));
+    assert!(
+        serde_json::from_str::<serde_json::Value>(
+            rows[0].event.data.as_deref().expect("bounded event data")
+        )
+        .is_ok()
     );
+    let EventKind::Other(code) = &rows[0].event.kind else {
+        panic!("other kind changed variant");
+    };
+    assert!(code.len() <= iris_core::event::MAX_EVENT_KIND_LEN);
+    catalog.shutdown();
+}
+
+#[tokio::test]
+async fn event_listing_enforces_an_aggregate_payload_budget() {
+    let (_dir, catalog) = open();
+    let payload = json_string_with_encoded_len(iris_core::event::MAX_EVENT_DATA_LEN);
+    for at in 1..=140 {
+        let mut value = event("cam1", at, EventKind::Motion);
+        value.data = Some(payload.clone());
+        catalog.insert_event(&value).await.unwrap();
+    }
+    let rows = catalog
+        .events(
+            None,
+            TimeRange {
+                from: WallUs::new(0),
+                to: WallUs::new(1_000),
+            },
+            10_000,
+        )
+        .await
+        .unwrap();
+    let payload_bytes: usize = rows
+        .iter()
+        .filter_map(|row| row.event.data.as_ref())
+        .map(String::len)
+        .sum();
+    rows.first().expect("event budget returned no rows");
+    assert!(rows.len() < 140, "aggregate byte cap must end the page");
+    assert!(payload_bytes <= 8 * 1024 * 1024);
+    catalog.shutdown();
+}
+
+#[tokio::test]
+async fn retained_protection_projection_is_bounded_and_pages_equal_times() {
+    let (_dir, catalog) = open();
+    let now = WallUs::new(10_000);
+    for _ in 0..515 {
+        let mut value = event("cam1", 1_000, EventKind::Motion);
+        value.data = Some("payload that the protection projection must not clone".repeat(100));
+        let id = catalog.insert_event(&value).await.unwrap();
+        catalog
+            .retain_event(id, Some(WallUs::new(i64::MAX)))
+            .await
+            .unwrap();
+    }
+    let first = catalog
+        .event_protections(now, None, usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(first.len(), 512);
+    let last = first.last().unwrap();
+    let second = catalog
+        .event_protections(
+            now,
+            Some(EventProtectionCursor {
+                retain_until: last.retain_until,
+                id: last.id,
+            }),
+            usize::MAX,
+        )
+        .await
+        .unwrap();
+    assert_eq!(second.len(), 3);
+    assert!(first.last().unwrap().id < second[0].id);
     catalog.shutdown();
 }
 
@@ -397,6 +852,76 @@ async fn metrics_count_batches_queries_and_waits() {
     assert_eq!(metrics.query().snapshot().count(), 1);
     assert_eq!(metrics.wait().snapshot().count(), 1);
     assert_eq!(metrics.event_commit().snapshot().count(), 0);
+    catalog.shutdown();
+}
+
+#[tokio::test]
+async fn stalled_sqlite_consumer_has_bounded_ingress_and_query_overload() {
+    const PRODUCERS: usize = 16;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("catalog.db");
+    let catalog = CatalogHandle::open(&path).unwrap();
+    let lock = rusqlite::Connection::open(&path).unwrap();
+    lock.execute_batch("BEGIN IMMEDIATE").unwrap();
+    let metrics = catalog.metrics();
+    let payload = Arc::new("x".repeat(iris_core::event::MAX_EVENT_DATA_LEN - 2));
+    let start = Arc::new(std::sync::Barrier::new(PRODUCERS + 1));
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let submitted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let producers: Vec<_> = (0..PRODUCERS)
+        .map(|_| {
+            let catalog = catalog.clone();
+            let payload = Arc::clone(&payload);
+            let start = Arc::clone(&start);
+            let stop = Arc::clone(&stop);
+            let submitted = Arc::clone(&submitted);
+            std::thread::spawn(move || {
+                start.wait();
+                while !stop.load(std::sync::atomic::Ordering::Acquire) {
+                    let at = submitted.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let mut value = event(
+                        "cam1",
+                        i64::try_from(at).unwrap_or(i64::MAX),
+                        EventKind::Motion,
+                    );
+                    value.data = Some(payload.as_ref().clone());
+                    catalog.notify(Change::Event(value));
+                }
+            })
+        })
+        .collect();
+    start.wait();
+    let overload_deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while metrics.rejected_events() == 0 && std::time::Instant::now() < overload_deadline {
+        std::thread::yield_now();
+    }
+    let overloaded_query = catalog.stats().await;
+    stop.store(true, std::sync::atomic::Ordering::Release);
+    for producer in producers {
+        producer.join().unwrap();
+    }
+    assert!(metrics.queue_depth() <= 2_048);
+    assert!(metrics.queue_bytes() <= 16 * 1024 * 1024);
+    assert!(metrics.rejected_events() > 0);
+    assert!(matches!(overloaded_query, Err(CatalogError::Overloaded)));
+
+    lock.execute_batch("COMMIT").unwrap();
+    let stats = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            match catalog.stats().await {
+                Err(CatalogError::Overloaded) => tokio::task::yield_now().await,
+                result => break result,
+            }
+        }
+    })
+    .await
+    .expect("bounded backlog did not drain")
+    .unwrap();
+    assert!(stats.events > 0);
+    assert!(
+        stats.events < u64::try_from(submitted.load(std::sync::atomic::Ordering::Relaxed)).unwrap()
+    );
     catalog.shutdown();
 }
 

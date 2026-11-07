@@ -7,7 +7,7 @@ Full notes with citations: `appendix/E-language-runtime.md`. Versions checked on
 
 **Rust (stable, edition 2024), no C core.** Runtime: **tokio `current_thread`** (opt-in
 `multi_thread` with 2 workers on ≥ 4-core hosts) owning every socket and timer; **one
-dedicated `std::thread` writer per storage disk** doing batched `pwritev` + `fdatasync` from
+dedicated `std::thread` writer per configured storage root** doing batched `pwritev` + `fdatasync` from
 a bounded channel; **one `std::thread` owning the SQLite connection**; **no io_uring**.
 
 ## 2. Why Rust and not C, C++, Zig, or Go
@@ -80,7 +80,7 @@ per-thread arenas inflating RSS on ARM.
 | metrics | counters/gauges | 0.24.6 | 2026-05 | Prometheus exporter optional |
 | sd-notify | READY/WATCHDOG | 0.5.0 | 2026-03 | zero deps |
 | landlock | in-process fs/net sandbox (ABI V7 on 6.17) | 0.4.7 | 2026-07 | apply after opening dirs and binding |
-| rustix | fallocate, fadvise, sync_file_range, pwritev2 | 1.1.6 | 2026-10-27 | check `RWF_DONTCACHE` exposure, else `libc::pwritev2` |
+| rustix | descriptor-relative filesystem access, `openat2`, `pwritev`, `fallocate`, process control | 1.1.6 | 2026-10-27 | safe Linux syscall wrappers |
 | crc32c | fragment trailers | current | | hardware CRC32C |
 | GUI: gtk4 (gtk4-rs), gstreamer / gstreamer-app / gst-plugin-gtk4 | Linux client | 0.25.4 / 0.15.2 | 2026-09 / 2026-05 | `gst-plugin-gtk4` is itself Rust and links statically |
 | libmpv2 | fallback video widget | 7.0.0 | 2026-10-30 | |
@@ -95,22 +95,26 @@ Do not use: `tokio-uring`, `glommio`, `monoio` (stale or incompatible), `mp4` 0.
   4–8 MB static-ish binary with rustls + bundled SQLite.
 - Cross-compile for ARM64 SBCs with `cargo zigbuild --target aarch64-unknown-linux-gnu.2.28`
   (or musl for a static binary); cross-rs as fallback.
-- systemd unit: `Type=notify`, `WatchdogSec=30` (ping only when every ingest task reported
+- systemd unit: `Type=notify`, `WatchdogSec=60` (ping only when every ingest task reported
   progress, so a wedged runtime is killed), `Restart=always`, static `User=irisd` via
   `sysusers.d`, `StateDirectory=irisd` for the catalog, `ReadWritePaths=` for the video root,
   and the hardening set: `ProtectSystem=strict ProtectHome=yes PrivateTmp=yes
   PrivateDevices=yes ProtectKernelTunables=yes ProtectKernelModules=yes
   ProtectKernelLogs=yes ProtectControlGroups=yes ProtectClock=yes ProtectHostname=yes
   ProtectProc=invisible ProcSubset=pid NoNewPrivileges=yes RestrictNamespaces=yes
-  RestrictRealtime=yes RestrictSUIDSGID=yes LockPersonality=yes MemoryDenyWriteExecute=yes
+  RestrictRealtime=yes LockPersonality=yes MemoryDenyWriteExecute=yes
   RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX SystemCallArchitectures=native
   SystemCallFilter=@system-service SystemCallFilter=~@privileged @resources
   CapabilityBoundingSet= UMask=0077 IPAddressDeny=any IPAddressAllow=<LAN> localhost`.
   Verify with `systemd-analyze security`. Avoid `DynamicUser=` when recordings live outside
   `StateDirectory` (UID reallocation breaks ownership).
+- Leave `RestrictSUIDSGID` disabled: its systemd syscall filter rejects `openat2`, while
+  descriptor-relative no-follow and beneath-root resolution require `openat2` throughout the
+  recording lifecycle. `NoNewPrivileges`, an empty capability set, and read-only system paths
+  retain the relevant privilege boundary.
 - Landlock in-process after startup: read/write only the video root and state dir; TCP connect
   only to camera ports; TCP bind only to the API port.
-- Linux 6.17 features that matter: `RWF_DONTCACHE` buffered-uncached writes on ext4 (6.17) and
-  XFS (6.15), `fallocate`, `fdatasync`, large-folio ext4 sequential-write gains (6.16),
+- Linux features that matter: descriptor-relative `openat2`, `fallocate`, `fdatasync`,
+  large-folio ext4 sequential-write gains,
   improved HDD readahead. Features that do not matter at this scale: io_uring zero-copy rx,
   SQPOLL, registered buffers, cachestat, sched_ext.

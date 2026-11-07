@@ -31,7 +31,7 @@ async fn record(read_interval: Option<Duration>) -> (Arc<Media>, Arc<StreamStats
         trail_len: 2_000,
         ..Plan::default()
     };
-    let media = Arc::new(Media::from_bytes(synth::recording(plan)).unwrap());
+    let media = Arc::new(Media::from_bytes(synth::recording(plan).unwrap()).unwrap());
     let mounts = [("cam".to_owned(), Arc::clone(&media))]
         .into_iter()
         .collect();
@@ -117,6 +117,25 @@ async fn timer_driven_reads_record_the_replayed_frames() {
     check(&media, &stats, &fragments);
 }
 
+#[tokio::test]
+async fn shutdown_flushes_every_received_frame_and_clears_connection_state() {
+    for interval in [None, Some(Duration::from_millis(20))] {
+        for _ in 0..8 {
+            let (_, stats, fragments) = record(interval).await;
+            let persisted: usize = fragments
+                .iter()
+                .map(|fragment| fragment.samples.len())
+                .sum();
+            assert_eq!(
+                persisted as u64,
+                stats.frames(),
+                "shutdown discarded pending frames"
+            );
+            assert!(!stats.connected(), "shutdown left the stream connected");
+        }
+    }
+}
+
 /// A camera that stops sending: the detached socket's reads return nothing,
 /// the inactivity timeout fires, the session tears down and reconnects.
 #[tokio::test]
@@ -128,7 +147,7 @@ async fn timer_driven_reads_reconnect_after_a_stall() {
         trail_len: 2_000,
         ..Plan::default()
     };
-    let media = Arc::new(Media::from_bytes(synth::recording(plan)).unwrap());
+    let media = Arc::new(Media::from_bytes(synth::recording(plan).unwrap()).unwrap());
     let mounts = [("cam".to_owned(), Arc::clone(&media))]
         .into_iter()
         .collect();

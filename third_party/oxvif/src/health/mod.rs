@@ -1,0 +1,1040 @@
+//! Fast, scriptable ONVIF health / conformance check for a target device.
+//!
+//! A lightweight, readable alternative to the official ONVIF Device Test Tool.
+//! Point it at a camera and it runs a curated set of read-only checks
+//! concurrently, then reports per-check Pass/Warn/Fail/Skip with timings plus a
+//! Profile S/T/G assessment.
+//!
+//! This module is **additive and feature-gated** (`health`): it builds on
+//! [`OnvifSession`] internally but adds no methods to it.
+//!
+//! ```no_run
+//! # async fn run() {
+//! use oxvif::health::HealthCheck;
+//! let report = HealthCheck::new("http://192.168.1.100/onvif/device_service")
+//!     .with_credentials("admin", "password")
+//!     .run()
+//!     .await;
+//! println!("{report}");
+//! # }
+//! ```
+//!
+//! [`HealthCheck::run`] **never returns an error.** An unreachable or
+//! unauthenticated device is a failing `connect` check inside the report, not an
+//! `Err`, so one bad camera cannot derail a batch run over a fleet. Use
+//! [`HealthReport::ok`] for the pass/fail decision and
+//! [`HealthReport::to_json`] for CI.
+//!
+//! # Try it without a camera
+//!
+//! With the `mock-server` feature you can check a throwaway in-process device.
+//! This is a real run of every check, and it is how the examples below are
+//! verified:
+//!
+//! ```
+//! # #[cfg(feature = "mock-server")]
+//! # #[tokio::main] async fn main() {
+//! use oxvif::health::HealthCheck;
+//! use oxvif::mock::MockServer;
+//!
+//! let server = MockServer::start().await.unwrap();
+//! let report = HealthCheck::new(server.device_url()).run().await;
+//!
+//! assert!(report.ok(), "the mock should be healthy:\n{report}");
+//! println!("{report}");
+//! # }
+//! # #[cfg(not(feature = "mock-server"))] fn main() {}
+//! ```
+//!
+//! From the command line, one line and no hardware:
+//!
+//! ```text
+//! cargo run --example healthcheck --features health,mock-server -- --mock
+//! ```
+//!
+//! # Inspecting the report instead of printing it
+//!
+//! ```no_run
+//! # use oxvif::health::{HealthCheck, CheckStatus};
+//! # async fn run() {
+//! let report = HealthCheck::new("http://192.168.1.100/onvif/device_service")
+//!     .with_liveness_probes(true)   // actually fetch the snapshot, reach the RTSP port
+//!     .run()
+//!     .await;
+//!
+//! for c in &report.checks {
+//!     if let CheckStatus::Fail(reason) = &c.status {
+//!         println!("{} failed: {reason}", c.id);
+//!     }
+//! }
+//!
+//! // What the device *claims* via its scopes, vs what was actually verified.
+//! println!("declared: {:?}", report.declared_profiles);
+//! println!("assessed: {:?}", report.profiles.profile_s.verdict);
+//! # }
+//! ```
+
+mod capture;
+mod checks;
+mod coverage;
+mod report;
+pub mod snapshot;
+
+pub use report::{
+    CapturedExchange, Category, CheckError, CheckResult, CheckStatus, ErrorClass, HealthReport,
+    ProfileAssessment, ProfileState, ProfileVerdict, ReportDiff, SlowedCheck,
+};
+
+use std::time::Instant;
+
+use tokio::task::JoinSet;
+
+use crate::OnvifSession;
+
+/// Builder + runner for a single device health check.
+pub struct HealthCheck {
+    device_url: String,
+    credentials: Option<(String, String)>,
+    transport: Option<std::sync::Arc<dyn crate::transport::Transport>>,
+    write_checks: bool,
+    liveness_probes: bool,
+    snapshot_options: snapshot::SnapshotOptions,
+    force_unsupported: bool,
+    clock_sync: bool,
+    capture: bool,
+}
+
+impl HealthCheck {
+    /// Target a device by its device-service URL.
+    pub fn new(device_url: impl Into<String>) -> Self {
+        Self {
+            device_url: device_url.into(),
+            credentials: None,
+            transport: None,
+            write_checks: false,
+            liveness_probes: false,
+            snapshot_options: snapshot::SnapshotOptions::default(),
+            force_unsupported: false,
+            clock_sync: false,
+            capture: false,
+        }
+    }
+
+    /// Configure snapshot deadlines and extra CA roots for liveness probes.
+    ///
+    /// This does not configure the SOAP transport. Snapshot requests retain the
+    /// same-host, no-redirect, no-proxy and no-auth-downgrade policies shared
+    /// with the CLI. Image signatures are checked; full decoding is not tested.
+    pub fn with_snapshot_options(mut self, options: snapshot::SnapshotOptions) -> Self {
+        self.snapshot_options = options;
+        self
+    }
+
+    /// Supply credentials for WS-Security / HTTP Digest.
+    pub fn with_credentials(
+        mut self,
+        username: impl Into<String>,
+        password: impl Into<String>,
+    ) -> Self {
+        self.credentials = Some((username.into(), password.into()));
+        self
+    }
+
+    /// Replace the default HTTP transport for all SOAP checks.
+    ///
+    /// Callers that install a custom transport remain responsible for applying
+    /// HTTP-layer credentials such as Digest authentication to that transport.
+    /// WS-Security credentials continue to come from
+    /// [`with_credentials`](Self::with_credentials).
+    pub fn with_transport(
+        mut self,
+        transport: std::sync::Arc<dyn crate::transport::Transport>,
+    ) -> Self {
+        self.transport = Some(transport);
+        self
+    }
+
+    /// Enable the opt-in, non-destructive write round-trip check (re-applies an
+    /// unchanged video encoder configuration to exercise the `Set` path).
+    pub fn with_write_checks(mut self, enabled: bool) -> Self {
+        self.write_checks = enabled;
+        self
+    }
+
+    /// Enable opt-in active liveness probes that go beyond the SOAP responses:
+    /// an RTSP `OPTIONS` reachability probe on the stream URI, a snapshot byte
+    /// fetch (signature checked, not fully decoded; empty bodies and HTML error
+    /// pages are rejected), and a real Profile G exercise (recording search + replay URI)
+    /// instead of advertised-only presence. Off by default because these open
+    /// extra network connections (RTSP/TCP and HTTP GET) the read-only SOAP
+    /// checks never touch.
+    pub fn with_liveness_probes(mut self, enabled: bool) -> Self {
+        self.liveness_probes = enabled;
+        self
+    }
+
+    /// Enable opt-in force-verification of services the device does **not**
+    /// advertise. For each unadvertised service that gates a profile (Media2,
+    /// recording / search / replay), try a few conventional service URLs
+    /// (derived from the device endpoint, plus the device endpoint itself for
+    /// single-endpoint devices) and actually call the operation. A service that
+    /// responds despite not being advertised is flagged as under-declared —
+    /// catching the mirror of "declares a profile but it's broken". Best-effort:
+    /// vendors use non-standard paths (`/onvif/media2`, `/Media2`,
+    /// `/media2_service`), so a miss is not proof of absence. Off by default
+    /// because it opens extra requests to guessed endpoints.
+    pub fn with_force_unsupported(mut self, enabled: bool) -> Self {
+        self.force_unsupported = enabled;
+        self
+    }
+
+    /// Sync the WS-Security timestamp to the device clock before checks
+    /// (mirrors [`OnvifSessionBuilder::with_clock_sync`](crate::OnvifSessionBuilder::with_clock_sync)).
+    pub fn with_clock_sync(mut self, enabled: bool) -> Self {
+        self.clock_sync = enabled;
+        self
+    }
+
+    /// Capture the raw request/response of every SOAP call that **fails** (a
+    /// transport error or a SOAP Fault) into
+    /// [`HealthReport::captured`](crate::health::HealthReport). Off by default.
+    ///
+    /// The stored request has its WS-Security `Password`/`Nonce` blanked, so it
+    /// never carries credential-derivation material; successful (and therefore
+    /// credential-bearing) requests are not stored at all. This is the raw
+    /// evidence a maintainer needs to see *why* a specific brand rejected a
+    /// call — pair it with the structured [`CheckError`] on the failing check.
+    pub fn with_capture(mut self, enabled: bool) -> Self {
+        self.capture = enabled;
+        self
+    }
+
+    /// Run the checks and produce a [`HealthReport`].
+    pub async fn run(self) -> HealthReport {
+        let started = Instant::now();
+
+        // 1. Connectivity — build the session (one GetCapabilities round-trip).
+        let conn_start = Instant::now();
+        // Wrap the HTTP transport in a coverage tap so the parse-coverage check
+        // can compare parsed item counts against the raw responses. Credentials
+        // go on the transport (HTTP Digest) AND the builder (WS-Security).
+        let base_transport: std::sync::Arc<dyn crate::transport::Transport> = match self.transport {
+            Some(transport) => transport,
+            None => {
+                let mut http = crate::transport::HttpTransport::new();
+                if let Some((u, p)) = &self.credentials {
+                    http = http.with_credentials(u.clone(), p.clone());
+                }
+                std::sync::Arc::new(http)
+            }
+        };
+        let tap = std::sync::Arc::new(coverage::CoverageTransport::new(base_transport));
+        // When capture is on, insert a tap that records the failing exchanges.
+        // It wraps the coverage tap, so both observe the same requests/responses
+        // and `coverage()` still reads its own map. `None` when off — zero cost.
+        let capture: Option<std::sync::Arc<capture::CaptureTransport>> = self
+            .capture
+            .then(|| std::sync::Arc::new(capture::CaptureTransport::new(tap.clone())));
+        let transport: std::sync::Arc<dyn crate::transport::Transport> = match &capture {
+            Some(c) => c.clone(),
+            None => tap.clone(),
+        };
+        let mut builder = OnvifSession::builder(&self.device_url).with_transport(transport);
+        if let Some((u, p)) = &self.credentials {
+            builder = builder.with_credentials(u.clone(), p.clone());
+        }
+        if self.clock_sync {
+            builder = builder.with_clock_sync();
+        }
+        let session = match builder.build().await {
+            Ok(s) => s,
+            Err(e) => {
+                // Can't reach / auth the device — report just the failure.
+                let conn = CheckResult::fail("connect", Category::Connectivity, e.to_string())
+                    .with_elapsed(conn_start.elapsed());
+                return HealthReport {
+                    target: self.device_url,
+                    total_elapsed: started.elapsed(),
+                    profiles: assess(std::slice::from_ref(&conn)),
+                    checks: vec![conn],
+                    clock_skew_s: None,
+                    declared_profiles: vec![],
+                    // The connect failure went through the tap — capture it too.
+                    captured: capture.map(|c| c.take()).unwrap_or_default(),
+                };
+            }
+        };
+        let mut checks = vec![
+            CheckResult::pass("connect", Category::Connectivity, "GetCapabilities ok")
+                .with_elapsed(conn_start.elapsed()),
+        ];
+
+        // 2. Independent checks, concurrently (session is cheap to clone).
+        let mut set: JoinSet<Vec<CheckResult>> = JoinSet::new();
+        macro_rules! spawn_check {
+            ($f:path) => {{
+                let s = session.clone();
+                set.spawn(async move { $f(&s).await });
+            }};
+        }
+        spawn_check!(checks::device_info);
+        spawn_check!(checks::time);
+        spawn_check!(checks::service_capabilities);
+        spawn_check!(checks::imaging);
+        spawn_check!(checks::ptz);
+        spawn_check!(checks::events);
+        spawn_check!(checks::network);
+        spawn_check!(checks::users);
+        // Services (incl. Media2 presence) can force-verify an unadvertised
+        // Media2 against guessed URLs, so it takes the flag + device URL.
+        {
+            let s = session.clone();
+            let force = self.force_unsupported;
+            let url = self.device_url.clone();
+            set.spawn(async move { checks::services(&s, force, &url).await });
+        }
+        // Media (stream/snapshot) and Profile G take the liveness flag; media
+        // also needs the credentials for an authenticated snapshot GET.
+        {
+            let s = session.clone();
+            let liveness = self.liveness_probes;
+            let creds = self.credentials.clone();
+            let url = self.device_url.clone();
+            let snapshot_options = self.snapshot_options.clone();
+            set.spawn(async move {
+                checks::media(&s, liveness, creds.as_ref(), &url, &snapshot_options).await
+            });
+        }
+        {
+            let s = session.clone();
+            let liveness = self.liveness_probes;
+            let force = self.force_unsupported;
+            let url = self.device_url.clone();
+            set.spawn(async move { checks::recording_services(&s, liveness, force, &url).await });
+        }
+        // Negative auth-enforcement probe — opens its own credential-free
+        // session, so it takes the device URL rather than the authed session.
+        {
+            let url = self.device_url.clone();
+            let had_creds = self.credentials.is_some();
+            set.spawn(async move { checks::auth_enforcement(&url, had_creds).await });
+        }
+        if self.write_checks {
+            spawn_check!(checks::write_roundtrip);
+        }
+        // Parse-coverage runs over the same tap (re-calls list ops; each
+        // comparison uses its own call's raw, so it is race-free).
+        {
+            let s = session.clone();
+            let tap = tap.clone();
+            set.spawn(async move { coverage::coverage(&s, &tap).await });
+        }
+
+        while let Some(joined) = set.join_next().await {
+            match joined {
+                Ok(mut v) => checks.append(&mut v),
+                Err(e) => checks.push(CheckResult::fail(
+                    "internal",
+                    Category::Connectivity,
+                    format!("check task panicked: {e}"),
+                )),
+            }
+        }
+
+        // 3. Stable ordering for the report.
+        checks.sort_by(|a, b| a.category.cmp(&b.category).then_with(|| a.id.cmp(&b.id)));
+
+        let profiles = assess(&checks);
+        let clock_skew_s = checks
+            .iter()
+            .find(|c| c.id == "system_date_time")
+            .and_then(|c| checks::parse_skew(&c.detail));
+        // Vendor-declared profiles from scopes (best-effort; the health check is
+        // infallible, so a scopes failure just leaves this empty).
+        let declared_profiles = session
+            .get_scopes()
+            .await
+            .ok()
+            .map(|sc| declared_profiles_from_scopes(&sc))
+            .unwrap_or_default();
+        HealthReport {
+            target: self.device_url,
+            total_elapsed: started.elapsed(),
+            checks,
+            profiles,
+            clock_skew_s,
+            declared_profiles,
+            captured: capture.map(|c| c.take()).unwrap_or_default(),
+        }
+    }
+}
+
+/// Extract the ONVIF profiles a device self-declares from its scope URIs.
+///
+/// Scope form: `onvif://www.onvif.org/Profile/<X>`, where `<X>` is `Streaming`
+/// (Profile S) or a single letter (`G`, `T`, `M`, `A`, `C`, `D`, `K`). Returns
+/// canonical letters, deduped and ordered `[S, T, G, M, A, C, D, K]`; unknown
+/// tokens are dropped.
+fn declared_profiles_from_scopes(scopes: &[String]) -> Vec<String> {
+    const ORDER: [&str; 8] = ["S", "T", "G", "M", "A", "C", "D", "K"];
+    let mut found = std::collections::HashSet::new();
+    for scope in scopes {
+        let Some((_, rest)) = scope.split_once("/Profile/") else {
+            continue;
+        };
+        let tok = rest.split('/').next().unwrap_or("");
+        let letter: Option<&'static str> = match tok.to_ascii_uppercase().as_str() {
+            "STREAMING" | "S" => Some("S"),
+            "T" => Some("T"),
+            "G" => Some("G"),
+            "M" => Some("M"),
+            "A" => Some("A"),
+            "C" => Some("C"),
+            "D" => Some("D"),
+            "K" => Some("K"),
+            _ => None,
+        };
+        if let Some(l) = letter {
+            found.insert(l);
+        }
+    }
+    ORDER
+        .iter()
+        .filter(|l| found.contains(*l))
+        .map(|l| l.to_string())
+        .collect()
+}
+
+#[cfg(all(test, feature = "mock-server"))]
+fn check_passed(checks: &[CheckResult], id: &str) -> bool {
+    checks
+        .iter()
+        .any(|c| c.id == id && matches!(c.status, CheckStatus::Pass | CheckStatus::Warn(_)))
+}
+
+/// Why a required check did not contribute a pass to a profile.
+enum ReqOutcome {
+    Passed,
+    /// Verified to genuinely fail (a real device fault) or a capability the
+    /// device definitively does not advertise — either way, a real gap.
+    FailedVerified,
+    /// Could not be tested — auth was blocked (a "couldn't verify" unknown).
+    Unverifiable,
+    /// The service is present but there was nothing to exercise it with (e.g. a
+    /// recording device with zero recordings to replay). Not a gap and not an
+    /// unknown — excluded from the verdict entirely so it neither fails nor
+    /// clouds a device whose other checks all pass.
+    NotApplicable,
+}
+
+fn classify_required(checks: &[CheckResult], id: &str) -> ReqOutcome {
+    match checks.iter().find(|c| c.id == id) {
+        Some(c) => match &c.status {
+            CheckStatus::Pass | CheckStatus::Warn(_) => ReqOutcome::Passed,
+            // A capability the device does not advertise is a definitive gap
+            // ("not supported"); every capability-absent skip oxvif emits says
+            // "…advertised".
+            CheckStatus::Skip(reason) if reason.contains("advertised") => {
+                ReqOutcome::FailedVerified
+            }
+            // The service is present but had no data to exercise ("no
+            // recordings to replay") — excluded, don't penalise the verdict.
+            CheckStatus::Skip(reason) if reason.contains("no recordings") => {
+                ReqOutcome::NotApplicable
+            }
+            CheckStatus::Skip(_) => ReqOutcome::Unverifiable,
+            CheckStatus::Fail(_) => {
+                if c.error.as_ref().is_some_and(CheckError::is_auth) {
+                    ReqOutcome::Unverifiable
+                } else {
+                    ReqOutcome::FailedVerified
+                }
+            }
+        },
+        // Expected but absent from the report → treat as a genuine gap.
+        None => ReqOutcome::FailedVerified,
+    }
+}
+
+fn verdict(checks: &[CheckResult], required: &[&'static str]) -> ProfileState {
+    let mut missing = Vec::new();
+    let mut unverified = Vec::new();
+    let mut passed = 0usize;
+    for id in required {
+        match classify_required(checks, id) {
+            ReqOutcome::Passed => passed += 1,
+            ReqOutcome::FailedVerified => missing.push((*id).to_string()),
+            ReqOutcome::Unverifiable => unverified.push((*id).to_string()),
+            // Excluded from the verdict — see [`ReqOutcome::NotApplicable`].
+            ReqOutcome::NotApplicable => {}
+        }
+    }
+    let verdict = if missing.is_empty() && unverified.is_empty() {
+        ProfileVerdict::Conformant
+    } else if !missing.is_empty() && passed > 0 {
+        ProfileVerdict::Partial
+    } else if missing.is_empty() {
+        // Nothing genuinely failed, but some required checks couldn't be tested.
+        ProfileVerdict::Inconclusive
+    } else {
+        // Genuine failures and nothing passed.
+        ProfileVerdict::Unsupported
+    };
+    ProfileState {
+        verdict,
+        missing,
+        unverified,
+    }
+}
+
+fn assess(checks: &[CheckResult]) -> ProfileAssessment {
+    ProfileAssessment {
+        profile_s: verdict(
+            checks,
+            &[
+                "connect",
+                "get_services",
+                "get_profiles",
+                "get_stream_uri",
+                "get_snapshot_uri",
+                "get_video_encoder_configurations",
+            ],
+        ),
+        profile_t: verdict(
+            checks,
+            &[
+                "connect",
+                "get_profiles",
+                "get_stream_uri",
+                "media2",
+                "get_imaging_settings",
+                "get_event_properties",
+                "event_motion_topic",
+            ],
+        ),
+        // Profile G (recording/search/replay) — advertised-only by default, or
+        // genuinely exercised when liveness probing is on; see
+        // `checks::recording_services`.
+        profile_g: verdict(checks, &["recording", "search", "replay"]),
+    }
+}
+
+#[cfg(test)]
+mod declared_tests {
+    use super::declared_profiles_from_scopes;
+
+    #[test]
+    fn parses_and_canonicalizes_profile_scopes() {
+        let scopes = vec![
+            "onvif://www.onvif.org/name/Camera1".to_string(),
+            "onvif://www.onvif.org/Profile/G".to_string(),
+            "onvif://www.onvif.org/Profile/Streaming".to_string(), // Profile S
+            "onvif://www.onvif.org/Profile/M".to_string(),
+            "onvif://www.onvif.org/Profile/G".to_string(), // dupe
+            "onvif://www.onvif.org/Profile/Zzz".to_string(), // unknown → dropped
+        ];
+        // Canonical order [S, T, G, M, A, C, D, K]; deduped; unknown dropped.
+        assert_eq!(declared_profiles_from_scopes(&scopes), ["S", "G", "M"]);
+    }
+
+    #[test]
+    fn empty_when_no_profile_scopes() {
+        let scopes = vec!["onvif://www.onvif.org/location/Lobby".to_string()];
+        assert!(declared_profiles_from_scopes(&scopes).is_empty());
+        assert!(declared_profiles_from_scopes(&[]).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod verdict_tests {
+    use super::*;
+
+    fn chk(id: &str, status: CheckStatus, error: Option<CheckError>) -> CheckResult {
+        CheckResult {
+            id: id.into(),
+            category: Category::Media,
+            status,
+            detail: String::new(),
+            error,
+            elapsed: None,
+        }
+    }
+    fn soap(class: ErrorClass, subcode: &str, reason: &str) -> CheckError {
+        CheckError {
+            class,
+            fault_code: None,
+            subcode: (!subcode.is_empty()).then(|| subcode.to_string()),
+            reason: reason.into(),
+            detail: None,
+        }
+    }
+
+    #[test]
+    fn verdict_splits_auth_from_genuine_failure() {
+        use ProfileVerdict::*;
+        let auth = || {
+            Some(soap(
+                ErrorClass::SoapFault,
+                "ter:NotAuthorized",
+                "sender not authorized",
+            ))
+        };
+        let parse = || Some(soap(ErrorClass::Parse, "", "bad xml"));
+
+        // Something passed, the rest was auth-blocked → Inconclusive (unknown),
+        // NOT Partial; the blocked id lands in `unverified`, not `missing`.
+        let st = verdict(
+            &[
+                chk("a", CheckStatus::Pass, None),
+                chk("b", CheckStatus::Fail("x".into()), auth()),
+            ],
+            &["a", "b"],
+        );
+        assert_eq!(st.verdict, Inconclusive);
+        assert_eq!(st.unverified, ["b"]);
+        assert!(st.missing.is_empty());
+
+        // A genuine (non-auth) failure alongside a pass → Partial, id in `missing`.
+        let st = verdict(
+            &[
+                chk("a", CheckStatus::Pass, None),
+                chk("b", CheckStatus::Fail("x".into()), parse()),
+            ],
+            &["a", "b"],
+        );
+        assert_eq!(st.verdict, Partial);
+        assert_eq!(st.missing, ["b"]);
+        assert!(st.unverified.is_empty());
+
+        // All required pass → Conformant.
+        assert_eq!(
+            verdict(&[chk("a", CheckStatus::Pass, None)], &["a"]).verdict,
+            Conformant
+        );
+        // Genuine failures, nothing passed → Unsupported.
+        assert_eq!(
+            verdict(&[chk("a", CheckStatus::Fail("x".into()), parse())], &["a"]).verdict,
+            Unsupported
+        );
+    }
+
+    #[test]
+    fn unadvertised_capability_is_a_gap_not_inconclusive() {
+        use ProfileVerdict::*;
+        // A required capability the device doesn't advertise (a "…advertised"
+        // skip) is a definitive gap → `missing`, so a device with none of the
+        // capability is Unsupported, not Inconclusive.
+        let st = verdict(
+            &[
+                chk("a", CheckStatus::Skip("not advertised".into()), None),
+                chk("b", CheckStatus::Skip("Media2 not advertised".into()), None),
+            ],
+            &["a", "b"],
+        );
+        assert_eq!(st.verdict, Unsupported);
+        assert_eq!(st.missing, ["a", "b"]);
+        assert!(st.unverified.is_empty());
+
+        // A "no data to exercise it" skip (service present, nothing to test) is
+        // excluded from the verdict — it neither fails nor clouds a device whose
+        // other required checks all pass.
+        let st = verdict(
+            &[
+                chk("a", CheckStatus::Pass, None),
+                chk(
+                    "b",
+                    CheckStatus::Skip("no recordings to replay".into()),
+                    None,
+                ),
+            ],
+            &["a", "b"],
+        );
+        assert_eq!(st.verdict, Conformant);
+        assert!(st.unverified.is_empty());
+        assert!(st.missing.is_empty());
+    }
+}
+
+#[cfg(all(test, feature = "mock-server"))]
+mod tests {
+    use super::*;
+    use crate::mock::MockServer;
+
+    #[tokio::test]
+    async fn healthcheck_against_mock_passes_core() {
+        let server = MockServer::start().await.unwrap();
+        let report = HealthCheck::new(server.device_url()).run().await;
+
+        assert!(report.ok(), "mock health check had failures:\n{report}");
+        assert!(check_passed(&report.checks, "connect"));
+        assert!(check_passed(&report.checks, "get_profiles"));
+        assert!(check_passed(&report.checks, "get_users"));
+        // The mock advertises Media/Imaging/PTZ/Events, so Profile S/T should
+        // not come back Unsupported.
+        assert_ne!(
+            report.profiles.profile_s.verdict,
+            ProfileVerdict::Unsupported
+        );
+        // Parse-coverage must not false-positive on the compliant mock: the
+        // parser's item counts match the raw response item counts.
+        assert!(
+            !report
+                .checks
+                .iter()
+                .any(|c| c.category == Category::Coverage
+                    && matches!(c.status, CheckStatus::Warn(_))),
+            "unexpected parse-coverage warning on the mock:\n{report}"
+        );
+    }
+
+    #[tokio::test]
+    async fn liveness_probes_exercise_profile_g_and_fetch_snapshot() {
+        let server = MockServer::start().await.unwrap();
+        let report = HealthCheck::new(server.device_url())
+            .with_liveness_probes(true)
+            .run()
+            .await;
+
+        let detail = |id: &str| {
+            report
+                .checks
+                .iter()
+                .find(|c| c.id == id)
+                .map(|c| c.detail.clone())
+                .unwrap_or_default()
+        };
+
+        // Snapshot bytes were fetched and signature checked (the mock serves a
+        // test-pattern BMP at /mock/snapshot.jpg, not ONVIF-conformant JPEG).
+        assert!(
+            check_passed(&report.checks, "get_snapshot_uri"),
+            "snapshot check should pass:\n{report}"
+        );
+        assert!(
+            detail("get_snapshot_uri").contains("image"),
+            "snapshot detail should note a validated image, got: {:?}",
+            detail("get_snapshot_uri")
+        );
+
+        // Profile G is now genuinely exercised, not advertised-only: the mock
+        // answers FindRecordings / GetReplayUri / GetRecordings, so all three
+        // pass and the detail no longer carries the "(not exercised)" marker.
+        for id in ["recording", "search", "replay"] {
+            assert!(
+                check_passed(&report.checks, id),
+                "{id} should pass when exercised:\n{report}"
+            );
+            assert!(
+                !detail(id).contains("not exercised"),
+                "{id} should be exercised, not presence-only"
+            );
+        }
+        assert_eq!(
+            report.profiles.profile_g.verdict,
+            ProfileVerdict::Conformant,
+            "exercised Profile G should be Conformant against the mock:\n{report}"
+        );
+    }
+
+    #[tokio::test]
+    async fn profile_t_gates_on_media2_and_motion_topic() {
+        let server = MockServer::start().await.unwrap();
+        let report = HealthCheck::new(server.device_url()).run().await;
+
+        // The mock advertises Media2 and a motion-alarm topic, so both
+        // Profile-T-defining checks pass and Profile T is Conformant.
+        assert!(
+            check_passed(&report.checks, "media2"),
+            "mock advertises Media2:\n{report}"
+        );
+        assert!(
+            check_passed(&report.checks, "event_motion_topic"),
+            "mock exposes a motion-alarm topic:\n{report}"
+        );
+        assert_eq!(
+            report.profiles.profile_t.verdict,
+            ProfileVerdict::Conformant,
+            "exercised Profile T should be Conformant against the mock:\n{report}"
+        );
+    }
+
+    #[tokio::test]
+    async fn negative_auth_probe_flags_and_confirms_enforcement() {
+        let status_of = |report: &HealthReport| {
+            report
+                .checks
+                .iter()
+                .find(|c| c.id == "auth_enforcement")
+                .expect("auth_enforcement check present")
+                .status
+                .clone()
+        };
+
+        // Auth OFF + credentials supplied → the device serves GetDeviceInformation
+        // anonymously → a security Warn.
+        let open = MockServer::start().await.unwrap();
+        let report = HealthCheck::new(open.device_url())
+            .with_credentials("admin", "admin")
+            .run()
+            .await;
+        assert!(
+            matches!(status_of(&report), CheckStatus::Warn(_)),
+            "auth-off device should warn:\n{report}"
+        );
+
+        // No credentials → nothing to compare against → Skip.
+        let report = HealthCheck::new(open.device_url()).run().await;
+        assert!(
+            matches!(status_of(&report), CheckStatus::Skip(_)),
+            "no credentials → skip:\n{report}"
+        );
+
+        // Auth ENFORCED + valid credentials → the anonymous read is rejected → Pass.
+        let locked = MockServer::builder()
+            .enforce_auth(true)
+            .start()
+            .await
+            .unwrap();
+        let report = HealthCheck::new(locked.device_url())
+            .with_credentials("admin", "admin")
+            .run()
+            .await;
+        assert!(
+            matches!(status_of(&report), CheckStatus::Pass),
+            "auth-enforced device should pass:\n{report}"
+        );
+    }
+
+    /// The nine `GetServiceCapabilities` operations shipped in 0.15.0; this is
+    /// the health check actually asking them.
+    #[tokio::test]
+    async fn service_capabilities_are_asked_of_every_advertised_service() {
+        let server = MockServer::start().await.unwrap();
+        let report = HealthCheck::new(server.device_url()).run().await;
+
+        // The mock advertises all nine, so all nine must answer — a Skip here
+        // would mean the capability gate read the wrong URL, and a Fail that the
+        // action did not route.
+        for service in [
+            "device",
+            "media",
+            "media2",
+            "ptz",
+            "imaging",
+            "events",
+            "recording",
+            "search",
+            "replay",
+        ] {
+            let id = format!("service_caps_{service}");
+            let c = report
+                .checks
+                .iter()
+                .find(|c| c.id == id)
+                .unwrap_or_else(|| panic!("{id} missing from the report:\n{report}"));
+            assert!(
+                matches!(c.status, CheckStatus::Pass),
+                "{id} should pass against the mock, got {:?}:\n{report}",
+                c.status
+            );
+        }
+    }
+
+    /// The negative half: a service that **refuses** `GetServiceCapabilities`
+    /// must come back as a Fail carrying the device's own reason, not as a Pass
+    /// and not as a Skip.
+    ///
+    /// Without this, `caps_check` could report every outcome as a pass and the
+    /// positive test above would not notice — measured, by mutating exactly that
+    /// and watching the suite stay green.
+    ///
+    /// The fault is armed with the **full URI tail**, not the bare operation
+    /// name: `inject_fault` matches on `action.ends_with(..)` and eight of the
+    /// nine services spell this operation identically, so `"GetServiceCapabilities"`
+    /// alone would be consumed by whichever call happened to arrive first.
+    #[tokio::test]
+    async fn a_service_that_refuses_get_service_capabilities_is_a_failure() {
+        let server = MockServer::start().await.unwrap();
+        server.inject_fault(
+            "ver10/device/wsdl/GetServiceCapabilities",
+            "env:Receiver",
+            "NoServiceCaps-HEALTH-7701",
+        );
+
+        let report = HealthCheck::new(server.device_url()).run().await;
+        let c = report
+            .checks
+            .iter()
+            .find(|c| c.id == "service_caps_device")
+            .expect("service_caps_device present");
+
+        let CheckStatus::Fail(reason) = &c.status else {
+            panic!("expected a Fail, got {:?}:\n{report}", c.status);
+        };
+        // The device's own reason, not a generic "it failed" — this is what
+        // makes the assertion able to fail for the right reason.
+        assert!(
+            reason.contains("NoServiceCaps-HEALTH-7701"),
+            "the injected reason must survive into the check: {reason}"
+        );
+        assert_eq!(
+            c.error.as_ref().map(|e| e.reason.as_str()),
+            Some("NoServiceCaps-HEALTH-7701"),
+            "structured CheckError should carry the same reason:\n{report}"
+        );
+
+        // Its facts drop out of the cross-check rather than defaulting to
+        // `false` and inventing contradictions against the device-level `true`s.
+        let x = report
+            .checks
+            .iter()
+            .find(|c| c.id == "service_caps_self_consistent")
+            .expect("cross-check present");
+        assert!(
+            !matches!(x.status, CheckStatus::Warn(_)),
+            "a failed capability call must not manufacture contradictions: {:?}",
+            x.status
+        );
+    }
+
+    /// The cross-check must be *exercised*, not merely present: assert it
+    /// compared a non-zero number of facts. A Skip would also be "no
+    /// disagreements", and that is the outcome that proves nothing.
+    #[tokio::test]
+    async fn the_mock_does_not_contradict_itself_between_the_two_capability_calls() {
+        let server = MockServer::start().await.unwrap();
+        let report = HealthCheck::new(server.device_url()).run().await;
+
+        let c = report
+            .checks
+            .iter()
+            .find(|c| c.id == "service_caps_self_consistent")
+            .expect("self-consistency check present");
+        assert!(
+            matches!(c.status, CheckStatus::Pass),
+            "the mock should agree with itself, got {:?}:\n{report}",
+            c.status
+        );
+        // "N fact(s) cross-checked, …" — N must not be 0, or a Pass would mean
+        // "nothing was compared" rather than "nothing was wrong".
+        let n: usize = c
+            .detail
+            .split_whitespace()
+            .next()
+            .and_then(|w| w.parse().ok())
+            .unwrap_or_else(|| panic!("unparseable detail {:?}", c.detail));
+        // 24, measured: 20 device (4 network + 5 system + 11 security) + 3 media
+        // + 1 events. The floor is the exact count rather than a loose one, so
+        // losing *any* one block fails here — dropping `<tt:Security>` alone
+        // leaves 13, and dropping only its two `Extension` levels leaves 20.
+        // Adding a genuine new pair raises `n` and still passes, which is the
+        // direction that should.
+        //
+        // This was `>= 14` and the message said "the mock states 14 attributes
+        // in both" until 0.15, then `>= 17`. 18 → 17 was `device/UsernameToken`
+        // leaving the cross-check because `tt:SecurityCapabilities` never
+        // declared it; 17 → 24 is the seven security facts that type *does*
+        // declare and `SecurityCapabilities` did not model until 0.15 — see
+        // `checks::capability_cross_check`.
+        assert!(
+            n >= 24,
+            "the mock states 24 attributes in both GetCapabilities and \
+             GetServiceCapabilities; only {n} were cross-checked, so the mock's \
+             device-level response has lost its Device/Network/System/Security \
+             blocks again — or the two `Extension` levels inside Security, \
+             which carry four of them: {:?}\n\
+             If the drop is deliberate, update this expectation **and** every \
+             file that quotes the number: `LIBRARY_GUIDE.md` (the sample health \
+             output and the `service_caps_self_consistent` prose), \
+             `src/lib.rs`'s crate header, `src/health/checks.rs` \
+             (`capability_cross_check`'s doc comment and the `checked` \
+             assertion in `capability_cross_check_tests`), `CHANGELOG.md`'s \
+             0.15.0 entry, and \
+             `docs/active/mock-schema-conformance-2026-08.md` §1.3.",
+            c.detail
+        );
+        // …and with both sides stating them, none should be service-only.
+        assert!(
+            c.detail.contains("(0 stated only by the service)"),
+            "the mock should state every cross-checked fact on both sides: {:?}",
+            c.detail
+        );
+    }
+
+    #[tokio::test]
+    async fn healthcheck_write_roundtrip_against_mock() {
+        let server = MockServer::start().await.unwrap();
+        let report = HealthCheck::new(server.device_url())
+            .with_write_checks(true)
+            .run()
+            .await;
+        assert!(
+            check_passed(&report.checks, "set_video_encoder_roundtrip"),
+            "write round-trip should pass against the mock:\n{report}"
+        );
+    }
+
+    #[tokio::test]
+    async fn capture_is_opt_in_and_records_failing_exchanges() {
+        // An auth-enforced device probed without credentials: the anonymous
+        // calls fault, so capture should collect their raw exchanges.
+        let locked = MockServer::builder()
+            .enforce_auth(true)
+            .start()
+            .await
+            .unwrap();
+
+        // Off by default → nothing captured, even though checks fail.
+        let report = HealthCheck::new(locked.device_url()).run().await;
+        assert!(report.captured.is_empty(), "capture must be opt-in");
+
+        // On → the failing exchanges are recorded, keyed by action.
+        let report = HealthCheck::new(locked.device_url())
+            .with_capture(true)
+            .run()
+            .await;
+        assert!(
+            !report.captured.is_empty(),
+            "expected captured faults from an auth-enforced device"
+        );
+        for ex in &report.captured {
+            assert!(!ex.action.is_empty(), "captured exchange needs an action");
+            assert!(
+                !ex.response.is_empty(),
+                "captured exchange needs a response"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn healthcheck_report_to_json_is_valid_and_round_trips() {
+        let server = MockServer::start().await.unwrap();
+        let report = HealthCheck::new(server.device_url()).run().await;
+
+        // Compact and pretty are both valid JSON and equivalent values.
+        let compact: serde_json::Value =
+            serde_json::from_str(&report.to_json()).expect("compact JSON parses");
+        let pretty: serde_json::Value =
+            serde_json::from_str(&report.to_json_pretty()).expect("pretty JSON parses");
+        assert_eq!(compact, pretty);
+
+        // Core fields are present and durations are integer-millisecond.
+        assert!(compact.get("target").and_then(|v| v.as_str()).is_some());
+        assert!(
+            compact
+                .get("total_elapsed_ms")
+                .and_then(|v| v.as_u64())
+                .is_some()
+        );
+        let checks = compact
+            .get("checks")
+            .and_then(|v| v.as_array())
+            .expect("checks array");
+        let first = &checks[0];
+        assert!(first.get("id").and_then(|v| v.as_str()).is_some());
+        assert!(first.get("elapsed_ms").and_then(|v| v.as_u64()).is_some());
+        // CheckStatus is tagged: { "kind": "Pass" } or { "kind": "Fail", "reason": "..." }
+        let status = first.get("status").expect("status field");
+        assert!(status.get("kind").and_then(|v| v.as_str()).is_some());
+    }
+}

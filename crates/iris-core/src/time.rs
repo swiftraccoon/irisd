@@ -78,7 +78,9 @@ impl WallUs {
     /// exactly. Times before 1970 saturate to zero.
     #[must_use]
     pub fn from_ntp64(ntp: u64) -> Self {
-        let secs = (ntp >> 32).saturating_sub(NTP_UNIX_OFFSET_SECS);
+        let Some(secs) = (ntp >> 32).checked_sub(NTP_UNIX_OFFSET_SECS) else {
+            return Self(0);
+        };
         let frac_micros = ((ntp & 0xffff_ffff) * 1_000_000 + (1 << 31)) >> 32;
         Self(i64::try_from(secs * 1_000_000 + frac_micros).unwrap_or(i64::MAX))
     }
@@ -191,6 +193,14 @@ impl MediaTicks {
         Self(millis * (TIMESCALE as i64 / 1000))
     }
 
+    /// Converts nonnegative milliseconds to ticks, returning `None` when the
+    /// input or exact multiplication cannot fit in the signed tick unit.
+    #[must_use]
+    pub fn checked_from_millis(millis: u64) -> Option<Self> {
+        let millis = i64::try_from(millis).ok()?;
+        millis.checked_mul(i64::from(TIMESCALE) / 1_000).map(Self)
+    }
+
     /// Returns the tick count.
     #[must_use]
     pub const fn get(self) -> i64 {
@@ -230,6 +240,23 @@ impl std::ops::Sub for MediaTicks {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pre_unix_epoch_ntp_fractions_saturate_to_zero() {
+        for fraction in [0, 1 << 31, 0xffff_ffff] {
+            let ntp = ((NTP_UNIX_OFFSET_SECS - 1) << 32) | fraction;
+            assert_eq!(WallUs::from_ntp64(ntp), WallUs::new(0));
+        }
+        assert_eq!(
+            WallUs::from_ntp64((NTP_UNIX_OFFSET_SECS << 32) | (1 << 31)),
+            WallUs::new(500_000)
+        );
+        let last_microsecond = WallUs::new(999_999);
+        assert_eq!(
+            WallUs::from_ntp64(last_microsecond.to_ntp64()),
+            last_microsecond
+        );
+    }
 
     #[test]
     fn formats_rfc3339_utc() {
@@ -275,5 +302,16 @@ mod tests {
         assert_eq!(MediaTicks::from_secs(1).as_micros(), 1_000_000);
         assert_eq!(MediaTicks::new(90).as_micros(), 1000);
         assert_eq!(MediaTicks::from_millis(33).get(), 2970);
+    }
+
+    #[test]
+    fn checked_millisecond_conversion_has_an_exact_boundary() {
+        let largest = u64::try_from(i64::MAX / 90).unwrap();
+        assert_eq!(
+            MediaTicks::checked_from_millis(largest),
+            Some(MediaTicks::new((i64::MAX / 90) * 90))
+        );
+        assert_eq!(MediaTicks::checked_from_millis(largest + 1), None);
+        assert_eq!(MediaTicks::checked_from_millis(u64::MAX), None);
     }
 }

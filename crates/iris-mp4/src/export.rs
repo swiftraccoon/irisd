@@ -1,17 +1,22 @@
 //! Rewrites that turn stored fragments into a stand-alone export: a continuous
 //! timeline from zero, fresh sequence numbers, a trailer over the rewritten
-//! bytes, and an edit list in the init segment that trims the first and last
-//! fragments to the requested range.
+//! bytes, physical tail sample trimming, and an edit list in the init segment
+//! that hides the first fragment's sync preroll.
 //!
 //! Stored decode times run on across the files of a recording run and
 //! sequence numbers restart per file, so an export that copied fragments
 //! verbatim would start hours into its own timeline and jump at every file
-//! boundary. These functions patch the boxes in place; sample data is never
-//! touched.
+//! boundary. These functions rewrite boxes; retained sample data is never changed.
+
+use bytes::Bytes;
 
 use crate::boxes::{BoxHeader, BoxWriter, be_u32};
 use crate::crc::Crc32c;
-use crate::fragment::{TRAILER_LEN, encode_trailer};
+use crate::fragment::{
+    FragmentHeader, Sample, TRAILER_LEN, decode_trailer, encode_fragment, encode_trailer,
+};
+use crate::reader::FragmentInfo;
+use iris_core::time::MediaTicks;
 
 /// Movie timescale written by [`crate::init::build_init_segment`] (`mvhd`).
 pub const MOVIE_TIMESCALE: u32 = 1000;
@@ -27,21 +32,17 @@ pub enum ExportError {
 /// Rewrites one complete fragment in place (`prft`, `moof`, `mdat`, trailer):
 /// the `mfhd` sequence number becomes `sequence`, the `tfdt` decode time and
 /// the `prft` media time become `decode_time`, and the trailer is recomputed
-/// over the rewritten bytes.
+/// over the rewritten bytes. The original checksum is verified before any
+/// bytes are changed; corrupt input is rejected.
 pub fn rebase_fragment(
     fragment: &mut [u8],
     sequence: u32,
     decode_time: u64,
 ) -> Result<(), ExportError> {
-    // The whole fragment must parse first (`moof`, `mdat` whose size agrees
-    // with the sample table, a trailer whose length matches), or a corrupt
-    // file would be rewritten into another corrupt file with a valid trailer.
-    if crate::reader::parse_fragment(fragment).is_none() {
-        return Err(ExportError::Malformed("fragment"));
-    }
+    validated_fragment(fragment)?;
+    let body_end = fragment.len() - TRAILER_LEN;
     let mut pos = 0usize;
     let mut saw_moof = false;
-    let body_end = fragment.len() - TRAILER_LEN;
     while pos < body_end {
         let (kind, header_len, size) = header(&fragment[pos..body_end], "fragment")?;
         match &kind {
@@ -74,6 +75,82 @@ pub fn rebase_fragment(
     let len = u32::try_from(fragment.len()).map_err(|_| ExportError::Malformed("length"))?;
     fragment[body_end..].copy_from_slice(&encode_trailer(crc.finish(), len));
     Ok(())
+}
+
+fn validated_fragment(fragment: &[u8]) -> Result<FragmentInfo, ExportError> {
+    // The whole fragment must parse first (`moof`, `mdat` whose size agrees
+    // with the sample table, a trailer whose length matches), or a corrupt
+    // file would be rewritten into another corrupt file with a valid trailer.
+    let info = crate::reader::parse_fragment(fragment).ok_or(ExportError::Malformed("fragment"))?;
+    let body_end = fragment.len() - TRAILER_LEN;
+    let trailer = decode_trailer(&fragment[body_end..]).ok_or(ExportError::Malformed("trailer"))?;
+    let mut original_crc = Crc32c::new();
+    original_crc.update(&fragment[..body_end]);
+    if original_crc.finish() != trailer.crc {
+        return Err(ExportError::Malformed("checksum"));
+    }
+    Ok(info)
+}
+
+/// Rebuilds a checksum-verified fragment's prefix through `duration`, rebased
+/// to `header`. Samples starting at or after that duration are omitted; a
+/// crossing sample's duration is shortened. Retained sample bytes are unchanged.
+///
+/// The input allocation backs sample slices while the output is assembled;
+/// sample count and payload remain bounded by the fragment parser and encoder.
+///
+/// # Errors
+/// Returns an error for invalid structure or CRC, a nonpositive duration, or
+/// a prefix that the recording fragment encoder cannot represent.
+pub fn trim_fragment_end(
+    fragment: Vec<u8>,
+    header: FragmentHeader,
+    duration: MediaTicks,
+) -> Result<Vec<u8>, ExportError> {
+    let info = validated_fragment(&fragment)?;
+    let mut remaining =
+        u64::try_from(duration.get()).map_err(|_| ExportError::Malformed("duration"))?;
+    if remaining == 0 {
+        return Err(ExportError::Malformed("duration"));
+    }
+    let data = Bytes::from(fragment);
+    let mut offset = usize::try_from(info.payload_offset)
+        .map_err(|_| ExportError::Malformed("payload offset"))?;
+    let mut samples = Vec::with_capacity(usize::from(info.sample_count));
+    for (index, (&size, &duration)) in info
+        .sample_sizes
+        .iter()
+        .zip(&info.sample_durations)
+        .enumerate()
+    {
+        if remaining == 0 {
+            break;
+        }
+        let end = offset
+            .checked_add(size as usize)
+            .ok_or(ExportError::Malformed("sample size"))?;
+        if end > data.len() {
+            return Err(ExportError::Malformed("sample data"));
+        }
+        let duration = u32::try_from(remaining.min(u64::from(duration)))
+            .map_err(|_| ExportError::Malformed("sample duration"))?;
+        samples.push(Sample {
+            data: data.slice(offset..end),
+            duration,
+            is_sync: index == 0 && info.starts_with_sync,
+        });
+        offset = end;
+        remaining -= u64::from(duration);
+    }
+    let encoded =
+        encode_fragment(&header, &samples).map_err(|_| ExportError::Malformed("export prefix"))?;
+    let mut out = Vec::with_capacity(
+        usize::try_from(encoded.total_len()).map_err(|_| ExportError::Malformed("length"))?,
+    );
+    for slice in encoded.io_slices(&samples) {
+        out.extend_from_slice(&slice);
+    }
+    Ok(out)
 }
 
 fn rebase_moof(body: &mut [u8], sequence: u32, decode_time: u64) -> Result<(), ExportError> {
@@ -114,6 +191,7 @@ fn rebase_traf(body: &mut [u8], decode_time: u64) -> Result<(), ExportError> {
 /// Inserts an `edts`/`elst` (version 1, one entry) into the init segment's
 /// `trak`: presentation starts `media_time` ticks into the media and lasts
 /// `duration_ms` in the movie timescale. Returns the rewritten init segment.
+/// Extended-size `moov` or `trak` parents are rejected.
 pub fn with_edit_list(
     init: &[u8],
     media_time: u64,
@@ -133,6 +211,9 @@ pub fn with_edit_list(
 
     let moov = find_box(init, 0, init.len(), *b"moov", "moov")?;
     let trak = find_box(init, moov.body, moov.end, *b"trak", "trak")?;
+    if moov.body - moov.start != 8 || trak.body - trak.start != 8 {
+        return Err(ExportError::Malformed("extended init parent"));
+    }
     let tkhd = find_box(init, trak.body, trak.end, *b"tkhd", "tkhd")?;
     let grow = u32::try_from(edts.len()).map_err(|_| ExportError::Malformed("edts"))?;
     let mut out = Vec::with_capacity(init.len() + edts.len());
@@ -239,6 +320,61 @@ mod tests {
     }
 
     #[test]
+    fn rejects_payload_corruption_before_rewriting_the_checksum() {
+        let mut bytes = fragment(7, 90_000);
+        let payload_end = bytes.len() - TRAILER_LEN;
+        bytes[payload_end - 1] ^= 0x80;
+        let original = bytes.clone();
+        assert!(rebase_fragment(&mut bytes, 1, 0).is_err());
+        assert_eq!(bytes, original, "a failed rewrite leaves the input intact");
+    }
+
+    #[test]
+    fn tail_trimming_preserves_sample_bytes_and_shortens_only_the_crossing_duration() {
+        let bytes = fragment(7, 90_000);
+        let original = parse_fragment(&bytes).unwrap();
+        let payload = &bytes[original.payload_offset as usize..bytes.len() - TRAILER_LEN];
+        let header = FragmentHeader {
+            sequence: 1,
+            decode_time: 0,
+            wall: original.wall.unwrap(),
+        };
+        for (limit, sizes, durations) in [
+            (3000, vec![6], vec![3000]),
+            (4500, vec![6, 7], vec![3000, 1500]),
+            (9000, vec![6, 7], vec![3000, 3000]),
+        ] {
+            let trimmed = trim_fragment_end(bytes.clone(), header, MediaTicks::new(limit)).unwrap();
+            let info = parse_fragment(&trimmed).unwrap();
+            assert_eq!(info.sample_sizes, sizes);
+            assert_eq!(info.sample_durations, durations);
+            assert_eq!(info.sequence, 1);
+            assert_eq!(info.decode_time, 0);
+            let kept = info.sample_sizes.iter().sum::<u32>() as usize;
+            assert_eq!(
+                &trimmed[info.payload_offset as usize..trimmed.len() - TRAILER_LEN],
+                &payload[..kept]
+            );
+            let mut file = build_init_segment(&crate::init::tests::fake_sample_entry()).to_vec();
+            file.extend_from_slice(&trimmed);
+            let scan = scan(
+                std::io::Cursor::new(file),
+                ScanOptions {
+                    verify_crc: true,
+                    collect_samples: false,
+                },
+            )
+            .unwrap();
+            assert_eq!(scan.stop, None);
+        }
+        assert!(trim_fragment_end(bytes.clone(), header, MediaTicks::new(0)).is_err());
+        assert!(trim_fragment_end(bytes.clone(), header, MediaTicks::new(-1)).is_err());
+        let mut corrupt = bytes;
+        corrupt[original.payload_offset as usize] ^= 1;
+        assert!(trim_fragment_end(corrupt, header, MediaTicks::new(3000)).is_err());
+    }
+
+    #[test]
     fn rebased_fragments_carry_new_times_and_a_valid_trailer() {
         let mut bytes = fragment(900, 90_000 * 3_600);
         rebase_fragment(&mut bytes, 1, 6000).unwrap();
@@ -302,5 +438,60 @@ mod tests {
         )
         .unwrap();
         assert_eq!(report.init_len as usize, out.len());
+    }
+
+    fn init_tree_valid(mut bytes: &[u8]) -> bool {
+        while !bytes.is_empty() {
+            let Some(header) = BoxHeader::parse(bytes) else {
+                return false;
+            };
+            let Some(size) = header.size.and_then(|n| usize::try_from(n).ok()) else {
+                return false;
+            };
+            if size < usize::from(header.header_len) || size > bytes.len() {
+                return false;
+            }
+            if [*b"moov", *b"trak"].contains(&header.kind)
+                && !init_tree_valid(&bytes[usize::from(header.header_len)..size])
+            {
+                return false;
+            }
+            bytes = &bytes[size..];
+        }
+        true
+    }
+
+    fn extend_parent(init: &[u8], kind: [u8; 4]) -> Vec<u8> {
+        let moov = find_box(init, 0, init.len(), *b"moov", "moov").unwrap();
+        let parent = if kind == *b"moov" {
+            find_box(init, 0, init.len(), kind, "moov").unwrap()
+        } else {
+            find_box(init, moov.body, moov.end, kind, "trak").unwrap()
+        };
+        let mut out = init[..parent.start].to_vec();
+        out.extend(1u32.to_be_bytes());
+        out.extend(kind);
+        out.extend(((parent.end - parent.start + 8) as u64).to_be_bytes());
+        out.extend_from_slice(&init[parent.body..]);
+        if kind == *b"trak" {
+            let size = be_u32(&out, moov.start).unwrap() + 8;
+            out[moov.start..moov.start + 4].copy_from_slice(&size.to_be_bytes());
+        }
+        out
+    }
+
+    #[test]
+    fn edit_insertion_rejects_extended_parents_without_corrupt_output() {
+        let init = build_init_segment(&crate::init::tests::fake_sample_entry());
+        assert!(init_tree_valid(&with_edit_list(&init, 0, 33).unwrap()));
+        let extended_trak = extend_parent(&init, *b"trak");
+        for bytes in [
+            extend_parent(&init, *b"moov"),
+            extended_trak.clone(),
+            extend_parent(&extended_trak, *b"moov"),
+        ] {
+            assert!(init_tree_valid(&bytes));
+            assert!(with_edit_list(&bytes, 0, 33).is_err());
+        }
     }
 }

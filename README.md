@@ -4,8 +4,12 @@
 [![rustdoc](https://github.com/swiftraccoon/irisd/actions/workflows/docs.yml/badge.svg)](https://swiftraccoon.github.io/irisd/)
 
 An H.265 network video recorder for Linux whose record path never decodes video: RTSP in,
-standard fragmented MP4 on disk, byte-range serving out to a Linux GUI and an iOS app.
+standard fragmented MP4 on disk, and authenticated serving to a Linux GUI and other clients.
 Written in Rust; SQLite, linked through `rusqlite`, is the one C library in the daemon.
+
+The `0.1.0` workspace is unreleased alpha software. It makes no compatibility promises:
+APIs, configuration, command-line behavior, storage schemas, and formats may change in pursuit
+of correctness, efficiency, readability, and simplicity.
 
 ## What it does
 
@@ -15,7 +19,8 @@ Written in Rust; SQLite, linked through `rusqlite`, is the one C library in the 
 - Keeps the NVR clock as the authority for time: a constant-frame-rate regulariser turns
   camera RTP timestamps into exact frame durations and renders camera-dropped frames as holds.
 - Catalogs files, runs, and camera events in SQLite; enforces retention by free space, a
-  size quota, and per-camera age; recovers from a crash by scanning the open files.
+  size quota, and per-camera age; recovers from a crash through validated sidecar tails with
+  a bounded media scan as the fallback.
 - Serves byte-range HLS playlists, per-frame live fragments over WebSocket, MP4 export,
   snapshots, and events over an authenticated HTTP API.
 - Subscribes to camera events (vendor push feeds and ONVIF pull-point) and stores them with
@@ -24,8 +29,8 @@ Written in Rust; SQLite, linked through `rusqlite`, is the one C library in the 
   ingest progress, and a statistics line per stream, feed, writer, catalog, and root every
   minute.
 
-Cost, measured with the replay harness: about 0.065 % of one core per Mbit/s of H.265 at
-100 Mbit/s, about 90 MiB resident for fourteen streams (`docs/research/12-ingest-cost.md`).
+Cost, measured with the replay harness: about 0.021 % of one core per Mbit/s of H.265 at
+132 Mbit/s for fourteen streams (`docs/research/12-ingest-cost.md` §6).
 
 ## Layout
 

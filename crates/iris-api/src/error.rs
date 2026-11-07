@@ -39,6 +39,9 @@ impl IntoResponse for ApiError {
         let status = match &self {
             Self::BadRequest(_) => StatusCode::BAD_REQUEST,
             Self::NotFound => StatusCode::NOT_FOUND,
+            Self::Catalog(iris_catalog::CatalogError::Overloaded) => {
+                StatusCode::SERVICE_UNAVAILABLE
+            }
             Self::Catalog(_) | Self::Io(_) => StatusCode::INTERNAL_SERVER_ERROR,
             Self::Upstream(_) => StatusCode::BAD_GATEWAY,
             Self::Unavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
@@ -53,5 +56,16 @@ impl IntoResponse for ApiError {
             }),
         )
             .into_response()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn catalog_overload_is_service_unavailable() {
+        let response = ApiError::Catalog(iris_catalog::CatalogError::Overloaded).into_response();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 }

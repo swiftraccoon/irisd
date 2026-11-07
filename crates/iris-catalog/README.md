@@ -9,20 +9,31 @@ serving) this crate is the index that turns a wall-clock range into byte ranges 
 
 ## What it provides
 
+- `CatalogRootRegistry` — synchronously migrates and resolves configured-root expectations
+  before Landlock or any worker thread is created.
 - `CatalogHandle` — `open` creates or migrates the database and starts the thread;
-  `notify` queues a `Change`; async queries (`cameras`, `segments`, `segment`,
-  `segment_by_path`, `writing_segments`, `oldest_sealed`, `newest_sealed`, `total_bytes`,
-  `events`, `retained_events`, `oldest_sealed_after`, `stats`) and mutations
-  (`ensure_camera`, `mark_sealed`, `adopt_segment`, `delete_segment`, `insert_event`,
-  `retain_event`); `metrics`; `shutdown`.
+  `notify` queues a `Change`; async queries (`cameras`, `segments`, `segments_limited`, `segment`,
+  `segment_by_path`, paged writing/deleting rows, exact path membership, `oldest_sealed`,
+  `newest_sealed`, `total_bytes`,
+  `events_after`, `event_protections`, `retention_candidates`, `expired_candidates`,
+  `stats`) and mutations (`ensure_camera`, `mark_sealed`, `adopt_segment`,
+  `mark_deleting_if_unprotected`, `delete_segment`, `insert_event`, `retain_event`,
+  `maintain_events`), plus durable root registration, bounded root assignment, and the
+  empty-writing deletion-intent transition for startup reconciliation; `metrics`; `shutdown`.
 - `Change` — `SegmentOpened`, `SegmentProgress`, `SegmentSealed`, `Event`: what the store's
   observer and the event feeds report, batched into one transaction per 100 ms.
-- `SegmentRow`, `EventRow`, `CameraRow`, `NewSegment`, `SegmentId`, `EventId`, `TimeRange`
-  (half-open `[from, to)` in wall microseconds) — the row types.
-- `CatalogStats` — segment count, sealed bytes, event count, database and WAL sizes.
+- `SegmentRow`, `EventRow`, `EventProtection`, `RetentionPage`, `CameraRow`, `NewSegment`,
+  `SegmentId`, `EventId`, `EventCursor`, `EventProtectionCursor`, `DeleteMarkResult`, and
+  `TimeRange` (half-open `[from, to)` in wall microseconds) — rows, stable cursors, scan
+  progress, and mutation outcomes.
+- `CatalogStats` — segment and sealed-byte totals; event row, logical-byte, active-mark, and
+  prune totals; database and WAL sizes.
 - `CatalogMetrics` — transaction, query, queue-wait, and event receipt-to-commit latency
-  histograms with batch counters, shared by every clone of the handle.
-- `CatalogError` — SQLite, I/O, not-found, and closed-handle errors.
+  histograms; batch counters; queue count/owned-byte gauges and peaks; coalescing, rejection,
+  and rejection counters plus the reconciliation-required flag, shared by every clone of the
+  handle.
+- `CatalogError` — SQLite, I/O, corruption, unsupported-schema, overload, event-capacity,
+  not-found, and closed-handle errors.
 
 ## How it is used
 
@@ -54,31 +65,77 @@ catalog.shutdown();
 - **Ordering.** Commands are processed in send order; a query issued after `notify`
   observes that change because pending changes are committed before any query runs
   (`docs/design/phase2-interfaces.md`).
+- **Bounded admission.** The ordering domain admits at most 2,048 commands and 16 MiB of
+  estimated owned input, including commands already running. It reserves 128 commands and
+  1 MiB for segment open/seal transitions. Events reject under overload, same-path progress
+  may coalesce only within the unqueried tail, lifecycle eviction never crosses a query, and
+  queries return `CatalogError::Overloaded`. Exhausting the lifecycle reserve latches
+  `reconciliation_required`; explicit shutdown or dropping the final handle drains only the
+  admitted bounded tail and joins the thread.
 - **Batching.** Changes are committed within 100 ms of the first pending one, or at 1,000
   pending, or before the next query, in one transaction; a failed batch is counted and
   dropped, never retried (`docs/research/04-storage-format.md §6`).
-- **Durability settings.** WAL mode, `synchronous = NORMAL`, foreign keys on, a 5 s busy
-  timeout; the database belongs on an SSD (`04 §6`).
-- **Schema.** `camera`, `sample_entry` (codec configurations keyed by hash), `segment`
-  (one row per file, no per-fragment rows; index on `(camera_id, kind, wall_start_us)`),
-  `event` (index on `(camera_id, nvr_time_us)`; version 2 adds `retain_until_us`),
-  `schema_version` (migrations run on open, each version's statements in a transaction)
-  (`docs/design/phase2-interfaces.md`).
+- **Connection settings.** WAL mode, `synchronous = NORMAL` for ordinary work, foreign keys
+  on, a 5 s busy timeout, and `temp_store = MEMORY` so bounded sorters and materialized queries
+  never need an ambient temporary directory outside the filesystem sandbox. Deletion intent
+  commits under scoped `synchronous = FULL` before filesystem mutation and restores `NORMAL`;
+  the database belongs on an SSD (`04 §6`).
+- **Schema.** Version 9 contains `camera`, `sample_entry`, `segment`, `event`,
+  `catalog_state`, `recording_root`, `recording_root_state`, and `schema_version`. Migrations add event retention (v2), deletion intent
+  (v3), injective vendor-kind storage (v4), root/global time indexes (v5), and transactional
+  event-capacity accounting (v6), the camera-horizon index (v7), then explicit cursor tie keys
+  plus age/protection access paths (v8), then configured-path to durable-root-identity binding
+  (v9). Open rejects a schema version above nine and rejects
+  invalid `segment.sealed` or `segment.deleting` domains before persistent pragmas or writes.
+  Persisted values pass through checked conversions; invalid identities, enums, booleans,
+  numerics, or aggregates return `CatalogError::Corrupt`.
+- **Legacy root state.** A catalog migrated from any pre-v9 schema keeps a durable
+  `pre_identity_catalog` bit. Every configured path without a registered identity therefore
+  remains `LegacyOwned`, including a migrated catalog with no segment rows; it cannot be mistaken
+  for a fresh root after a crash or later restart.
 - **Segment rows** carry wall and media extents, the durable length (updated after each
-  sync), the final length and fragment count at seal, and the sealed flag; `bytes` of an
-  open file is its written length, so `total_bytes` is what a quota compares against.
-- **Retention queries** (`oldest_sealed`, `total_bytes`, `segments` by range) are what
-  `irisd`'s retention pass uses; the self-check uses `newest_sealed`.
-- **Event data is bounded** before insertion (`Event::bounded`), so a camera cannot grow a
-  row without limit.
+  sync), the final length and fragment count at seal, the sealed flag, and durable deletion
+  intent. Deleting rows are hidden from serving and candidate queries but retain their bytes
+  until pair removal and row deletion complete, so a failed attempt cannot claim quota
+  progress. `bytes` of an open file is its written length, so `total_bytes` is what a quota
+  compares against.
+- **Startup reconciliation.** Root assignment, open rows, and deletion intents are paged by
+  stable ids with at most 512 rows per page. Existing non-null root ownership is never rewritten.
+  Empty open rows enter FULL-synchronous deletion intent before pair removal, and exact-path
+  probes replace a cardinality-wide in-memory deletion set.
+- **Bounded serving query.** `segments_limited` applies its row limit in SQLite before rows and
+  their owned strings are materialized. Media-serving callers use it to reject ranges above their
+  documented row budget; `segments` is the unbounded internal query for callers that enforce
+  their own limits.
+- **Retention.** Candidate SQL is indexed, root-aware, and paged by `(wall_start, segment id)`.
+  Each call caps raw indexed input before active-protection filtering and returns the last
+  scanned cursor/count even when no row passes. Age pages bound raw rows by start before
+  testing end time. Protection checks seek past inactive and expired history before testing
+  overlap. Explicit tie-key indexes and split seek branches bound continuation inside equal
+  start groups. `mark_deleting_if_unprotected` repeats the protection check and records
+  deletion intent atomically under FULL synchronization, returning `Marked`, `Protected`, or
+  `NotFound`.
+- **Event reads.** Listings use separate camera/global indexed statements, stable
+  `(nvr_time_us, id)` cursors, at most 10,000 rows, and at most 8 MiB of aggregate owned
+  materialized-row bytes (fixed row storage plus owned camera, kind, and payload strings).
+  Protection pages contain only id, camera, event time, and retention deadline, contain at
+  most 512 rows, and continue by `(retain_until_us, id)` through the deadline-leading index.
+- **Event lifecycle.** `Event::bounded` limits payloads to 64 KiB and unmapped kind codes to
+  1 KiB. Maintenance spends at most 1,000 row-work units per transaction, carrying scan
+  progress across zero-match inactive pages while applying the 90-day or recording-horizon
+  boundary and enforcing 2,000,000 rows or 512 MiB of logical event strings.
+  Active marks are preserved and admitted up to 100,000 rows or 128 MiB. Capacity admission
+  prunes at most the same bounded work, then rejects a direct insertion or omits an async event
+  without rolling back segment lifecycle changes.
 
 ## Tests and measurements
 
-- `tests/catalog.rs`: camera round trip; the segment lifecycle observed in order (opened,
-  progress, sealed); retention ordering and deletion; sealing and adoption; event filters
-  by camera, range, and limit; bounded event data; idempotent shutdown and closed clones;
-  reopening with the schema intact; metrics counting batches, queries, and waits; event
-  commit latency; `newest_sealed`; database and WAL sizes in `stats`.
+- `tests/catalog.rs`: ordered segment lifecycle; retention ordering, root isolation, atomic
+  protection, and deletion; event filters, tied-time cursors, aggregate read budgets, bounded
+  strings, and lifecycle plateau; bounded ingress overload; idempotent shutdown; metrics;
+  database and WAL sizes. Database unit tests cover migrations through version 9, unsupported
+  schema rejection before side effects, checked corruption errors, injective vendor kinds,
+  query plans, and durable deletion intent.
 - Measurements: `docs/research/12-ingest-cost.md` (transaction p99 under load) and the soak
   figures in `docs/research/11-multi-camera-results.md`.
 

@@ -9,7 +9,7 @@ use iris_core::time::WallUs;
 use serde::Serialize;
 
 use crate::error::ApiError;
-use crate::state::ApiState;
+use crate::state::{ActiveCamera, ApiState};
 
 /// A camera as the API presents it.
 #[derive(Debug, Serialize)]
@@ -23,16 +23,12 @@ pub(crate) struct CameraDto {
 pub(crate) async fn list(
     State(state): State<Arc<ApiState>>,
 ) -> Result<Json<Vec<CameraDto>>, ApiError> {
-    let rows = state.catalog.cameras().await?;
-    let cameras = rows
-        .into_iter()
-        .map(|row| CameraDto {
-            has_snapshot: state.snapshot_sources.contains_key(&row.id),
-            id: row.id.to_string(),
-            name: row.name,
-            vendor: row.vendor,
-        })
+    let mut cameras: Vec<CameraDto> = state
+        .active_cameras
+        .values()
+        .map(|camera| camera_dto(camera, &state))
         .collect();
+    cameras.sort_by(|a, b| a.id.cmp(&b.id));
     Ok(Json(cameras))
 }
 
@@ -72,46 +68,44 @@ pub(crate) async fn detail(
     Path(camera): Path<String>,
 ) -> Result<Json<CameraDetailDto>, ApiError> {
     let id = CameraId::try_new(&camera).map_err(|e| ApiError::BadRequest(e.to_string()))?;
-    let row = state
-        .catalog
-        .cameras()
-        .await?
-        .into_iter()
-        .find(|row| row.id == id)
-        .ok_or(ApiError::NotFound)?;
+    let camera = state.active_cameras.get(&id).ok_or(ApiError::NotFound)?;
     let streams = state
         .live
         .camera_stats(&id)
         .into_iter()
-        .map(|(key, stats)| StreamHealthDto {
-            kind: key.kind.to_string(),
-            connected: stats.connected(),
-            frames: stats.frames(),
-            fragments: stats.fragments(),
-            bytes: stats.bytes(),
-            reconnects: stats.reconnects(),
-            loss_events: stats.loss_events(),
-            gaps: stats.gaps(),
-            last_frame: stats.last_frame_wall().map(rfc3339),
-            last_frame_us: stats.last_frame_wall().map(WallUs::get),
-            codec: stats.codec_description(),
-            nominal_ticks: stats.nominal_ticks(),
-            camera_offset_ms: stats.camera_offset_us().map(|us| us / 1000),
-            live_viewers: state
-                .live
-                .get(&key)
-                .map_or(0, |ring| ring.subscriber_count()),
+        .map(|(key, stats)| {
+            let last_frame = stats.last_frame_wall();
+            StreamHealthDto {
+                kind: key.kind.to_string(),
+                connected: stats.connected(),
+                frames: stats.frames(),
+                fragments: stats.fragments(),
+                bytes: stats.bytes(),
+                reconnects: stats.reconnects(),
+                loss_events: stats.loss_events(),
+                gaps: stats.gaps(),
+                last_frame: last_frame.map(rfc3339),
+                last_frame_us: last_frame.map(WallUs::get),
+                codec: stats.codec_description(),
+                nominal_ticks: stats.nominal_ticks(),
+                camera_offset_ms: stats.camera_offset_us().map(|us| us / 1000),
+                live_viewers: state.live.external_viewers(&key),
+            }
         })
         .collect();
     Ok(Json(CameraDetailDto {
-        camera: CameraDto {
-            has_snapshot: state.snapshot_sources.contains_key(&row.id),
-            id: row.id.to_string(),
-            name: row.name,
-            vendor: row.vendor,
-        },
+        camera: camera_dto(camera, &state),
         streams,
     }))
+}
+
+fn camera_dto(camera: &ActiveCamera, state: &ApiState) -> CameraDto {
+    CameraDto {
+        has_snapshot: state.snapshot_sources.contains_key(&camera.id),
+        id: camera.id.to_string(),
+        name: camera.name.clone(),
+        vendor: camera.vendor.clone(),
+    }
 }
 
 fn rfc3339(wall: WallUs) -> String {

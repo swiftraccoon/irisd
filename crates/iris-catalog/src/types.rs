@@ -21,6 +21,60 @@ pub struct SegmentId(pub i64);
 #[serde(transparent)]
 pub struct EventId(pub i64);
 
+/// Stable continuation position for event listings ordered by receipt time and row id.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct EventCursor {
+    /// Receipt time of the last event returned by the preceding page.
+    pub time: WallUs,
+    /// Row id of the last event returned by the preceding page.
+    pub id: EventId,
+}
+
+/// Stable continuation position for active protections ordered by retention deadline.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct EventProtectionCursor {
+    /// Retention deadline of the last protection returned by the preceding page.
+    pub retain_until: WallUs,
+    /// Row id of the last protection returned by the preceding page.
+    pub id: EventId,
+}
+
+/// Minimal event fields needed to decide whether footage is protected.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EventProtection {
+    /// Stable event row id used for paging equal timestamps.
+    pub id: EventId,
+    /// Camera whose footage the event protects.
+    pub camera: CameraId,
+    /// Authoritative event placement on the NVR clock.
+    pub time: WallUs,
+    /// Time through which the protection remains active.
+    pub retain_until: WallUs,
+}
+
+/// One bounded page of sealed segments inspected for retention.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RetentionPage {
+    /// Rows that were unprotected when the catalog query ran.
+    pub rows: Vec<SegmentRow>,
+    /// Last raw indexed segment inspected, including when every inspected row was protected.
+    pub next: Option<(WallUs, SegmentId)>,
+    /// Number of raw indexed segments inspected before protection filtering.
+    pub scanned: usize,
+}
+
+/// Outcome of conditionally recording durable deletion intent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[must_use]
+pub enum DeleteMarkResult {
+    /// Deletion intent was committed under the FULL durability barrier.
+    Marked,
+    /// An active retained event overlaps the segment.
+    Protected,
+    /// No ordinary sealed row has this id.
+    NotFound,
+}
+
 /// A half-open wall-clock interval `[from, to)`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct TimeRange {
@@ -116,6 +170,12 @@ pub struct CatalogStats {
     pub sealed_bytes: u64,
     /// Event rows.
     pub events: u64,
+    /// Logical bytes owned by event strings.
+    pub event_bytes: u64,
+    /// Events with an active retention mark.
+    pub retained_events: u64,
+    /// Event rows removed by lifecycle maintenance since schema version 6.
+    pub pruned_events: u64,
     /// Size of the database file.
     pub db_bytes: u64,
     /// Size of the write-ahead log file, zero when absent.
@@ -211,6 +271,34 @@ pub enum CatalogError {
     /// SQLite failed.
     #[error("catalog database error: {0}")]
     Sqlite(#[from] rusqlite::Error),
+    /// The database was created by a catalog schema this binary cannot safely write.
+    #[error("unsupported catalog schema version {found}; this binary supports up to {supported}")]
+    UnsupportedSchema {
+        /// Version advertised by the database.
+        found: i64,
+        /// Highest version this binary understands.
+        supported: i64,
+    },
+    /// A persisted value violates the catalog schema's typed invariants.
+    #[error("catalog is corrupt: {0}")]
+    Corrupt(String),
+    /// A single persisted row exceeds the aggregate event-read budget.
+    #[error("catalog event row requires {bytes} bytes; read budget is {max_bytes} bytes")]
+    EventReadTooLarge {
+        /// Approximate owned bytes required by the row.
+        bytes: usize,
+        /// Maximum aggregate owned bytes for one event listing.
+        max_bytes: usize,
+    },
+    /// The bounded catalog command ingress has no ordinary admission capacity.
+    #[error("catalog command queue is overloaded")]
+    Overloaded,
+    /// Active event-retention marks reached their state-database budget.
+    #[error("active event retention capacity is exhausted")]
+    EventRetentionLimit,
+    /// An event could not fit after one bounded inactive-pruning step.
+    #[error("event state capacity is exhausted")]
+    EventStorageLimit,
     /// The catalog thread has stopped.
     #[error("catalog is closed")]
     Closed,

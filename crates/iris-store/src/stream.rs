@@ -13,6 +13,7 @@ use iris_mp4::index::{
 use iris_mp4::init::build_init_segment;
 use tracing::{info, warn};
 
+use crate::fs::ApprovedRoot;
 use crate::layout;
 use crate::observer::{SegmentOpened, StoreObserver};
 use crate::policy::StoragePolicy;
@@ -32,8 +33,8 @@ pub(crate) struct StreamWriter {
     key: StreamKey,
     root: PathBuf,
     policy: StoragePolicy,
-    /// Offset of this stream's syncs within the interval.
-    sync_phase: Duration,
+    /// Absolute deadline retained across file rotations.
+    next_sync: Instant,
     current: Option<SegmentFile>,
     run_id: u64,
     sequence: u32,
@@ -41,6 +42,7 @@ pub(crate) struct StreamWriter {
     pending_new_run: bool,
     files_opened: u64,
     observer: Arc<dyn StoreObserver>,
+    approved_root: Option<ApprovedRoot>,
 }
 
 impl std::fmt::Debug for StreamWriter {
@@ -61,12 +63,13 @@ impl StreamWriter {
         policy: StoragePolicy,
         observer: Arc<dyn StoreObserver>,
         sync_phase: Duration,
+        approved_root: Option<ApprovedRoot>,
     ) -> Self {
         Self {
             key,
             root,
             policy,
-            sync_phase,
+            next_sync: Instant::now() + sync_phase,
             current: None,
             run_id: 0,
             sequence: 0,
@@ -74,6 +77,7 @@ impl StreamWriter {
             pending_new_run: false,
             files_opened: 0,
             observer,
+            approved_root,
         }
     }
 
@@ -137,6 +141,14 @@ impl StreamWriter {
     }
 
     fn rotate(&mut self, fragment: &Fragment) -> io::Result<()> {
+        self.rotate_with(fragment, || Ok(()))
+    }
+
+    fn rotate_with(
+        &mut self,
+        fragment: &Fragment,
+        after_root_verification: impl FnOnce() -> io::Result<()>,
+    ) -> io::Result<()> {
         if let Some(segment) = self.current.take() {
             info!(stream = %self.key, path = %segment.path().display(), bytes = segment.bytes_written(), "sealing");
             self.observer.segment_sealed(segment.seal()?);
@@ -149,14 +161,32 @@ impl StreamWriter {
             sample_entry_hash: fragment.sample_entry.hash,
             ..IndexHeader::default()
         };
+        let root_directory = self
+            .approved_root
+            .as_ref()
+            .map(crate::fs::open_approved_root_directory)
+            .transpose()?;
+        after_root_verification()?;
         let path = layout::segment_path(&self.root, &self.key, fragment.wall);
-        let segment = SegmentFile::create(
-            &path,
-            &init,
-            header,
-            self.policy.preallocate_bytes,
-            self.sync_phase,
-        )?;
+        let segment = match (&self.approved_root, root_directory) {
+            (Some(root), Some(directory)) => SegmentFile::create_beneath(
+                root,
+                directory,
+                &path,
+                &init,
+                header,
+                self.policy.preallocate_bytes,
+                self.next_sync,
+            ),
+            (None, None) => SegmentFile::create(
+                &path,
+                &init,
+                header,
+                self.policy.preallocate_bytes,
+                self.next_sync,
+            ),
+            _ => unreachable!("an approved root and its descriptor are paired"),
+        }?;
         info!(stream = %self.key, path = %segment.path().display(), run = self.run_id, "opened");
         self.current = Some(segment);
         self.sequence = 0;
@@ -170,7 +200,9 @@ impl StreamWriter {
         let Some(segment) = self.current.as_mut() else {
             return Ok(false);
         };
-        if !segment.maybe_sync(now, interval)? {
+        let synced = segment.maybe_sync(now, interval)?;
+        self.next_sync = segment.next_sync();
+        if !synced {
             return Ok(false);
         }
         self.observer.segment_progress(segment.progress());
@@ -187,13 +219,237 @@ impl StreamWriter {
 
     /// Forgets the open file after an I/O error; recovery repairs it later.
     pub(crate) fn abandon(&mut self) {
+        self.mark_discontinuity();
         if let Some(segment) = self.current.take() {
             warn!(stream = %self.key, path = %segment.path().display(), "abandoning file after error");
         }
     }
 
+    /// Marks a recording gap so reopening after pressure or an error starts a run.
+    pub(crate) fn mark_discontinuity(&mut self) {
+        self.pending_new_run = true;
+    }
+
     /// Number of files this stream has opened.
     pub(crate) fn files_opened(&self) -> u64 {
         self.files_opened
+    }
+
+    #[cfg(test)]
+    fn sync_deadline(&self) -> Instant {
+        self.current
+            .as_ref()
+            .map_or(self.next_sync, SegmentFile::next_sync)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bytes::Bytes;
+    use iris_core::id::{CameraId, StreamKind};
+    use iris_core::time::WallUs;
+    use iris_mp4::fragment::Sample;
+    use iris_mp4::init::SampleEntry;
+
+    use crate::observer::NoopObserver;
+
+    fn key() -> StreamKey {
+        StreamKey {
+            camera: CameraId::try_new("cam1").unwrap(),
+            kind: StreamKind::Main,
+        }
+    }
+
+    fn fragment(index: u64, new_run: bool) -> Fragment {
+        Fragment {
+            samples: vec![Sample {
+                data: Bytes::from_static(&[0, 0, 0, 2, 0x26, 1]),
+                duration: 3_000,
+                is_sync: true,
+            }],
+            decode_time: index * 3_000,
+            wall: WallUs::new(1_700_000_000_000_000 + i64::try_from(index).unwrap()),
+            raw_rtp: 0,
+            new_run,
+            sample_entry: Arc::new(SampleEntry::new(
+                Bytes::from_static(b"\0\0\0\x10hvc1\0\0\0\0\0\0\0\0"),
+                "hvc1".into(),
+                16,
+                16,
+            )),
+        }
+    }
+
+    fn writer(root: PathBuf, phase: Duration) -> StreamWriter {
+        StreamWriter::new(
+            key(),
+            root,
+            StoragePolicy {
+                sync_interval: Duration::from_secs(5),
+                preallocate_bytes: 0,
+                rotate_bytes: u64::MAX,
+                rotate_secs: u64::MAX,
+            },
+            Arc::new(NoopObserver),
+            phase,
+            None,
+        )
+    }
+
+    #[test]
+    fn rotation_inherits_the_absolute_sync_deadline() {
+        for phase in [Duration::ZERO, Duration::from_millis(1_250)] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut writer = writer(dir.path().to_path_buf(), phase);
+            let initial = writer.sync_deadline();
+            writer.write(&fragment(0, false)).unwrap();
+            assert_eq!(writer.sync_deadline(), initial);
+
+            let interval = Duration::from_secs(5);
+            assert!(writer.maybe_sync(initial, interval).unwrap());
+            let advanced = initial + interval;
+            assert_eq!(writer.sync_deadline(), advanced);
+
+            writer.write(&fragment(1, true)).unwrap();
+            assert_eq!(writer.sync_deadline(), advanced);
+            assert!(writer.maybe_sync(advanced, interval).unwrap());
+            assert_eq!(writer.sync_deadline(), advanced + interval);
+            assert!(!writer.maybe_sync(advanced + interval, interval).unwrap());
+            assert_eq!(writer.sync_deadline(), advanced + 2 * interval);
+
+            let late = advanced + 10 * interval;
+            assert!(!writer.maybe_sync(late, interval).unwrap());
+            assert_eq!(writer.sync_deadline(), late);
+            writer.close().unwrap();
+        }
+    }
+
+    #[test]
+    fn approved_rotation_stays_on_the_verified_root_after_its_path_is_replaced() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("root");
+        let displaced = dir.path().join("displaced");
+        let approved =
+            crate::fs::admit_recording_root(&root, crate::fs::RootExpectation::Fresh).unwrap();
+        let mut writer = StreamWriter::new(
+            key(),
+            root.clone(),
+            StoragePolicy {
+                sync_interval: Duration::from_secs(5),
+                preallocate_bytes: 0,
+                rotate_bytes: u64::MAX,
+                rotate_secs: u64::MAX,
+            },
+            Arc::new(NoopObserver),
+            Duration::ZERO,
+            Some(approved),
+        );
+        let fragment = fragment(0, false);
+        let replacement_path = layout::segment_path(&root, &key(), fragment.wall);
+        let original_path = displaced.join(replacement_path.strip_prefix(&root).unwrap());
+
+        writer
+            .rotate_with(&fragment, || {
+                std::fs::rename(&root, &displaced)?;
+                std::fs::create_dir(&root)?;
+                std::fs::copy(
+                    displaced.join(crate::fs::ROOT_IDENTITY_MARKER),
+                    root.join(crate::fs::ROOT_IDENTITY_MARKER),
+                )?;
+                std::fs::write(root.join("sentinel"), b"replacement bytes")?;
+                Ok(())
+            })
+            .unwrap();
+        writer.close().unwrap();
+
+        assert!(
+            original_path.exists(),
+            "the pinned original root receives the pair"
+        );
+        assert!(
+            !replacement_path.exists(),
+            "the replacement root must remain untouched"
+        );
+        assert_eq!(
+            std::fs::read(root.join("sentinel")).unwrap(),
+            b"replacement bytes"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn approved_rotation_rejects_a_layout_symlink_installed_after_root_verification() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("root");
+        let victim = dir.path().join("victim-camera");
+        let approved =
+            crate::fs::admit_recording_root(&root, crate::fs::RootExpectation::Fresh).unwrap();
+        let mut writer = StreamWriter::new(
+            key(),
+            root.clone(),
+            StoragePolicy {
+                sync_interval: Duration::from_secs(5),
+                preallocate_bytes: 0,
+                rotate_bytes: u64::MAX,
+                rotate_secs: u64::MAX,
+            },
+            Arc::new(NoopObserver),
+            Duration::ZERO,
+            Some(approved),
+        );
+        let fragment = fragment(0, false);
+        let requested = layout::segment_path(&root, &key(), fragment.wall);
+        std::fs::create_dir(&victim).unwrap();
+        std::fs::write(victim.join("sentinel"), b"victim bytes").unwrap();
+
+        let result = writer.rotate_with(&fragment, || {
+            symlink(&victim, root.join("cam1"))?;
+            Ok(())
+        });
+        assert!(result.is_err());
+        assert_eq!(
+            std::fs::read(victim.join("sentinel")).unwrap(),
+            b"victim bytes"
+        );
+        assert!(
+            !victim
+                .join(requested.strip_prefix(root.join("cam1")).unwrap())
+                .exists(),
+            "no pair may be created through the injected layout symlink"
+        );
+    }
+
+    #[test]
+    fn an_approved_writer_creates_and_seals_a_normal_pair() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("root");
+        let approved =
+            crate::fs::admit_recording_root(&root, crate::fs::RootExpectation::Fresh).unwrap();
+        let mut writer = StreamWriter::new(
+            key(),
+            root.clone(),
+            StoragePolicy {
+                sync_interval: Duration::from_secs(5),
+                preallocate_bytes: 0,
+                rotate_bytes: u64::MAX,
+                rotate_secs: u64::MAX,
+            },
+            Arc::new(NoopObserver),
+            Duration::ZERO,
+            Some(approved),
+        );
+        let fragment = fragment(0, false);
+        let path = layout::segment_path(&root, &key(), fragment.wall);
+
+        assert!(matches!(
+            writer.write(&fragment).unwrap(),
+            Written::Record(_)
+        ));
+        writer.close().unwrap();
+        assert!(path.is_file());
+        assert!(layout::index_path(&path).is_file());
     }
 }

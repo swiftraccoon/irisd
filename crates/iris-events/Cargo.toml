@@ -7,8 +7,13 @@ rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
 
+[features]
+fuzzing = []
+
 [dependencies]
+async-trait = { workspace = true }
 bytes = { workspace = true }
+diqwest = { workspace = true }
 futures-util = { workspace = true }
 md-5 = { workspace = true }
 hex = { workspace = true }
@@ -19,11 +24,15 @@ thiserror = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 tracing = { workspace = true }
+url = { workspace = true }
 iris-core = { workspace = true }
 oxvif = { workspace = true }
 
 [dev-dependencies]
+rcgen = { workspace = true }
 tempfile = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }
+tokio-rustls = { workspace = true }
 
 [lints]
 workspace = true

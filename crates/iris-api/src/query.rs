@@ -6,6 +6,10 @@ use serde::Deserialize;
 
 use crate::error::ApiError;
 
+mod time;
+
+pub(crate) use time::parse_time;
+
 /// Longest range a single request may cover.
 pub(crate) const MAX_RANGE_US: i64 = 7 * 86_400 * 1_000_000;
 /// Default window when `from` is absent.
@@ -30,91 +34,21 @@ pub(crate) fn resolve_range(params: &TimeParams, now: WallUs) -> Result<TimeRang
         Some(raw) => {
             parse_time(raw).ok_or_else(|| ApiError::BadRequest(format!("bad 'from' {raw:?}")))?
         }
-        None => to.offset(-DEFAULT_WINDOW_US),
+        None => WallUs::new(to.get().checked_sub(DEFAULT_WINDOW_US).ok_or_else(|| {
+            ApiError::BadRequest("'to' is too early for the default window".into())
+        })?),
     };
     if to <= from {
         return Err(ApiError::BadRequest("'to' must be after 'from'".into()));
     }
-    if to.micros_since(from) > MAX_RANGE_US {
+    if to
+        .get()
+        .checked_sub(from.get())
+        .is_none_or(|span| span > MAX_RANGE_US)
+    {
         return Err(ApiError::BadRequest("range exceeds 7 days".into()));
     }
     Ok(TimeRange { from, to })
-}
-
-/// Parses either Unix microseconds or RFC 3339 (`2026-10-31T17:00:00Z`,
-/// optional fraction, `Z` or a `±HH:MM` offset).
-pub(crate) fn parse_time(raw: &str) -> Option<WallUs> {
-    let raw = raw.trim();
-    if let Ok(micros) = raw.parse::<i64>() {
-        return Some(WallUs::new(micros));
-    }
-    parse_rfc3339(raw)
-}
-
-fn parse_rfc3339(raw: &str) -> Option<WallUs> {
-    let bytes = raw.as_bytes();
-    if bytes.len() < 20
-        || bytes[4] != b'-'
-        || bytes[7] != b'-'
-        || !matches!(bytes[10], b'T' | b't' | b' ')
-        || bytes[13] != b':'
-        || bytes[16] != b':'
-    {
-        return None;
-    }
-    let year: i64 = raw[0..4].parse().ok()?;
-    let month: u32 = raw[5..7].parse().ok()?;
-    let day: u32 = raw[8..10].parse().ok()?;
-    let hour: i64 = raw[11..13].parse().ok()?;
-    let minute: i64 = raw[14..16].parse().ok()?;
-    let second: i64 = raw[17..19].parse().ok()?;
-    if !(1..=12).contains(&month)
-        || !(1..=31).contains(&day)
-        || hour > 23
-        || minute > 59
-        || second > 60
-    {
-        return None;
-    }
-    let mut pos = 19;
-    let mut micros: i64 = 0;
-    if bytes.get(pos) == Some(&b'.') {
-        pos += 1;
-        let start = pos;
-        while pos < bytes.len() && bytes[pos].is_ascii_digit() {
-            pos += 1;
-        }
-        let digits = &raw[start..pos];
-        if digits.is_empty() {
-            return None;
-        }
-        let scaled = format!("{digits:0<6}");
-        micros = scaled[..6].parse().ok()?;
-    }
-    let offset_secs: i64 = match bytes.get(pos) {
-        Some(b'Z' | b'z') if pos + 1 == bytes.len() => 0,
-        Some(sign @ (b'+' | b'-')) if pos + 6 == bytes.len() && bytes[pos + 3] == b':' => {
-            let oh: i64 = raw[pos + 1..pos + 3].parse().ok()?;
-            let om: i64 = raw[pos + 4..pos + 6].parse().ok()?;
-            let total = oh * 3600 + om * 60;
-            if *sign == b'+' { total } else { -total }
-        }
-        _ => return None,
-    };
-    let days = days_from_civil(year, month, day);
-    let secs = days * 86_400 + hour * 3600 + minute * 60 + second - offset_secs;
-    Some(WallUs::new(secs * 1_000_000 + micros))
-}
-
-/// Days since 1970-01-01 for a proleptic Gregorian date (Howard Hinnant's algorithm).
-fn days_from_civil(year: i64, month: u32, day: u32) -> i64 {
-    let y = if month <= 2 { year - 1 } else { year };
-    let era = y.div_euclid(400);
-    let yoe = y.rem_euclid(400);
-    let m = i64::from(month);
-    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + i64::from(day) - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    era * 146_097 + doe - 719_468
 }
 
 #[cfg(test)]
@@ -158,5 +92,29 @@ mod tests {
             resolve_range(&inverted, now),
             Err(ApiError::BadRequest(_))
         ));
+    }
+
+    #[test]
+    fn rejects_ranges_whose_span_or_default_start_overflows() {
+        for params in [
+            TimeParams {
+                from: Some(i64::MIN.to_string()),
+                to: Some(i64::MAX.to_string()),
+            },
+            TimeParams {
+                from: None,
+                to: Some(i64::MIN.to_string()),
+            },
+        ] {
+            assert!(matches!(
+                resolve_range(&params, WallUs::new(0)),
+                Err(ApiError::BadRequest(_))
+            ));
+        }
+        let params = TimeParams {
+            from: Some((i64::MIN + 1).to_string()),
+            to: Some((i64::MIN + 1 + MAX_RANGE_US).to_string()),
+        };
+        assert!(resolve_range(&params, WallUs::new(0)).is_ok());
     }
 }

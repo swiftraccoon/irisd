@@ -7,11 +7,15 @@ use std::path::PathBuf;
 use anyhow::Context;
 use clap::Parser;
 
-use crate::logs::{col_max, fmt, kv, mean, median, number, rates, split, strip_ansi};
+use crate::logs::{
+    col_max, fmt, kv, mean, median, number, rates, root_identity, split, strip_ansi,
+};
 use crate::time::parse_seconds;
 
 /// Row type: a timestamp in seconds and the line's fields.
 pub type Row = (f64, BTreeMap<String, String>);
+/// An event statistics stream, identified independently by camera and source.
+pub type EventFeedKey = (String, String);
 
 const STATS: [&str; 6] = ["stream", "events", "writer", "catalog", "root", "process"];
 const NOTABLE: [&str; 4] = ["gap ", "selfcheck ", "retention pass", "slow "];
@@ -27,7 +31,7 @@ pub struct Args {
 #[derive(Debug, Default)]
 pub struct Parsed {
     pub streams: BTreeMap<String, Vec<Row>>,
-    pub events: BTreeMap<String, Vec<Row>>,
+    pub events: BTreeMap<EventFeedKey, Vec<Row>>,
     pub writer: Vec<Row>,
     pub catalog: Vec<Row>,
     pub process: Vec<Row>,
@@ -51,26 +55,36 @@ pub fn parse(lines: impl Iterator<Item = String>) -> Parsed {
             continue;
         };
         if l.level == "INFO" && STATS.contains(&kind) && l.rest.contains('=') {
-            let d = kv(l.rest);
+            let mut d = kv(l.rest);
+            if kind == "root"
+                && let Some(root) = root_identity(l.rest)
+            {
+                d.insert("root".into(), root);
+            }
             match kind {
-                "stream" => p
+                "stream" if d.get("stream").is_some_and(|v| !v.is_empty()) => p
                     .streams
-                    .entry(d.get("stream").cloned().unwrap_or_default())
+                    .entry(d["stream"].clone())
                     .or_default()
                     .push((t, d)),
-                "events" => p
-                    .events
-                    .entry(d.get("camera").cloned().unwrap_or_default())
-                    .or_default()
-                    .push((t, d)),
-                "root" => p
-                    .roots
-                    .entry(d.get("root").cloned().unwrap_or_default())
-                    .or_default()
-                    .push((t, d)),
-                "writer" => p.writer.push((t, d)),
-                "catalog" => p.catalog.push((t, d)),
-                _ => p.process.push((t, d)),
+                "events"
+                    if d.get("camera").is_some_and(|v| !v.is_empty())
+                        && d.get("source").is_some_and(|v| !v.is_empty()) =>
+                {
+                    p.events
+                        .entry((d["camera"].clone(), d["source"].clone()))
+                        .or_default()
+                        .push((t, d));
+                }
+                "root" if d.get("root").is_some_and(|v| !v.is_empty()) => {
+                    p.roots.entry(d["root"].clone()).or_default().push((t, d));
+                }
+                "writer" if d.contains_key("fragments") => p.writer.push((t, d)),
+                "catalog" if d.contains_key("segments") && d.contains_key("gib") => {
+                    p.catalog.push((t, d));
+                }
+                "process" => p.process.push((t, d)),
+                _ => p.other.push(line.clone()),
             }
         } else if NOTABLE.iter().any(|prefix| l.rest.starts_with(prefix)) {
             p.notable.push(format!("{} {} {}", l.ts, l.level, l.rest));
@@ -112,12 +126,12 @@ pub fn render(p: &Parsed, out: &mut impl Write) -> std::io::Result<()> {
         )?;
         writeln!(
             out,
-            "cpu_pct min={:.2} mean={:.2} max={:.2}  rss_mib min={:.1} max={:.1}  loop_lag_max_ms={}  retention_max_ms={}  fds_max={}",
-            cpu.iter().copied().fold(f64::INFINITY, f64::min),
-            mean(&cpu).unwrap_or(0.0),
-            cpu.iter().copied().fold(f64::NEG_INFINITY, f64::max),
-            rss.iter().copied().fold(f64::INFINITY, f64::min),
-            rss.iter().copied().fold(f64::NEG_INFINITY, f64::max),
+            "cpu_pct min={} mean={} max={}  rss_mib min={} max={}  loop_lag_max_ms={}  retention_max_ms={}  fds_max={}",
+            fmt(cpu.iter().copied().reduce(f64::min), 2),
+            fmt(mean(&cpu), 2),
+            fmt(cpu.iter().copied().reduce(f64::max), 2),
+            fmt(rss.iter().copied().reduce(f64::min), 1),
+            fmt(rss.iter().copied().reduce(f64::max), 1),
             fmt(col_max(&p.process, "loop_lag_max_ms"), 0),
             fmt(col_max(&p.process, "retention_max_ms"), 0),
             fmt(col_max(&p.process, "fds"), 0),
@@ -169,13 +183,16 @@ pub fn render(p: &Parsed, out: &mut impl Write) -> std::io::Result<()> {
     if let Some(last) = p.catalog.last() {
         writeln!(
             out,
-            "catalog txn_p99_max_ms={} txn_max_ms={} query_max_ms={} wait_max_ms={} event_commit_p99_max_ms={} batch_peak={}",
+            "catalog txn_p99_max_ms={} txn_max_ms={} query_max_ms={} wait_max_ms={} event_commit_p99_max_ms={} event_commit_max_ms={} batch_peak={} queue_peak={} queue_mib_peak={}",
             fmt(col_max(&p.catalog, "txn_p99_ms"), 1),
             fmt(col_max(&p.catalog, "txn_max_ms"), 1),
             fmt(col_max(&p.catalog, "query_max_ms"), 1),
             fmt(col_max(&p.catalog, "wait_max_ms"), 1),
             fmt(col_max(&p.catalog, "event_commit_p99_ms"), 1),
+            fmt(col_max(&p.catalog, "event_commit_max_ms"), 1),
             fmt(col_max(&p.catalog, "batch_peak"), 0),
+            fmt(col_max(&p.catalog, "queue_peak"), 0),
+            fmt(col_max(&p.catalog, "queue_mib_peak"), 1),
         )?;
         writeln!(
             out,
@@ -183,7 +200,25 @@ pub fn render(p: &Parsed, out: &mut impl Write) -> std::io::Result<()> {
             pairs(
                 &last.1,
                 &[
-                    "segments", "gib", "events", "db_mib", "wal_mib", "batches", "failures"
+                    "segments",
+                    "gib",
+                    "events",
+                    "event_mib",
+                    "retained_events",
+                    "pruned_events",
+                    "db_mib",
+                    "wal_mib",
+                    "queued",
+                    "queue_mib",
+                    "coalesced",
+                    "rejected",
+                    "rejected_events",
+                    "rejected_progress",
+                    "rejected_queries",
+                    "rejected_critical",
+                    "reconcile_required",
+                    "batches",
+                    "failures"
                 ]
             )
         )?;
@@ -196,9 +231,9 @@ pub fn render(p: &Parsed, out: &mut impl Write) -> std::io::Result<()> {
         if let Some(last) = rows.last() {
             writeln!(
                 out,
-                "root {root} free_pct min={:.1} max={:.1} last_free_gib={}",
-                free.iter().copied().fold(f64::INFINITY, f64::min),
-                free.iter().copied().fold(f64::NEG_INFINITY, f64::max),
+                "root {root} free_pct min={} max={} last_free_gib={}",
+                fmt(free.iter().copied().reduce(f64::min), 1),
+                fmt(free.iter().copied().reduce(f64::max), 1),
                 get(&last.1, "free_gib")
             )?;
         }
@@ -210,14 +245,22 @@ pub fn render(p: &Parsed, out: &mut impl Write) -> std::io::Result<()> {
     )?;
     for (name, rows) in &p.streams {
         let r = rates(rows);
-        let Some(med) = median(&r) else { continue };
-        let stalls = r.iter().filter(|&&x| x < 0.5 * med).count();
+        let positive = r
+            .iter()
+            .copied()
+            .filter(|rate| *rate > 0.0)
+            .collect::<Vec<_>>();
+        let med = median(&positive).unwrap_or(0.0);
+        let stalls = r
+            .iter()
+            .filter(|&&rate| rate <= 0.0 || (med > 0.0 && rate < 0.5 * med))
+            .count();
         let f = &rows.last().expect("rates imply rows").1;
         writeln!(
             out,
-            "{name:16} {med:7.2} {:7.2} {:7.2} {stalls:6} {:>7} {:>9} {:>6} {:>4} {:>4} {:>5} {:>4} {:>6} {:>8} {}",
-            r.iter().copied().fold(f64::INFINITY, f64::min),
-            r.iter().copied().fold(f64::NEG_INFINITY, f64::max),
+            "{name:16} {med:7.2} {:>7} {:>7} {stalls:6} {:>7} {:>9} {:>6} {:>4} {:>4} {:>5} {:>4} {:>6} {:>8} {}",
+            fmt(r.iter().copied().reduce(f64::min), 2),
+            fmt(r.iter().copied().reduce(f64::max), 2),
             get(f, "frames"),
             get(f, "fragments"),
             get(f, "reconnects"),
@@ -234,13 +277,13 @@ pub fn render(p: &Parsed, out: &mut impl Write) -> std::io::Result<()> {
     if !p.events.is_empty() {
         writeln!(
             out,
-            "\nevents camera  events messages reconnects renewals errors idle_max pull_p99_max connected"
+            "\nevents camera       source             events messages reconnects renewals errors idle_max pull_p99_max pull_max connected"
         )?;
-        for (cam, rows) in &p.events {
+        for ((camera, source), rows) in &p.events {
             let f = &rows.last().expect("non-empty").1;
             writeln!(
                 out,
-                "{cam:13} {:>7} {:>8} {:>10} {:>8} {:>6} {:>8} {:>12} {}",
+                "{camera:12} {source:18} {:>7} {:>8} {:>10} {:>8} {:>6} {:>8} {:>12} {:>8} {}",
                 get(f, "events"),
                 get(f, "messages"),
                 get(f, "reconnects"),
@@ -248,6 +291,7 @@ pub fn render(p: &Parsed, out: &mut impl Write) -> std::io::Result<()> {
                 get(f, "errors"),
                 fmt(col_max(rows, "idle_s"), 1),
                 fmt(col_max(rows, "pull_p99_ms"), 1),
+                fmt(col_max(rows, "pull_max_ms"), 1),
                 get(f, "connected"),
             )?;
         }
@@ -323,12 +367,107 @@ fn truncate(s: &str, max: usize) -> &str {
 pub fn run(args: &Args) -> anyhow::Result<()> {
     let file = std::fs::File::open(&args.log)
         .with_context(|| format!("opening {}", args.log.display()))?;
-    let lines = BufReader::new(file).lines().map_while(Result::ok);
-    let parsed = parse(lines);
+    let lines = BufReader::new(file)
+        .lines()
+        .enumerate()
+        .map(|(line, result)| {
+            result.with_context(|| format!("reading {} line {}", args.log.display(), line + 1))
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    let parsed = parse(lines.into_iter());
     let stdout = std::io::stdout();
     let mut out = std::io::BufWriter::new(stdout.lock());
     match render(&parsed, &mut out) {
         Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
         other => other.context("writing the summary"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn event_rows_remain_separate_by_camera_and_source() {
+        let parsed = parse(
+            concat!(
+                "2026-11-01T00:00:00Z INFO events camera=cam1 source=dahua_cgi events=10 messages=11 reconnects=1 renewals=0 errors=0 connected=true\n",
+                "2026-11-01T00:00:01Z INFO events camera=cam1 source=onvif_pull_point events=2 messages=4 reconnects=3 renewals=1 errors=2 connected=false\n",
+                "2026-11-01T00:00:02Z INFO events camera=cam1 source=dahua_cgi events=12 messages=13 reconnects=1 renewals=0 errors=0 connected=true\n",
+                "2026-11-01T00:00:03Z INFO events camera=cam1 source=onvif_pull_point events=1 messages=2 reconnects=0 renewals=0 errors=0 connected=true\n",
+            )
+            .lines()
+            .map(str::to_owned),
+        );
+        assert_eq!(parsed.events.len(), 2);
+        assert_eq!(
+            parsed.events[&("cam1".to_owned(), "dahua_cgi".to_owned())].len(),
+            2
+        );
+        assert_eq!(
+            parsed.events[&("cam1".to_owned(), "onvif_pull_point".to_owned())].len(),
+            2
+        );
+
+        let mut output = Vec::new();
+        render(&parsed, &mut output).unwrap();
+        let output = String::from_utf8(output).unwrap();
+        let dahua = output
+            .lines()
+            .find(|line| line.contains("dahua_cgi"))
+            .unwrap();
+        let onvif = output
+            .lines()
+            .find(|line| line.contains("onvif_pull_point"))
+            .unwrap();
+        assert_eq!(
+            dahua.split_whitespace().collect::<Vec<_>>(),
+            [
+                "cam1",
+                "dahua_cgi",
+                "12",
+                "13",
+                "1",
+                "0",
+                "0",
+                "-",
+                "-",
+                "-",
+                "true"
+            ]
+        );
+        assert_eq!(
+            onvif.split_whitespace().collect::<Vec<_>>(),
+            [
+                "cam1",
+                "onvif_pull_point",
+                "1",
+                "2",
+                "0",
+                "0",
+                "0",
+                "-",
+                "-",
+                "-",
+                "true"
+            ]
+        );
+    }
+
+    #[test]
+    fn missing_numeric_series_never_render_as_infinity() {
+        let parsed = parse(
+            concat!(
+                "2026-11-01T00:00:00Z INFO process threads=1\n",
+                "2026-11-01T00:00:00Z INFO stream stream=cam1/main frames=1\n",
+            )
+            .lines()
+            .map(str::to_owned),
+        );
+        let mut output = Vec::new();
+        render(&parsed, &mut output).unwrap();
+        let output = String::from_utf8(output).unwrap();
+        assert!(!output.contains("inf"));
+        assert!(output.contains("cpu_pct min=- mean=- max=-"));
     }
 }

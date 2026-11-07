@@ -19,9 +19,9 @@ const BUCKETS: usize = BOUNDS_US.len() + 1;
 #[derive(Debug, Default)]
 pub struct Histogram {
     buckets: [AtomicU64; BUCKETS],
-    count: AtomicU64,
     sum_us: AtomicU64,
     max_us: AtomicU64,
+    interval_max_us: AtomicU64,
 }
 
 impl Histogram {
@@ -38,26 +38,28 @@ impl Histogram {
             .iter()
             .position(|&bound| us <= bound)
             .unwrap_or(BOUNDS_US.len());
-        self.buckets[index].fetch_add(1, Ordering::Relaxed);
-        self.count.fetch_add(1, Ordering::Relaxed);
         self.sum_us.fetch_add(us, Ordering::Relaxed);
         self.max_us.fetch_max(us, Ordering::Relaxed);
+        self.interval_max_us.fetch_max(us, Ordering::Relaxed);
+        // Publish the sample only after its non-resetting open-bucket bound.
+        self.buckets[index].fetch_add(1, Ordering::Release);
     }
 
-    /// Copies the counters.
+    /// Copies the counters. Bucket samples define the count and percentile ranks;
+    /// concurrent updates can skew the mean and interval cutoff.
     #[must_use]
     pub fn snapshot(&self) -> HistogramSnapshot {
         HistogramSnapshot {
-            buckets: std::array::from_fn(|i| self.buckets[i].load(Ordering::Relaxed)),
-            count: self.count.load(Ordering::Relaxed),
+            buckets: std::array::from_fn(|i| self.buckets[i].load(Ordering::Acquire)),
             sum_us: self.sum_us.load(Ordering::Relaxed),
             max_us: self.max_us.load(Ordering::Relaxed),
         }
     }
 
     /// The largest duration recorded since the previous call, which this call resets.
+    /// Only one reporter may call this; cumulative percentile bounds are not reset.
     pub fn take_max(&self) -> Duration {
-        Duration::from_micros(self.max_us.swap(0, Ordering::Relaxed))
+        Duration::from_micros(self.interval_max_us.swap(0, Ordering::Relaxed))
     }
 }
 
@@ -65,7 +67,6 @@ impl Histogram {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct HistogramSnapshot {
     buckets: [u64; BUCKETS],
-    count: u64,
     sum_us: u64,
     max_us: u64,
 }
@@ -74,10 +75,11 @@ impl HistogramSnapshot {
     /// Durations counted.
     #[must_use]
     pub fn count(&self) -> u64 {
-        self.count
+        self.buckets.iter().sum()
     }
 
-    /// The largest duration counted, or zero when empty.
+    /// The cumulative maximum observed while copying the counters. This bound
+    /// can include samples outside a [`Self::since`] interval or still being published.
     #[must_use]
     pub fn max(&self) -> Duration {
         Duration::from_micros(self.max_us)
@@ -87,7 +89,7 @@ impl HistogramSnapshot {
     #[must_use]
     pub fn mean(&self) -> Duration {
         self.sum_us
-            .checked_div(self.count)
+            .checked_div(self.count())
             .map_or(Duration::ZERO, Duration::from_micros)
     }
 
@@ -97,7 +99,6 @@ impl HistogramSnapshot {
     pub fn since(&self, earlier: &Self) -> Self {
         Self {
             buckets: std::array::from_fn(|i| self.buckets[i].saturating_sub(earlier.buckets[i])),
-            count: self.count.saturating_sub(earlier.count),
             sum_us: self.sum_us.saturating_sub(earlier.sum_us),
             max_us: self.max_us,
         }
@@ -107,12 +108,13 @@ impl HistogramSnapshot {
     /// holds that sample, or the maximum when it fell in the open bucket. Zero when empty.
     #[must_use]
     pub fn percentile(&self, p: f64) -> Duration {
-        if self.count == 0 {
+        let count = self.count();
+        if count == 0 {
             return Duration::ZERO;
         }
         let fraction = p.clamp(0.0, 100.0) / 100.0;
         // Rank from 1 to count; the cast keeps the ceiling exact below 2^53 samples.
-        let rank = (fraction * self.count as f64).ceil().max(1.0) as u64;
+        let rank = (fraction * count as f64).ceil().max(1.0) as u64;
         let mut seen = 0u64;
         for (index, &n) in self.buckets.iter().enumerate() {
             seen += n;
@@ -158,6 +160,54 @@ impl Peak {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn open_bucket_bound_survives_interval_maximum_reset() {
+        let h = Histogram::new();
+        let earlier = h.snapshot();
+        h.record(Duration::from_secs(20));
+        assert_eq!(h.take_max(), Duration::from_secs(20));
+        let delta = h.snapshot().since(&earlier);
+        assert_eq!(delta.count(), 1);
+        assert!(delta.percentile(99.0) >= Duration::from_secs(20));
+        assert_eq!(h.take_max(), Duration::ZERO);
+    }
+
+    #[test]
+    fn snapshot_counts_follow_published_buckets() {
+        let h = Histogram::new();
+        h.record(Duration::from_micros(50));
+        let earlier = h.snapshot();
+        // Pause a producer after bucket publication while independent aggregates lag.
+        h.max_us.fetch_max(20_000_000, Ordering::Relaxed);
+        h.buckets[BUCKETS - 1].fetch_add(1, Ordering::Release);
+        let delta = h.snapshot().since(&earlier);
+        assert_eq!(delta.count(), 1);
+        assert_eq!(delta.percentile(99.0), Duration::from_secs(20));
+    }
+
+    #[test]
+    fn concurrent_reporting_preserves_open_bucket_bounds() {
+        let h = Histogram::new();
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                for _ in 0..10_000 {
+                    h.record(Duration::from_secs(20));
+                }
+            });
+            let mut earlier = HistogramSnapshot::default();
+            for _ in 0..10_000 {
+                let snapshot = h.snapshot();
+                let delta = snapshot.since(&earlier);
+                if delta.count() > 0 {
+                    assert!(delta.percentile(99.0) >= Duration::from_secs(20));
+                }
+                h.take_max();
+                earlier = snapshot;
+            }
+        });
+        assert_eq!(h.snapshot().count(), 10_000);
+    }
 
     #[test]
     fn durations_land_in_logarithmic_buckets() {

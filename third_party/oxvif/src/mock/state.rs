@@ -1,0 +1,4437 @@
+//! In-memory mock device state.
+
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
+use std::sync::RwLock;
+
+// ── Device State ────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeviceState {
+    #[serde(default = "default_device_info")]
+    pub info: DeviceInfo,
+    #[serde(default = "default_hostname")]
+    pub hostname: String,
+    #[serde(default)]
+    pub hostname_from_dhcp: bool,
+    #[serde(default = "default_users")]
+    pub users: Vec<MockUser>,
+    #[serde(default = "default_scopes")]
+    pub scopes: Vec<String>,
+    #[serde(default = "default_tz")]
+    pub timezone: String,
+    #[serde(default)]
+    pub daylight_savings: bool,
+    #[serde(default = "default_dns")]
+    pub dns: DnsState,
+    #[serde(default = "default_ntp")]
+    pub ntp: NtpState,
+    #[serde(default = "default_gateway")]
+    pub gateway_ipv4: Vec<String>,
+    #[serde(default = "default_discovery_mode")]
+    pub discovery_mode: String,
+    #[serde(default = "default_imaging_sources")]
+    pub imaging_sources: Vec<ImagingState>,
+    #[serde(default = "default_ptz")]
+    pub ptz: PtzState,
+    #[serde(default = "default_ptz_nodes")]
+    pub ptz_nodes: Vec<PtzNodeEntry>,
+    #[serde(default = "default_ptz_configs")]
+    pub ptz_configs: Vec<PtzConfigEntry>,
+    #[serde(default = "default_interface")]
+    pub interface: NetworkInterfaceState,
+    #[serde(default = "default_protocols")]
+    pub protocols: Vec<NetworkProtocolState>,
+    #[serde(default = "default_osd")]
+    pub osd: OsdState,
+    #[serde(default = "default_profiles")]
+    pub profiles: ProfilesState,
+    #[serde(default = "default_recording")]
+    pub recording: RecordingState,
+    #[serde(default = "default_video_sources")]
+    pub video_sources: Vec<VideoSourceEntry>,
+    #[serde(default = "default_video_source_configs")]
+    pub video_source_configs: Vec<VideoSourceConfigEntry>,
+    #[serde(default = "default_video_encoders")]
+    pub video_encoders: Vec<VideoEncoderState>,
+    #[serde(default = "default_relay_outputs")]
+    pub relay_outputs: Vec<RelayOutputState>,
+    #[serde(default = "default_digital_inputs")]
+    pub digital_inputs: Vec<DigitalInputState>,
+    #[serde(default = "default_storage")]
+    pub storage: Vec<StorageEntry>,
+    #[serde(default = "default_metadata")]
+    pub metadata: Vec<MetadataEntry>,
+    #[serde(default = "default_audio_sources")]
+    pub audio_sources: Vec<AudioSourceEntry>,
+    #[serde(default = "default_audio_source_configs")]
+    pub audio_source_configs: Vec<AudioSourceConfigEntry>,
+    #[serde(default = "default_audio_encoders")]
+    pub audio_encoders: Vec<AudioEncoderEntry>,
+    #[serde(default = "default_audio_outputs")]
+    pub audio_outputs: Vec<AudioOutputEntry>,
+    #[serde(default = "default_audio_decoders")]
+    pub audio_decoders: Vec<AudioDecoderEntry>,
+    /// Monotonic event counter for the pull-point stream (per-instance,
+    /// not persisted). Replaces the former process-global `EVENT_SEQ`.
+    #[serde(skip)]
+    pub event_seq: u64,
+    /// Active pull-point topic filter, set by CreatePullPointSubscription
+    /// (per-instance, not persisted). `None` = emit every topic.
+    #[serde(skip)]
+    pub event_filter: Option<Vec<String>>,
+    /// Pending events emitted out-of-band (e.g. by the
+    /// `/mock/digital-input/...` simulator endpoint) and surfaced on the
+    /// next `PullMessages` call. Per-instance, not persisted.
+    #[serde(skip)]
+    pub pending_io_events: Vec<PendingIoEvent>,
+}
+
+// ── Relay output / Digital input ──────────────────────────────────────────────
+//
+// Real cameras expose 0–2 of each on the Device service. The mock seeds two
+// of each so callers exercise both single-port and multi-port flows. The
+// `logical_state` field on `RelayOutputState` is what `SetRelayOutputState`
+// writes (active/inactive); `GetRelayOutputs` by spec doesn't return it,
+// but the mock keeps it for event emission and for tests that want to
+// assert the latched state after a Set call.
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RelayOutputState {
+    pub token: String,
+    /// `"Bistable"` (latching) or `"Monostable"` (timed pulse).
+    pub mode: String,
+    /// ISO 8601 duration for monostable mode, e.g. `"PT1S"`.
+    pub delay_time: String,
+    /// Idle electrical state: `"closed"` or `"open"`.
+    pub idle_state: String,
+    /// Current logical state — `"active"` or `"inactive"`. Updated by
+    /// `SetRelayOutputState`. The mock's monostable handler does NOT
+    /// auto-revert (a real device would, but that needs a timer the
+    /// mock doesn't run); callers wanting that flow should use the
+    /// `/mock/relay-output/.../pulse` REST hook.
+    #[serde(default = "default_logical_inactive")]
+    pub logical_state: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DigitalInputState {
+    pub token: String,
+    /// Idle electrical state: `"closed"` or `"open"`. Empty when the
+    /// firmware omits the attribute.
+    pub idle_state: String,
+    /// Current logical state — `"active"` or `"inactive"`. Flipped by
+    /// the `/mock/digital-input/.../pulse|set` REST endpoint to simulate
+    /// sensor signals. Drives PullPoint event emission.
+    #[serde(default = "default_logical_inactive")]
+    pub logical_state: String,
+}
+
+// ── Storage ───────────────────────────────────────────────────────────────────
+
+/// One storage location, as returned by `GetStorageConfigurations` and
+/// written by `SetStorageConfiguration`.
+///
+/// The field set is exactly what `crate::types::StorageConfiguration` parses,
+/// so every field the client can read is a field the mock can store. Before
+/// 0.15 this whole family was a single static fixture that emitted `token`,
+/// `Data/@type` and `LocalPath` only — `storage_uri` and `user` were the
+/// "storage credential fields" of the audit's Tier 4.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StorageEntry {
+    pub token: String,
+    /// `"LocalStorage"`, `"NFS"`, `"CIFS"` — the `type` attribute of `Data`.
+    pub storage_type: String,
+    /// Mount path on the device. Empty for a share addressed only by URI.
+    pub local_path: String,
+    /// Network URI for NFS / CIFS shares. Empty for local storage.
+    pub storage_uri: String,
+    /// Username for an authenticated share. Empty when none is configured.
+    ///
+    /// The password is **deliberately not modelled**. `tt:UserCredential` has a
+    /// `Password` element, but `StorageConfiguration` does not parse it and no
+    /// getter could return it, so storing it would be write-only state that
+    /// nothing can observe — and a mock that holds a password it never uses is
+    /// a worse default than one that visibly does not.
+    pub user: String,
+}
+
+// ── Metadata (Media2) ─────────────────────────────────────────────────────────
+
+/// One Media2 metadata stream configuration.
+///
+/// The field set is what `crate::types::MetadataConfiguration` parses, plus the
+/// two `tt:PTZStatusFilterOptions` booleans, which belong to the *options*
+/// answer rather than the configuration itself — `GetMetadataConfigurationOptions`
+/// is addressed by the same token, so without a per-entry value it could not
+/// discriminate.
+///
+/// Retains complete multicast and required session timeout. Older flattened
+/// snapshots require explicit migration from known complete values. AutoStart
+/// is readonly; the synthetic device does not implement persistent RTP.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MetadataEntry {
+    pub token: String,
+    pub name: String,
+    pub use_count: u32,
+    pub analytics: bool,
+    pub ptz_status: bool,
+    pub ptz_position: bool,
+    /// Full configured multicast value; AutoStart is a readonly indication.
+    pub multicast: MulticastEntry,
+    /// Required wire duration; deprecated and ignored by Media2 setters.
+    pub session_timeout: String,
+    /// Reported as `Options/PTZStatusFilterOptions/PanTiltStatusSupported`.
+    pub pan_tilt_status_supported: bool,
+    /// Reported as `Options/PTZStatusFilterOptions/ZoomStatusSupported`.
+    pub zoom_status_supported: bool,
+}
+
+/// One-shot event emitted by the IO simulator endpoint and consumed by
+/// the next `PullMessages` call. Distinct from the regular periodic
+/// event stream (`event_seq`) — these are demand-driven.
+#[derive(Debug, Clone)]
+pub struct PendingIoEvent {
+    /// `"DigitalInput"` or `"RelayOutput"`. Maps to the
+    /// `tns1:Device/Trigger/{this}` PullPoint topic.
+    pub kind: &'static str,
+    pub token: String,
+    /// `"active"` or `"inactive"`.
+    pub logical_state: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NetworkInterfaceState {
+    pub token: String,
+    pub name: String,
+    pub mac: String,
+    pub mtu: u32,
+    pub enabled: bool,
+    pub ipv4_from_dhcp: bool,
+    pub ipv4_address: String,
+    pub ipv4_prefix_length: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NetworkProtocolState {
+    pub name: String,
+    pub enabled: bool,
+    pub ports: Vec<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeviceInfo {
+    pub manufacturer: String,
+    pub model: String,
+    pub firmware_version: String,
+    pub serial_number: String,
+    pub hardware_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MockUser {
+    pub username: String,
+    pub level: String,
+    /// Plaintext password used to validate WS-Security digests.
+    /// `#[serde(default)]` keeps older state files (pre-per-user-auth)
+    /// loadable; those users get a blank password until re-set.
+    #[serde(default)]
+    pub password: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DnsState {
+    pub from_dhcp: bool,
+    pub servers: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NtpState {
+    pub from_dhcp: bool,
+    pub servers: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PtzPreset {
+    pub token: String,
+    pub name: String,
+    pub pan: f32,
+    pub tilt: f32,
+    pub zoom: f32,
+}
+
+/// One stop on a mock preset tour. `preset_token` is the only stop kind the
+/// mock stores — `Home` and explicit positions parse fine on the client side
+/// but are not something this device offers, and inventing them here would
+/// make the mock claim a capability it does not honour.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PtzTourSpot {
+    pub preset_token: String,
+    pub stay_time: String,
+}
+
+/// A stored preset tour. Created empty by `CreatePresetTour`, filled in by
+/// `ModifyPresetTour`, and walked by `OperatePresetTour` — which moves `state`
+/// only, since the mock has no clock to tour on.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PtzTour {
+    pub token: String,
+    pub name: String,
+    /// `Idle`, `Touring` or `Paused`.
+    pub state: String,
+    pub auto_start: bool,
+    pub random_preset_order: bool,
+    pub recurring_time: Option<u32>,
+    pub direction: String,
+    pub spots: Vec<PtzTourSpot>,
+}
+
+/// PTZ state for **one** media profile.
+///
+/// Every PTZ operation that moves or reads the head takes a `ProfileToken`, so
+/// on a multi-head device there is one of these per profile and none of them is
+/// "the device's" position. Same reasoning as [`ImagingState`] and the video
+/// encoder catalogue: with a single global copy, a handler that ignores the
+/// token is indistinguishable from one that reads it, and every test of
+/// "does my code address the right head?" passes against a mock that never
+/// looked.
+///
+/// Until 0.15 this *was* the whole of `PtzState` — one position, one preset
+/// list, one tour list for the entire device — and **no PTZ handler read the
+/// `ProfileToken`**: 16 of the 27 dispatch arms never received the request body,
+/// and the 11 that did read something else out of it. The client sent
+/// `ProfileToken` at 20 call sites. `docs/active/mock-audit-2026-07.md` §4.1.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PtzChannel {
+    pub pan: f32,
+    pub tilt: f32,
+    pub zoom: f32,
+    pub home_pan: f32,
+    pub home_tilt: f32,
+    pub home_zoom: f32,
+    pub presets: Vec<PtzPreset>,
+    #[serde(default)]
+    pub tours: Vec<PtzTour>,
+}
+
+impl Default for PtzChannel {
+    /// A head parked at the origin with nothing stored. This is what a profile
+    /// with no seeded channel gets on first use.
+    fn default() -> Self {
+        Self {
+            pan: 0.0,
+            tilt: 0.0,
+            zoom: 0.0,
+            home_pan: 0.0,
+            home_tilt: 0.0,
+            home_zoom: 0.0,
+            presets: Vec::new(),
+            tours: Vec::new(),
+        }
+    }
+}
+
+/// The device's PTZ heads, keyed by **PTZ node token**.
+///
+/// It was keyed by *profile* token until this change, which made the main and
+/// the sub stream of one lens two independent heads: moving `Profile_1` left
+/// `Profile_2` where it was, though both address the same physical motor. No
+/// camera behaves that way. A profile now reaches a head through its PTZ
+/// configuration — see [`PtzConfigEntry`] — and the two streams of one lens
+/// share one [`PtzChannel`].
+///
+/// `BTreeMap` rather than `HashMap` so a serialised snapshot is stable.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PtzState {
+    #[serde(default = "default_ptz_channels")]
+    pub channels: BTreeMap<String, PtzChannel>,
+}
+
+impl PtzState {
+    /// The channel for PTZ node `node`, or `None` if it has never been touched
+    /// and was not seeded. Read paths render an empty head rather than
+    /// faulting — a head with no presets is a legitimate device state.
+    pub fn channel(&self, node: &str) -> Option<&PtzChannel> {
+        self.channels.get(node)
+    }
+
+    /// The channel for PTZ node `node`, created empty if absent. Write paths
+    /// use this so a seeded state that lists nodes but no PTZ channels still
+    /// works.
+    pub fn channel_mut(&mut self, node: &str) -> &mut PtzChannel {
+        self.channels.entry(node.to_string()).or_default()
+    }
+}
+
+// ── PTZ nodes, configurations and coordinate spaces ───────────────────────────
+//
+// A PTZ *node* is the physical head; a PTZ *configuration* is a profile-facing
+// view of one. A media profile reaches a head only through a configuration:
+//
+//     ProfileToken → ProfileEntry.ptz_config_token → PtzConfigEntry.node_token
+//
+// Until this change the mock modelled neither. `GetNodes`, `GetNode`,
+// `GetConfigurations`, `GetConfiguration`, `GetCompatibleConfigurations` and
+// `GetConfigurationOptions` were string literals whose handlers did not receive
+// the request body at all, so all four profiles were told about one node and
+// one configuration, `SupportedPTZSpaces` was sent as an empty element, and
+// `PtzNode::pan_tilt_spaces` / `zoom_spaces` were `Vec::new()` forever.
+// `docs/active/ptz-wiring-plan-2026-07.md` §2.1 and §2.2.
+
+/// Which of the eight `tt:PTZSpaces` slots a [`SpaceEntry`] fills.
+///
+/// Variant order is the schema's sequence order and [`SpaceKind::ALL`] renders
+/// in it. **Only three slots are two-dimensional** — `PanTiltSpeedSpace` is a
+/// `tt:Space1DDescription` despite being a pan/tilt slot, because a combined
+/// pan/tilt *speed* is one non-negative scalar with no direction in it
+/// (`onvif.xsd`, `tt:PTZSpaces`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SpaceKind {
+    AbsolutePanTiltPosition,
+    AbsoluteZoomPosition,
+    RelativePanTiltTranslation,
+    RelativeZoomTranslation,
+    ContinuousPanTiltVelocity,
+    ContinuousZoomVelocity,
+    PanTiltSpeed,
+    ZoomSpeed,
+}
+
+impl SpaceKind {
+    /// Every slot, in `tt:PTZSpaces` sequence order.
+    pub const ALL: [SpaceKind; 8] = [
+        SpaceKind::AbsolutePanTiltPosition,
+        SpaceKind::AbsoluteZoomPosition,
+        SpaceKind::RelativePanTiltTranslation,
+        SpaceKind::RelativeZoomTranslation,
+        SpaceKind::ContinuousPanTiltVelocity,
+        SpaceKind::ContinuousZoomVelocity,
+        SpaceKind::PanTiltSpeed,
+        SpaceKind::ZoomSpeed,
+    ];
+
+    /// The `tt:` element name this slot renders as.
+    pub fn element(self) -> &'static str {
+        match self {
+            SpaceKind::AbsolutePanTiltPosition => "AbsolutePanTiltPositionSpace",
+            SpaceKind::AbsoluteZoomPosition => "AbsoluteZoomPositionSpace",
+            SpaceKind::RelativePanTiltTranslation => "RelativePanTiltTranslationSpace",
+            SpaceKind::RelativeZoomTranslation => "RelativeZoomTranslationSpace",
+            SpaceKind::ContinuousPanTiltVelocity => "ContinuousPanTiltVelocitySpace",
+            SpaceKind::ContinuousZoomVelocity => "ContinuousZoomVelocitySpace",
+            SpaceKind::PanTiltSpeed => "PanTiltSpeedSpace",
+            SpaceKind::ZoomSpeed => "ZoomSpeedSpace",
+        }
+    }
+}
+
+/// One entry in a node's `SupportedPTZSpaces`.
+///
+/// Renders as `tt:Space2DDescription` when `y_range` is set and
+/// `tt:Space1DDescription` when it is not — the schema picks per slot, so the
+/// two must agree (see [`SpaceKind`]).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SpaceEntry {
+    pub kind: SpaceKind,
+    pub uri: String,
+    pub x_range: (f32, f32),
+    pub y_range: Option<(f32, f32)>,
+}
+
+/// One physical PTZ head (`tptz:GetNodes` / `GetNode`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PtzNodeEntry {
+    pub token: String,
+    pub name: String,
+    pub fixed_home_position: bool,
+    pub home_supported: bool,
+    pub max_presets: u32,
+    #[serde(default)]
+    pub aux_commands: Vec<String>,
+    /// The four pan/tilt slots. **Empty means a zoom-only head** — that is what
+    /// makes a pan/tilt move on `PTZNode_2` refusable.
+    #[serde(default)]
+    pub pan_tilt_spaces: Vec<SpaceEntry>,
+    #[serde(default)]
+    pub zoom_spaces: Vec<SpaceEntry>,
+}
+
+impl PtzNodeEntry {
+    /// Does this head declare the given space slot?
+    ///
+    /// Asked before a move: a head with no `AbsolutePanTiltPositionSpace`
+    /// cannot honour an `AbsoluteMove` that carries a `PanTilt` vector, and
+    /// answering `Ok` would be the mock telling a caller their code works on
+    /// hardware where it does not.
+    pub fn supports(&self, kind: SpaceKind) -> bool {
+        self.pan_tilt_spaces
+            .iter()
+            .chain(self.zoom_spaces.iter())
+            .any(|s| s.kind == kind)
+    }
+}
+
+/// One PTZ configuration (`tptz:GetConfigurations` / `GetConfiguration`).
+///
+/// The field set is what `crate::types::PtzConfiguration` parses, plus the
+/// `PTZTimeout` bounds `GetConfigurationOptions` answers with — those are
+/// per-configuration on a real device and were one static pair here.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PtzConfigEntry {
+    pub token: String,
+    pub name: String,
+    pub use_count: u32,
+    /// The [`PtzNodeEntry`] this configuration drives.
+    pub node_token: String,
+    pub default_ptz_timeout: Option<String>,
+    /// `DefaultAbsolutePantTiltPositionSpace` — ONVIF's spelling, `Pant`.
+    pub abs_pan_tilt_space: Option<String>,
+    pub abs_zoom_space: Option<String>,
+    pub rel_pan_tilt_space: Option<String>,
+    pub rel_zoom_space: Option<String>,
+    pub cont_pan_tilt_space: Option<String>,
+    pub cont_zoom_space: Option<String>,
+    pub default_speed_pan_tilt: Option<(f32, f32)>,
+    pub default_speed_zoom: Option<f32>,
+    pub pan_tilt_limits: Option<SpaceEntry>,
+    pub zoom_limits: Option<SpaceEntry>,
+    /// `GetConfigurationOptions` → `PTZTimeout/Min`.
+    pub timeout_min: String,
+    /// `GetConfigurationOptions` → `PTZTimeout/Max`.
+    pub timeout_max: String,
+}
+
+// ── Audio ────────────────────────────────────────────────────────────────────
+//
+// The whole audio family was six string literals until 0.15 — the last Tier 3
+// entry in `docs/active/mock-audit-2026-07.md` §5. Two facts about it were
+// invisible while it was:
+//
+// 1. **Media1 and Media2 disagreed about the same tokens.** `ASC_1` was
+//    `AudioSourceConfig1` reading `AudioSource_1` on one service and
+//    `AudioSourceConfig` reading `AudioSrc_1` on the other; `AEC_1` was
+//    `AudioEncoder` and `AudioEncoderConfig`. Nothing failed, because
+//    `tests/mock_media1_media2_agree.rs` had no audio row — the audit's §5b
+//    divergence class, hiding inside its §5 stub class.
+// 2. **Both option responses had the wrong shape**, in opposite directions.
+//    See `services/media.rs::resp_audio_encoder_configuration_options`.
+
+/// A physical audio input (`tt:AudioSource`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AudioSourceEntry {
+    pub token: String,
+    /// `Channels` belongs **here**, not on an encoder configuration — the place
+    /// `crate::types::AudioEncoderConfiguration` looked for it until 0.15.
+    pub channels: u32,
+}
+
+/// `tt:AudioSourceConfiguration` — which input a profile listens to.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AudioSourceConfigEntry {
+    pub token: String,
+    pub name: String,
+    pub use_count: u32,
+    pub source_token: String,
+}
+
+/// One `(encoding, bitrates, sample rates)` row of a
+/// `GetAudioEncoderConfigurationOptions` answer.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AudioOptionEntry {
+    pub encoding: String,
+    pub bitrates: Vec<u32>,
+    pub sample_rates: Vec<u32>,
+}
+
+/// Multicast settings, as `tt:MulticastConfiguration` carries them.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MulticastEntry {
+    pub address: String,
+    pub port: u32,
+    pub ttl: u32,
+    pub auto_start: bool,
+}
+
+/// `tt:AudioEncoderConfiguration` / `tt:AudioEncoder2Configuration` — **one
+/// entry, rendered two ways.**
+///
+/// The two schema types are not a namespace variant of each other:
+///
+/// ```text
+/// Media1  Encoding, Bitrate, SampleRate, Multicast, SessionTimeout   both required
+/// Media2  Encoding, Multicast?, Bitrate, SampleRate                  no SessionTimeout
+/// ```
+///
+/// So the state is shared (`CLAUDE.md` step 5b) and each service renders its own
+/// sequence.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AudioEncoderEntry {
+    pub token: String,
+    pub name: String,
+    pub use_count: u32,
+    pub encoding: String,
+    pub bitrate: u32,
+    pub sample_rate: u32,
+    /// Required by the Media1 type, optional in the Media2 one.
+    #[serde(default)]
+    pub multicast: Option<MulticastEntry>,
+    /// Required by the Media1 type; **the Media2 type has no such member**, so
+    /// a Media2 write cannot express it and must not destroy it.
+    #[serde(default)]
+    pub session_timeout: Option<String>,
+    /// What `GetAudioEncoderConfigurationOptions` answers **for this
+    /// configuration**. It was one static pair for the whole device.
+    #[serde(default)]
+    pub options: Vec<AudioOptionEntry>,
+}
+
+/// `tt:AudioOutputConfiguration` — a speaker (Media2 only in oxvif).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AudioOutputEntry {
+    pub token: String,
+    pub name: String,
+    pub use_count: u32,
+    pub output_token: String,
+    pub output_level: u32,
+}
+
+/// `tt:AudioDecoderConfiguration` — a `ConfigurationEntity` and nothing more;
+/// the schema adds no members of its own.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AudioDecoderEntry {
+    pub token: String,
+    pub name: String,
+    pub use_count: u32,
+}
+
+/// Imaging state for **one** video source.
+///
+/// Every operation in the Imaging service takes a `VideoSourceToken`, so on a
+/// multi-sensor device there is one of these per lens and none of them is the
+/// device's answer. The mock holds a `Vec` for exactly the reason the video
+/// encoder catalogue does: with a single entry, a responder that ignores the
+/// token is indistinguishable from one that reads it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ImagingState {
+    /// Which sensor these settings belong to (`VS_1` / `VS_2`).
+    #[serde(default = "default_source_token")]
+    pub source_token: String,
+    pub brightness: f32,
+    pub color_saturation: f32,
+    pub contrast: f32,
+    pub sharpness: f32,
+    pub exposure_mode: String,
+    pub white_balance_mode: String,
+    pub backlight_compensation: String,
+    pub wide_dynamic_range_mode: String,
+    pub wide_dynamic_range_level: f32,
+    pub ir_cut_filter: String,
+    pub focus_mode: String,
+    /// Whether this lens has a motorised focus.
+    ///
+    /// A dual-sensor camera commonly pairs one motorised lens with one fixed
+    /// one, and the fixed one **faults** on `GetMoveOptions` / `Move` / `Stop`
+    /// rather than reporting a focus range it does not have. That asymmetry is
+    /// what lets a test tell "the device supports focus" apart from "*this
+    /// channel* supports focus" — a distinction a single-sensor fixture cannot
+    /// express at all.
+    #[serde(default = "default_true")]
+    pub focus_supported: bool,
+    /// Upper bound this sensor reports for brightness/saturation/contrast/
+    /// sharpness in `GetOptions`.
+    ///
+    /// Vendors genuinely differ per sensor here (0–100 on one, 0–255 on
+    /// another), and it gives the per-channel options test a single number to
+    /// assert rather than a structural difference.
+    #[serde(default = "default_level_max")]
+    pub level_max: f32,
+}
+
+// ── OSD state ───────────────────────────────────────────────────────────────
+//
+// OSDs are persisted by `(token, video_source_config_token)`. The mock
+// advertises per-type quotas in `GetOSDOptions` (Genetec/late-Hikvision
+// shape) and enforces them in `CreateOSD` — over-limit returns
+// `ter:InvalidArgs`. This lets clients exercise their quota-gate UI
+// against the mock instead of waiting for real-camera failures.
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OsdState {
+    pub osds: Vec<OsdEntry>,
+    /// Counter for tokens. Persists across restarts so deleted tokens
+    /// don't get reused (matches what real cameras do).
+    #[serde(default)]
+    pub next_token_id: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OsdEntry {
+    pub token: String,
+    pub video_source_config_token: String,
+    /// `"Text"` or `"Image"`.
+    pub osd_type: String,
+    /// `"UpperLeft"`, `"UpperRight"`, `"LowerLeft"`, `"LowerRight"`,
+    /// or `"Custom"` (uses `position_x`/`position_y`).
+    pub position_type: String,
+    #[serde(default)]
+    pub position_x: Option<f32>,
+    #[serde(default)]
+    pub position_y: Option<f32>,
+    /// Text-OSD payload — `Some` when `osd_type == "Text"`.
+    #[serde(default)]
+    pub text: Option<OsdTextEntry>,
+    /// Image-OSD URL — `Some` when `osd_type == "Image"`.
+    #[serde(default)]
+    pub image_path: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OsdTextEntry {
+    /// `"Plain"`, `"Date"`, `"Time"`, or `"DateAndTime"`.
+    pub text_type: String,
+    #[serde(default)]
+    pub plain_text: Option<String>,
+    #[serde(default)]
+    pub date_format: Option<String>,
+    #[serde(default)]
+    pub time_format: Option<String>,
+    #[serde(default)]
+    pub font_size: Option<u32>,
+    #[serde(default)]
+    pub font_color: Option<OsdColorEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OsdColorEntry {
+    pub x: f32,
+    pub y: f32,
+    pub z: f32,
+    #[serde(default)]
+    pub colorspace: Option<String>,
+    #[serde(default)]
+    pub transparent: Option<f32>,
+}
+
+/// Per-text-type OSD quotas. Matches what the mock advertises in
+/// `GetOSDOptionsResponse`. `CreateOSD` enforces these — over-limit
+/// returns a `ter:InvalidArgs` SOAP fault, mirroring Genetec's
+/// behaviour.
+pub const OSD_QUOTA_TOTAL: u32 = 8;
+pub const OSD_QUOTA_PLAIN: u32 = 7;
+pub const OSD_QUOTA_DATE: u32 = 1;
+pub const OSD_QUOTA_TIME: u32 = 1;
+pub const OSD_QUOTA_DATE_AND_TIME: u32 = 1;
+
+// ── Media profile state ─────────────────────────────────────────────────────
+//
+// Tracks the camera's media profile list. Real cameras seed two or
+// three "fixed" profiles (mainStream / subStream / sometimes thirdStream)
+// that can't be deleted, plus any user-created ones. The actual
+// configuration objects (VSC, VEC, etc.) referenced by the profile
+// stay hardcoded in `services/media.rs`'s render helpers — only the
+// attachment (which token is bound to which profile) is mutable.
+//
+// `CreateProfile` adds an entry with no configurations attached, matching
+// real-camera behaviour where the caller follows up with
+// `AddVideoSourceConfiguration` etc. to fill it in. `DeleteProfile`
+// refuses to remove `fixed=true` profiles (per ONVIF spec — returns
+// `ter:DeletionOfFixedProfile`).
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProfilesState {
+    pub profiles: Vec<ProfileEntry>,
+    /// Persisted search hint for generated tokens. Allocation skips occupied
+    /// identities under the write lock. The hint wraps at the u32 boundary;
+    /// uniqueness is guaranteed among current profiles, not historical deletions.
+    #[serde(default)]
+    pub next_token_id: u32,
+}
+
+// ── Recording / Search / Replay ─────────────────────────────────────────────
+//
+// Profile G, modelled on `ProfilesState` above for the same reason.
+//
+// Until 0.15 `grep -c recording src/mock/state.rs` was **0**: every one of the
+// eleven Recording operations was a static fixture, so `CreateRecording`
+// answered `Rec_new` and `GetRecordings` never listed it — the identical shape
+// to the reported Media2 `CreateProfile` bug, in a different service.
+// `docs/active/mock-audit-2026-07.md` §4.2.
+//
+// The consequence went past the mock — see the header of
+// `src/mock/services/recording.rs` for what the health check's Profile G
+// liveness chain was and was not proving against a fixture.
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RecordingState {
+    pub recordings: Vec<RecordingEntry>,
+    pub jobs: Vec<RecordingJobEntry>,
+    /// Counters for generated tokens, so a deleted token is never reused.
+    #[serde(default)]
+    pub next_recording_id: u32,
+    #[serde(default)]
+    pub next_track_id: u32,
+    #[serde(default)]
+    pub next_job_id: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RecordingEntry {
+    pub token: String,
+    pub source_id: String,
+    pub source_name: String,
+    pub location: String,
+    pub description: String,
+    /// `tt:RecordingSourceInformation/Address` — required by the schema and
+    /// read by [`RecordingSourceInformation::address`]. It had no home here
+    /// until 0.15.0, so `CreateRecording` accepted it and threw it away and
+    /// both getters dropped it: the `SetNetworkInterfaces`/`MTU` shape.
+    ///
+    /// [`RecordingSourceInformation::address`]: crate::RecordingSourceInformation::address
+    #[serde(default)]
+    pub address: String,
+    pub content: String,
+    pub maximum_retention_time: String,
+    #[serde(default)]
+    pub tracks: Vec<RecordingTrackEntry>,
+    /// Bounds reported by `FindRecordings` / `GetRecordingSearchResults`.
+    pub earliest: String,
+    pub latest: String,
+    /// `Initiated`, `Recording` or `Stopped`.
+    pub status: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RecordingTrackEntry {
+    pub token: String,
+    /// `Video`, `Audio` or `Metadata`.
+    pub track_type: String,
+    pub description: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RecordingJobEntry {
+    pub token: String,
+    pub recording_token: String,
+    /// `Active` or `Idle`.
+    pub mode: String,
+    pub priority: u32,
+    /// Media profile token this job records from.
+    pub source_token: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProfileEntry {
+    /// Literal profile identifier. Migrated Media and PTZ identity paths decode
+    /// request XML once and compare this value without trimming. Profile views
+    /// escape it on output; loading a snapshot never unescapes it automatically.
+    /// Use a nonempty value: unfiltered profile reads refuse empty seeded tokens
+    /// with Receiver / `mock:RequestPolicy`, without rewriting stored entries.
+    pub token: String,
+    pub name: String,
+    /// `true` for factory-baked profiles that can't be deleted.
+    pub fixed: bool,
+    #[serde(default)]
+    pub video_source_config_token: Option<String>,
+    #[serde(default)]
+    pub video_encoder_config_token: Option<String>,
+    #[serde(default)]
+    pub audio_source_config_token: Option<String>,
+    #[serde(default)]
+    pub audio_encoder_config_token: Option<String>,
+    /// The PTZ configuration bound to this profile, and through it the head
+    /// every PTZ operation on this profile addresses. `None` means the profile
+    /// is not PTZ-capable — a legitimate state, and the one `Profile_4` is in.
+    #[serde(default)]
+    pub ptz_config_token: Option<String>,
+}
+
+// ── Video source / encoder state ──────────────────────────────────────────────
+//
+// The mock is a **two-sensor** device: one ONVIF endpoint, two physical lenses,
+// two streams each. That is not decoration. Per the multi-sensor rule in
+// CLAUDE.md, every `Get…Options` / `Get…Configuration` answer depends on which
+// channel was asked about, and a single-sensor fixture cannot tell a parser
+// that reads the token from one that ignores it — both pass.
+//
+// The numbers below are transcribed from a real two-sensor device measured
+// 2026-07-28. The load-bearing property is that the sensors **disagree**:
+// VS_2 tops out at 1280x720, while VS_1 goes to 2592x1944. So VEC_1's current
+// 1920x1080 does not appear anywhere in VEC_3's option list, and a responder
+// that returns lens 0's list for a lens 1 query fails an assertion instead of
+// silently answering for the wrong channel.
+
+/// One physical sensor (`trt:GetVideoSources`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VideoSourceEntry {
+    pub token: String,
+    pub framerate: u32,
+    pub width: u32,
+    pub height: u32,
+}
+
+/// A video *source* configuration — the crop/bounds view onto one sensor.
+/// `source_token` is what ties it back to a [`VideoSourceEntry`].
+/// Synthetic writes only support zero-origin crops, clamp positive sizes to that
+/// sensor, and leave `use_count` read-only. Unsupported settings refuse atomically.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VideoSourceConfigEntry {
+    pub token: String,
+    pub name: String,
+    pub use_count: u32,
+    pub source_token: String,
+    pub width: u32,
+    pub height: u32,
+}
+
+/// One video encoder configuration — a (sensor, stream) pair.
+///
+/// `GetVideoEncoderConfigurations` renders from here and
+/// `SetVideoEncoderConfiguration` persists into it, so a Set → Get roundtrip
+/// reflects the change. Uses Media2's flat, H.265-capable shape.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VideoEncoderState {
+    pub token: String,
+    pub name: String,
+    pub use_count: u32,
+    /// `"H264"`, `"H265"`, or `"JPEG"`.
+    pub encoding: String,
+    pub width: u32,
+    pub height: u32,
+    pub quality: f32,
+    /// Finite, nonnegative Media2 frame rate. Fractional rates cannot be
+    /// represented by a Media1 view and produce an explicit mock-policy Fault.
+    /// Changed from `u32`; old integer JSON snapshots remain readable.
+    #[serde(with = "crate::types::frame_rate_serde")]
+    pub frame_rate_limit: f32,
+    pub bitrate_limit: u32,
+    pub gov_length: u32,
+    pub profile: String,
+    /// Which sensor this encoder draws from (`VS_1` / `VS_2`).
+    #[serde(default = "default_source_token")]
+    pub source_token: String,
+    /// The resolutions `GetVideoEncoderConfigurationOptions` reports **for this
+    /// channel**. `(width, height)`, widest first.
+    ///
+    /// The invariant that makes this list worth having: `(width, height)` above
+    /// must appear in it. A device that offers a resolution it is not running,
+    /// or runs one it does not offer, is a bug the mock should not model by
+    /// accident — `default_video_encoders_are_self_consistent` asserts it.
+    #[serde(default)]
+    pub resolutions: Vec<(u32, u32)>,
+}
+
+// ── Defaults ────────────────────────────────────────────────────────────────
+
+fn default_device_info() -> DeviceInfo {
+    DeviceInfo {
+        manufacturer: "oxvif-mock".into(),
+        model: "MockCam-1080p".into(),
+        firmware_version: "1.0.0".into(),
+        serial_number: "MOCK-0001".into(),
+        hardware_id: "1.0".into(),
+    }
+}
+fn default_hostname() -> String {
+    "mock-camera".into()
+}
+fn default_users() -> Vec<MockUser> {
+    vec![
+        MockUser {
+            username: "admin".into(),
+            level: "Administrator".into(),
+            password: "admin".into(),
+        },
+        MockUser {
+            username: "operator".into(),
+            level: "Operator".into(),
+            password: "operator".into(),
+        },
+    ]
+}
+fn default_scopes() -> Vec<String> {
+    vec![
+        "onvif://www.onvif.org/name/MockCamera".into(),
+        "onvif://www.onvif.org/type/video_encoder".into(),
+        "onvif://www.onvif.org/location/country/taiwan".into(),
+    ]
+}
+fn default_tz() -> String {
+    "UTC".into()
+}
+fn default_dns() -> DnsState {
+    DnsState {
+        from_dhcp: false,
+        servers: vec!["8.8.8.8".into(), "8.8.4.4".into()],
+    }
+}
+fn default_ntp() -> NtpState {
+    NtpState {
+        from_dhcp: false,
+        servers: vec!["pool.ntp.org".into()],
+    }
+}
+fn default_gateway() -> Vec<String> {
+    vec!["192.168.1.1".into()]
+}
+fn default_interface() -> NetworkInterfaceState {
+    NetworkInterfaceState {
+        token: "eth0".into(),
+        name: "eth0".into(),
+        mac: "00:11:22:33:44:55".into(),
+        mtu: 1500,
+        enabled: true,
+        ipv4_from_dhcp: false,
+        ipv4_address: "192.168.1.100".into(),
+        ipv4_prefix_length: 24,
+    }
+}
+fn default_protocols() -> Vec<NetworkProtocolState> {
+    vec![
+        NetworkProtocolState {
+            name: "HTTP".into(),
+            enabled: true,
+            ports: vec![80],
+        },
+        NetworkProtocolState {
+            name: "HTTPS".into(),
+            enabled: true,
+            ports: vec![443],
+        },
+        NetworkProtocolState {
+            name: "RTSP".into(),
+            enabled: true,
+            ports: vec![554],
+        },
+    ]
+}
+fn default_discovery_mode() -> String {
+    "Discoverable".into()
+}
+fn default_ptz() -> PtzState {
+    PtzState {
+        channels: default_ptz_channels(),
+    }
+}
+
+fn preset(token: &str, name: &str, pan: f32, tilt: f32, zoom: f32) -> PtzPreset {
+    PtzPreset {
+        token: token.into(),
+        name: name.into(),
+        pan,
+        tilt,
+        zoom,
+    }
+}
+
+/// **The two heads deliberately disagree.**
+///
+/// `CLAUDE.md` — "a single-sensor fixture cannot cover a per-channel feature":
+/// a fixture whose channels give the same answer is passed just as well by a
+/// handler that ignores the token entirely. So these differ in *position*, in
+/// *preset count*, in *preset names*, and in *whether tours exist at all* —
+/// every one of those is something an assertion can read.
+///
+/// Measured before per-head state existed: `ptz_get_status(Profile_1 vs
+/// Profile_3)` gave `pan Some(0.77)` both times, and `ptz_get_presets` gave
+/// `2 vs 2`.
+///
+/// **Keyed by node, not by profile.** There were four channels here, one per
+/// profile, which made the main and the sub stream of one lens two independent
+/// heads — `Profile_1` and `Profile_2` are the same motor. Their channels are
+/// now one, and `Profile_4`'s has gone: an unbound profile does not reach a
+/// head at all, and asking it for presets faults rather than answering for a
+/// head it does not have.
+///
+/// `PTZNode_2` is zoom-only, so its presets carry **zero pan and tilt** — a
+/// head with no pan/tilt space cannot hold a pan/tilt preset. Their zoom values
+/// (`0.80`, `0.10`, `1.0`) still differ from each other and from `PTZNode_1`'s,
+/// so nothing that reads a position loses its ability to fail.
+fn default_ptz_channels() -> BTreeMap<String, PtzChannel> {
+    BTreeMap::from([
+        (
+            "PTZNode_1".to_string(),
+            PtzChannel {
+                presets: vec![
+                    preset("Preset_1", "Home", 0.0, 0.0, 0.0),
+                    preset("Preset_2", "Door", 0.5, 0.2, 0.0),
+                ],
+                tours: default_tours(),
+                ..PtzChannel::default()
+            },
+        ),
+        (
+            "PTZNode_2".to_string(),
+            PtzChannel {
+                pan: 0.0,
+                tilt: 0.0,
+                zoom: 0.80,
+                presets: vec![
+                    preset("Preset_1", "Lobby", 0.0, 0.0, 0.80),
+                    preset("Preset_2", "Dock", 0.0, 0.0, 0.10),
+                    preset("Preset_3", "Roof", 0.0, 0.0, 1.0),
+                ],
+                ..PtzChannel::default()
+            },
+        ),
+    ])
+}
+
+// The eight ONVIF *generic* coordinate spaces, transcribed from the ONVIF PTZ
+// Service Specification (fetched 2026-08-03) together with the ranges it gives
+// for each. The element names and the 1D/2D split come from `onvif.xsd`
+// (`tt:PTZSpaces`), which is the normative source and disagrees with the
+// specification's own examples: the PDF writes `<tt:SpaceURI>` where the schema
+// says `URI`. oxvif's parser follows the schema, so the mock does too.
+const SP_ABS_PT: &str = "http://www.onvif.org/ver10/tptz/PanTiltSpaces/PositionGenericSpace";
+const SP_ABS_Z: &str = "http://www.onvif.org/ver10/tptz/ZoomSpaces/PositionGenericSpace";
+const SP_REL_PT: &str = "http://www.onvif.org/ver10/tptz/PanTiltSpaces/TranslationGenericSpace";
+const SP_REL_Z: &str = "http://www.onvif.org/ver10/tptz/ZoomSpaces/TranslationGenericSpace";
+const SP_CONT_PT: &str = "http://www.onvif.org/ver10/tptz/PanTiltSpaces/VelocityGenericSpace";
+const SP_CONT_Z: &str = "http://www.onvif.org/ver10/tptz/ZoomSpaces/VelocityGenericSpace";
+const SP_SPEED_PT: &str = "http://www.onvif.org/ver10/tptz/PanTiltSpaces/GenericSpeedSpace";
+const SP_SPEED_Z: &str = "http://www.onvif.org/ver10/tptz/ZoomSpaces/ZoomGenericSpeedSpace";
+
+fn space(kind: SpaceKind, uri: &str, x: (f32, f32), y: Option<(f32, f32)>) -> SpaceEntry {
+    SpaceEntry {
+        kind,
+        uri: uri.into(),
+        x_range: x,
+        y_range: y,
+    }
+}
+
+/// The four zoom slots, identical on both heads — a zoom-only head still zooms.
+fn zoom_spaces() -> Vec<SpaceEntry> {
+    vec![
+        space(SpaceKind::AbsoluteZoomPosition, SP_ABS_Z, (0.0, 1.0), None),
+        space(
+            SpaceKind::RelativeZoomTranslation,
+            SP_REL_Z,
+            (-1.0, 1.0),
+            None,
+        ),
+        space(
+            SpaceKind::ContinuousZoomVelocity,
+            SP_CONT_Z,
+            (-1.0, 1.0),
+            None,
+        ),
+        space(SpaceKind::ZoomSpeed, SP_SPEED_Z, (0.0, 1.0), None),
+    ]
+}
+
+/// **Two heads, and the second cannot pan or tilt.**
+///
+/// `PTZNode_2` has no pan/tilt space at all. That is not decoration: it is the
+/// only way a test can reach the "this head does not do that" branch through a
+/// real profile, and it matches the rest of the fixture, where sensor 2 is the
+/// lesser lens (1280×720 cap, fixed focus). The two nodes also disagree on
+/// `HomeSupported`, `FixedHomePosition`, `MaximumNumberOfPresets` and whether
+/// auxiliary commands exist — four more things an assertion can read that a
+/// renderer ignoring `NodeToken` cannot get right.
+///
+/// `PanTiltSpeedSpace` is 1D on purpose; see [`SpaceKind`].
+fn default_ptz_nodes() -> Vec<PtzNodeEntry> {
+    vec![
+        PtzNodeEntry {
+            token: "PTZNode_1".into(),
+            name: "Head 1".into(),
+            fixed_home_position: false,
+            home_supported: true,
+            max_presets: 100,
+            aux_commands: vec!["tt:Wiper|On".into(), "tt:Wiper|Off".into()],
+            pan_tilt_spaces: vec![
+                space(
+                    SpaceKind::AbsolutePanTiltPosition,
+                    SP_ABS_PT,
+                    (-1.0, 1.0),
+                    Some((-1.0, 1.0)),
+                ),
+                space(
+                    SpaceKind::RelativePanTiltTranslation,
+                    SP_REL_PT,
+                    (-1.0, 1.0),
+                    Some((-1.0, 1.0)),
+                ),
+                space(
+                    SpaceKind::ContinuousPanTiltVelocity,
+                    SP_CONT_PT,
+                    (-1.0, 1.0),
+                    Some((-1.0, 1.0)),
+                ),
+                space(SpaceKind::PanTiltSpeed, SP_SPEED_PT, (0.0, 1.0), None),
+            ],
+            zoom_spaces: zoom_spaces(),
+        },
+        PtzNodeEntry {
+            token: "PTZNode_2".into(),
+            name: "Head 2 (zoom only)".into(),
+            fixed_home_position: true,
+            home_supported: false,
+            max_presets: 8,
+            aux_commands: Vec::new(),
+            pan_tilt_spaces: Vec::new(),
+            zoom_spaces: zoom_spaces(),
+        },
+    ]
+}
+
+/// **The two configurations disagree on which members are absent.**
+///
+/// `PTZConfig_2` has no `DefaultPTZSpeed`, no `PanTiltLimits` and none of the
+/// three pan/tilt `Default*Space` URIs — because its node cannot pan or tilt.
+/// The absences are the point: an `Option` field is only observable as
+/// `None`-versus-`Some` if some fixture exercises each, and `CLAUDE.md`'s batch
+/// mutation for `Option` parse helpers ("make it return `Some(false)` where it
+/// returns `None`") has nothing to redden otherwise.
+///
+/// They also disagree on `DefaultPTZTimeout` and on the `PTZTimeout` bounds
+/// `GetConfigurationOptions` answers with, which was one static `PT1S`/`PT60S`
+/// pair for the whole device.
+fn default_ptz_configs() -> Vec<PtzConfigEntry> {
+    vec![
+        PtzConfigEntry {
+            token: "PTZConfig_1".into(),
+            name: "PTZConfig_1".into(),
+            // Profile_1 and Profile_2 — the main and sub stream of lens 1.
+            use_count: 2,
+            node_token: "PTZNode_1".into(),
+            default_ptz_timeout: Some("PT10S".into()),
+            abs_pan_tilt_space: Some(SP_ABS_PT.into()),
+            abs_zoom_space: Some(SP_ABS_Z.into()),
+            rel_pan_tilt_space: Some(SP_REL_PT.into()),
+            rel_zoom_space: Some(SP_REL_Z.into()),
+            cont_pan_tilt_space: Some(SP_CONT_PT.into()),
+            cont_zoom_space: Some(SP_CONT_Z.into()),
+            default_speed_pan_tilt: Some((0.5, 0.5)),
+            default_speed_zoom: Some(0.5),
+            pan_tilt_limits: Some(space(
+                SpaceKind::AbsolutePanTiltPosition,
+                SP_ABS_PT,
+                (-0.9, 0.9),
+                Some((-0.7, 0.7)),
+            )),
+            zoom_limits: Some(space(
+                SpaceKind::AbsoluteZoomPosition,
+                SP_ABS_Z,
+                (0.0, 1.0),
+                None,
+            )),
+            timeout_min: "PT1S".into(),
+            timeout_max: "PT60S".into(),
+        },
+        PtzConfigEntry {
+            token: "PTZConfig_2".into(),
+            name: "PTZConfig_2".into(),
+            // Profile_3 only. Profile_4 is deliberately unbound.
+            use_count: 1,
+            node_token: "PTZNode_2".into(),
+            default_ptz_timeout: Some("PT30S".into()),
+            abs_pan_tilt_space: None,
+            abs_zoom_space: Some(SP_ABS_Z.into()),
+            rel_pan_tilt_space: None,
+            rel_zoom_space: Some(SP_REL_Z.into()),
+            cont_pan_tilt_space: None,
+            cont_zoom_space: Some(SP_CONT_Z.into()),
+            default_speed_pan_tilt: None,
+            default_speed_zoom: None,
+            pan_tilt_limits: None,
+            zoom_limits: Some(space(
+                SpaceKind::AbsoluteZoomPosition,
+                SP_ABS_Z,
+                (0.1, 0.95),
+                None,
+            )),
+            timeout_min: "PT5S".into(),
+            timeout_max: "PT30S".into(),
+        },
+    ]
+}
+
+// ── Audio fixture ────────────────────────────────────────────────────────────
+//
+// **Two of everything, disagreeing on every value an assertion can read.** One
+// audio source and one encoder — what this was — cannot tell a handler that
+// resolves its token from one that ignores it, which is the same reason the
+// video encoder catalogue has four entries and PTZ has two heads.
+
+fn default_audio_sources() -> Vec<AudioSourceEntry> {
+    vec![
+        AudioSourceEntry {
+            token: "AudioSrc_1".into(),
+            channels: 1,
+        },
+        AudioSourceEntry {
+            token: "AudioSrc_2".into(),
+            channels: 2,
+        },
+    ]
+}
+
+fn default_audio_source_configs() -> Vec<AudioSourceConfigEntry> {
+    vec![
+        AudioSourceConfigEntry {
+            token: "ASC_1".into(),
+            name: "AudioSourceConfig1".into(),
+            use_count: 1,
+            source_token: "AudioSrc_1".into(),
+        },
+        AudioSourceConfigEntry {
+            token: "ASC_2".into(),
+            name: "AudioSourceConfig2".into(),
+            use_count: 0,
+            source_token: "AudioSrc_2".into(),
+        },
+    ]
+}
+
+fn default_audio_encoders() -> Vec<AudioEncoderEntry> {
+    vec![
+        AudioEncoderEntry {
+            token: "AEC_1".into(),
+            name: "AudioEncoder1".into(),
+            use_count: 1,
+            encoding: "G711".into(),
+            bitrate: 64,
+            sample_rate: 8,
+            // Both members are *required* by `tt:AudioEncoderConfiguration`, so
+            // a conformant Media1 device always sends them, and this mock is
+            // the conformant device.
+            multicast: Some(MulticastEntry {
+                address: "239.0.0.5".into(),
+                port: 40002,
+                ttl: 5,
+                auto_start: false,
+            }),
+            session_timeout: Some("PT60S".into()),
+            options: vec![AudioOptionEntry {
+                encoding: "G711".into(),
+                bitrates: vec![64],
+                sample_rates: vec![8],
+            }],
+        },
+        AudioEncoderEntry {
+            token: "AEC_2".into(),
+            name: "AudioEncoder2".into(),
+            use_count: 0,
+            encoding: "AAC".into(),
+            bitrate: 128,
+            sample_rate: 48,
+            multicast: Some(MulticastEntry {
+                address: "239.0.0.6".into(),
+                port: 40006,
+                ttl: 3,
+                auto_start: false,
+            }),
+            session_timeout: Some("PT30S".into()),
+            // Two rows against `AEC_1`'s one, and neither encoding overlaps its
+            // list: an options handler that ignores its token cannot produce
+            // this, and a caller that reads `options[0]` cannot get it by luck.
+            options: vec![
+                AudioOptionEntry {
+                    encoding: "AAC".into(),
+                    bitrates: vec![64, 128, 256],
+                    sample_rates: vec![16, 44, 48],
+                },
+                AudioOptionEntry {
+                    encoding: "G726".into(),
+                    bitrates: vec![16, 32],
+                    sample_rates: vec![8],
+                },
+            ],
+        },
+    ]
+}
+
+fn default_audio_outputs() -> Vec<AudioOutputEntry> {
+    vec![AudioOutputEntry {
+        token: "AOC_1".into(),
+        name: "AudioOutput".into(),
+        use_count: 1,
+        output_token: "AudioOut_1".into(),
+        output_level: 50,
+    }]
+}
+
+fn default_audio_decoders() -> Vec<AudioDecoderEntry> {
+    vec![AudioDecoderEntry {
+        token: "ADC_1".into(),
+        name: "AudioDecoder".into(),
+        use_count: 1,
+    }]
+}
+
+/// One tour, with **two** stops. A single-stop fixture cannot tell a parser
+/// that returns the first spot and drops the rest from one that collects them
+/// all, which is the specific defect the `vec_from_xml` rule exists to catch.
+fn default_tours() -> Vec<PtzTour> {
+    vec![PtzTour {
+        token: "Tour_1".into(),
+        name: "Perimeter".into(),
+        state: "Idle".into(),
+        auto_start: false,
+        random_preset_order: false,
+        recurring_time: Some(3),
+        direction: "Forward".into(),
+        spots: vec![
+            PtzTourSpot {
+                preset_token: "Preset_1".into(),
+                stay_time: "PT10S".into(),
+            },
+            PtzTourSpot {
+                preset_token: "Preset_2".into(),
+                stay_time: "PT20S".into(),
+            },
+        ],
+    }]
+}
+fn default_osd() -> OsdState {
+    OsdState {
+        osds: vec![OsdEntry {
+            token: "OSD_1".into(),
+            video_source_config_token: "VSC_1".into(),
+            osd_type: "Text".into(),
+            position_type: "UpperLeft".into(),
+            position_x: None,
+            position_y: None,
+            text: Some(OsdTextEntry {
+                text_type: "DateAndTime".into(),
+                plain_text: None,
+                date_format: Some("MM/dd/yyyy".into()),
+                time_format: Some("HH:mm:ss".into()),
+                font_size: Some(20),
+                font_color: None,
+            }),
+            image_path: None,
+        }],
+        next_token_id: 2,
+    }
+}
+
+/// Two recordings and **two** jobs, deliberately disagreeing.
+///
+/// `Rec_001` carries a track and `Rec_002` does not, so a renderer that emits a
+/// fixed track list cannot satisfy both. `Job_001` is `Active` and `Job_002` is
+/// `Idle`, which is what lets `GetRecordingJobState` be a per-token question at
+/// all — with one job it is indistinguishable from a constant.
+fn default_recording() -> RecordingState {
+    RecordingState {
+        recordings: vec![
+            RecordingEntry {
+                token: "Rec_001".into(),
+                source_id: "rtsp://mock/live".into(),
+                source_name: "MockCamera".into(),
+                location: "Lab".into(),
+                description: "Mock recording".into(),
+                address: "http://192.168.1.100/onvif/device_service".into(),
+                content: "Normal".into(),
+                maximum_retention_time: "PT0S".into(),
+                tracks: vec![RecordingTrackEntry {
+                    token: "VIDEO001".into(),
+                    track_type: "Video".into(),
+                    description: "videoTrack".into(),
+                }],
+                earliest: "2026-01-01T00:00:00Z".into(),
+                latest: "2026-04-01T00:00:00Z".into(),
+                status: "Stopped".into(),
+            },
+            RecordingEntry {
+                token: "Rec_002".into(),
+                source_id: String::new(),
+                source_name: "MockCamera".into(),
+                location: String::new(),
+                description: String::new(),
+                address: String::new(),
+                content: String::new(),
+                maximum_retention_time: "PT0S".into(),
+                tracks: Vec::new(),
+                earliest: "2026-05-01T00:00:00Z".into(),
+                latest: "2026-06-01T00:00:00Z".into(),
+                status: "Recording".into(),
+            },
+        ],
+        jobs: vec![
+            RecordingJobEntry {
+                token: "Job_001".into(),
+                recording_token: "Rec_001".into(),
+                mode: "Active".into(),
+                priority: 1,
+                source_token: "Profile_1".into(),
+            },
+            RecordingJobEntry {
+                token: "Job_002".into(),
+                recording_token: "Rec_002".into(),
+                mode: "Idle".into(),
+                priority: 2,
+                source_token: "Profile_3".into(),
+            },
+        ],
+        next_recording_id: 3,
+        next_track_id: 2,
+        next_job_id: 3,
+    }
+}
+
+fn default_profiles() -> ProfilesState {
+    ProfilesState {
+        profiles: vec![
+            ProfileEntry {
+                token: "Profile_1".into(),
+                name: "mainStream".into(),
+                fixed: true,
+                video_source_config_token: Some("VSC_1".into()),
+                video_encoder_config_token: Some("VEC_1".into()),
+                // The only profile with audio, which is what `ASC_1` and
+                // `AEC_1`'s `UseCount: 1` claims. Every profile was unbound
+                // while the audio family was a string literal, so the two
+                // renderers emitted nothing and agreed perfectly.
+                audio_source_config_token: Some("ASC_1".into()),
+                audio_encoder_config_token: Some("AEC_1".into()),
+                ptz_config_token: Some("PTZConfig_1".into()),
+            },
+            ProfileEntry {
+                token: "Profile_2".into(),
+                name: "subStream".into(),
+                fixed: false,
+                video_source_config_token: Some("VSC_1".into()),
+                video_encoder_config_token: Some("VEC_2".into()),
+                audio_source_config_token: None,
+                audio_encoder_config_token: None,
+                ptz_config_token: Some("PTZConfig_1".into()),
+            },
+            // Sensor 2. Present so the second lens is reachable the way a
+            // client actually reaches one — via a profile — and not only by
+            // guessing configuration tokens.
+            ProfileEntry {
+                token: "Profile_3".into(),
+                name: "mainStream2".into(),
+                fixed: true,
+                video_source_config_token: Some("VSC_2".into()),
+                video_encoder_config_token: Some("VEC_3".into()),
+                audio_source_config_token: None,
+                audio_encoder_config_token: None,
+                ptz_config_token: Some("PTZConfig_2".into()),
+            },
+            ProfileEntry {
+                token: "Profile_4".into(),
+                name: "subStream2".into(),
+                fixed: false,
+                video_source_config_token: Some("VSC_2".into()),
+                video_encoder_config_token: Some("VEC_4".into()),
+                audio_source_config_token: None,
+                audio_encoder_config_token: None,
+                ptz_config_token: None,
+            },
+        ],
+        next_token_id: 5,
+    }
+}
+
+fn default_source_token() -> String {
+    "VS_1".into()
+}
+
+fn default_video_sources() -> Vec<VideoSourceEntry> {
+    vec![
+        VideoSourceEntry {
+            token: "VS_1".into(),
+            framerate: 25,
+            width: 2592,
+            height: 1944,
+        },
+        VideoSourceEntry {
+            token: "VS_2".into(),
+            framerate: 25,
+            width: 1280,
+            height: 720,
+        },
+    ]
+}
+
+fn default_video_source_configs() -> Vec<VideoSourceConfigEntry> {
+    vec![
+        VideoSourceConfigEntry {
+            token: "VSC_1".into(),
+            name: "VSConfig1".into(),
+            use_count: 2,
+            source_token: "VS_1".into(),
+            width: 2592,
+            height: 1944,
+        },
+        VideoSourceConfigEntry {
+            token: "VSC_2".into(),
+            name: "VSConfig2".into(),
+            use_count: 2,
+            source_token: "VS_2".into(),
+            width: 1280,
+            height: 720,
+        },
+    ]
+}
+
+/// Four encoder configs: two sensors x (main, sub).
+///
+/// See the section comment above [`VideoEncoderState`] for why the two sensors
+/// deliberately disagree about what they can do.
+///
+/// `gov_length` was 25 on all four until 0.15, which made any assertion reading
+/// it pass just as well against a renderer that ignored the field — the same
+/// coincidence the differing `resolutions` lists exist to rule out. The four are
+/// now 25 / 30 / 50 / 15 against profiles Main / Main / High / Baseline, so
+/// `VEC_1` and `VEC_3` disagree on *both* attributes.
+fn default_video_encoders() -> Vec<VideoEncoderState> {
+    vec![
+        // ── Sensor 1 (VS_1, 5MP) ────────────────────────────────────────────
+        VideoEncoderState {
+            token: "VEC_1".into(),
+            name: "MainStream".into(),
+            use_count: 1,
+            encoding: "H264".into(),
+            width: 1920,
+            height: 1080,
+            quality: 5.0,
+            frame_rate_limit: 25.0,
+            bitrate_limit: 4096,
+            gov_length: 25,
+            profile: "Main".into(),
+            source_token: "VS_1".into(),
+            resolutions: vec![
+                (2592, 1944),
+                (2592, 1520),
+                (2560, 1440),
+                (2304, 1296),
+                (1920, 1080),
+                (1280, 720),
+            ],
+        },
+        VideoEncoderState {
+            token: "VEC_2".into(),
+            name: "SubStream".into(),
+            use_count: 1,
+            encoding: "H264".into(),
+            width: 704,
+            height: 480,
+            quality: 4.0,
+            frame_rate_limit: 15.0,
+            bitrate_limit: 1024,
+            gov_length: 30,
+            profile: "Main".into(),
+            source_token: "VS_1".into(),
+            resolutions: vec![(1280, 720), (704, 480), (352, 240)],
+        },
+        // ── Sensor 2 (VS_2, 720p) ───────────────────────────────────────────
+        VideoEncoderState {
+            token: "VEC_3".into(),
+            name: "MainStream2".into(),
+            use_count: 1,
+            encoding: "H264".into(),
+            width: 1280,
+            height: 720,
+            quality: 5.0,
+            frame_rate_limit: 25.0,
+            bitrate_limit: 2048,
+            gov_length: 50,
+            profile: "High".into(),
+            source_token: "VS_2".into(),
+            resolutions: vec![(1280, 720), (704, 480), (480, 240), (352, 240)],
+        },
+        VideoEncoderState {
+            token: "VEC_4".into(),
+            name: "SubStream2".into(),
+            use_count: 1,
+            encoding: "JPEG".into(),
+            width: 704,
+            height: 480,
+            quality: 3.0,
+            frame_rate_limit: 10.0,
+            bitrate_limit: 512,
+            gov_length: 15,
+            profile: "Baseline".into(),
+            source_token: "VS_2".into(),
+            resolutions: vec![(704, 480), (480, 240), (352, 240)],
+        },
+    ]
+}
+
+fn default_logical_inactive() -> String {
+    "inactive".into()
+}
+
+fn default_relay_outputs() -> Vec<RelayOutputState> {
+    vec![
+        RelayOutputState {
+            token: "RelayOutput_1".into(),
+            mode: "Bistable".into(),
+            delay_time: "PT0S".into(),
+            idle_state: "closed".into(),
+            logical_state: "inactive".into(),
+        },
+        RelayOutputState {
+            token: "RelayOutput_2".into(),
+            mode: "Monostable".into(),
+            delay_time: "PT1S".into(),
+            idle_state: "open".into(),
+            logical_state: "inactive".into(),
+        },
+    ]
+}
+
+fn default_digital_inputs() -> Vec<DigitalInputState> {
+    vec![
+        DigitalInputState {
+            token: "DigitalInput_1".into(),
+            idle_state: "closed".into(),
+            logical_state: "inactive".into(),
+        },
+        DigitalInputState {
+            token: "DigitalInput_2".into(),
+            idle_state: "open".into(),
+            logical_state: "inactive".into(),
+        },
+    ]
+}
+
+/// Three storage locations that **disagree on every field independently**.
+///
+/// A single entry would let a renderer that hard-codes `LocalPath` and omits
+/// `StorageUri`/`User` pass just as well as a correct one — the same
+/// single-fixture blindness the multi-sensor rule in `CLAUDE.md` describes.
+/// Here `local_path`, `storage_uri` and `user` are each present on some
+/// entries and empty on others, and no two entries share a `storage_type`,
+/// so an assertion on any one of them can fail on its own.
+///
+/// Note what this does *not* buy: `StorageConfiguration` parses these as
+/// `String` with `unwrap_or_default()`, so a client cannot tell an omitted
+/// element from an empty one. The empty fields here prove the renderer reads
+/// state rather than hard-coding the seed; they do not pin the wire shape.
+fn default_storage() -> Vec<StorageEntry> {
+    vec![
+        // Local card: a path, no network URI, no credentials.
+        StorageEntry {
+            token: "SD_01".into(),
+            storage_type: "LocalStorage".into(),
+            local_path: "/mnt/sd".into(),
+            storage_uri: String::new(),
+            user: String::new(),
+        },
+        // Authenticated NFS share: every field populated.
+        StorageEntry {
+            token: "NAS_01".into(),
+            storage_type: "NFS".into(),
+            local_path: "/mnt/nas".into(),
+            storage_uri: "nfs://192.168.1.50/records".into(),
+            user: "recorder".into(),
+        },
+        // Anonymous CIFS share: a URI and nothing else. The entry that keeps
+        // "the device did not say" distinguishable from "the device said
+        // empty" on both `local_path` and `user`.
+        StorageEntry {
+            token: "CIFS_01".into(),
+            storage_type: "CIFS".into(),
+            local_path: String::new(),
+            storage_uri: "smb://192.168.1.60/cam".into(),
+            user: String::new(),
+        },
+    ]
+}
+
+/// Two metadata configurations that **disagree on every field**.
+///
+/// `MetaConf_1` has a multicast group and reports pan/tilt status;
+/// `MetaConf_2` has none and reports zoom status. Every boolean is inverted
+/// between them, so a renderer emitting a constant for any one of `analytics`,
+/// `ptz_status`, `ptz_position`, `pan_tilt_status_supported` or
+/// `zoom_status_supported` fails on one entry or the other.
+fn default_metadata() -> Vec<MetadataEntry> {
+    vec![
+        MetadataEntry {
+            token: "MetaConf_1".into(),
+            name: "MetadataConfig".into(),
+            use_count: 1,
+            analytics: true,
+            ptz_status: false,
+            ptz_position: true,
+            multicast: MulticastEntry {
+                address: "239.0.1.10".into(),
+                port: 40010,
+                ttl: 1,
+                auto_start: false,
+            },
+            session_timeout: "PT60S".into(),
+            pan_tilt_status_supported: true,
+            zoom_status_supported: false,
+        },
+        MetadataEntry {
+            token: "MetaConf_2".into(),
+            name: "MetadataMinimal".into(),
+            use_count: 0,
+            analytics: false,
+            ptz_status: true,
+            ptz_position: false,
+            multicast: MulticastEntry {
+                address: "0.0.0.0".into(),
+                port: 0,
+                ttl: 1,
+                auto_start: false,
+            },
+            session_timeout: "PT60S".into(),
+            pan_tilt_status_supported: false,
+            zoom_status_supported: true,
+        },
+    ]
+}
+
+fn default_true() -> bool {
+    true
+}
+fn default_level_max() -> f32 {
+    100.0
+}
+
+/// One imaging entry per sensor, and they deliberately differ.
+///
+/// `VS_1` is the motorised 5MP lens; `VS_2` is a fixed-focus 720p lens that
+/// refuses the focus operations outright and reports levels on a 0–255 scale.
+/// Every value below that differs between the two is one a per-channel test can
+/// assert on; if they were equal, the tests would pass against a mock that
+/// threw the `VideoSourceToken` away.
+fn default_imaging_sources() -> Vec<ImagingState> {
+    vec![
+        ImagingState {
+            source_token: "VS_1".into(),
+            brightness: 60.0,
+            color_saturation: 50.0,
+            contrast: 50.0,
+            sharpness: 50.0,
+            exposure_mode: "AUTO".into(),
+            white_balance_mode: "AUTO".into(),
+            backlight_compensation: "OFF".into(),
+            wide_dynamic_range_mode: "OFF".into(),
+            wide_dynamic_range_level: 50.0,
+            ir_cut_filter: "AUTO".into(),
+            focus_mode: "AUTO".into(),
+            focus_supported: true,
+            level_max: 100.0,
+        },
+        ImagingState {
+            source_token: "VS_2".into(),
+            brightness: 45.0,
+            color_saturation: 128.0,
+            contrast: 130.0,
+            sharpness: 96.0,
+            exposure_mode: "MANUAL".into(),
+            white_balance_mode: "MANUAL".into(),
+            backlight_compensation: "ON".into(),
+            wide_dynamic_range_mode: "ON".into(),
+            wide_dynamic_range_level: 70.0,
+            ir_cut_filter: "ON".into(),
+            // No motorised focus, so the mode is the only one such a lens can
+            // report — and `GetMoveOptions` on it is a fault, not a range.
+            focus_mode: "MANUAL".into(),
+            focus_supported: false,
+            level_max: 255.0,
+        },
+    ]
+}
+
+impl Default for DeviceState {
+    fn default() -> Self {
+        Self {
+            info: default_device_info(),
+            hostname: default_hostname(),
+            hostname_from_dhcp: false,
+            users: default_users(),
+            scopes: default_scopes(),
+            timezone: default_tz(),
+            daylight_savings: false,
+            dns: default_dns(),
+            ntp: default_ntp(),
+            gateway_ipv4: default_gateway(),
+            discovery_mode: default_discovery_mode(),
+            imaging_sources: default_imaging_sources(),
+            ptz: default_ptz(),
+            ptz_nodes: default_ptz_nodes(),
+            ptz_configs: default_ptz_configs(),
+            interface: default_interface(),
+            protocols: default_protocols(),
+            osd: default_osd(),
+            profiles: default_profiles(),
+            recording: default_recording(),
+            video_sources: default_video_sources(),
+            video_source_configs: default_video_source_configs(),
+            video_encoders: default_video_encoders(),
+            relay_outputs: default_relay_outputs(),
+            digital_inputs: default_digital_inputs(),
+            storage: default_storage(),
+            metadata: default_metadata(),
+            audio_sources: default_audio_sources(),
+            audio_source_configs: default_audio_source_configs(),
+            audio_encoders: default_audio_encoders(),
+            audio_outputs: default_audio_outputs(),
+            audio_decoders: default_audio_decoders(),
+            event_seq: 0,
+            event_filter: None,
+            pending_io_events: Vec::new(),
+        }
+    }
+}
+
+// ── In-memory shared state ──────────────────────────────────────────────────
+//
+// The mock holds its `DeviceState` purely in memory and never touches the
+// filesystem. Persistence is opt-in and owned by the caller: register an
+// `on_change` hook (the bundled example writes TOML) and it fires after every
+// mutation with a snapshot of the new state.
+
+/// Callback fired after each state mutation — the seam for caller-owned
+/// persistence without the library doing any file I/O.
+///
+/// Receives an owned mutation snapshot by reference, with no state lock held.
+/// Reentrant writes are permitted, but the callback must bound its own recursion.
+/// Concurrent callbacks are not serialized or guaranteed to follow commit order;
+/// persistence owners must coordinate mutations or version their stored snapshots.
+pub type ChangeHook = std::sync::Arc<dyn Fn(&DeviceState) + Send + Sync>;
+
+/// Thread-safe in-memory device state shared by `MockTransport` / `MockServer`.
+pub struct MockState {
+    state: RwLock<DeviceState>,
+    on_change: Option<ChangeHook>,
+}
+
+/// Internal alias so service handlers keep reading `&SharedState` unchanged.
+pub type SharedState = MockState;
+
+impl MockState {
+    /// Fresh state seeded with factory defaults and no persistence hook.
+    pub fn new() -> Self {
+        Self {
+            state: RwLock::new(DeviceState::default()),
+            on_change: None,
+        }
+    }
+
+    /// Seed with a caller-supplied state (e.g. loaded from disk by the caller).
+    pub fn with_state(state: DeviceState) -> Self {
+        Self {
+            state: RwLock::new(state),
+            on_change: None,
+        }
+    }
+
+    /// Register a hook invoked after every mutation with a snapshot of the new
+    /// state. This is how opt-in persistence is wired — the library performs no
+    /// file I/O itself.
+    ///
+    /// The snapshot is captured under the mutation's write lock, then the hook
+    /// runs after that lock is released. See [`ChangeHook`] for concurrency and
+    /// reentrancy constraints.
+    pub fn set_on_change(&mut self, hook: ChangeHook) {
+        self.on_change = Some(hook);
+    }
+
+    /// Read access.
+    pub fn read(&self) -> std::sync::RwLockReadGuard<'_, DeviceState> {
+        self.state.read().unwrap()
+    }
+
+    /// Mutate the state, then fire the change hook (if any).
+    pub fn modify(&self, f: impl FnOnce(&mut DeviceState)) {
+        self.modify_returning(f);
+    }
+
+    /// Like [`modify`](Self::modify) but the closure returns a value
+    /// (e.g. a freshly-generated token).
+    pub fn modify_returning<R>(&self, f: impl FnOnce(&mut DeviceState) -> R) -> R {
+        self.modify_returning_if(f, |_| true)
+    }
+
+    /// Notify only for an explicitly committed outcome. The caller must perform
+    /// all rejection checks before mutation under the same write lock. This is
+    /// a notification boundary, NOT rollback or an inference from state equality.
+    pub(crate) fn modify_returning_if<R>(
+        &self,
+        f: impl FnOnce(&mut DeviceState) -> R,
+        committed: impl FnOnce(&R) -> bool,
+    ) -> R {
+        let (result, snapshot) = {
+            let mut guard = self.state.write().unwrap();
+            let result = f(&mut guard);
+            // Capture this mutation, not a later writer's state. No cloning is
+            // needed when persistence is disabled. The predicate remains outside
+            // the lock; a rejected result discards the snapshot without notifying.
+            let snapshot = self.on_change.as_ref().map(|_| guard.clone());
+            (result, snapshot)
+        };
+        if committed(&result) {
+            self.notify(snapshot.as_ref());
+        }
+        result
+    }
+
+    fn notify(&self, snapshot: Option<&DeviceState>) {
+        if let (Some(hook), Some(snapshot)) = (&self.on_change, snapshot) {
+            hook(snapshot);
+        }
+    }
+
+    /// In-memory instance for tests.
+    #[cfg(test)]
+    pub fn for_tests() -> Self {
+        Self::new()
+    }
+}
+
+impl Default for MockState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ── Tests ───────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::mock::services::device;
+
+    #[test]
+    fn change_hooks_release_state_lock_before_bounded_reentrant_writes() {
+        use std::sync::{
+            Arc, Weak,
+            atomic::{AtomicUsize, Ordering},
+        };
+        for entry in ["modify", "returning", "conditional"] {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let observed = calls.clone();
+            let state = Arc::new_cyclic(|weak: &Weak<super::MockState>| {
+                let weak = weak.clone();
+                let mut state = super::MockState::new();
+                state.set_on_change(Arc::new(move |snapshot| {
+                    let state = weak.upgrade().unwrap();
+                    // Fail promptly on the old locked callback instead of
+                    // hanging the test process on an actual reentrant write.
+                    drop(
+                        state
+                            .state
+                            .try_write()
+                            .expect("hook must run without a state lock"),
+                    );
+                    match observed.fetch_add(1, Ordering::SeqCst) {
+                        0 => {
+                            assert_eq!(snapshot.hostname, "outer-847");
+                            state.modify(|device| device.hostname = "nested-847".into());
+                            assert_eq!(snapshot.hostname, "outer-847");
+                        }
+                        1 => assert_eq!(snapshot.hostname, "nested-847"),
+                        _ => panic!("unexpected recursive notification"),
+                    }
+                }));
+                state
+            });
+            match entry {
+                "modify" => state.modify(|device| device.hostname = "outer-847".into()),
+                "returning" => {
+                    let result = state.modify_returning(|device| {
+                        device.hostname = "outer-847".into();
+                        847
+                    });
+                    assert_eq!(result, 847);
+                }
+                "conditional" => {
+                    let result = state.modify_returning_if(
+                        |device| {
+                            device.hostname = "outer-847".into();
+                            true
+                        },
+                        |committed| *committed,
+                    );
+                    assert!(result);
+                }
+                _ => unreachable!(),
+            }
+            assert_eq!(state.read().hostname, "nested-847");
+            assert_eq!(calls.load(Ordering::SeqCst), 2);
+            let result = state.modify_returning_if(|_| false, |committed| *committed);
+            assert!(!result);
+            assert_eq!(calls.load(Ordering::SeqCst), 2);
+        }
+    }
+
+    #[test]
+    fn conditional_change_hook_retains_its_commit_snapshot_after_an_intervening_write() {
+        use std::sync::{Arc, Mutex};
+        let observations = Arc::new(Mutex::new(Vec::new()));
+        let observed = observations.clone();
+        let mut state = super::MockState::new();
+        state.set_on_change(Arc::new(move |snapshot| {
+            observed
+                .lock()
+                .unwrap()
+                .push((snapshot.hostname.clone(), snapshot.event_seq));
+        }));
+        let result = state.modify_returning_if(
+            |device| {
+                device.hostname = "first-849".into();
+                device.event_seq = 849;
+                849
+            },
+            |result| {
+                assert_eq!(*result, 849);
+                // The predicate remains outside the lock, just as before. This
+                // deterministic interleaving needs no scheduling or sleeps.
+                state.modify(|device| {
+                    device.hostname = "intervening-850".into();
+                    device.event_seq = 850;
+                });
+                true
+            },
+        );
+        assert_eq!(result, 849);
+        assert_eq!(
+            *observations.lock().unwrap(),
+            vec![
+                ("intervening-850".to_owned(), 850),
+                ("first-849".to_owned(), 849)
+            ]
+        );
+        assert_eq!(state.read().hostname, "intervening-850");
+        assert_eq!(state.read().event_seq, 850);
+    }
+
+    fn new_state() -> MockState {
+        MockState::new()
+    }
+
+    /// The mock's clock must be the **real** clock, all six components.
+    ///
+    /// It used to compute the time of day from `SystemTime::now()` and hardcode
+    /// `<tt:Year>2026</tt:Year><tt:Month>4</tt:Month><tt:Day>15</tt:Day>`, so
+    /// the reported timestamp drifted a day further into the past every day. It
+    /// broke nothing and failed nothing — but `HealthCheck` compares the device
+    /// clock against the local one, so a healthy mock warned about clock skew,
+    /// and that warning was the first thing anyone saw when trying the health
+    /// check without a camera.
+    ///
+    /// Asserted against the parser rather than the string, and as a skew bound
+    /// rather than an expected date: a literal date would need editing every
+    /// day, which is how the bug got there.
+    #[test]
+    fn system_date_and_time_reports_the_real_clock_not_a_frozen_date() {
+        let xml = device::resp_system_date_and_time(&new_state());
+        let body = crate::soap::parse_soap_body(&xml).expect("mock response is a SOAP envelope");
+        let resp = body
+            .child("GetSystemDateAndTimeResponse")
+            .expect("response element present");
+        let dt = crate::types::SystemDateTime::from_xml(resp)
+            .expect("the mock's own response must parse");
+
+        let skew = dt.utc_offset_secs();
+        assert!(
+            skew.abs() < 120,
+            "the mock's clock is {skew}s off the local clock; a frozen date or a \
+             time-of-day-only computation is back. Response was:\n{xml}"
+        );
+    }
+
+    /// `GetSystemLog`'s one line carries the real clock, not a literal.
+    ///
+    /// It read `2026-04-15 12:00:00` until the 0.15.0 audit found it — the same
+    /// frozen date the sweep removed from `GetSystemDateAndTime`, which survived
+    /// because a log line does not look like a clock. Asserted as a bound on the
+    /// parsed date, not against an expected string: a literal here would need
+    /// editing every day, which is how the original got there.
+    #[test]
+    fn system_log_is_stamped_with_the_real_clock() {
+        let stamp = |unix: i64| {
+            let (y, mo, d, h, mi, s) = crate::soap::security::unix_secs_to_ymd_hms(unix);
+            format!("{y:04}-{mo:02}-{d:02} {h:02}:{mi:02}:{s:02}")
+        };
+        let now = || {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs() as i64
+        };
+
+        // Bracket the call rather than compare against a single reading: the
+        // format is fixed-width and zero-padded, so lexicographic order is
+        // chronological order, and a second ticking over mid-test cannot flake.
+        let before = stamp(now());
+        let xml = device::resp_system_log();
+        let after = stamp(now());
+
+        let got = xml
+            .split_once("<tt:String>")
+            .and_then(|(_, rest)| rest.split_once(" mock system started"))
+            .map(|(s, _)| s.to_string())
+            .unwrap_or_else(|| panic!("no stamped log line in:\n{xml}"));
+
+        assert!(
+            before <= got && got <= after,
+            "the system log is stamped {got}, outside [{before}, {after}] — a \
+             frozen literal is back. Response was:\n{xml}"
+        );
+    }
+
+    #[test]
+    fn get_hostname_returns_default() {
+        let s = new_state();
+        let xml = device::resp_hostname(&s);
+        assert!(xml.contains("mock-camera"), "default hostname");
+    }
+
+    #[test]
+    fn set_hostname_then_get() {
+        let s = new_state();
+        let body = r#"<tds:SetHostname><tt:Name>new-host</tt:Name></tds:SetHostname>"#;
+        device::handle_set_hostname(&s, body);
+        let xml = device::resp_hostname(&s);
+        assert!(xml.contains("new-host"));
+        assert!(!xml.contains("mock-camera"));
+    }
+
+    #[test]
+    fn get_users_returns_defaults() {
+        let s = new_state();
+        let xml = device::resp_users(&s);
+        assert!(xml.contains("admin"));
+        assert!(xml.contains("operator"));
+    }
+
+    #[test]
+    fn create_user_then_get() {
+        let s = new_state();
+        let body = r#"<tds:CreateUsers><tds:User><tt:Username>viewer</tt:Username><tt:Password>pass</tt:Password><tt:UserLevel>User</tt:UserLevel></tds:User></tds:CreateUsers>"#;
+        device::handle_create_users(&s, body);
+        let xml = device::resp_users(&s);
+        assert!(xml.contains("viewer"));
+    }
+
+    #[test]
+    fn delete_user_then_get() {
+        let s = new_state();
+        let body = r#"<tds:DeleteUsers><tt:Username>operator</tt:Username></tds:DeleteUsers>"#;
+        device::handle_delete_users(&s, body);
+        let xml = device::resp_users(&s);
+        assert!(xml.contains("admin"));
+        assert!(!xml.contains("operator"));
+    }
+
+    #[test]
+    fn set_user_level_then_get() {
+        let s = new_state();
+        let body = r#"<tds:SetUser><tds:User><tt:Username>operator</tt:Username><tt:UserLevel>Administrator</tt:UserLevel></tds:User></tds:SetUser>"#;
+        device::handle_set_user(&s, body);
+        let xml = device::resp_users(&s);
+        assert_eq!(xml.matches("Administrator").count(), 2);
+    }
+
+    #[test]
+    fn set_dns_then_get() {
+        let s = new_state();
+        let body = r#"<tds:SetDNS><tt:FromDHCP>false</tt:FromDHCP><tt:DNSManual><tt:Type>IPv4</tt:Type><tt:IPv4Address>1.1.1.1</tt:IPv4Address></tt:DNSManual></tds:SetDNS>"#;
+        device::handle_set_dns(&s, body);
+        let xml = device::resp_dns(&s);
+        assert!(xml.contains("1.1.1.1"));
+        assert!(!xml.contains("8.8.8.8"));
+    }
+
+    #[test]
+    fn set_ntp_then_get() {
+        let s = new_state();
+        let body = r#"<tds:SetNTP><tt:FromDHCP>false</tt:FromDHCP><tt:NTPManual><tt:Type>DNS</tt:Type><tt:DNSname>time.google.com</tt:DNSname></tt:NTPManual></tds:SetNTP>"#;
+        device::handle_set_ntp(&s, body);
+        let xml = device::resp_ntp(&s);
+        assert!(xml.contains("time.google.com"));
+        assert!(!xml.contains("pool.ntp.org"));
+    }
+
+    #[test]
+    fn set_scopes_then_get() {
+        let s = new_state();
+        // ONVIF SetScopes: each URI is sent as a bare <Scopes>URI</Scopes>
+        // element — NOT wrapped in <ScopeItem>. The old test was matching
+        // a broken parser that looked for the wrong tag; fixed along with
+        // `handle_set_scopes` itself.
+        let body = r#"<tds:SetScopes><tds:Scopes>onvif://www.onvif.org/name/NewCam</tds:Scopes></tds:SetScopes>"#;
+        device::handle_set_scopes(&s, body);
+        let xml = device::resp_scopes(&s);
+        assert!(xml.contains("NewCam"));
+        assert!(!xml.contains("MockCamera"));
+    }
+
+    #[test]
+    fn set_timezone_then_get() {
+        let s = new_state();
+        let body = r#"<tds:SetSystemDateAndTime><tt:TimeZone><tt:TZ>CST-8</tt:TZ></tt:TimeZone><tt:DaylightSavings>true</tt:DaylightSavings></tds:SetSystemDateAndTime>"#;
+        device::handle_set_system_date_and_time(&s, body);
+        let xml = device::resp_system_date_and_time(&s);
+        assert!(xml.contains("CST-8"));
+        assert!(xml.contains("<tt:DaylightSavings>true</tt:DaylightSavings>"));
+    }
+
+    #[test]
+    fn device_info_reads_from_state() {
+        let s = new_state();
+        let xml = device::resp_device_info(&s);
+        assert!(xml.contains("oxvif-mock"));
+        assert!(xml.contains("MockCam-1080p"));
+    }
+
+    #[test]
+    fn set_network_interfaces_updates_ip_and_dhcp() {
+        let s = new_state();
+        // SetNetworkInterfaces body shape per oxvif's `set_network_interfaces`.
+        let body = r#"<tds:SetNetworkInterfaces>
+            <tds:InterfaceToken>eth0</tds:InterfaceToken>
+            <tds:NetworkInterface>
+              <tt:Enabled>true</tt:Enabled>
+              <tt:IPv4>
+                <tt:Enabled>true</tt:Enabled>
+                <tt:DHCP>false</tt:DHCP>
+                <tt:Manual>
+                  <tt:Address>10.0.0.5</tt:Address>
+                  <tt:PrefixLength>16</tt:PrefixLength>
+                </tt:Manual>
+              </tt:IPv4>
+            </tds:NetworkInterface>
+          </tds:SetNetworkInterfaces>"#;
+        let resp = device::handle_set_network_interfaces(&s, body);
+        // Response wraps RebootNeeded — sanity check that the handler ran.
+        assert!(resp.contains("SetNetworkInterfacesResponse"));
+        assert!(resp.contains("RebootNeeded"));
+        let xml = device::resp_network_interfaces(&s);
+        assert!(xml.contains("10.0.0.5"));
+        assert!(xml.contains("<tt:PrefixLength>16</tt:PrefixLength>"));
+        assert!(!xml.contains("192.168.1.100"));
+    }
+
+    #[test]
+    fn set_network_protocols_updates_and_inserts() {
+        let s = new_state();
+        // Flip HTTP port, add a brand-new "FTP" entry the mock didn't have.
+        let body = r#"<tds:SetNetworkProtocols>
+            <tds:NetworkProtocols><tt:Name>HTTP</tt:Name><tt:Enabled>false</tt:Enabled><tt:Port>8080</tt:Port></tds:NetworkProtocols>
+            <tds:NetworkProtocols><tt:Name>FTP</tt:Name><tt:Enabled>true</tt:Enabled><tt:Port>21</tt:Port></tds:NetworkProtocols>
+          </tds:SetNetworkProtocols>"#;
+        device::handle_set_network_protocols(&s, body);
+        let xml = device::resp_network_protocols(&s);
+        // HTTP should still be there but disabled + new port.
+        assert!(xml.contains("<tt:Name>HTTP</tt:Name>"));
+        assert!(xml.contains("<tt:Port>8080</tt:Port>"));
+        // FTP newly inserted.
+        assert!(xml.contains("<tt:Name>FTP</tt:Name>"));
+        assert!(xml.contains("<tt:Port>21</tt:Port>"));
+    }
+
+    #[test]
+    fn set_network_default_gateway_replaces_list() {
+        let s = new_state();
+        let body = r#"<tds:SetNetworkDefaultGateway>
+            <tds:IPv4Address>10.0.0.1</tds:IPv4Address>
+            <tds:IPv4Address>10.0.0.254</tds:IPv4Address>
+          </tds:SetNetworkDefaultGateway>"#;
+        device::handle_set_network_default_gateway(&s, body);
+        let xml = device::resp_network_default_gateway(&s);
+        assert!(xml.contains("10.0.0.1"));
+        assert!(xml.contains("10.0.0.254"));
+        // Default was 192.168.1.1 — must be gone after replacement.
+        assert!(!xml.contains("192.168.1.1"));
+    }
+
+    /// Every PTZ request names a profile. Wrapping it here keeps each test
+    /// below reading like the operation it exercises rather than like XML.
+    fn ptz_req(profile: &str, op: &str, inner: &str) -> String {
+        format!(
+            "<tptz:{op} xmlns:tptz='http://www.onvif.org/ver20/ptz/wsdl' xmlns:tt='http://www.onvif.org/ver10/schema'><tptz:ProfileToken>{profile}</tptz:ProfileToken>{inner}</tptz:{op}>"
+        )
+    }
+
+    fn ptz_call(state: &SharedState, op: &str, body: &str) -> String {
+        crate::mock::dispatch::dispatch(
+            &format!("http://www.onvif.org/ver20/ptz/wsdl/{op}"),
+            "http://mock",
+            state,
+            body,
+        )
+    }
+
+    fn ptz_ask(profile: &str, op: &str) -> String {
+        ptz_req(profile, op, "")
+    }
+
+    const MOVE_TO: &str = r#"<tptz:Position>
+        <tt:PanTilt x="{X}" y="{Y}"/><tt:Zoom x="{Z}"/>
+      </tptz:Position>"#;
+
+    fn move_to(profile: &str, x: &str, y: &str, z: &str) -> String {
+        ptz_req(
+            profile,
+            "AbsoluteMove",
+            &MOVE_TO
+                .replace("{X}", x)
+                .replace("{Y}", y)
+                .replace("{Z}", z),
+        )
+    }
+
+    #[test]
+    fn ptz_absolute_move_updates_position() {
+        let s = new_state();
+        ptz_call(
+            &s,
+            "AbsoluteMove",
+            &move_to("Profile_1", "0.5", "-0.3", "0.7"),
+        );
+        let xml = ptz_call(&s, "GetStatus", &ptz_ask("Profile_1", "GetStatus"));
+        assert!(xml.contains(r#"x="0.5""#));
+        assert!(xml.contains(r#"y="-0.3""#));
+        assert!(xml.contains(r#"x="0.7""#));
+    }
+
+    /// The whole point of `PtzChannel`: two *lenses* are two heads.
+    ///
+    /// Before 0.15 this could not be written — `PtzState` held one position for
+    /// the entire device, so moving "Profile_1" moved everything. The measured
+    /// symptom was `ptz_get_status(Profile_1 vs Profile_3)` returning the same
+    /// pan for both.
+    ///
+    /// `Profile_3` is lens 2, which is a zoom-only head, so what distinguishes
+    /// it from lens 1 is its **zoom**, not its pan — a zoom-only head has no
+    /// pan to seed.
+    #[test]
+    fn ptz_move_on_one_profile_does_not_move_another() {
+        let s = new_state();
+        let before = ptz_call(&s, "GetStatus", &ptz_ask("Profile_3", "GetStatus"));
+        // PTZNode_2's seeded position, deliberately not PTZNode_1's.
+        assert!(before.contains(r#"x="0.8""#), "got {before}");
+
+        ptz_call(
+            &s,
+            "AbsoluteMove",
+            &move_to("Profile_1", "0.5", "-0.3", "0.7"),
+        );
+
+        let after = ptz_call(&s, "GetStatus", &ptz_ask("Profile_3", "GetStatus"));
+        assert_eq!(
+            before, after,
+            "moving Profile_1 must not move Profile_3 — they are separate heads"
+        );
+    }
+
+    /// …and the same for the preset list, which is the other half of the state
+    /// that used to be global.
+    #[test]
+    fn ptz_presets_are_per_head() {
+        let s = new_state();
+        let p1 = ptz_call(&s, "GetPresets", &ptz_ask("Profile_1", "GetPresets"));
+        let p3 = ptz_call(&s, "GetPresets", &ptz_ask("Profile_3", "GetPresets"));
+
+        // Counts differ, so a handler that ignores the token cannot be right.
+        assert_eq!(p1.matches("<tptz:Preset ").count(), 2, "got {p1}");
+        assert_eq!(p3.matches("<tptz:Preset ").count(), 3, "got {p3}");
+
+        // …and so do the names, so a count-only assertion is not the only guard.
+        assert!(p1.contains("Door") && !p1.contains("Lobby"), "got {p1}");
+        assert!(p3.contains("Lobby") && !p3.contains("Door"), "got {p3}");
+    }
+
+    /// **The main and the sub stream of one lens are one head.**
+    ///
+    /// Stated positively and on its own rather than left implied by the
+    /// negatives around it. Every "these two differ" test here compares
+    /// `Profile_1` with `Profile_3`; a broken resolver that always returned the
+    /// first node would fail those, but nothing in them would notice a resolver
+    /// that got `Profile_2` right only by accident. This asserts the sharing.
+    #[test]
+    fn ptz_main_and_sub_stream_of_one_lens_are_one_head() {
+        let s = new_state();
+        ptz_call(
+            &s,
+            "AbsoluteMove",
+            &move_to("Profile_1", "0.42", "-0.17", "0.63"),
+        );
+
+        let sub = ptz_call(&s, "GetStatus", &ptz_ask("Profile_2", "GetStatus"));
+        assert!(
+            sub.contains(r#"x="0.42""#) && sub.contains(r#"y="-0.17""#),
+            "Profile_1 and Profile_2 are the main and sub stream of one lens and \
+             must report one position: {sub}"
+        );
+
+        // …and the other lens must not have moved, or "one head" would be
+        // satisfied by a single global position, which is the bug this replaced.
+        let other = ptz_call(&s, "GetStatus", &ptz_ask("Profile_3", "GetStatus"));
+        assert!(!other.contains(r#"x="0.42""#), "got {other}");
+    }
+
+    /// **The mock must emit the spelling `onvif.xsd` defines, on the wire.**
+    ///
+    /// `PtzConfiguration::from_xml` accepts both spellings — deliberately, so a
+    /// vendor who "corrected" ONVIF's typo still parses — which means no test
+    /// going through the client can tell what the mock actually sent. Measured
+    /// while writing this: swapping the renderer to
+    /// `DefaultAbsolutePanTiltPositionSpace` left all 907 tests green. A
+    /// namespace-strict consumer would have seen an element no schema declares,
+    /// and the mock's whole point is to be the conformant device.
+    ///
+    /// So this asserts the bytes, not the parsed value.
+    #[test]
+    fn ptz_configuration_uses_the_schema_spelling_on_the_wire() {
+        use crate::mock::services::ptz;
+        let s = new_state();
+        let xml = ptz::resp_ptz_configurations(&s);
+        assert!(
+            xml.contains("<tt:DefaultAbsolutePantTiltPositionSpace>"),
+            "onvif.xsd spells it `Pant`, double t: {xml}"
+        );
+        assert!(
+            !xml.contains("<tt:DefaultAbsolutePanTiltPositionSpace>"),
+            "the corrected spelling is an element no schema declares: {xml}"
+        );
+    }
+
+    /// A `SetConfiguration` request body, as the client builds it.
+    fn set_config_req(token: &str, node: &str, extra: &str) -> String {
+        format!(
+            r#"<tptz:SetConfiguration>
+                 <tptz:PTZConfiguration token="{token}">
+                   <tt:Name>{token}</tt:Name>
+                   <tt:UseCount>1</tt:UseCount>
+                   <tt:NodeToken>{node}</tt:NodeToken>
+                   {extra}
+                 </tptz:PTZConfiguration>
+                 <tptz:ForcePersistence>true</tptz:ForcePersistence>
+               </tptz:SetConfiguration>"#
+        )
+    }
+
+    /// Writing a `NodeToken` that names no head is refused, and refused
+    /// *before* anything is stored.
+    ///
+    /// A dangling configuration is worse than a rejected write: every later
+    /// `GetStatus` through a profile bound to it resolves to a head that does
+    /// not exist, and the caller sees a fault on an operation they never
+    /// touched.
+    #[test]
+    fn ptz_set_configuration_refuses_a_node_the_device_does_not_have() {
+        use crate::mock::services::ptz;
+        let s = new_state();
+        let xml = ptz::handle_ptz_set_configuration(
+            &s,
+            &set_config_req("PTZConfig_1", "PTZNode_nope", ""),
+        );
+        assert!(xml.contains("NoSuchNode-SETCFG-5626"), "got {xml}");
+        assert!(xml.contains("PTZNode_nope"), "got {xml}");
+        assert_eq!(s.read().ptz_configs[0].node_token, "PTZNode_1");
+    }
+
+    #[test]
+    fn ptz_set_configuration_refuses_a_configuration_the_device_does_not_have() {
+        use crate::mock::services::ptz;
+        let s = new_state();
+        let xml =
+            ptz::handle_ptz_set_configuration(&s, &set_config_req("PTZConfig_9", "PTZNode_1", ""));
+        assert!(xml.contains("NoSuchPTZConfig-SETCFG-5624"), "got {xml}");
+        assert!(xml.contains("PTZConfig_9"), "got {xml}");
+        assert_eq!(
+            s.read().ptz_configs.len(),
+            2,
+            "no configuration was created"
+        );
+    }
+
+    #[test]
+    fn ptz_set_configuration_without_a_node_token_faults() {
+        use crate::mock::services::ptz;
+        let s = new_state();
+        let body = r#"<tptz:SetConfiguration>
+             <tptz:PTZConfiguration token="PTZConfig_1"><tt:Name>x</tt:Name></tptz:PTZConfiguration>
+           </tptz:SetConfiguration>"#;
+        let xml = ptz::handle_ptz_set_configuration(&s, body);
+        assert!(xml.contains("NoNodeToken-SETCFG-5625"), "got {xml}");
+        assert_eq!(s.read().ptz_configs[0].name, "PTZConfig_1");
+    }
+
+    /// The mock parses `Pant` — ONVIF's spelling — and nothing else.
+    ///
+    /// This is the parse-direction half of
+    /// [`ptz_configuration_uses_the_schema_spelling_on_the_wire`]. Accepting
+    /// both spellings here would leave `tests/mock_roundtrip.rs` green if the
+    /// client regressed to writing the corrected one, which is the same
+    /// hollowness a lenient reader created on the client side: the two ends
+    /// would agree with each other and with no conformant device.
+    #[test]
+    fn ptz_set_configuration_reads_only_the_schema_spelling() {
+        use crate::mock::services::ptz;
+        let s = new_state();
+        const URI: &str = "http://example.invalid/space/5627";
+
+        let corrected = format!(
+            "<tt:DefaultAbsolutePanTiltPositionSpace>{URI}\
+             </tt:DefaultAbsolutePanTiltPositionSpace>"
+        );
+        ptz::handle_ptz_set_configuration(
+            &s,
+            &set_config_req("PTZConfig_1", "PTZNode_1", &corrected),
+        );
+        assert_eq!(
+            s.read().ptz_configs[0].abs_pan_tilt_space,
+            None,
+            "the corrected spelling is an element onvif.xsd does not declare"
+        );
+
+        let schema = format!(
+            "<tt:DefaultAbsolutePantTiltPositionSpace>{URI}\
+             </tt:DefaultAbsolutePantTiltPositionSpace>"
+        );
+        ptz::handle_ptz_set_configuration(&s, &set_config_req("PTZConfig_1", "PTZNode_1", &schema));
+        assert_eq!(
+            s.read().ptz_configs[0].abs_pan_tilt_space.as_deref(),
+            Some(URI)
+        );
+    }
+
+    // ── Audio ────────────────────────────────────────────────────────────
+    //
+    // These assert **bytes**, and they have to.
+    //
+    // `AudioEncoderConfigurationOptions::from_xml` reads both nestings — it
+    // must, because the two services genuinely differ — so a test going
+    // through the client parses either shape happily and can no longer tell
+    // which one the mock sent. Exactly the hole the `Pant` spelling test
+    // closes on the PTZ side, and it was found the same way: by a perturbation
+    // that came back green.
+
+    fn encoder_query_audio(m2: bool, op: &str, state: &MockState, body: &str) -> String {
+        let prefix = if m2 { "tr2" } else { "trt" };
+        let body = if body.contains(&format!("<{prefix}:{op}>")) {
+            body.to_owned()
+        } else {
+            format!("<{prefix}:{op}>{body}</{prefix}:{op}>")
+        };
+        encoder_query(state, m2, op, &body)
+    }
+    fn set_audio_req(prefix: &str, token: &str, extra: &str) -> String {
+        let encoding = if prefix == "tr2" { "PCMU" } else { "G711" };
+        let tail = if prefix == "tr2" {
+            format!("{extra}<tt:Bitrate>64</tt:Bitrate><tt:SampleRate>8</tt:SampleRate>")
+        } else {
+            format!("<tt:Bitrate>64</tt:Bitrate><tt:SampleRate>8</tt:SampleRate>{extra}")
+        };
+        let persistence = if prefix == "trt" {
+            "<trt:ForcePersistence>true</trt:ForcePersistence>"
+        } else {
+            ""
+        };
+        format!(
+            r#"<{prefix}:SetAudioEncoderConfiguration><{prefix}:Configuration token="{token}"><tt:Name>renamed-5719</tt:Name><tt:UseCount>1</tt:UseCount><tt:Encoding>{encoding}</tt:Encoding>{tail}</{prefix}:Configuration>{persistence}</{prefix}:SetAudioEncoderConfiguration>"#
+        )
+    }
+
+    const MULTICAST_EL: &str = r#"<tt:Multicast>
+        <tt:Address><tt:Type>IPv4</tt:Type><tt:IPv4Address>239.9.9.9</tt:IPv4Address></tt:Address>
+        <tt:Port>41234</tt:Port><tt:TTL>7</tt:TTL><tt:AutoStart>true</tt:AutoStart>
+      </tt:Multicast>"#;
+
+    /// Media1 wraps its option rows; the wrapper is the type
+    /// `tt:AudioEncoderConfigurationOptions` and the rows are
+    /// `tt:AudioEncoderConfigurationOption`.
+    #[test]
+    fn audio_options_use_media1_nesting_on_the_wire() {
+        let s = new_state();
+        let body = "<trt:GetAudioEncoderConfigurationOptions>\
+                    <trt:ConfigurationToken>AEC_2</trt:ConfigurationToken>\
+                    </trt:GetAudioEncoderConfigurationOptions>";
+        let xml = encoder_query_audio(false, "GetAudioEncoderConfigurationOptions", &s, body);
+        assert!(xml.contains("<trt:Options><tt:Options>"), "got {xml}");
+        // Two rows for `AEC_2`, and the second is `G726` — a handler ignoring
+        // its token answers `AEC_1`'s single `G711` row.
+        assert_eq!(xml.matches("<tt:Options>").count(), 2, "got {xml}");
+        assert!(xml.contains("<tt:Encoding>G726</tt:Encoding>"), "got {xml}");
+    }
+
+    /// Media2 does not wrap: `Options` is `maxOccurs="unbounded"` and carries
+    /// `Encoding` directly.
+    #[test]
+    fn audio_options_use_media2_nesting_on_the_wire() {
+        let s = new_state();
+        let body = "<tr2:GetAudioEncoderConfigurationOptions>\
+                    <tr2:ConfigurationToken>AEC_2</tr2:ConfigurationToken>\
+                    </tr2:GetAudioEncoderConfigurationOptions>";
+        let xml = encoder_query_audio(true, "GetAudioEncoderConfigurationOptions", &s, body);
+        assert!(
+            !xml.contains("<tt:Options>"),
+            "tt:Options is Media1's wrapper and has no place here: {xml}"
+        );
+        assert_eq!(xml.matches("<tr2:Options>").count(), 2, "got {xml}");
+        assert!(xml.contains("<tt:Encoding>G726</tt:Encoding>"), "got {xml}");
+    }
+
+    /// Media1 renders `Multicast` then `SessionTimeout` after `SampleRate`;
+    /// Media2 renders `Multicast` before `Bitrate` and no `SessionTimeout`.
+    #[test]
+    fn the_two_services_sequence_the_audio_encoder_differently() {
+        let s = new_state();
+        let m1 = encoder_query_audio(false, "GetAudioEncoderConfigurations", &s, "");
+        let m2 = encoder_query_audio(true, "GetAudioEncoderConfigurations", &s, "");
+        let pos = |x: &str, t: &str| x.find(t).unwrap_or_else(|| panic!("{t} missing from {x}"));
+
+        assert!(
+            pos(&m1, "<tt:Multicast>") > pos(&m1, "<tt:SampleRate>"),
+            "{m1}"
+        );
+        assert!(
+            m1.contains("<tt:SessionTimeout>PT60S</tt:SessionTimeout>"),
+            "{m1}"
+        );
+        assert!(
+            pos(&m2, "<tt:Multicast>") < pos(&m2, "<tt:Bitrate>"),
+            "{m2}"
+        );
+        assert!(
+            !m2.contains("SessionTimeout"),
+            "tt:AudioEncoder2Configuration has no SessionTimeout member: {m2}"
+        );
+    }
+
+    /// `Multicast` and `SessionTimeout` are required by
+    /// `tt:AudioEncoderConfiguration`, so Media1 refuses a body without them —
+    /// which is the body oxvif itself sent until 0.15.
+    #[test]
+    fn media1_set_audio_encoder_requires_multicast_and_session_timeout() {
+        let s = new_state();
+
+        let xml = encoder_query_audio(
+            false,
+            "SetAudioEncoderConfiguration",
+            &s,
+            &set_audio_req("trt", "AEC_1", ""),
+        );
+        assert!(xml.contains("Invalid Args"), "got {xml}");
+        assert_eq!(
+            s.read().audio_encoders[0].name,
+            "AudioEncoder1",
+            "not written"
+        );
+
+        // …and accepts one that carries both.
+        let full = format!("{MULTICAST_EL}<tt:SessionTimeout>PT5S</tt:SessionTimeout>");
+        let xml = encoder_query_audio(
+            false,
+            "SetAudioEncoderConfiguration",
+            &s,
+            &set_audio_req("trt", "AEC_1", &full),
+        );
+        assert!(
+            xml.contains("SetAudioEncoderConfigurationResponse"),
+            "got {xml}"
+        );
+        let c = s.read().audio_encoders[0].clone();
+        assert_eq!(c.name, "renamed-5719");
+        assert_eq!(c.session_timeout.as_deref(), Some("PT5S"));
+        assert_eq!(
+            c.multicast
+                .map(|m| (m.address, m.port, m.ttl, m.auto_start)),
+            Some(("239.9.9.9".to_string(), 41234, 7, false))
+        );
+    }
+
+    /// A Media2 write cannot express `SessionTimeout` — its type has no such
+    /// member — so it must leave the stored one alone rather than clearing a
+    /// value the Media1 type requires.
+    #[test]
+    fn media2_set_audio_encoder_preserves_the_session_timeout() {
+        let s = new_state();
+        let xml = encoder_query_audio(
+            true,
+            "SetAudioEncoderConfiguration",
+            &s,
+            &set_audio_req("tr2", "AEC_1", MULTICAST_EL),
+        );
+        assert!(
+            xml.contains("SetAudioEncoderConfigurationResponse"),
+            "got {xml}"
+        );
+        let c = s.read().audio_encoders[0].clone();
+        assert_eq!(c.name, "renamed-5719", "the write did land");
+        assert_eq!(
+            c.session_timeout.as_deref(),
+            Some("PT60S"),
+            "the seeded timeout must survive a write that cannot carry it"
+        );
+    }
+
+    #[test]
+    fn audio_encoder_operations_fault_on_an_unknown_token() {
+        let s = new_state();
+        let get = encoder_query_audio(
+            false,
+            "GetAudioEncoderConfiguration",
+            &s,
+            "<trt:ConfigurationToken>AEC_9</trt:ConfigurationToken>",
+        );
+        assert!(get.contains("Configuration not found: AEC_9"), "got {get}");
+        let opts = encoder_query_audio(
+            false,
+            "GetAudioEncoderConfigurationOptions",
+            &s,
+            "<trt:ConfigurationToken>AEC_9</trt:ConfigurationToken>",
+        );
+        assert!(
+            opts.contains("Configuration not found: AEC_9"),
+            "got {opts}"
+        );
+        let opts2 = encoder_query_audio(
+            true,
+            "GetAudioEncoderConfigurationOptions",
+            &s,
+            "<tr2:ConfigurationToken>AEC_9</tr2:ConfigurationToken>",
+        );
+        assert!(
+            opts2.contains("Configuration not found: AEC_9"),
+            "got {opts2}"
+        );
+        let set = encoder_query_audio(
+            false,
+            "SetAudioEncoderConfiguration",
+            &s,
+            &set_audio_req(
+                "trt",
+                "AEC_9",
+                &format!("{MULTICAST_EL}<tt:SessionTimeout>PT5S</tt:SessionTimeout>"),
+            ),
+        );
+        assert!(set.contains("Configuration not found: AEC_9"), "got {set}");
+    }
+
+    /// Binding a PTZ configuration the device does not have is refused, and the
+    /// profile is left unbound rather than pointing at nothing.
+    ///
+    /// The positive direction is `media2/add-ptz-configuration` in
+    /// `tests/mock_roundtrip.rs`; this is the arm that proves `ConfigKind::Ptz`
+    /// validates its token against `ptz_configs` instead of accepting anything.
+    /// See `media2_binding_an_unknown_audio_configuration_faults` for the audio
+    /// kinds, which accepted anything until their catalogues existed.
+    #[test]
+    fn media2_binding_an_unknown_ptz_configuration_faults() {
+        let s = new_state();
+        let body = r#"<tr2:AddConfiguration xmlns:tr2='http://www.onvif.org/ver20/media/wsdl'>
+             <tr2:ProfileToken>Profile_4</tr2:ProfileToken>
+             <tr2:Configuration>
+               <tr2:Type>PTZ</tr2:Type>
+               <tr2:Token>PTZConfig_9</tr2:Token>
+             </tr2:Configuration>
+           </tr2:AddConfiguration>"#;
+        let xml = crate::mock::dispatch::dispatch(
+            "http://www.onvif.org/ver20/media/wsdl/AddConfiguration",
+            "http://mock",
+            &s,
+            body,
+        );
+        assert!(xml.contains("NoSuchConfig-ADDCFG2-5543"), "got {xml}");
+        assert!(xml.contains("PTZConfig_9"), "got {xml}");
+        let s = s.read();
+        let p4 = s
+            .profiles
+            .profiles
+            .iter()
+            .find(|p| p.token == "Profile_4")
+            .expect("Profile_4 exists");
+        assert_eq!(p4.ptz_config_token, None);
+    }
+
+    /// Both audio kinds validate their token, and both still bind a real one.
+    ///
+    /// `ConfigKind::known_token` returned `true` unconditionally for
+    /// `AudioSource` and `AudioEncoder`, justified by a comment saying the audio
+    /// families were static fixtures with nothing to check against. `ee7e0b3`
+    /// gave them catalogues and the justification stopped being true, so a
+    /// nonsense token bound silently and the profile then rendered no audio,
+    /// with nothing to say why.
+    ///
+    /// Both directions are asserted for each kind: a bogus token must fault
+    /// *and* leave the slot empty, and a seeded token must still land. Asserting
+    /// only the fault would pass against a `known_token` that returns `false`
+    /// for everything.
+    #[test]
+    fn media2_binding_an_unknown_audio_configuration_faults() {
+        let req = |kind: &str, token: &str| {
+            format!(
+                r#"<tr2:AddConfiguration xmlns:tr2='http://www.onvif.org/ver20/media/wsdl'>
+                     <tr2:ProfileToken>Profile_4</tr2:ProfileToken>
+                     <tr2:Configuration>
+                       <tr2:Type>{kind}</tr2:Type>
+                       <tr2:Token>{token}</tr2:Token>
+                     </tr2:Configuration>
+                   </tr2:AddConfiguration>"#
+            )
+        };
+
+        for (kind, bogus, real) in [
+            ("AudioSource", "ASC_9", "ASC_2"),
+            ("AudioEncoder", "AEC_9", "AEC_2"),
+        ] {
+            let s = new_state();
+            let xml = crate::mock::dispatch::dispatch(
+                "http://www.onvif.org/ver20/media/wsdl/AddConfiguration",
+                "http://mock",
+                &s,
+                &req(kind, bogus),
+            );
+            assert!(
+                xml.contains("NoSuchConfig-ADDCFG2-5543") && xml.contains(bogus),
+                "{kind}: binding {bogus} must fault naming the token, got {xml}"
+            );
+            let slot = |s: &crate::mock::state::MockState| {
+                let g = s.read();
+                let p = g
+                    .profiles
+                    .profiles
+                    .iter()
+                    .find(|p| p.token == "Profile_4")
+                    .expect("Profile_4 exists");
+                if kind == "AudioSource" {
+                    p.audio_source_config_token.clone()
+                } else {
+                    p.audio_encoder_config_token.clone()
+                }
+            };
+            assert_eq!(
+                slot(&s),
+                None,
+                "{kind}: refused bind must leave the slot empty"
+            );
+
+            let ok = crate::mock::dispatch::dispatch(
+                "http://www.onvif.org/ver20/media/wsdl/AddConfiguration",
+                "http://mock",
+                &s,
+                &req(kind, real),
+            );
+            assert!(
+                !ok.contains("NoSuchConfig"),
+                "{kind}: {real} is seeded and must bind, got {ok}"
+            );
+            assert_eq!(
+                slot(&s),
+                Some(real.to_string()),
+                "{kind}: {real} did not land"
+            );
+        }
+    }
+
+    /// `UseCount` is the device's count of profiles referencing the
+    /// configuration, not a field the caller sets. The request above says `1`;
+    /// `PTZConfig_1` is referenced by `Profile_1` and `Profile_2`, so it stays
+    /// `2`. A documented omission is a design decision — `CLAUDE.md` step 5c.
+    #[test]
+    fn ptz_set_configuration_does_not_take_the_callers_use_count() {
+        use crate::mock::services::ptz;
+        let s = new_state();
+        ptz::handle_ptz_set_configuration(&s, &set_config_req("PTZConfig_1", "PTZNode_1", ""));
+        assert_eq!(s.read().ptz_configs[0].use_count, 2);
+    }
+
+    /// A profile with no PTZ configuration reaches no head, so PTZ operations
+    /// on it fault instead of answering for an empty channel invented on the
+    /// spot. `Profile_4` is that profile.
+    ///
+    /// This replaces the old "an empty preset list is a legitimate answer" case.
+    /// That was true, but it was asserted against a profile that should not have
+    /// been answerable at all — and `0 presets` is also what a handler ignoring
+    /// the token returns, so the assertion could not fail for its own reason.
+    #[test]
+    fn ptz_on_a_profile_with_no_configuration_faults() {
+        let s = new_state();
+        let xml = ptz_call(&s, "GetPresets", &ptz_ask("Profile_4", "GetPresets"));
+        assert!(xml.contains("NoPTZConfig-PRESETS-5602-5619"), "got {xml}");
+        assert!(xml.contains("Profile_4"), "got {xml}");
+        assert_eq!(xml.matches("<tptz:Preset ").count(), 0, "got {xml}");
+    }
+
+    /// A PTZ request with no `ProfileToken` faults rather than answering for
+    /// some default head. That fallback is exactly what made a token-less
+    /// handler indistinguishable from a correct one.
+    #[test]
+    fn ptz_without_a_profile_token_faults() {
+        let s = new_state();
+        let xml = ptz_call(
+            &s,
+            "GetStatus",
+            "<tptz:GetStatus xmlns:tptz='http://www.onvif.org/ver20/ptz/wsdl'/>",
+        );
+        assert!(xml.contains("NoProfileToken-STATUS-5601"), "got {xml}");
+
+        let unknown = ptz_call(&s, "GetStatus", &ptz_ask("Profile_nope", "GetStatus"));
+        assert!(
+            unknown.contains("NoSuchProfile-STATUS-5601"),
+            "got {unknown}"
+        );
+        assert!(unknown.contains("Profile_nope"), "got {unknown}");
+
+        // …and a profile that exists but binds no PTZ configuration is its own
+        // failure with its own code: `ter:NoConfig`, not `ter:NoProfile`.
+        let unbound = ptz_call(&s, "GetStatus", &ptz_ask("Profile_4", "GetStatus"));
+        assert!(
+            unbound.contains("NoPTZConfig-STATUS-5601-5619"),
+            "got {unbound}"
+        );
+        assert!(unbound.contains("ter:NoConfig"), "got {unbound}");
+        assert!(!unbound.contains("NoSuchProfile"), "got {unbound}");
+    }
+
+    #[test]
+    fn ptz_set_preset_uses_current_position_and_returns_token() {
+        let s = new_state();
+        // Move first so SetPreset captures a non-zero position.
+        ptz_call(
+            &s,
+            "AbsoluteMove",
+            &move_to("Profile_1", "0.4", "0.1", "0.2"),
+        );
+
+        let body = ptz_req(
+            "Profile_1",
+            "SetPreset",
+            "<tptz:PresetName>Garden</tptz:PresetName>",
+        );
+        let resp = ptz_call(&s, "SetPreset", &body);
+        // Profile_1 already has Preset_1 and Preset_2, so the new one is Preset_3.
+        assert!(resp.contains("Preset_3"), "got {resp}");
+
+        let presets = ptz_call(&s, "GetPresets", &ptz_ask("Profile_1", "GetPresets"));
+        assert!(presets.contains("Garden"));
+        assert!(presets.contains(r#"x="0.4""#));
+
+        // Profile_3 is the *other lens* and must be untouched. Deliberately
+        // not Profile_2: that is the sub stream of the same lens, so it shares
+        // this head and **does** see the new preset — see
+        // `ptz_main_and_sub_stream_of_one_lens_are_one_head`.
+        let other = ptz_call(&s, "GetPresets", &ptz_ask("Profile_3", "GetPresets"));
+        assert!(!other.contains("Garden"), "got {other}");
+    }
+
+    #[test]
+    fn ptz_remove_preset_then_get() {
+        let s = new_state();
+        let body = ptz_req(
+            "Profile_1",
+            "RemovePreset",
+            "<tptz:PresetToken>Preset_2</tptz:PresetToken>",
+        );
+        ptz_call(&s, "RemovePreset", &body);
+        let xml = ptz_call(&s, "GetPresets", &ptz_ask("Profile_1", "GetPresets"));
+        assert!(xml.contains("Preset_1"));
+        assert!(!xml.contains(r#"token="Preset_2""#));
+
+        // Profile_3 also has a Preset_2 — removing Profile_1's must not take it.
+        let other = ptz_call(&s, "GetPresets", &ptz_ask("Profile_3", "GetPresets"));
+        assert!(other.contains(r#"token="Preset_2""#), "got {other}");
+    }
+
+    #[test]
+    fn ptz_goto_preset_jumps_position() {
+        let s = new_state();
+        // Profile_1's Preset_2 ("Door"): pan=0.5 tilt=0.2 zoom=0.0
+        let body = ptz_req(
+            "Profile_1",
+            "GotoPreset",
+            "<tptz:PresetToken>Preset_2</tptz:PresetToken>",
+        );
+        ptz_call(&s, "GotoPreset", &body);
+        let xml = ptz_call(&s, "GetStatus", &ptz_ask("Profile_1", "GetStatus"));
+        assert!(xml.contains(r#"x="0.5""#));
+        assert!(xml.contains(r#"y="0.2""#));
+    }
+
+    #[test]
+    fn ptz_set_home_then_goto_home() {
+        let s = new_state();
+        // Move, set home, move away, goto home → position should reset to setpoint.
+        ptz_call(
+            &s,
+            "AbsoluteMove",
+            &move_to("Profile_1", "0.8", "-0.4", "0.3"),
+        );
+        ptz_call(
+            &s,
+            "SetHomePosition",
+            &ptz_ask("Profile_1", "SetHomePosition"),
+        );
+
+        ptz_call(
+            &s,
+            "AbsoluteMove",
+            &move_to("Profile_1", "-0.5", "0.5", "0.0"),
+        );
+        ptz_call(
+            &s,
+            "GotoHomePosition",
+            &ptz_ask("Profile_1", "GotoHomePosition"),
+        );
+
+        let xml = ptz_call(&s, "GetStatus", &ptz_ask("Profile_1", "GetStatus"));
+        assert!(xml.contains(r#"x="0.8""#));
+        assert!(xml.contains(r#"y="-0.4""#));
+    }
+
+    /// Preset *tours* were global too. Lens 1 ships one and lens 2 ships none,
+    /// so a tour handler that ignores the head cannot answer both.
+    ///
+    /// `Profile_3`, not `Profile_2`: the sub stream of lens 1 now shares lens
+    /// 1's head and therefore lens 1's tours, which is what a camera does.
+    #[test]
+    fn ptz_preset_tours_are_per_head() {
+        let s = new_state();
+        let p1 = ptz_call(
+            &s,
+            "GetPresetTours",
+            &ptz_ask("Profile_1", "GetPresetTours"),
+        );
+        let p3 = ptz_call(
+            &s,
+            "GetPresetTours",
+            &ptz_ask("Profile_3", "GetPresetTours"),
+        );
+        assert!(p1.contains("Tour_1"), "got {p1}");
+        assert!(!p3.contains("Tour_1"), "got {p3}");
+
+        // A tour created on lens 2 is lens 2's alone.
+        let created = ptz_call(
+            &s,
+            "CreatePresetTour",
+            &ptz_ask("Profile_3", "CreatePresetTour"),
+        );
+        assert!(
+            created.contains("Tour_1"),
+            "first tour on this head: {created}"
+        );
+        let p1_after = ptz_call(
+            &s,
+            "GetPresetTours",
+            &ptz_ask("Profile_1", "GetPresetTours"),
+        );
+        assert_eq!(
+            p1_after.matches("<tptz:PresetTour ").count(),
+            1,
+            "Profile_1 still has exactly its own one tour: {p1_after}"
+        );
+    }
+
+    // ── OSD CRUD + quota ─────────────────────────────────────────────────
+
+    #[test]
+    fn osd_default_state_has_one_datetime_entry() {
+        let s = new_state();
+        let snap = s.read().osd.clone();
+        assert_eq!(snap.osds.len(), 1);
+        assert_eq!(snap.osds[0].token, "OSD_1");
+        assert_eq!(snap.osds[0].text.as_ref().unwrap().text_type, "DateAndTime");
+    }
+
+    #[test]
+    fn create_osd_then_appears_in_get() {
+        use crate::mock::services::media;
+        let s = new_state();
+        // Create a Plain text OSD — DateAndTime is at quota (1/1) by default.
+        let body = r#"<trt:CreateOSD><trt:OSD>
+            <tt:VideoSourceConfigurationToken>VSC_1</tt:VideoSourceConfigurationToken>
+            <tt:Type>Text</tt:Type>
+            <tt:Position><tt:Type>UpperRight</tt:Type></tt:Position>
+            <tt:TextString>
+              <tt:Type>Plain</tt:Type>
+              <tt:PlainText>Hello camera</tt:PlainText>
+              <tt:FontSize>24</tt:FontSize>
+            </tt:TextString>
+          </trt:OSD></trt:CreateOSD>"#;
+        let resp = media::handle_create_osd(&s, body);
+        assert!(resp.contains("CreateOSDResponse"));
+        assert!(resp.contains("OSD_2"), "new token should be OSD_2");
+
+        let listed = media::resp_osds(&s, "<trt:GetOSDs/>");
+        assert!(listed.contains("OSD_1"));
+        assert!(listed.contains("OSD_2"));
+        assert!(listed.contains("Hello camera"));
+    }
+
+    #[test]
+    fn create_osd_rejects_when_per_type_quota_full() {
+        use crate::mock::services::media;
+        let s = new_state();
+        // Default already has one DateAndTime — DateAndTime quota is 1.
+        // A second one must be rejected.
+        let body = r#"<trt:CreateOSD><trt:OSD>
+            <tt:VideoSourceConfigurationToken>VSC_1</tt:VideoSourceConfigurationToken>
+            <tt:Type>Text</tt:Type>
+            <tt:Position><tt:Type>LowerRight</tt:Type></tt:Position>
+            <tt:TextString><tt:Type>DateAndTime</tt:Type></tt:TextString>
+          </trt:OSD></trt:CreateOSD>"#;
+        let resp = media::handle_create_osd(&s, body);
+        assert!(resp.contains("Fault"), "should be SOAP fault");
+        assert!(resp.contains("InvalidArgs"));
+        assert!(resp.contains("DateAndTime"));
+        // State unchanged — still just the default one.
+        assert_eq!(s.read().osd.osds.len(), 1);
+    }
+
+    #[test]
+    fn set_osd_updates_existing() {
+        use crate::mock::services::media;
+        let s = new_state();
+        let body = r#"<trt:SetOSD><trt:OSD token="OSD_1">
+            <tt:VideoSourceConfigurationToken>VSC_1</tt:VideoSourceConfigurationToken>
+            <tt:Type>Text</tt:Type>
+            <tt:Position><tt:Type>LowerLeft</tt:Type></tt:Position>
+            <tt:TextString>
+              <tt:Type>DateAndTime</tt:Type>
+              <tt:DateFormat>yyyy-MM-dd</tt:DateFormat>
+            </tt:TextString>
+          </trt:OSD></trt:SetOSD>"#;
+        let resp = media::handle_set_osd(&s, body);
+        assert!(resp.contains("SetOSDResponse"));
+        assert!(!resp.contains("Fault"));
+
+        let listed = media::resp_osds(&s, "<trt:GetOSDs/>");
+        assert!(listed.contains("LowerLeft"));
+        assert!(listed.contains("yyyy-MM-dd"));
+        // VSC token must be preserved across SetOSD.
+        assert!(listed.contains("VSC_1"));
+    }
+
+    #[test]
+    fn delete_osd_removes_entry() {
+        use crate::mock::services::media;
+        let s = new_state();
+        let body = r#"<trt:DeleteOSD><trt:OSDToken>OSD_1</trt:OSDToken></trt:DeleteOSD>"#;
+        let resp = media::handle_delete_osd(&s, body);
+        assert!(resp.contains("DeleteOSDResponse"));
+        assert_eq!(s.read().osd.osds.len(), 0);
+    }
+
+    #[test]
+    fn delete_osd_unknown_token_returns_fault() {
+        use crate::mock::services::media;
+        let s = new_state();
+        let body = r#"<trt:DeleteOSD><trt:OSDToken>OSD_99</trt:OSDToken></trt:DeleteOSD>"#;
+        let resp = media::handle_delete_osd(&s, body);
+        assert!(resp.contains("Fault"));
+        assert!(resp.contains("OSD_99"));
+        // State untouched.
+        assert_eq!(s.read().osd.osds.len(), 1);
+    }
+
+    #[test]
+    fn get_osds_filters_by_configuration_token() {
+        use crate::mock::services::media;
+        let s = new_state();
+        // Create one OSD on a different VSC.
+        let create = r#"<trt:CreateOSD><trt:OSD>
+            <tt:VideoSourceConfigurationToken>VSC_OTHER</tt:VideoSourceConfigurationToken>
+            <tt:Type>Text</tt:Type>
+            <tt:Position><tt:Type>UpperLeft</tt:Type></tt:Position>
+            <tt:TextString><tt:Type>Plain</tt:Type><tt:PlainText>Other</tt:PlainText></tt:TextString>
+          </trt:OSD></trt:CreateOSD>"#;
+        media::handle_create_osd(&s, create);
+        assert_eq!(s.read().osd.osds.len(), 2);
+
+        // Filter by VSC_1 — should NOT include the VSC_OTHER one.
+        let only_vsc1 = media::resp_osds(
+            &s,
+            r#"<trt:GetOSDs><trt:ConfigurationToken>VSC_1</trt:ConfigurationToken></trt:GetOSDs>"#,
+        );
+        assert!(only_vsc1.contains("OSD_1"));
+        assert!(!only_vsc1.contains("Other"));
+    }
+
+    #[test]
+    fn osd_options_advertises_per_type_quotas_via_attributes() {
+        use crate::mock::services::media;
+        let xml = media::resp_osd_options();
+        // Genetec/late-Hikvision shape — attributes on <MaximumNumberOfOSDs>,
+        // not element text. oxvif::OnvifSession parses these.
+        assert!(xml.contains(r#"Total="8""#));
+        assert!(xml.contains(r#"DateAndTime="1""#));
+        assert!(xml.contains(r#"Plain="7""#));
+    }
+
+    // ── Profile CRUD ─────────────────────────────────────────────────────
+
+    #[test]
+    fn profiles_default_state_has_two() {
+        use crate::mock::services::media;
+        let s = new_state();
+        let xml = media::resp_profiles(&s);
+        assert!(xml.contains(r#"token="Profile_1" fixed="true""#));
+        assert!(xml.contains(r#"token="Profile_2" fixed="false""#));
+        assert!(xml.contains("mainStream"));
+        assert!(xml.contains("subStream"));
+        // Default profiles have video configs attached.
+        assert!(xml.contains("VSC_1"));
+        assert!(xml.contains("VEC_1"));
+        assert!(xml.contains("VEC_2"));
+        // Sensor 2's pair, so a caller enumerating profiles reaches both lenses.
+        assert!(xml.contains(r#"token="Profile_3" fixed="true""#));
+        assert!(xml.contains(r#"token="Profile_4" fixed="false""#));
+        assert!(xml.contains("VSC_2"));
+        assert!(xml.contains("VEC_3"));
+        assert!(xml.contains("VEC_4"));
+        // Each profile carries its *own* source config, not a shared one: the
+        // sensor-2 profiles must not be rendered with VS_1's bounds.
+        assert!(xml.contains("<tt:SourceToken>VS_2</tt:SourceToken>"));
+    }
+
+    #[test]
+    fn create_profile_then_appears_in_get_profiles() {
+        use crate::mock::services::media;
+        let s = new_state();
+        let body = r#"<trt:CreateProfile xmlns:trt="http://www.onvif.org/ver10/media/wsdl"><trt:Name>customStream</trt:Name></trt:CreateProfile>"#;
+        let resp = crate::mock::dispatch::dispatch(
+            "http://www.onvif.org/ver10/media/wsdl/CreateProfile",
+            "http://mock",
+            &s,
+            body,
+        );
+        assert!(resp.contains("CreateProfileResponse"));
+        // Four default profiles, so the counter starts at 5.
+        assert!(resp.contains("Profile_5"));
+        assert!(resp.contains("customStream"));
+        assert!(resp.contains(r#"fixed="false""#));
+
+        let listed = media::resp_profiles(&s);
+        assert!(listed.contains("Profile_5"));
+        assert!(listed.contains("customStream"));
+        // New profiles have no configurations attached.
+        let new_p_block = listed
+            .find("Profile_5")
+            .and_then(|i| {
+                listed[i..]
+                    .find("</trt:Profiles>")
+                    .map(|j| &listed[i..i + j])
+            })
+            .unwrap_or("");
+        assert!(!new_p_block.contains("VideoSourceConfiguration"));
+        assert!(!new_p_block.contains("VideoEncoderConfiguration"));
+    }
+
+    #[test]
+    fn create_profile_with_explicit_token_honoured() {
+        let s = new_state();
+        let body = r#"<trt:CreateProfile xmlns:trt="http://www.onvif.org/ver10/media/wsdl">
+            <trt:Name>specialName</trt:Name>
+            <trt:Token>MyProfile</trt:Token>
+          </trt:CreateProfile>"#;
+        let resp = crate::mock::dispatch::dispatch(
+            "http://www.onvif.org/ver10/media/wsdl/CreateProfile",
+            "http://mock",
+            &s,
+            body,
+        );
+        assert!(resp.contains("MyProfile"));
+        // Counter should NOT have been bumped — explicit token, no generation.
+        assert_eq!(s.read().profiles.next_token_id, 5);
+    }
+
+    #[test]
+    fn create_profile_rejects_duplicate_token() {
+        let s = new_state();
+        let body = r#"<trt:CreateProfile xmlns:trt="http://www.onvif.org/ver10/media/wsdl">
+            <trt:Name>dup</trt:Name>
+            <trt:Token>Profile_1</trt:Token>
+          </trt:CreateProfile>"#;
+        let resp = crate::mock::dispatch::dispatch(
+            "http://www.onvif.org/ver10/media/wsdl/CreateProfile",
+            "http://mock",
+            &s,
+            body,
+        );
+        assert!(resp.contains("Fault"));
+        assert!(resp.contains("ProfileExists"));
+        // No new entry, no counter change.
+        assert_eq!(s.read().profiles.profiles.len(), 4);
+    }
+
+    #[test]
+    fn delete_profile_removes_non_fixed() {
+        let s = new_state();
+        let body = r#"<trt:DeleteProfile xmlns:trt="http://www.onvif.org/ver10/media/wsdl"><trt:ProfileToken>Profile_2</trt:ProfileToken></trt:DeleteProfile>"#;
+        let resp = crate::mock::dispatch::dispatch(
+            "http://www.onvif.org/ver10/media/wsdl/DeleteProfile",
+            "http://mock",
+            &s,
+            body,
+        );
+        assert!(resp.contains("DeleteProfileResponse"));
+        assert_eq!(s.read().profiles.profiles.len(), 3);
+        // Only Profile_2 went; the other three are untouched and in order.
+        let tokens: Vec<String> = s
+            .read()
+            .profiles
+            .profiles
+            .iter()
+            .map(|p| p.token.clone())
+            .collect();
+        assert_eq!(tokens, ["Profile_1", "Profile_3", "Profile_4"]);
+    }
+
+    #[test]
+    fn delete_profile_refuses_fixed() {
+        let s = new_state();
+        let body = r#"<trt:DeleteProfile xmlns:trt="http://www.onvif.org/ver10/media/wsdl"><trt:ProfileToken>Profile_1</trt:ProfileToken></trt:DeleteProfile>"#;
+        let resp = crate::mock::dispatch::dispatch(
+            "http://www.onvif.org/ver10/media/wsdl/DeleteProfile",
+            "http://mock",
+            &s,
+            body,
+        );
+        assert!(resp.contains("Fault"));
+        assert!(resp.contains("DeletionOfFixedProfile"));
+        // State untouched.
+        assert_eq!(s.read().profiles.profiles.len(), 4);
+    }
+
+    #[test]
+    fn delete_profile_unknown_token_returns_fault() {
+        let s = new_state();
+        let body = r#"<trt:DeleteProfile xmlns:trt="http://www.onvif.org/ver10/media/wsdl"><trt:ProfileToken>NoSuch</trt:ProfileToken></trt:DeleteProfile>"#;
+        let resp = crate::mock::dispatch::dispatch(
+            "http://www.onvif.org/ver10/media/wsdl/DeleteProfile",
+            "http://mock",
+            &s,
+            body,
+        );
+        assert!(resp.contains("Fault"));
+        assert!(resp.contains("NoProfile"));
+        assert_eq!(s.read().profiles.profiles.len(), 4);
+    }
+
+    #[test]
+    fn get_profile_by_token() {
+        let s = new_state();
+        let body = r#"<trt:GetProfile xmlns:trt='http://www.onvif.org/ver10/media/wsdl'><trt:ProfileToken>Profile_2</trt:ProfileToken></trt:GetProfile>"#;
+        let resp = crate::mock::dispatch::dispatch(
+            "http://www.onvif.org/ver10/media/wsdl/GetProfile",
+            "http://mock",
+            &s,
+            body,
+        );
+        assert!(resp.contains("GetProfileResponse"));
+        assert!(resp.contains("subStream"));
+        assert!(!resp.contains("mainStream"));
+    }
+
+    #[test]
+    fn get_profile_unknown_token_returns_fault() {
+        let s = new_state();
+        let body = r#"<trt:GetProfile xmlns:trt='http://www.onvif.org/ver10/media/wsdl'><trt:ProfileToken>Bogus</trt:ProfileToken></trt:GetProfile>"#;
+        let resp = crate::mock::dispatch::dispatch(
+            "http://www.onvif.org/ver10/media/wsdl/GetProfile",
+            "http://mock",
+            &s,
+            body,
+        );
+        assert!(resp.contains("Fault"));
+        assert!(resp.contains("NoProfile"));
+    }
+
+    // ── Media2 video encoder config (stateful get/set) ───────────────────
+
+    #[test]
+    fn media2_get_video_encoder_configurations_returns_default() {
+        let s = new_state();
+        let xml = encoder_query(
+            &s,
+            true,
+            "GetVideoEncoderConfigurations",
+            "<tr2:GetVideoEncoderConfigurations/>",
+        );
+        assert!(xml.contains("GetVideoEncoderConfigurationsResponse"));
+        // All four channels, not just one: the token-less plural getter lists
+        // everything, which is what makes the filtering test below meaningful.
+        for tok in ["VEC_1", "VEC_2", "VEC_3", "VEC_4"] {
+            assert!(xml.contains(&format!(r#"token="{tok}""#)), "missing {tok}");
+        }
+        assert!(xml.contains("<tt:Width>1920</tt:Width>"));
+        // Sensor 2's main stream is 720p — a value sensor 1 never reports, so
+        // this also pins that the list is not four copies of one channel.
+        assert!(xml.contains("<tt:Width>1280</tt:Width>"));
+        assert!(xml.contains("<tt:Encoding>JPEG</tt:Encoding>"));
+    }
+
+    #[test]
+    fn media2_get_video_encoder_configurations_filters_by_token() {
+        let s = new_state();
+        let xml = encoder_query(
+            &s,
+            true,
+            "GetVideoEncoderConfigurations",
+            r#"<tr2:GetVideoEncoderConfigurations><tr2:ConfigurationToken>OTHER</tr2:ConfigurationToken></tr2:GetVideoEncoderConfigurations>"#,
+        );
+        assert!(xml.contains("ter:NoConfig"));
+        assert!(xml.contains("Encoder configuration not found: OTHER"));
+        assert!(!xml.contains("GetVideoEncoderConfigurationsResponse"));
+        let selected = encoder_query(
+            &s,
+            true,
+            "GetVideoEncoderConfigurations",
+            r#"<tr2:GetVideoEncoderConfigurations><tr2:ConfigurationToken>VEC_3</tr2:ConfigurationToken></tr2:GetVideoEncoderConfigurations>"#,
+        );
+        assert!(selected.contains(r#"token="VEC_3""#));
+        assert!(!selected.contains(r#"token="VEC_1""#));
+    }
+
+    // ── Relay output / Digital input (stateful) ───────────────────────────
+
+    #[test]
+    fn get_relay_outputs_returns_two_defaults() {
+        let s = new_state();
+        let xml = device::resp_relay_outputs(&s);
+        assert!(xml.contains(r#"token="RelayOutput_1""#));
+        assert!(xml.contains(r#"token="RelayOutput_2""#));
+        assert!(xml.contains("<tt:Mode>Bistable</tt:Mode>"));
+        assert!(xml.contains("<tt:Mode>Monostable</tt:Mode>"));
+    }
+
+    #[test]
+    fn set_relay_output_state_updates_logical_and_queues_event() {
+        let s = new_state();
+        let body = r#"<tds:SetRelayOutputState>
+            <tds:RelayOutputToken>RelayOutput_1</tds:RelayOutputToken>
+            <tds:LogicalState>active</tds:LogicalState>
+          </tds:SetRelayOutputState>"#;
+        let resp = device::handle_set_relay_output_state(&s, body);
+        assert!(resp.contains("SetRelayOutputStateResponse"));
+        assert!(!resp.contains("Fault"));
+
+        let snap = s.read();
+        let r1 = snap
+            .relay_outputs
+            .iter()
+            .find(|r| r.token == "RelayOutput_1");
+        assert_eq!(r1.unwrap().logical_state, "active");
+        assert_eq!(snap.pending_io_events.len(), 1);
+        assert_eq!(snap.pending_io_events[0].kind, "RelayOutput");
+        assert_eq!(snap.pending_io_events[0].logical_state, "active");
+    }
+
+    #[test]
+    fn set_relay_output_state_unknown_token_returns_fault() {
+        let s = new_state();
+        let body = r#"<tds:SetRelayOutputState>
+            <tds:RelayOutputToken>NoSuch</tds:RelayOutputToken>
+            <tds:LogicalState>active</tds:LogicalState>
+          </tds:SetRelayOutputState>"#;
+        let resp = device::handle_set_relay_output_state(&s, body);
+        assert!(resp.contains("Fault"));
+        assert!(resp.contains("NoSuch"));
+        // State untouched.
+        assert_eq!(s.read().pending_io_events.len(), 0);
+    }
+
+    #[test]
+    fn set_relay_output_settings_updates_mode_and_delay() {
+        let s = new_state();
+        let body = r#"<tds:SetRelayOutputSettings>
+            <tds:RelayOutputToken>RelayOutput_1</tds:RelayOutputToken>
+            <tds:Properties>
+              <tt:Mode>Monostable</tt:Mode>
+              <tt:DelayTime>PT5S</tt:DelayTime>
+              <tt:IdleState>open</tt:IdleState>
+            </tds:Properties>
+          </tds:SetRelayOutputSettings>"#;
+        let resp = device::handle_set_relay_output_settings(&s, body);
+        assert!(resp.contains("SetRelayOutputSettingsResponse"));
+
+        let snap = s.read();
+        let r1 = snap
+            .relay_outputs
+            .iter()
+            .find(|r| r.token == "RelayOutput_1");
+        let r1 = r1.unwrap();
+        assert_eq!(r1.mode, "Monostable");
+        assert_eq!(r1.delay_time, "PT5S");
+        assert_eq!(r1.idle_state, "open");
+    }
+
+    #[test]
+    fn get_digital_inputs_returns_two_defaults() {
+        let s = new_state();
+        let xml = device::resp_digital_inputs(&s);
+        assert!(xml.contains(r#"token="DigitalInput_1""#));
+        assert!(xml.contains(r#"token="DigitalInput_2""#));
+        assert!(xml.contains(r#"IdleState="closed""#));
+        assert!(xml.contains(r#"IdleState="open""#));
+    }
+
+    #[test]
+    fn pull_messages_drains_pending_io_event_first() {
+        use crate::mock::services::events;
+        let s = new_state();
+        // Seed an IO event as if the pulse endpoint fired.
+        s.modify(|st| {
+            st.pending_io_events.push(PendingIoEvent {
+                kind: "DigitalInput",
+                token: "DigitalInput_1".into(),
+                logical_state: "active".into(),
+            });
+        });
+        let xml = events::resp_pull_messages(&s);
+        assert!(xml.contains("tns1:Device/Trigger/DigitalInput"));
+        assert!(xml.contains(r#"Name="InputToken" Value="DigitalInput_1""#));
+        assert!(xml.contains(r#"Name="LogicalState" Value="true""#));
+        // Queue drained; next call falls through to the synthetic stream.
+        assert_eq!(s.read().pending_io_events.len(), 0);
+        let xml2 = events::resp_pull_messages(&s);
+        assert!(xml2.contains("MotionAlarm") || xml2.contains("RuleEngine"));
+    }
+
+    #[test]
+    fn pull_messages_io_event_relay_uses_relay_token_source() {
+        use crate::mock::services::events;
+        let s = new_state();
+        s.modify(|st| {
+            st.pending_io_events.push(PendingIoEvent {
+                kind: "RelayOutput",
+                token: "RelayOutput_1".into(),
+                logical_state: "inactive".into(),
+            });
+        });
+        let xml = events::resp_pull_messages(&s);
+        assert!(xml.contains("tns1:Device/Trigger/RelayOutput"));
+        assert!(xml.contains(r#"Name="RelayToken" Value="RelayOutput_1""#));
+        assert!(xml.contains(r#"Name="LogicalState" Value="false""#));
+    }
+
+    // ── Multi-sensor: per-channel answers ─────────────────────────────────
+    //
+    // The rule these cover (CLAUDE.md, "Multi-sensor devices"): a single-sensor
+    // fixture cannot cover a per-channel feature, because it passes just as well
+    // against a responder that ignores the token entirely. Every assertion below
+    // is written so that it fails if the token stops being read — most of them
+    // by naming a value that exists on *one* channel only.
+
+    /// Pull the `<tt:Width>` values out of a rendered response, in order.
+    fn widths(xml: &str) -> Vec<u32> {
+        xml.split("<tt:Width>")
+            .skip(1)
+            .filter_map(|s| s.split("</tt:Width>").next())
+            .filter_map(|s| s.trim().parse().ok())
+            .collect()
+    }
+
+    /// Every default encoder must run a resolution it also offers, draw from a
+    /// sensor that exists, and every source config must point at a real sensor.
+    ///
+    /// Without this, the fixture could drift into a shape no camera produces —
+    /// a channel advertising 720p while running 1080p — and the per-channel
+    /// tests below would still pass while asserting nonsense.
+    #[test]
+    fn default_video_catalogue_is_self_consistent() {
+        let s = new_state();
+        let snap = s.read();
+        let sensors: Vec<&str> = snap
+            .video_sources
+            .iter()
+            .map(|v| v.token.as_str())
+            .collect();
+        assert_eq!(sensors, ["VS_1", "VS_2"], "two sensors");
+
+        for c in &snap.video_encoders {
+            assert!(
+                c.resolutions.contains(&(c.width, c.height)),
+                "{} runs {}x{} but does not offer it: {:?}",
+                c.token,
+                c.width,
+                c.height,
+                c.resolutions
+            );
+            assert!(
+                sensors.contains(&c.source_token.as_str()),
+                "{} draws from unknown sensor {}",
+                c.token,
+                c.source_token
+            );
+        }
+        for c in &snap.video_source_configs {
+            assert!(
+                sensors.contains(&c.source_token.as_str()),
+                "{} points at unknown sensor {}",
+                c.token,
+                c.source_token
+            );
+        }
+        // The property every per-channel test leans on: the two sensors do not
+        // agree about their maximum. If this ever becomes false the tests below
+        // stop distinguishing a token-aware responder from a token-blind one.
+        let max_of = |tok: &str| -> u32 {
+            snap.video_encoders
+                .iter()
+                .filter(|c| c.source_token == tok)
+                .flat_map(|c| c.resolutions.iter().map(|(w, _)| *w))
+                .max()
+                .unwrap()
+        };
+        assert!(
+            max_of("VS_1") > max_of("VS_2"),
+            "the sensors must disagree: VS_1 max {} vs VS_2 max {}",
+            max_of("VS_1"),
+            max_of("VS_2")
+        );
+    }
+
+    #[test]
+    fn get_video_sources_lists_both_sensors() {
+        let s = new_state();
+        let xml = source_query(&s, false, "GetVideoSources", None);
+        assert!(xml.contains(r#"token="VS_1""#));
+        assert!(xml.contains(r#"token="VS_2""#));
+        // Their resolutions differ, so this is not one sensor listed twice.
+        assert_eq!(widths(&xml), vec![2592, 1280]);
+    }
+
+    // ── Media1 video encoder options ──────────────────────────────────────
+
+    fn vec_options_body(token: &str) -> String {
+        format!(
+            "<trt:GetVideoEncoderConfigurationOptions>\
+               <trt:ConfigurationToken>{token}</trt:ConfigurationToken>\
+             </trt:GetVideoEncoderConfigurationOptions>"
+        )
+    }
+
+    /// The regression this whole change exists for.
+    ///
+    /// Before 0.15 `resp_video_encoder_configuration_options` took no arguments,
+    /// so both halves of this test saw sensor 1's list and the assertion below
+    /// could not have failed.
+    #[test]
+    fn video_encoder_options_are_per_channel() {
+        let s = new_state();
+
+        let lens1 = encoder_query(
+            &s,
+            false,
+            "GetVideoEncoderConfigurationOptions",
+            &vec_options_body("VEC_1"),
+        );
+        let lens2 = encoder_query(
+            &s,
+            false,
+            "GetVideoEncoderConfigurationOptions",
+            &vec_options_body("VEC_3"),
+        );
+
+        // Sensor 1 offers 5MP; sensor 2 cannot and must not claim to.
+        assert!(lens1.contains("<tt:Width>2592</tt:Width>"), "VEC_1 max");
+        assert!(
+            !lens2.contains("<tt:Width>2592</tt:Width>"),
+            "VEC_3 must not report sensor 1's 2592-wide mode — token ignored?"
+        );
+        assert_eq!(
+            widths(&lens2).into_iter().max(),
+            Some(1280),
+            "VEC_3 tops out at 720p"
+        );
+        // And the two responses are genuinely different documents.
+        assert_ne!(lens1, lens2);
+    }
+
+    /// The `Extension` copy is the superset — a parser reading only the shallow
+    /// `Options/H264` loses the widest mode. Pinned here because the two copies
+    /// are generated from one list and could silently become identical.
+    #[test]
+    fn video_encoder_options_extension_copy_is_a_superset() {
+        let s = new_state();
+        let xml = encoder_query(
+            &s,
+            false,
+            "GetVideoEncoderConfigurationOptions",
+            &vec_options_body("VEC_1"),
+        );
+
+        // Match the full pair, not the width alone — VEC_1 offers both
+        // 2592x1944 and 2592x1520, so a width-only check cannot tell the two
+        // copies apart. (It didn't: this assertion was written that way first
+        // and passed against a response where the widest mode *was* present.)
+        const WIDEST: &str = "<tt:Width>2592</tt:Width><tt:Height>1944</tt:Height>";
+        let (shallow, extension) = xml.split_once("<tt:Extension>").expect("Extension block");
+        assert!(
+            !shallow.contains(WIDEST),
+            "the shallow copy is the older device's smaller list"
+        );
+        assert!(
+            extension.contains(WIDEST),
+            "the Extension copy adds the widest mode"
+        );
+        // Same channel either way — the Extension is a superset, not a different
+        // lens's list.
+        assert!(shallow.contains("<tt:Width>1280</tt:Width>"));
+        assert!(extension.contains("<tt:Width>1280</tt:Width>"));
+    }
+
+    #[test]
+    fn video_encoder_options_without_token_are_generic() {
+        let s = new_state();
+        let xml = encoder_query(
+            &s,
+            false,
+            "GetVideoEncoderConfigurationOptions",
+            "<trt:GetVideoEncoderConfigurationOptions/>",
+        );
+        let body = crate::soap::parse_soap_body(&xml).unwrap();
+        let response =
+            crate::soap::find_response(&body, "GetVideoEncoderConfigurationOptionsResponse")
+                .unwrap();
+        let options = crate::types::VideoEncoderConfigurationOptions::from_xml(response).unwrap();
+        assert_eq!(
+            options
+                .h264
+                .unwrap()
+                .resolutions
+                .iter()
+                .map(|r| (r.width, r.height))
+                .collect::<Vec<_>>(),
+            [
+                (2592, 1944),
+                (2592, 1520),
+                (2560, 1440),
+                (2304, 1296),
+                (1920, 1080),
+                (1280, 720),
+                (704, 480),
+                (352, 240),
+                (480, 240),
+            ],
+            "generic options must include the resolution union across both sensors"
+        );
+    }
+
+    #[test]
+    fn video_encoder_options_unknown_token_faults() {
+        let s = new_state();
+        let xml = encoder_query(
+            &s,
+            false,
+            "GetVideoEncoderConfigurationOptions",
+            &vec_options_body("VEC_99"),
+        );
+        assert!(
+            xml.contains("Encoder configuration not found: VEC_99"),
+            "the fault must name the token that was rejected; got: {xml}"
+        );
+        assert!(!xml.contains("ResolutionsAvailable"));
+    }
+
+    // ── Media1 video source options ───────────────────────────────────────
+
+    fn source_query(s: &MockState, media2: bool, op: &str, token: Option<&str>) -> String {
+        let ns = if media2 {
+            "http://www.onvif.org/ver20/media/wsdl"
+        } else {
+            "http://www.onvif.org/ver10/media/wsdl"
+        };
+        let fields = token
+            .map(|token| {
+                format!(
+                    "<m:ConfigurationToken>{}</m:ConfigurationToken>",
+                    crate::types::xml_escape(token)
+                )
+            })
+            .unwrap_or_default();
+        crate::mock::dispatch::dispatch(
+            &format!("{ns}/{op}"),
+            "http://mock",
+            s,
+            &format!("<m:{op} xmlns:m='{ns}'>{fields}</m:{op}>"),
+        )
+    }
+
+    #[test]
+    fn video_source_options_are_per_channel() {
+        let s = new_state();
+        let lens1 = source_query(
+            &s,
+            false,
+            "GetVideoSourceConfigurationOptions",
+            Some("VSC_1"),
+        );
+        let lens2 = source_query(
+            &s,
+            false,
+            "GetVideoSourceConfigurationOptions",
+            Some("VSC_2"),
+        );
+
+        assert!(lens1.contains("<tt:Max>2592</tt:Max>"), "VSC_1 bounds");
+        assert!(lens2.contains("<tt:Max>1280</tt:Max>"), "VSC_2 bounds");
+        assert!(!lens2.contains("<tt:Max>2592</tt:Max>"));
+        // Each names only its own sensor.
+        assert!(lens1.contains("<tt:VideoSourceTokensAvailable>VS_1<"));
+        assert!(lens2.contains("<tt:VideoSourceTokensAvailable>VS_2<"));
+    }
+
+    #[test]
+    fn video_source_options_without_token_are_generic() {
+        let s = new_state();
+        let xml = source_query(&s, false, "GetVideoSourceConfigurationOptions", None);
+        let parsed = crate::soap::parse_soap_body(&xml).unwrap();
+        let options = parsed.children[0].child("Options").unwrap();
+        assert_eq!(
+            options
+                .children_named("VideoSourceTokensAvailable")
+                .map(|n| n.text())
+                .collect::<Vec<_>>(),
+            ["VS_1", "VS_2"]
+        );
+        assert_eq!(
+            options
+                .path(&["BoundsRange", "WidthRange", "Max"])
+                .unwrap()
+                .text(),
+            "1280"
+        );
+    }
+
+    #[test]
+    fn video_source_options_unknown_token_faults() {
+        let s = new_state();
+        let xml = source_query(
+            &s,
+            false,
+            "GetVideoSourceConfigurationOptions",
+            Some("VSC_9"),
+        );
+        assert!(
+            xml.contains("Source configuration not found: VSC_9"),
+            "got: {xml}"
+        );
+        assert!(!xml.contains("BoundsRange"));
+    }
+
+    // ── Media1 singular getters ───────────────────────────────────────────
+
+    #[test]
+    fn get_video_encoder_configuration_is_per_channel() {
+        let s = new_state();
+        let body = |t: &str| {
+            format!(
+                "<trt:GetVideoEncoderConfiguration>\
+                   <trt:ConfigurationToken>{t}</trt:ConfigurationToken>\
+                 </trt:GetVideoEncoderConfiguration>"
+            )
+        };
+        let one = encoder_query(&s, false, "GetVideoEncoderConfiguration", &body("VEC_1"));
+        let three = encoder_query(&s, false, "GetVideoEncoderConfiguration", &body("VEC_3"));
+        assert!(one.contains(r#"token="VEC_1""#) && one.contains("<tt:Width>1920</tt:Width>"));
+        assert!(three.contains(r#"token="VEC_3""#) && three.contains("<tt:Width>1280</tt:Width>"));
+        assert!(!three.contains(r#"token="VEC_1""#));
+
+        // JPEG channels carry no tt:H264 block — it is an encoding-specific
+        // element and a conformant device does not send it here.
+        let four = encoder_query(&s, false, "GetVideoEncoderConfiguration", &body("VEC_4"));
+        assert!(four.contains("<tt:Encoding>JPEG</tt:Encoding>"));
+        assert!(!four.contains("<tt:H264>"));
+    }
+
+    #[test]
+    fn get_video_encoder_configuration_unknown_token_faults() {
+        let s = new_state();
+        let xml = encoder_query(
+            &s,
+            false,
+            "GetVideoEncoderConfiguration",
+            "<trt:GetVideoEncoderConfiguration>\
+               <trt:ConfigurationToken>VEC_77</trt:ConfigurationToken>\
+             </trt:GetVideoEncoderConfiguration>",
+        );
+        assert!(
+            xml.contains("Encoder configuration not found: VEC_77"),
+            "got: {xml}"
+        );
+    }
+
+    #[test]
+    fn get_video_source_configuration_is_per_channel() {
+        let s = new_state();
+        let one = source_query(&s, false, "GetVideoSourceConfiguration", Some("VSC_1"));
+        let two = source_query(&s, false, "GetVideoSourceConfiguration", Some("VSC_2"));
+        assert!(one.contains("<tt:SourceToken>VS_1</tt:SourceToken>"));
+        assert!(two.contains("<tt:SourceToken>VS_2</tt:SourceToken>"));
+        assert!(!two.contains("<tt:SourceToken>VS_1</tt:SourceToken>"));
+    }
+
+    #[test]
+    fn get_video_source_configuration_unknown_token_faults() {
+        let s = new_state();
+        let xml = source_query(&s, false, "GetVideoSourceConfiguration", Some("VSC_77"));
+        assert!(
+            xml.contains("Source configuration not found: VSC_77"),
+            "got: {xml}"
+        );
+    }
+
+    // ── Media2 ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn media2_video_encoder_options_are_per_channel() {
+        let s = new_state();
+        let body = |t: &str| {
+            format!(
+                "<tr2:GetVideoEncoderConfigurationOptions>\
+                   <tr2:ConfigurationToken>{t}</tr2:ConfigurationToken>\
+                 </tr2:GetVideoEncoderConfigurationOptions>"
+            )
+        };
+        let lens1 = encoder_query(
+            &s,
+            true,
+            "GetVideoEncoderConfigurationOptions",
+            &body("VEC_1"),
+        );
+        let lens2 = encoder_query(
+            &s,
+            true,
+            "GetVideoEncoderConfigurationOptions",
+            &body("VEC_3"),
+        );
+
+        assert!(lens1.contains("<tt:Width>2592</tt:Width>"));
+        assert!(!lens2.contains("<tt:Width>2592</tt:Width>"));
+        // Only the 5MP sensor advertises H.265, so codec support is per-channel
+        // too, not a device-wide fact.
+        assert!(lens1.contains("<tt:Encoding>H265</tt:Encoding>"));
+        assert!(!lens2.contains("<tt:Encoding>H265</tt:Encoding>"));
+        assert!(lens2.contains("<tt:Encoding>H264</tt:Encoding>"));
+    }
+
+    #[test]
+    fn media2_video_encoder_options_without_token_are_generic() {
+        let s = new_state();
+        let xml = encoder_query(
+            &s,
+            true,
+            "GetVideoEncoderConfigurationOptions",
+            "<tr2:GetVideoEncoderConfigurationOptions/>",
+        );
+        let body = crate::soap::parse_soap_body(&xml).unwrap();
+        let response =
+            crate::soap::find_response(&body, "GetVideoEncoderConfigurationOptionsResponse")
+                .unwrap();
+        let options = crate::types::VideoEncoderConfigurationOptions2::from_xml(response).unwrap();
+        let h264 = options
+            .options
+            .iter()
+            .find(|o| o.encoding == crate::VideoEncoding::H264)
+            .unwrap();
+        assert_eq!(
+            h264.resolutions
+                .iter()
+                .map(|r| (r.width, r.height))
+                .collect::<Vec<_>>(),
+            [
+                (2592, 1944),
+                (2592, 1520),
+                (2560, 1440),
+                (2304, 1296),
+                (1920, 1080),
+                (1280, 720),
+                (704, 480),
+                (352, 240),
+                (480, 240),
+            ],
+            "generic options must include the resolution union across both sensors"
+        );
+    }
+
+    #[test]
+    fn media2_video_encoder_options_unknown_token_faults() {
+        let s = new_state();
+        let xml = encoder_query(
+            &s,
+            true,
+            "GetVideoEncoderConfigurationOptions",
+            "<tr2:GetVideoEncoderConfigurationOptions>\
+               <tr2:ConfigurationToken>VEC_42</tr2:ConfigurationToken>\
+             </tr2:GetVideoEncoderConfigurationOptions>",
+        );
+        assert!(
+            xml.contains("Encoder configuration not found: VEC_42"),
+            "got: {xml}"
+        );
+    }
+
+    #[test]
+    fn media2_video_source_options_are_per_channel() {
+        let s = new_state();
+        let one = source_query(
+            &s,
+            true,
+            "GetVideoSourceConfigurationOptions",
+            Some("VSC_1"),
+        );
+        let two = source_query(
+            &s,
+            true,
+            "GetVideoSourceConfigurationOptions",
+            Some("VSC_2"),
+        );
+        assert!(one.contains("<tt:VideoSourceTokensAvailable>VS_1<"));
+        assert!(two.contains("<tt:VideoSourceTokensAvailable>VS_2<"));
+        assert!(one.contains("<tt:Max>2592</tt:Max>"));
+        assert!(!two.contains("<tt:Max>2592</tt:Max>"));
+    }
+
+    #[test]
+    fn media2_video_source_options_unknown_token_faults() {
+        let s = new_state();
+        let xml = source_query(
+            &s,
+            true,
+            "GetVideoSourceConfigurationOptions",
+            Some("VSC_42"),
+        );
+        assert!(
+            xml.contains("Source configuration not found: VSC_42"),
+            "got: {xml}"
+        );
+    }
+
+    /// A Set must write the channel it names and leave the other three alone.
+    ///
+    /// The old version of this test asserted `!xml.contains("H265")` after
+    /// setting the single global config to H264 — with four channels and no
+    /// H265 among them that assertion is true no matter what the handler does,
+    /// so it is replaced by one that reads the sibling channels.
+    #[test]
+    fn media2_set_video_encoder_writes_only_the_named_channel() {
+        let s = new_state();
+        // `GovLength` / `Profile` are attributes of `tr2:Configuration` — the
+        // shape `tt:VideoEncoder2Configuration` declares and the one the client
+        // now sends. `Baseline` is deliberately *not* VEC_3's factory profile
+        // (`High`), so the assertion below cannot pass on the untouched value.
+        let body = r#"<tr2:SetVideoEncoderConfiguration><tr2:Configuration token="VEC_3" GovLength="60" Profile="Baseline">
+            <tt:Name>Retuned</tt:Name>
+            <tt:UseCount>1</tt:UseCount>
+            <tt:Encoding>H264</tt:Encoding>
+            <tt:Resolution><tt:Width>704</tt:Width><tt:Height>480</tt:Height></tt:Resolution>
+            <tt:RateControl><tt:FrameRateLimit>12</tt:FrameRateLimit><tt:BitrateLimit>777</tt:BitrateLimit></tt:RateControl>
+            <tt:Quality>6</tt:Quality>
+          </tr2:Configuration></tr2:SetVideoEncoderConfiguration>"#;
+        let resp = encoder_write(&s, body);
+        assert!(resp.contains("SetVideoEncoderConfigurationResponse"));
+        assert!(!resp.contains("Fault"));
+
+        let snap = s.read();
+        let by = |t: &str| snap.video_encoders.iter().find(|c| c.token == t).unwrap();
+        let three = by("VEC_3");
+        assert_eq!(three.name, "Retuned");
+        assert_eq!((three.width, three.height), (704, 480));
+        assert_eq!(three.bitrate_limit, 777);
+        assert_eq!(three.frame_rate_limit, 12.0);
+        assert_eq!(three.gov_length, 60);
+        assert_eq!(three.profile, "Baseline");
+        // The other three keep their factory values — in particular VEC_1 must
+        // not have picked up VEC_3's bitrate.
+        assert_eq!(by("VEC_1").bitrate_limit, 4096);
+        assert_eq!(by("VEC_1").name, "MainStream");
+        assert_eq!(by("VEC_1").gov_length, 25);
+        assert_eq!(by("VEC_1").profile, "Main");
+        assert_eq!(by("VEC_2").bitrate_limit, 1024);
+        assert_eq!(by("VEC_4").bitrate_limit, 512);
+    }
+
+    #[test]
+    fn media2_set_video_encoder_without_token_faults() {
+        let s = new_state();
+        let resp = encoder_write(
+            &s,
+            "<tr2:SetVideoEncoderConfiguration><tr2:Configuration>\
+               <tt:Name>Nope</tt:Name>\
+             </tr2:Configuration></tr2:SetVideoEncoderConfiguration>",
+        );
+        assert!(resp.contains("Invalid Args"), "got: {resp}");
+        // And no channel was renamed on the way past.
+        assert!(s.read().video_encoders.iter().all(|c| c.name != "Nope"));
+    }
+
+    #[test]
+    fn media2_set_video_encoder_unknown_token_faults() {
+        let s = new_state();
+        let resp = encoder_write(
+            &s,
+            r#"<tr2:SetVideoEncoderConfiguration><tr2:Configuration token="VEC_88">
+               <tt:Name>Nope</tt:Name>
+               <tt:UseCount>1</tt:UseCount><tt:Encoding>H264</tt:Encoding>
+               <tt:Resolution><tt:Width>1920</tt:Width><tt:Height>1080</tt:Height></tt:Resolution><tt:Quality>5</tt:Quality>
+             </tr2:Configuration></tr2:SetVideoEncoderConfiguration>"#,
+        );
+        assert!(
+            resp.contains("Encoder configuration not found: VEC_88"),
+            "got: {resp}"
+        );
+        assert!(s.read().video_encoders.iter().all(|c| c.name != "Nope"));
+    }
+
+    fn encoder_query(state: &MockState, media2: bool, op: &str, body: &str) -> String {
+        let ns = if media2 {
+            "http://www.onvif.org/ver20/media/wsdl"
+        } else {
+            "http://www.onvif.org/ver10/media/wsdl"
+        };
+        crate::mock::dispatch::dispatch(
+            &format!("{ns}/{op}"),
+            "http://mock",
+            state,
+            &format!(
+                "<s:Envelope xmlns:s='http://www.w3.org/2003/05/soap-envelope' xmlns:trt='http://www.onvif.org/ver10/media/wsdl' xmlns:tr2='http://www.onvif.org/ver20/media/wsdl' xmlns:tt='http://www.onvif.org/ver10/schema'><s:Body>{body}</s:Body></s:Envelope>"
+            ),
+        )
+    }
+
+    fn encoder_write(state: &MockState, body: &str) -> String {
+        crate::mock::dispatch::dispatch(
+            "http://www.onvif.org/ver20/media/wsdl/SetVideoEncoderConfiguration",
+            "http://mock",
+            state,
+            &format!(
+                "<s:Envelope xmlns:s='http://www.w3.org/2003/05/soap-envelope' xmlns:tr2='http://www.onvif.org/ver20/media/wsdl' xmlns:tt='http://www.onvif.org/ver10/schema'><s:Body>{body}</s:Body></s:Envelope>"
+            ),
+        )
+    }
+
+    // ── Imaging: every operation is per-VideoSourceToken ──────────────────
+    //
+    // Same rule as the video encoder options above, applied to the service
+    // where *every* method carries the token. The two lenses differ in three
+    // independent ways — level scale, focus support, and current values — so
+    // an assertion that survives a token being ignored has to be trying.
+
+    fn img_body(op: &str, token: &str) -> String {
+        format!("<timg:{op}><timg:VideoSourceToken>{token}</timg:VideoSourceToken></timg:{op}>")
+    }
+
+    #[test]
+    fn default_imaging_sources_cover_both_sensors_and_disagree() {
+        let s = new_state();
+        let snap = s.read();
+        let tokens: Vec<&str> = snap
+            .imaging_sources
+            .iter()
+            .map(|i| i.source_token.as_str())
+            .collect();
+        assert_eq!(tokens, ["VS_1", "VS_2"]);
+
+        // Each imaging entry must name a sensor that exists.
+        for i in &snap.imaging_sources {
+            assert!(
+                snap.video_sources.iter().any(|v| v.token == i.source_token),
+                "imaging entry for unknown sensor {}",
+                i.source_token
+            );
+        }
+        let vs1 = &snap.imaging_sources[0];
+        let vs2 = &snap.imaging_sources[1];
+        // The three properties the per-channel tests lean on. If any of these
+        // becomes an equality the corresponding test stops discriminating.
+        assert_ne!(vs1.brightness, vs2.brightness);
+        assert_ne!(vs1.level_max, vs2.level_max);
+        assert!(vs1.focus_supported && !vs2.focus_supported);
+    }
+
+    #[test]
+    fn imaging_settings_are_per_source() {
+        use crate::mock::services::imaging;
+        let s = new_state();
+        let one = imaging::resp_imaging_settings(&s, &img_body("GetImagingSettings", "VS_1"));
+        let two = imaging::resp_imaging_settings(&s, &img_body("GetImagingSettings", "VS_2"));
+
+        assert!(one.contains("<tt:Brightness>60</tt:Brightness>"), "{one}");
+        assert!(two.contains("<tt:Brightness>45</tt:Brightness>"), "{two}");
+        assert!(one.contains("<tt:IrCutFilter>AUTO</tt:IrCutFilter>"));
+        assert!(two.contains("<tt:IrCutFilter>ON</tt:IrCutFilter>"));
+        // The fixed lens omits tt:Focus entirely — it is [0..1] in the schema
+        // and a lens with no motor has no auto-focus mode to report.
+        assert!(one.contains("<tt:AutoFocusMode>AUTO</tt:AutoFocusMode>"));
+        assert!(!two.contains("<tt:Focus>"));
+    }
+
+    #[test]
+    fn imaging_settings_without_token_faults() {
+        use crate::mock::services::imaging;
+        let s = new_state();
+        let xml = imaging::resp_imaging_settings(&s, "<timg:GetImagingSettings/>");
+        assert!(xml.contains("NoVideoSourceToken-IMGSET-5601"), "got: {xml}");
+        assert!(!xml.contains("<tt:Brightness>"));
+    }
+
+    #[test]
+    fn imaging_settings_unknown_source_faults() {
+        use crate::mock::services::imaging;
+        let s = new_state();
+        let xml =
+            imaging::resp_imaging_settings(&s, &img_body("GetImagingSettings", "VideoSource_1"));
+        assert!(
+            xml.contains("NoSuchVideoSource-IMGSET-5602: VideoSource_1"),
+            "got: {xml}"
+        );
+    }
+
+    #[test]
+    fn imaging_options_are_per_source() {
+        use crate::mock::services::imaging;
+        let s = new_state();
+        let one = imaging::resp_imaging_options(&s, &img_body("GetOptions", "VS_1"));
+        let two = imaging::resp_imaging_options(&s, &img_body("GetOptions", "VS_2"));
+
+        // Different level scales — the single number that separates the two.
+        assert!(one.contains("<tt:Max>100</tt:Max>"), "{one}");
+        assert!(two.contains("<tt:Max>255</tt:Max>"), "{two}");
+        assert!(!two.contains("<tt:Max>100</tt:Max>"));
+        // And the fixed lens offers no auto-focus modes at all.
+        // Spelled as the schema has it — `tt:FocusOptions20/AutoFocusModes`.
+        assert!(one.contains("<tt:AutoFocusModes>AUTO</tt:AutoFocusModes>"));
+        assert!(!two.contains("<tt:AutoFocusModes>"));
+    }
+
+    #[test]
+    fn imaging_options_unknown_source_faults() {
+        use crate::mock::services::imaging;
+        let s = new_state();
+        let xml = imaging::resp_imaging_options(&s, &img_body("GetOptions", "VS_7"));
+        assert!(
+            xml.contains("NoSuchVideoSource-IMGOPT-5606: VS_7"),
+            "got: {xml}"
+        );
+    }
+
+    #[test]
+    fn imaging_status_reports_focus_only_where_there_is_one() {
+        use crate::mock::services::imaging;
+        let s = new_state();
+        let one = imaging::resp_imaging_status(&s, &img_body("GetStatus", "VS_1"));
+        let two = imaging::resp_imaging_status(&s, &img_body("GetStatus", "VS_2"));
+
+        assert!(one.contains("<tt:FocusStatus20>"));
+        assert!(one.contains("<tt:Position>0.5</tt:Position>"));
+        // Legal empty Status — FocusStatus20 is the type's only content and it
+        // is [0..1], so a caller has to survive its absence.
+        assert!(!two.contains("<tt:FocusStatus20>"));
+        assert!(two.contains("<timg:Status></timg:Status>"), "{two}");
+    }
+
+    #[test]
+    fn imaging_move_options_fault_on_a_fixed_lens() {
+        use crate::mock::services::imaging;
+        let s = new_state();
+        let one = imaging::resp_imaging_move_options(&s, &img_body("GetMoveOptions", "VS_1"));
+        // `tt:AbsoluteFocusOptions` is Position + Speed; the `…Space` spelling
+        // this used to assert is PTZ's, and is not declared for focus at all.
+        assert!(
+            one.contains("<tt:Position><tt:Min>0.0</tt:Min><tt:Max>1.0</tt:Max></tt:Position>"),
+            "{one}"
+        );
+        assert!(!one.contains("Space>"), "{one}");
+
+        let two = imaging::resp_imaging_move_options(&s, &img_body("GetMoveOptions", "VS_2"));
+        assert!(
+            two.contains("NoFocusSupport-IMGMOVEOPT-5611: VS_2"),
+            "got: {two}"
+        );
+        assert!(!two.contains("<tt:Position>"));
+    }
+
+    #[test]
+    fn imaging_move_and_stop_fault_on_a_fixed_lens() {
+        use crate::mock::services::imaging;
+        let s = new_state();
+        assert!(
+            imaging::handle_imaging_move(&s, &img_body("Move", "VS_1")).contains("MoveResponse")
+        );
+        assert!(
+            imaging::handle_imaging_stop(&s, &img_body("Stop", "VS_1")).contains("StopResponse")
+        );
+
+        let m = imaging::handle_imaging_move(&s, &img_body("Move", "VS_2"));
+        assert!(m.contains("NoFocusSupport-IMGMOVE-5614: VS_2"), "got: {m}");
+        let st = imaging::handle_imaging_stop(&s, &img_body("Stop", "VS_2"));
+        assert!(
+            st.contains("NoFocusSupport-IMGSTOP-5617: VS_2"),
+            "got: {st}"
+        );
+    }
+
+    #[test]
+    fn imaging_move_without_token_faults() {
+        use crate::mock::services::imaging;
+        let s = new_state();
+        let xml = imaging::handle_imaging_move(&s, "<timg:Move/>");
+        assert!(
+            xml.contains("NoVideoSourceToken-IMGMOVE-5612"),
+            "got: {xml}"
+        );
+    }
+
+    /// A Set writes the lens it names and leaves the other alone.
+    #[test]
+    fn set_imaging_settings_writes_only_the_named_source() {
+        use crate::mock::services::imaging;
+        let s = new_state();
+        let body = r#"<timg:SetImagingSettings>
+            <timg:VideoSourceToken>VS_2</timg:VideoSourceToken>
+            <timg:ImagingSettings>
+              <tt:Brightness>7</tt:Brightness>
+              <tt:IrCutFilter>OFF</tt:IrCutFilter>
+            </timg:ImagingSettings>
+          </timg:SetImagingSettings>"#;
+        let resp = imaging::handle_set_imaging_settings(&s, body);
+        assert!(resp.contains("SetImagingSettingsResponse"));
+        assert!(!resp.contains("Fault"));
+
+        let snap = s.read();
+        let by = |t: &str| {
+            snap.imaging_sources
+                .iter()
+                .find(|i| i.source_token == t)
+                .unwrap()
+        };
+        assert_eq!(by("VS_2").brightness, 7.0);
+        assert_eq!(by("VS_2").ir_cut_filter, "OFF");
+        // VS_1 untouched — the value it would have picked up is distinctive.
+        assert_eq!(by("VS_1").brightness, 60.0);
+        assert_eq!(by("VS_1").ir_cut_filter, "AUTO");
+    }
+
+    #[test]
+    fn set_imaging_settings_unknown_source_writes_nothing() {
+        use crate::mock::services::imaging;
+        let s = new_state();
+        let body = r#"<timg:SetImagingSettings>
+            <timg:VideoSourceToken>VS_9</timg:VideoSourceToken>
+            <timg:ImagingSettings><tt:Brightness>7</tt:Brightness></timg:ImagingSettings>
+          </timg:SetImagingSettings>"#;
+        let resp = imaging::handle_set_imaging_settings(&s, body);
+        assert!(
+            resp.contains("NoSuchVideoSource-IMGSETW-5604: VS_9"),
+            "got: {resp}"
+        );
+        // Neither lens moved.
+        assert!(s.read().imaging_sources.iter().all(|i| i.brightness != 7.0));
+    }
+
+    #[test]
+    fn set_imaging_settings_without_token_writes_nothing() {
+        use crate::mock::services::imaging;
+        let s = new_state();
+        let resp = imaging::handle_set_imaging_settings(
+            &s,
+            "<timg:SetImagingSettings><timg:ImagingSettings>\
+               <tt:Brightness>7</tt:Brightness>\
+             </timg:ImagingSettings></timg:SetImagingSettings>",
+        );
+        assert!(
+            resp.contains("NoVideoSourceToken-IMGSETW-5603"),
+            "got: {resp}"
+        );
+        assert!(s.read().imaging_sources.iter().all(|i| i.brightness != 7.0));
+    }
+}

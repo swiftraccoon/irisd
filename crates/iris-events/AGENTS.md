@@ -7,12 +7,21 @@ Scope: this crate only. Read the root `AGENTS.md` first.
 - Events are placed on the recorder's clock (`nvr_time`); a camera timestamp is carried
   alongside, never substituted. Changing this changes `docs/research/05-ingest-events.md §3`.
 - The ONVIF pull timeout stays below the 10 s request bound of the HTTP transport, and the
-  subscription is renewed before its lifetime ends. The timing constants at the top of
-  `onvif.rs` and `feed.rs` are measured values; a change needs a measurement in
+  subscription is renewed from its granted camera-clock lifetime before it ends, never faster
+  than the named 750 ms renewal floor. The timing constants at the top of `onvif.rs` and
+  `feed.rs` are measured values; a change needs a measurement in
   `docs/research/11-multi-camera-results.md` or a successor.
 - Credentials never appear in logs, URLs, errors, or `Debug` output (`CameraEndpoint`
   redacts its password).
+- `CameraEndpoint::host` is bare, including IPv6; `base_url` brackets IPv6 authorities.
 - `EventSink::publish` is called from receive loops and must stay non-blocking.
+- CGI attachment has a 10 s header/authentication deadline; do not apply an overall request
+  timeout to the indefinite feed body. Its stall clock advances only after a complete part.
+  Both CGI and ONVIF honor `CameraEndpoint::tls_verify`.
+- ONVIF-discovered service and subscription URLs stay on the configured full origin and
+  authenticated SOAP never follows redirects. SOAP has independent byte and XML-structure caps.
+  Clock/authentication classification uses Fault code, subcode, and reason, never free-form
+  Detail text.
 - The `EventStats` accessors feed the daemon's `events` statistics line; renaming or
   removing one changes `iris-tools daemon-stats` and `soak-report`.
 
@@ -27,6 +36,7 @@ Scope: this crate only. Read the root `AGENTS.md` first.
 - `onvif.rs` — pull-point subscription loop, topic mapping, ISO 8601 parsing.
 - `backoff.rs` — reconnection pacing.
 - `stats.rs` — per-source counters and the pull-latency histogram.
+- `transport.rs` — ONVIF SOAP HTTP transport with endpoint TLS policy and digest authentication.
 
 ## How to verify a change
 
@@ -49,7 +59,9 @@ the root `AGENTS.md`, and their results go in `docs/research`.
 - Multipart `Content-Length` headers arrive without a space after the colon on some firmware,
   and blank lines vary; the reader tolerates both and the tests pin that.
 - An ONVIF camera may report UTC an hour off while checking token time against its true
-  clock; keep the host-time fallback.
+  clock; keep the host-time fallback restricted to structured clock-authentication faults.
+- Once an ONVIF subscription reference exists, cancellation runs one bounded unsubscribe
+  epilogue and clears connected state before the source task exits.
 - Network-facing parsers must not panic on any input (root `AGENTS.md` rule 8); the multipart
   and digest parsers have fuzz targets under `fuzz/` (`multipart`, `digest_challenge`, `dahua_part`, `onvif_utc`); run them after a parser change.
 

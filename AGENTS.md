@@ -1,7 +1,7 @@
 # AGENTS.md — working in this repository
 
 irisd is an H.265 network video recorder for Linux whose record path never decodes video:
-RTSP in, standard fragmented MP4 out, byte-range serving to a Linux GUI and an iOS app.
+RTSP in, standard fragmented MP4 out, and authenticated serving to a Linux GUI and other clients.
 Rust workspace. Read this file first, then `STANDARDS.md`, then `docs/research/README.md`.
 
 ## Read before changing anything
@@ -23,12 +23,15 @@ crates/iris-h265     NAL classification, length-prefixed access-unit helpers
 crates/iris-mp4      fMP4 init segment, fragment encoder, scanner, sidecar index, HLS playlists
 crates/iris-ingest   retina RTSP sessions, timestamp regulariser, fragment assembly
 crates/iris-store    segment files, preallocation, sync policy, writer thread, recovery
+crates/iris-catalog  SQLite catalog, bounded admission, retention queries, migrations
+crates/iris-events   bounded Dahua CGI and ONVIF PullPoint event subscriptions
+crates/iris-api      authenticated HTTP/WebSocket serving, HLS, export, metrics
 crates/irisd         the binary: record, inspect, recover, hls, serve
 crates/iris-replay   RTSP replay server: recordings as synthetic cameras for benchmarks and fault injection
-crates/iris-gui      Linux viewer: GTK 4 grid of live tiles decoded by GStreamer (phase 3)
+crates/iris-gui      Linux viewer: GTK 4 live grid, focus, playback, timeline, export
 crates/iris-tools    the tools binary: log summaries, soak sampler and report, benchmark driver, camera probes, gh-commit
 config/              cameras.example.toml (committed), cameras.local.toml (gitignored secrets)
-docs/research/       research and design (dated measurements live only there and in CHANGELOG)
+docs/research/       research and design, including every dated measurement
 .rust-reference/     the Rust project reference pack (policies, vendored guides, its own Rust CLI)
 docs/standards/ietf/ the RTSP, RTP, HEVC payload, HLS, and codecs documents, as published
 third_party/         vendored dependencies with local patches (retina + SO_RCVLOWAT); see its README
@@ -69,8 +72,10 @@ third_party/         vendored dependencies with local patches (retina + SO_RCVLO
    is described by class only (an x86-64 host, an NVIDIA GPU with NVDEC, an ext4 HDD).
    Specifics that work needs go in gitignored files: `AGENTS.override.md`,
    `config/*.local.toml`, and `docs/local/`. Example addresses use RFC 5737 ranges
-   (`192.0.2.0/24`). The one exception is the repository's own address in the badge and
-   workflow links of `README.md` and `.github/`.
+   (`192.0.2.0/24`). Exceptions are the repository's own address in the badge and workflow
+   links of `README.md` and `.github/`, and legally required attribution, provenance, and
+   synthetic fixtures retained from published third-party source. Vendored material must
+   never contain locally captured identifiers or secrets.
 10. Documentation is part of every change: rustdoc on every public item (intra-doc links,
     an example where cheap), the crate's `README.md` and `AGENTS.md` when its surface or
     invariants move, and the design document that fixes the behaviour. CI builds rustdoc

@@ -5,19 +5,30 @@
 #[must_use]
 pub fn describe(sets: &[Vec<u8>], frame_rate: f64) -> String {
     let mut fmtp = String::from("a=fmtp:96");
-    let mut first = true;
+    let mut grouped = [Vec::new(), Vec::new(), Vec::new()];
     for nal in sets {
-        let key = match (nal[0] >> 1) & 0x3f {
-            32 => "sprop-vps",
-            33 => "sprop-sps",
-            34 => "sprop-pps",
+        let Some(first) = nal.first() else {
+            continue;
+        };
+        let index = match (first >> 1) & 0x3f {
+            32 => 0,
+            33 => 1,
+            34 => 2,
             _ => continue,
         };
+        grouped[index].push(base64(nal));
+    }
+    let mut first = true;
+    for (key, values) in ["sprop-vps", "sprop-sps", "sprop-pps"]
+        .into_iter()
+        .zip(grouped)
+        .filter(|(_, values)| !values.is_empty())
+    {
         fmtp.push(if first { ' ' } else { ';' });
         first = false;
         fmtp.push_str(key);
         fmtp.push('=');
-        fmtp.push_str(&base64(nal));
+        fmtp.push_str(&values.join(","));
     }
     format!(
         "v=0\r\n\
@@ -85,11 +96,36 @@ mod tests {
             30.0,
         );
         assert!(
-            sdp.contains("a=fmtp:96 sprop-pps=RAHA;sprop-vps=QAEM;sprop-sps=QgEB\r\n"),
+            sdp.contains("a=fmtp:96 sprop-vps=QAEM;sprop-sps=QgEB;sprop-pps=RAHA\r\n"),
             "{sdp}"
         );
         assert!(sdp.contains("m=video 0 RTP/AVP 96\r\n"));
         assert!(sdp.contains("a=rtpmap:96 H265/90000\r\n"));
         assert!(sdp.ends_with("a=control:trackID=0\r\n"));
+    }
+
+    #[test]
+    fn sdp_groups_multiple_parameter_sets_of_each_type() {
+        let sdp = describe(
+            &[
+                vec![0x42, 0x01, 0x01],
+                vec![0x40, 0x01, 0x0c],
+                vec![0x42, 0x01, 0x02],
+                vec![0x44, 0x01, 0xc0],
+                vec![0x40, 0x01, 0x0d],
+                vec![0x44, 0x01, 0xc1],
+            ],
+            30.0,
+        );
+        let fmtp = sdp
+            .lines()
+            .find(|line| line.starts_with("a=fmtp:"))
+            .unwrap();
+        assert_eq!(fmtp.matches("sprop-vps=").count(), 1);
+        assert_eq!(fmtp.matches("sprop-sps=").count(), 1);
+        assert_eq!(fmtp.matches("sprop-pps=").count(), 1);
+        assert!(fmtp.contains("sprop-vps=QAEM,QAEN"), "{fmtp}");
+        assert!(fmtp.contains("sprop-sps=QgEB,QgEC"), "{fmtp}");
+        assert!(fmtp.contains("sprop-pps=RAHA,RAHB"), "{fmtp}");
     }
 }

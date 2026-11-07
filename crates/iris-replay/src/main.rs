@@ -1,5 +1,6 @@
 //! `iris-replay`: serve recordings as synthetic RTSP cameras.
 
+use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -8,6 +9,7 @@ use std::time::Duration;
 use anyhow::{Context, bail};
 use clap::Parser;
 use iris_replay::media::Media;
+use iris_replay::rtsp::valid_mount_name;
 use iris_replay::server::{Mounts, Options, Server};
 use iris_replay::synth::{self, Plan};
 use tracing::info;
@@ -55,10 +57,12 @@ async fn main() -> anyhow::Result<()> {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
     tracing_subscriber::fmt().with_env_filter(filter).init();
     let mut mounts = Mounts::new();
+    let mut claimed_names = HashSet::new();
     for spec in &args.mounts {
         let (name, path) = spec
             .split_once('=')
             .with_context(|| format!("mount {spec:?} is not NAME=PATH"))?;
+        claim_mount_name(&mut claimed_names, name)?;
         let media = Media::load(&PathBuf::from(path))?;
         info!(
             name,
@@ -70,13 +74,14 @@ async fn main() -> anyhow::Result<()> {
     }
     for spec in &args.synths {
         let (name, gops) = spec.split_once('=').unwrap_or((spec, "30"));
+        claim_mount_name(&mut claimed_names, name)?;
         let plan = Plan {
             gops: gops
                 .parse()
                 .with_context(|| format!("synth {spec:?}: bad GOP count"))?,
             ..Plan::default()
         };
-        let media = Media::from_bytes(synth::recording(plan))?;
+        let media = Media::from_bytes(synth::recording(plan)?)?;
         info!(
             name,
             frames = media.frames.len(),
@@ -104,6 +109,37 @@ async fn main() -> anyhow::Result<()> {
         _ = tokio::signal::ctrl_c() => {
             info!("interrupted");
             Ok(())
+        }
+    }
+}
+
+fn claim_mount_name(claimed: &mut HashSet<String>, name: &str) -> anyhow::Result<()> {
+    if !valid_mount_name(name) {
+        bail!("invalid mount name {name:?}");
+    }
+    if !claimed.insert(name.to_owned()) {
+        bail!("duplicate mount name {name:?}");
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mount_names_are_reachable_and_unique_across_sources() {
+        let mut claimed = HashSet::new();
+        claim_mount_name(&mut claimed, "cam").unwrap();
+        let duplicate = claim_mount_name(&mut claimed, "cam").unwrap_err();
+        assert!(duplicate.to_string().contains("duplicate mount name"));
+
+        for invalid in ["", "trackID=0", "a/b", "a?b", "a#b"] {
+            let error = claim_mount_name(&mut claimed, invalid).unwrap_err();
+            assert!(
+                error.to_string().contains("invalid mount name"),
+                "{invalid:?}"
+            );
         }
     }
 }

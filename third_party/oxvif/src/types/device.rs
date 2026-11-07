@@ -1,0 +1,855 @@
+use super::{xml_bool, xml_str};
+use crate::error::OnvifError;
+use crate::soap::{SoapError, XmlNode};
+
+// ── DeviceInfo ────────────────────────────────────────────────────────────────
+
+/// Hardware and firmware information returned by `GetDeviceInformation`.
+///
+/// Absent fields in the device response are represented as empty strings.
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[derive(Debug, Clone, Default)]
+pub struct DeviceInfo {
+    /// Manufacturer name as the device reports it (e.g. `"Hikvision"`).
+    pub manufacturer: String,
+    /// Model designation (e.g. `"DS-2CD2085FWD-I"`).
+    pub model: String,
+    /// Firmware version string. Format is entirely vendor-defined — do not
+    /// attempt to order two of these.
+    pub firmware_version: String,
+    /// Device serial number.
+    pub serial_number: String,
+    /// Hardware revision identifier.
+    pub hardware_id: String,
+}
+
+impl DeviceInfo {
+    /// Parse from a `GetDeviceInformationResponse` node.
+    pub(crate) fn from_xml(resp: &XmlNode) -> Result<Self, OnvifError> {
+        Ok(Self {
+            manufacturer: xml_str(resp, "Manufacturer").unwrap_or_default(),
+            model: xml_str(resp, "Model").unwrap_or_default(),
+            firmware_version: xml_str(resp, "FirmwareVersion").unwrap_or_default(),
+            serial_number: xml_str(resp, "SerialNumber").unwrap_or_default(),
+            hardware_id: xml_str(resp, "HardwareId").unwrap_or_default(),
+        })
+    }
+}
+
+// ── SystemDateTime ────────────────────────────────────────────────────────────
+
+/// Device clock information returned by `GetSystemDateAndTime`.
+///
+/// The primary use-case is computing the UTC offset for WS-Security:
+///
+/// ```no_run
+/// # use oxvif::{OnvifClient, OnvifError};
+/// # async fn run() -> Result<(), OnvifError> {
+/// let client = OnvifClient::new("http://192.168.1.1/onvif/device_service");
+/// let dt     = client.get_system_date_and_time().await?;
+/// let client = client.with_utc_offset(dt.utc_offset_secs());
+/// # Ok(()) }
+/// ```
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[derive(Debug, Clone)]
+pub struct SystemDateTime {
+    /// Device UTC clock as a Unix timestamp (seconds since 1970-01-01T00:00:00Z).
+    /// `None` if the response contained no `UTCDateTime` element.
+    pub utc_unix: Option<i64>,
+    /// POSIX timezone string (e.g. `"CST-8"`).  Empty if absent.
+    pub timezone: String,
+    /// Whether daylight saving time is currently active on the device.
+    pub daylight_savings: bool,
+}
+
+impl SystemDateTime {
+    /// Seconds between the device UTC clock and the local system UTC clock.
+    ///
+    /// Returns `0` when `utc_unix` is `None`.
+    /// Pass the result to [`OnvifClient::with_utc_offset`](crate::client::OnvifClient::with_utc_offset).
+    pub fn utc_offset_secs(&self) -> i64 {
+        match self.utc_unix {
+            Some(device_utc) => {
+                let local_utc = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs() as i64;
+                device_utc - local_utc
+            }
+            None => 0,
+        }
+    }
+
+    /// Parse from a `GetSystemDateAndTimeResponse` node.
+    pub(crate) fn from_xml(resp: &XmlNode) -> Result<Self, OnvifError> {
+        let sdt = resp
+            .child("SystemDateAndTime")
+            .ok_or_else(|| SoapError::missing("SystemDateAndTime"))?;
+
+        Ok(Self {
+            utc_unix: sdt.child("UTCDateTime").and_then(parse_datetime_node),
+            timezone: sdt
+                .path(&["TimeZone", "TZ"])
+                .map(|n| n.text().to_string())
+                .unwrap_or_default(),
+            daylight_savings: xml_bool(sdt, "DaylightSavings"),
+        })
+    }
+}
+
+/// Parse year/month/day/hour/minute/second from an ONVIF `DateTime` node and
+/// return a Unix timestamp (seconds since epoch).
+fn parse_datetime_node(node: &XmlNode) -> Option<i64> {
+    let year = node
+        .path(&["Date", "Year"])
+        .and_then(|n| n.text().parse::<i32>().ok())?;
+    let month = node
+        .path(&["Date", "Month"])
+        .and_then(|n| n.text().parse::<i32>().ok())?;
+    let day = node
+        .path(&["Date", "Day"])
+        .and_then(|n| n.text().parse::<i32>().ok())?;
+    let hour = node
+        .path(&["Time", "Hour"])
+        .and_then(|n| n.text().parse::<i32>().ok())?;
+    let min = node
+        .path(&["Time", "Minute"])
+        .and_then(|n| n.text().parse::<i32>().ok())?;
+    let sec = node
+        .path(&["Time", "Second"])
+        .and_then(|n| n.text().parse::<i32>().ok())?;
+    Some(civil_to_unix(year, month, day, hour, min, sec))
+}
+
+/// Convert a proleptic Gregorian calendar date + time to a Unix timestamp.
+/// Uses the Howard Hinnant days-from-civil algorithm.
+pub(crate) fn civil_to_unix(year: i32, month: i32, day: i32, hour: i32, min: i32, sec: i32) -> i64 {
+    let mut y = year as i64;
+    let m = month as i64;
+    if m <= 2 {
+        y -= 1;
+    }
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let mp = if m > 2 { m - 3 } else { m + 9 };
+    let doy = (153 * mp + 2) / 5 + day as i64 - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    days * 86_400 + hour as i64 * 3600 + min as i64 * 60 + sec as i64
+}
+
+// ── SetDateTimeRequest ────────────────────────────────────────────────────────
+
+/// UTC date and time components for [`SetDateTimeRequest`].
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[derive(Debug, Clone, Copy)]
+pub struct UtcDateTime {
+    /// Full year, e.g. `2026`.
+    pub year: u16,
+    /// Month, `1`–`12`.
+    pub month: u8,
+    /// Day of month, `1`–`31`.
+    pub day: u8,
+    /// Hour, `0`–`23`.
+    pub hour: u8,
+    /// Minute, `0`–`59`.
+    pub minute: u8,
+    /// Second, `0`–`59`.
+    pub second: u8,
+}
+
+/// Parameters for `OnvifClient::set_system_date_and_time`.
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[derive(Debug, Clone)]
+pub struct SetDateTimeRequest {
+    /// `"Manual"` (use `utc_datetime`) or `"NTP"` (device syncs automatically).
+    pub datetime_type: String,
+    /// Whether daylight saving time is active.
+    pub daylight_savings: bool,
+    /// POSIX timezone string, e.g. `"CST-8"` for Asia/Taipei.
+    pub timezone: String,
+    /// Required when `datetime_type == "Manual"`; ignored for NTP.
+    pub utc_datetime: Option<UtcDateTime>,
+}
+
+// ── Hostname ──────────────────────────────────────────────────────────────────
+
+/// Hostname configuration returned by `GetHostname`.
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[derive(Debug, Clone)]
+pub struct Hostname {
+    /// `true` if the hostname is assigned by DHCP rather than set manually.
+    pub from_dhcp: bool,
+    /// The configured hostname. `None` if no hostname is set.
+    pub name: Option<String>,
+}
+
+impl Hostname {
+    /// Parse from a `GetHostnameResponse` node.
+    pub(crate) fn from_xml(resp: &XmlNode) -> Result<Self, OnvifError> {
+        let info = resp
+            .child("HostnameInformation")
+            .ok_or_else(|| SoapError::missing("HostnameInformation"))?;
+        Ok(Self {
+            from_dhcp: xml_bool(info, "FromDHCP"),
+            name: xml_str(info, "Name").filter(|s| !s.is_empty()),
+        })
+    }
+}
+
+// ── NtpInfo ───────────────────────────────────────────────────────────────────
+
+/// NTP configuration returned by `GetNTP`.
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[derive(Debug, Clone)]
+pub struct NtpInfo {
+    /// `true` if NTP servers are obtained from DHCP rather than set manually.
+    pub from_dhcp: bool,
+    /// Manually configured NTP server addresses (DNS names or IP strings).
+    /// Empty when `from_dhcp` is `true` or no servers are configured.
+    pub servers: Vec<String>,
+}
+
+impl NtpInfo {
+    /// Parse from a `GetNTPResponse` node.
+    pub(crate) fn from_xml(resp: &XmlNode) -> Result<Self, OnvifError> {
+        let info = resp
+            .child("NTPInformation")
+            .ok_or_else(|| SoapError::missing("NTPInformation"))?;
+        Ok(Self {
+            from_dhcp: xml_bool(info, "FromDHCP"),
+            servers: info
+                .children_named("NTPManual")
+                .chain(info.children_named("NTPFromDHCP"))
+                .filter_map(|entry| {
+                    // Prefer DNS name, then IPv4, then IPv6
+                    xml_str(entry, "DNSname")
+                        .filter(|s| !s.is_empty())
+                        .or_else(|| xml_str(entry, "IPv4Address").filter(|s| !s.is_empty()))
+                        .or_else(|| xml_str(entry, "IPv6Address").filter(|s| !s.is_empty()))
+                })
+                .collect(),
+        })
+    }
+}
+
+// ── OnvifService ─────────────────────────────────────────────────────────────
+
+/// A single service entry returned by `GetServices`.
+///
+/// `GetServices` is the proper ONVIF mechanism for discovering all service
+/// endpoints, including Media2. Use [`OnvifService::is_media2`] to identify
+/// the Media2 entry.
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[derive(Debug, Clone)]
+pub struct OnvifService {
+    /// Service namespace URI, e.g. `"http://www.onvif.org/ver20/media/wsdl"`.
+    pub namespace: String,
+    /// Service endpoint URL.
+    pub url: String,
+    /// Major part of the service version the device advertises.
+    pub version_major: u32,
+    /// Minor part of the service version the device advertises.
+    pub version_minor: u32,
+}
+
+impl OnvifService {
+    /// Returns `true` if this entry is the Media2 service.
+    pub fn is_media2(&self) -> bool {
+        self.namespace == "http://www.onvif.org/ver20/media/wsdl"
+    }
+
+    /// Returns `true` if this entry is the DeviceIO service — the endpoint
+    /// [`get_digital_inputs`](crate::OnvifClient::get_digital_inputs) needs.
+    ///
+    /// The comparison is case-insensitive on purpose. `deviceio.wsdl` declares
+    /// `targetNamespace="…/ver10/deviceIO/wsdl"` but spells the same segment
+    /// `deviceio` in every `soapAction` it binds, so firmware copying one or
+    /// the other is common; an exact match would silently fail to find the
+    /// service on half of them.
+    pub fn is_device_io(&self) -> bool {
+        self.namespace
+            .eq_ignore_ascii_case("http://www.onvif.org/ver10/deviceio/wsdl")
+    }
+
+    pub(crate) fn vec_from_xml(resp: &XmlNode) -> Result<Vec<Self>, OnvifError> {
+        Ok(resp
+            .children_named("Service")
+            .map(|s| Self {
+                namespace: xml_str(s, "Namespace").unwrap_or_default(),
+                url: xml_str(s, "XAddr").unwrap_or_default(),
+                version_major: s
+                    .path(&["Version", "Major"])
+                    .and_then(|n| n.text().parse().ok())
+                    .unwrap_or(0),
+                version_minor: s
+                    .path(&["Version", "Minor"])
+                    .and_then(|n| n.text().parse().ok())
+                    .unwrap_or(0),
+            })
+            .collect())
+    }
+}
+
+// ── User ──────────────────────────────────────────────────────────────────────
+
+/// A device user account returned by `GetUsers`.
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[derive(Debug, Clone)]
+pub struct User {
+    /// Login name. Passwords are never returned by `GetUsers`.
+    pub username: String,
+    /// Access level: `"Administrator"`, `"Operator"`, `"User"`, `"Anonymous"`, or `"Extended"`.
+    pub user_level: String,
+}
+
+impl User {
+    pub(crate) fn vec_from_xml(resp: &XmlNode) -> Result<Vec<Self>, OnvifError> {
+        resp.children_named("User")
+            .map(|n| {
+                let username = xml_str(n, "Username").unwrap_or_default();
+                let user_level = xml_str(n, "UserLevel").unwrap_or_default();
+                Ok(Self {
+                    username,
+                    user_level,
+                })
+            })
+            .collect()
+    }
+}
+
+// ── NetworkInterface ──────────────────────────────────────────────────────────
+
+/// Network interface configuration returned by `GetNetworkInterfaces`.
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[derive(Debug, Clone)]
+pub struct NetworkInterface {
+    /// Opaque token identifying this interface in `SetNetworkInterfaces`.
+    pub token: String,
+    /// `true` if the interface is administratively up.
+    pub enabled: bool,
+    /// Interface name as the device reports it (e.g. `"eth0"`).
+    pub name: String,
+    /// MAC address, in the device's own formatting.
+    pub hw_address: String,
+    /// Maximum transmission unit in bytes.
+    pub mtu: u32,
+    /// `true` if the IPv4 stack is enabled on this interface.
+    pub ipv4_enabled: bool,
+    /// Manual or DHCP-assigned IPv4 address. Empty when DHCP is active and no address is available.
+    pub ipv4_address: String,
+    /// IPv4 subnet mask in CIDR form (`24` = `255.255.255.0`).
+    pub ipv4_prefix_length: u32,
+    /// `true` if the IPv4 address came from DHCP rather than manual config.
+    pub ipv4_from_dhcp: bool,
+    /// `true` if the IPv6 stack is enabled on this interface.
+    pub ipv6_enabled: bool,
+    /// `true` if the IPv6 address is obtained via DHCPv6.
+    pub ipv6_from_dhcp: bool,
+    /// Manually configured or link-local IPv6 address, if available.
+    pub ipv6_address: Option<String>,
+}
+
+impl NetworkInterface {
+    pub(crate) fn vec_from_xml(resp: &XmlNode) -> Result<Vec<Self>, OnvifError> {
+        resp.children_named("NetworkInterfaces")
+            .map(|n| {
+                let token = n
+                    .attr("token")
+                    .filter(|t| !t.is_empty())
+                    .ok_or_else(|| SoapError::missing("NetworkInterfaces/@token"))?
+                    .to_string();
+                let enabled = xml_bool(n, "Enabled");
+                let name = n
+                    .path(&["Info", "Name"])
+                    .map(|x| x.text().to_string())
+                    .unwrap_or_default();
+                let hw_address = n
+                    .path(&["Info", "HwAddress"])
+                    .map(|x| x.text().to_string())
+                    .unwrap_or_default();
+                let mtu = n
+                    .path(&["Info", "MTU"])
+                    .and_then(|x| x.text().parse().ok())
+                    .unwrap_or(0);
+                let ipv4_enabled = n
+                    .path(&["IPv4", "Enabled"])
+                    .map(|x| x.text() == "true" || x.text() == "1")
+                    .unwrap_or(false);
+                let ipv4_from_dhcp = n
+                    .path(&["IPv4", "Config", "DHCP"])
+                    .map(|x| x.text() == "true" || x.text() == "1")
+                    .unwrap_or(false);
+                let ipv4_address = n
+                    .path(&["IPv4", "Config", "Manual", "Address"])
+                    .map(|x| x.text().to_string())
+                    .filter(|s| !s.is_empty())
+                    .or_else(|| {
+                        n.path(&["IPv4", "Config", "FromDHCP", "Address"])
+                            .map(|x| x.text().to_string())
+                            .filter(|s| !s.is_empty())
+                    })
+                    .unwrap_or_default();
+                let ipv4_prefix_length = n
+                    .path(&["IPv4", "Config", "Manual", "PrefixLength"])
+                    .and_then(|x| x.text().parse().ok())
+                    .or_else(|| {
+                        n.path(&["IPv4", "Config", "FromDHCP", "PrefixLength"])
+                            .and_then(|x| x.text().parse().ok())
+                    })
+                    .unwrap_or(0);
+                let ipv6_enabled = n
+                    .path(&["IPv6", "Enabled"])
+                    .map(|x| x.text() == "true" || x.text() == "1")
+                    .unwrap_or(false);
+                let ipv6_from_dhcp = n
+                    .path(&["IPv6", "Config", "DHCP"])
+                    .map(|x| {
+                        let t = x.text();
+                        t == "Stateful" || t == "Stateless" || t == "Both"
+                    })
+                    .unwrap_or(false);
+                let ipv6_address = n
+                    .path(&["IPv6", "Config", "Manual", "Address"])
+                    .map(|x| x.text().to_string())
+                    .filter(|s| !s.is_empty())
+                    .or_else(|| {
+                        n.path(&["IPv6", "Config", "LinkLocal", "Address"])
+                            .map(|x| x.text().to_string())
+                            .filter(|s| !s.is_empty())
+                    });
+                Ok(Self {
+                    token,
+                    enabled,
+                    name,
+                    hw_address,
+                    mtu,
+                    ipv4_enabled,
+                    ipv4_address,
+                    ipv4_prefix_length,
+                    ipv4_from_dhcp,
+                    ipv6_enabled,
+                    ipv6_from_dhcp,
+                    ipv6_address,
+                })
+            })
+            .collect()
+    }
+}
+
+// ── NetworkInterfaceConfig (write side) ───────────────────────────────────────
+
+/// New configuration for a single interface, passed to
+/// [`set_network_interfaces`](crate::OnvifClient::set_network_interfaces).
+///
+/// Fields left as `None` are omitted from the request — the device keeps its
+/// existing value for that property.
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[derive(Debug, Clone, Default)]
+pub struct NetworkInterfaceConfig {
+    /// Enable or disable the interface as a whole.
+    pub enabled: bool,
+    /// Maximum transmission unit in bytes. `None` leaves the current MTU.
+    pub mtu: Option<u32>,
+    /// IPv4 stack configuration. `None` leaves IPv4 untouched.
+    pub ipv4: Option<IpStackConfig>,
+    /// IPv6 stack configuration. `None` leaves IPv6 untouched.
+    ///
+    /// For IPv6, `from_dhcp = true` is sent as `<tt:DHCP>Stateful</tt:DHCP>`
+    /// and `false` as `<tt:DHCP>Off</tt:DHCP>` (the two common cases).
+    /// Stateless / Auto DHCPv6 modes are not exposed; callers that need them
+    /// can build the request manually until a richer enum is added.
+    pub ipv6: Option<IpStackConfig>,
+}
+
+/// One IP stack's configuration. Used for both IPv4 and IPv6 in
+/// [`NetworkInterfaceConfig`].
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[derive(Debug, Clone, Default)]
+pub struct IpStackConfig {
+    /// Enable or disable this stack on the interface.
+    pub enabled: bool,
+    /// Acquire an address via DHCP (or DHCPv6 / SLAAC for IPv6).
+    pub from_dhcp: bool,
+    /// Static (manual) addresses to assign. May be empty.
+    pub manual: Vec<ManualAddress>,
+}
+
+/// One static address with prefix length.
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ManualAddress {
+    /// The address itself, IPv4 or IPv6 depending on the field that holds it.
+    pub address: String,
+    /// Subnet mask in CIDR form (`24` = `255.255.255.0`; `64` is typical IPv6).
+    pub prefix_length: u32,
+}
+
+// ── NetworkProtocol ───────────────────────────────────────────────────────────
+
+/// A network protocol entry returned by `GetNetworkProtocols`.
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[derive(Debug, Clone)]
+pub struct NetworkProtocol {
+    /// Protocol name, e.g. `"HTTP"`, `"HTTPS"`, `"RTSP"`.
+    pub name: String,
+    /// `true` if the device is currently serving this protocol.
+    pub enabled: bool,
+    /// Configured port numbers (typically one element).
+    pub ports: Vec<u32>,
+}
+
+impl NetworkProtocol {
+    pub(crate) fn vec_from_xml(resp: &XmlNode) -> Result<Vec<Self>, OnvifError> {
+        Ok(resp
+            .children_named("NetworkProtocols")
+            .map(|n| Self {
+                name: xml_str(n, "Name").unwrap_or_default(),
+                enabled: xml_bool(n, "Enabled"),
+                ports: n
+                    .children_named("Port")
+                    .filter_map(|p| p.text().parse().ok())
+                    .collect(),
+            })
+            .collect())
+    }
+}
+
+// ── DnsInformation ────────────────────────────────────────────────────────────
+
+/// DNS configuration returned by `GetDNS`.
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[derive(Debug, Clone)]
+pub struct DnsInformation {
+    /// `true` if the DNS servers came from DHCP. When set, `servers` may still
+    /// list manual entries that the device is not currently using.
+    pub from_dhcp: bool,
+    /// Manually configured DNS server addresses (IPv4 or IPv6 strings).
+    pub servers: Vec<String>,
+    /// DNS search domain suffixes configured on the device.
+    pub search_domains: Vec<String>,
+}
+
+impl DnsInformation {
+    pub(crate) fn from_xml(resp: &XmlNode) -> Result<Self, OnvifError> {
+        let info = resp
+            .child("DNSInformation")
+            .ok_or_else(|| SoapError::missing("DNSInformation"))?;
+        Ok(Self {
+            from_dhcp: xml_bool(info, "FromDHCP"),
+            servers: info
+                .children_named("DNSManual")
+                .chain(info.children_named("DNSFromDHCP"))
+                .filter_map(|e| {
+                    xml_str(e, "IPv4Address")
+                        .filter(|s| !s.is_empty())
+                        .or_else(|| xml_str(e, "IPv6Address").filter(|s| !s.is_empty()))
+                        .or_else(|| xml_str(e, "DNSname").filter(|s| !s.is_empty()))
+                })
+                .collect(),
+            search_domains: info
+                .children_named("SearchDomain")
+                .map(|n| n.text().to_string())
+                .filter(|s| !s.is_empty())
+                .collect(),
+        })
+    }
+}
+
+// ── NetworkGateway ────────────────────────────────────────────────────────────
+
+/// Default gateway configuration returned by `GetNetworkDefaultGateway`.
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[derive(Debug, Clone)]
+pub struct NetworkGateway {
+    /// IPv4 default gateways. Usually one entry; empty if none is configured.
+    pub ipv4_addresses: Vec<String>,
+    /// IPv6 default gateways. Empty on devices without IPv6 routing.
+    pub ipv6_addresses: Vec<String>,
+}
+
+impl NetworkGateway {
+    pub(crate) fn from_xml(resp: &XmlNode) -> Result<Self, OnvifError> {
+        let gw = resp
+            .child("NetworkGateway")
+            .ok_or_else(|| SoapError::missing("NetworkGateway"))?;
+        Ok(Self {
+            ipv4_addresses: gw
+                .children_named("IPv4Address")
+                .filter_map(|n| {
+                    let t = n.text().to_string();
+                    if t.is_empty() { None } else { Some(t) }
+                })
+                .collect(),
+            ipv6_addresses: gw
+                .children_named("IPv6Address")
+                .filter_map(|n| {
+                    let t = n.text().to_string();
+                    if t.is_empty() { None } else { Some(t) }
+                })
+                .collect(),
+        })
+    }
+}
+
+// ── SystemLog ─────────────────────────────────────────────────────────────────
+
+/// System log content returned by `GetSystemLog`.
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[derive(Debug, Clone)]
+pub struct SystemLog {
+    /// Plain-text log content. `None` if the device returned binary data only.
+    pub string: Option<String>,
+}
+
+impl SystemLog {
+    pub(crate) fn from_xml(resp: &XmlNode) -> Result<Self, OnvifError> {
+        let log = resp
+            .child("SystemLog")
+            .ok_or_else(|| SoapError::missing("SystemLog"))?;
+        Ok(Self {
+            string: log
+                .child("String")
+                .map(|n| n.text().to_string())
+                .filter(|s| !s.is_empty()),
+        })
+    }
+}
+
+// ── RelayOutput ───────────────────────────────────────────────────────────────
+
+/// A relay output port returned by `GetRelayOutputs`.
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RelayOutput {
+    /// Opaque token; pass it to `set_relay_output_state` to switch this relay.
+    pub token: String,
+    /// `"Bistable"` (latching) or `"Monostable"` (timed).
+    pub mode: String,
+    /// ISO 8601 duration for monostable mode (e.g. `"PT1S"`).
+    pub delay_time: String,
+    /// Idle electrical state: `"closed"` or `"open"`.
+    pub idle_state: String,
+}
+
+impl RelayOutput {
+    pub(crate) fn vec_from_xml(resp: &XmlNode) -> Result<Vec<Self>, OnvifError> {
+        resp.children_named("RelayOutputs")
+            .map(|n| {
+                let token = n
+                    .attr("token")
+                    .filter(|t| !t.is_empty())
+                    .ok_or_else(|| SoapError::missing("RelayOutputs/@token"))?
+                    .to_string();
+                let props = n.child("Properties");
+                let mode = props
+                    .and_then(|p| p.child("Mode"))
+                    .map(|x| x.text().to_string())
+                    .unwrap_or_default();
+                let delay_time = props
+                    .and_then(|p| p.child("DelayTime"))
+                    .map(|x| x.text().to_string())
+                    .unwrap_or_default();
+                let idle_state = props
+                    .and_then(|p| p.child("IdleState"))
+                    .map(|x| x.text().to_string())
+                    .unwrap_or_default();
+                Ok(Self {
+                    token,
+                    mode,
+                    delay_time,
+                    idle_state,
+                })
+            })
+            .collect()
+    }
+}
+
+// ── DigitalInput ──────────────────────────────────────────────────────────────
+
+/// A digital input port returned by `GetDigitalInputs`.
+///
+/// The Device Service exposes only the port's configured idle state — the
+/// live (active/inactive) reading is not polled here. Subscribe to the
+/// `tns1:Device/Trigger/DigitalInput` PullPoint topic to observe transitions.
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DigitalInput {
+    /// Opaque token identifying this input port.
+    pub token: String,
+    /// Idle electrical state: `"closed"` or `"open"`. Empty when the
+    /// device omits the attribute (some firmwares do — treat as unknown).
+    pub idle_state: String,
+}
+
+impl DigitalInput {
+    pub(crate) fn vec_from_xml(resp: &XmlNode) -> Result<Vec<Self>, OnvifError> {
+        resp.children_named("DigitalInputs")
+            .map(|n| {
+                let token = n
+                    .attr("token")
+                    .filter(|t| !t.is_empty())
+                    .ok_or_else(|| SoapError::missing("DigitalInputs/@token"))?
+                    .to_string();
+                // ONVIF spec puts IdleState as an attribute on the
+                // DigitalInputs element. Empty / absent → unknown.
+                let idle_state = n.attr("IdleState").unwrap_or_default().to_string();
+                Ok(Self { token, idle_state })
+            })
+            .collect()
+    }
+}
+
+// ── StorageConfiguration ──────────────────────────────────────────────────────
+
+/// A storage location (SD card, NAS, etc.) returned by `GetStorageConfigurations`.
+///
+/// Per the ONVIF spec, all fields live inside the `<Data>` child element and
+/// `storage_type` is the `type` attribute of that element.
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[derive(Debug, Clone)]
+pub struct StorageConfiguration {
+    /// Opaque token identifying this storage location.
+    pub token: String,
+    /// `"LocalStorage"` or `"NFS"` — the `type` attribute of the `Data` element.
+    pub storage_type: String,
+    /// Mount path on the device (e.g. `"/mnt/sd"`).
+    pub local_path: String,
+    /// Network URI for NFS / CIFS shares. Empty for local storage.
+    pub storage_uri: String,
+    /// Username for authenticated shares (empty if no credentials configured).
+    pub user: String,
+}
+
+impl StorageConfiguration {
+    pub(crate) fn vec_from_xml(resp: &XmlNode) -> Result<Vec<Self>, OnvifError> {
+        resp.children_named("StorageConfigurations")
+            .map(|n| {
+                let token = n
+                    .attr("token")
+                    .filter(|t| !t.is_empty())
+                    .ok_or_else(|| SoapError::missing("StorageConfigurations/@token"))?
+                    .to_string();
+                let data = n.child("Data");
+                let storage_type = data
+                    .and_then(|d| d.attr("type"))
+                    .unwrap_or_default()
+                    .to_string();
+                let local_path = data
+                    .and_then(|d| d.child("LocalPath"))
+                    .map(|x| x.text().to_string())
+                    .unwrap_or_default();
+                let storage_uri = data
+                    .and_then(|d| d.child("StorageUri"))
+                    .map(|x| x.text().to_string())
+                    .unwrap_or_default();
+                let user = data
+                    .and_then(|d| d.child("User"))
+                    .and_then(|u| u.child("UserName"))
+                    .map(|x| x.text().to_string())
+                    .unwrap_or_default();
+                Ok(Self {
+                    token,
+                    storage_type,
+                    local_path,
+                    storage_uri,
+                    user,
+                })
+            })
+            .collect()
+    }
+}
+
+// ── SystemUris ────────────────────────────────────────────────────────────────
+
+/// HTTP URIs for system management tasks returned by `GetSystemUris`.
+///
+/// Per the ONVIF spec the response contains `SystemLogUris`, `SupportInfoUri`,
+/// and `SystemBackupUri`.  There is no firmware-upgrade URI in this response.
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[derive(Debug, Clone)]
+pub struct SystemUris {
+    /// URI of the first system-log entry reported by the device.
+    pub system_log_uri: Option<String>,
+    /// URI for downloading a support-info bundle.
+    pub support_info_uri: Option<String>,
+    /// URI for downloading a system backup.
+    pub system_backup_uri: Option<String>,
+}
+
+impl SystemUris {
+    /// # The repeated element is `SystemLog`, not `SystemLogUri`
+    ///
+    /// `SystemLogUris` is typed `tt:SystemLogUriList`, whose one child element
+    /// is named **`SystemLog`** and *typed* `tt:SystemLogUri`. Until 0.15.0
+    /// this walked `SystemLogUris/SystemLogUri/Uri`, reading the type name as
+    /// though it were the element name, so [`system_log_uri`] came back `None`
+    /// from every conformant device. `XmlNode` strips namespaces and matches on
+    /// the local name alone, so nothing about the lookup looked wrong.
+    ///
+    /// [`system_log_uri`]: SystemUris::system_log_uri
+    pub(crate) fn from_xml(resp: &XmlNode) -> Result<Self, OnvifError> {
+        Ok(Self {
+            system_log_uri: resp
+                .path(&["SystemLogUris", "SystemLog", "Uri"])
+                .map(|n| n.text().to_string())
+                .filter(|s| !s.is_empty()),
+            support_info_uri: xml_str(resp, "SupportInfoUri"),
+            system_backup_uri: xml_str(resp, "SystemBackupUri"),
+        })
+    }
+}
+
+// ── Firmware upgrade / system restore (upload-URI handshakes) ──────────────────
+
+/// Upload handle returned by `StartFirmwareUpgrade`.
+///
+/// The client waits `upload_delay`, HTTP POSTs the firmware image to
+/// `upload_uri`, then the device upgrades and reboots (offline for roughly
+/// `expected_down_time`). This upload-URI flow avoids the deprecated
+/// attachment-based `UpgradeSystemFirmware` (MTOM), which oxvif's
+/// SOAP-only transport can't produce. Durations are raw ISO 8601 strings
+/// (e.g. `"PT30S"`), matching the rest of oxvif's duration handling.
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[derive(Debug, Clone)]
+pub struct FirmwareUpgradeStart {
+    /// HTTP endpoint to POST the firmware image to.
+    pub upload_uri: String,
+    /// How long to wait before starting the upload (ISO 8601 duration).
+    pub upload_delay: String,
+    /// Expected time the device is offline during the upgrade (ISO 8601).
+    pub expected_down_time: String,
+}
+
+impl FirmwareUpgradeStart {
+    pub(crate) fn from_xml(resp: &XmlNode) -> Result<Self, OnvifError> {
+        Ok(Self {
+            upload_uri: xml_str(resp, "UploadUri").unwrap_or_default(),
+            upload_delay: xml_str(resp, "UploadDelay").unwrap_or_default(),
+            expected_down_time: xml_str(resp, "ExpectedDownTime").unwrap_or_default(),
+        })
+    }
+}
+
+/// Upload handle returned by `StartSystemRestore`.
+///
+/// The client HTTP POSTs a previously downloaded backup to `upload_uri`;
+/// the device then restores and reboots (offline for roughly
+/// `expected_down_time`). Avoids the attachment-based `RestoreSystem`.
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[derive(Debug, Clone)]
+pub struct SystemRestoreStart {
+    /// HTTP endpoint to POST the backup file to.
+    pub upload_uri: String,
+    /// Expected time the device is offline during the restore (ISO 8601).
+    pub expected_down_time: String,
+}
+
+impl SystemRestoreStart {
+    pub(crate) fn from_xml(resp: &XmlNode) -> Result<Self, OnvifError> {
+        Ok(Self {
+            upload_uri: xml_str(resp, "UploadUri").unwrap_or_default(),
+            expected_down_time: xml_str(resp, "ExpectedDownTime").unwrap_or_default(),
+        })
+    }
+}
