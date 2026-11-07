@@ -96,14 +96,17 @@ pub fn normalize(camera: &CameraId, raw: &RawEvent, now: WallUs) -> Option<Event
     if raw.code == "Heartbeat" {
         return None;
     }
-    let data = raw.data.as_ref().map(|d| {
-        if raw.index == 0 {
-            d.clone()
-        } else {
-            // Keep the index with the payload so rule-specific events stay distinguishable.
-            format!("{{\"index\":{},\"data\":{}}}", raw.index, d)
-        }
+    let vendor_data = raw.data.as_ref().map(|data| {
+        serde_json::from_str::<serde_json::Value>(data)
+            .unwrap_or_else(|_| serde_json::Value::String(data.clone()))
     });
+    let payload = match (raw.index, vendor_data) {
+        (0, None) => None,
+        (0, Some(data)) => Some(data),
+        (index, None) => Some(serde_json::json!({ "index": index })),
+        (index, Some(data)) => Some(serde_json::json!({ "index": index, "data": data })),
+    };
+    let data = payload.and_then(|value| serde_json::to_string(&value).ok());
     Some(
         Event {
             camera: camera.clone(),
@@ -164,7 +167,10 @@ mod tests {
         assert!(data.contains("ModifiedTime"));
         let event = normalize(&cam(), &raw, WallUs::new(0)).unwrap();
         assert_eq!(event.kind, EventKind::TimeChange);
-        assert_eq!(event.data.as_deref(), Some(data));
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(event.data.as_deref().unwrap()).unwrap(),
+            serde_json::from_str::<serde_json::Value>(data).unwrap()
+        );
     }
 
     #[test]
@@ -193,9 +199,24 @@ mod tests {
             parse_part("Code=CrossLineDetection;action=Start;index=2;data={\"Name\":\"rule\"}")
                 .unwrap();
         let event = normalize(&cam(), &raw, WallUs::new(0)).unwrap();
-        assert_eq!(
-            event.data.as_deref(),
-            Some("{\"index\":2,\"data\":{\"Name\":\"rule\"}}")
-        );
+        let payload: serde_json::Value =
+            serde_json::from_str(event.data.as_deref().unwrap()).unwrap();
+        assert_eq!(payload["index"], 2);
+        assert_eq!(payload["data"]["Name"], "rule");
+    }
+
+    #[test]
+    fn opaque_data_is_quoted_and_index_survives_without_data() {
+        let raw = parse_part("Code=VideoMotion;action=Start;index=2;data=plain").unwrap();
+        let event = normalize(&cam(), &raw, WallUs::new(0)).unwrap();
+        let payload: serde_json::Value =
+            serde_json::from_str(event.data.as_deref().unwrap()).unwrap();
+        assert_eq!(payload, serde_json::json!({"index": 2, "data": "plain"}));
+
+        let raw = parse_part("Code=VideoMotion;action=Start;index=3").unwrap();
+        let event = normalize(&cam(), &raw, WallUs::new(0)).unwrap();
+        let payload: serde_json::Value =
+            serde_json::from_str(event.data.as_deref().unwrap()).unwrap();
+        assert_eq!(payload, serde_json::json!({"index": 3}));
     }
 }

@@ -17,7 +17,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::fmt::Write as _;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use axum::extract::{Extension, Path, Query, State};
 use axum::http::header;
@@ -29,13 +29,15 @@ use iris_ingest::{LiveError, LiveFrame, LiveRing};
 use iris_mp4::init::build_init_segment;
 use serde::Deserialize;
 use tokio::sync::Notify;
+use tokio::time::Instant;
+use tokio_util::sync::CancellationToken;
 
-use crate::auth::AuthToken;
+use crate::auth::AuthContext;
 use crate::error::ApiError;
-use crate::hls::percent_encode;
 use crate::live::encode_live_fragment;
+use crate::media_admission;
 use crate::segments::stream_key;
-use crate::state::ApiState;
+use crate::state::{ApiState, admitted_media_bytes};
 
 /// Target length of a partial segment in media ticks (0.5 s).
 pub(crate) const PART_TARGET_TICKS: u64 = 45_000;
@@ -44,17 +46,27 @@ const KEEP_SEGMENTS: usize = 3;
 /// Segments that list their partial segments: the last ones, as the
 /// specification asks for parts within three target durations of the end.
 const SEGMENTS_WITH_PARTS: usize = 3;
+/// Most payload retained by one GOP. Four bounded GOPs may be retained.
+const MAX_GOP_PAYLOAD_BYTES: usize = 16 * 1_024 * 1_024;
+/// Most frames retained by one GOP.
+const MAX_GOP_FRAMES: usize = 600;
+/// Longest media duration retained by one GOP (ten seconds at 90 kHz).
+const MAX_GOP_DURATION_TICKS: u64 = 10 * TIMESCALE as u64;
 /// A feeder with no request for this long stops.
 const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 /// Longest a blocking request waits before answering 503.
 const BLOCK_TIMEOUT: Duration = Duration::from_secs(6);
 
 /// The frames of one group of pictures, one media segment.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct Gop {
     msn: u64,
+    /// Number of timeline discontinuities before this GOP.
+    discontinuity_sequence: u64,
     /// Frames with the `mfhd` sequence number each was encoded with.
     frames: Vec<(Arc<LiveFrame>, u32)>,
+    payload_bytes: usize,
+    duration_ticks: u64,
     complete: bool,
 }
 
@@ -90,7 +102,25 @@ impl Gop {
     }
 
     fn duration_ticks(&self) -> u64 {
-        self.frames.iter().map(|(f, _)| u64::from(f.duration)).sum()
+        self.duration_ticks
+    }
+
+    fn would_exceed_budget(&self, frame: &LiveFrame) -> bool {
+        self.frames.len() >= MAX_GOP_FRAMES
+            || self
+                .payload_bytes
+                .checked_add(frame.data.len())
+                .is_none_or(|bytes| bytes > MAX_GOP_PAYLOAD_BYTES)
+            || self
+                .duration_ticks
+                .checked_add(u64::from(frame.duration))
+                .is_none_or(|ticks| ticks > MAX_GOP_DURATION_TICKS)
+    }
+
+    fn push(&mut self, frame: Arc<LiveFrame>, sequence: u32) {
+        self.payload_bytes += frame.data.len();
+        self.duration_ticks += u64::from(frame.duration);
+        self.frames.push((frame, sequence));
     }
 }
 
@@ -101,15 +131,100 @@ struct Part {
     complete: bool,
 }
 
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 struct Inner {
     gops: VecDeque<Gop>,
     next_msn: u64,
     next_seq: u32,
     init: Option<Bytes>,
     init_hash: Option<u32>,
+    last_decode_time: Option<u64>,
+    discontinuity_sequence: u64,
     last_access: Option<Instant>,
     closed: bool,
+}
+
+impl Inner {
+    fn on_lag(&mut self, waiting_for_sync: &mut bool) {
+        *waiting_for_sync = true;
+        self.gops.clear();
+        if self.last_decode_time.take().is_some() {
+            self.discontinuity_sequence = self.discontinuity_sequence.saturating_add(1);
+        }
+    }
+
+    fn accept_frame(&mut self, frame: Arc<LiveFrame>, waiting_for_sync: &mut bool) {
+        if self.init_hash != Some(frame.sample_entry.hash) {
+            if self.init_hash.is_some() {
+                self.discontinuity_sequence = self.discontinuity_sequence.saturating_add(1);
+            }
+            self.init = Some(build_init_segment(&frame.sample_entry));
+            self.init_hash = Some(frame.sample_entry.hash);
+            self.gops.clear();
+            self.last_decode_time = None;
+            *waiting_for_sync = true;
+        }
+        if !*waiting_for_sync
+            && self
+                .last_decode_time
+                .is_some_and(|previous| frame.decode_time <= previous)
+        {
+            self.discontinuity_sequence = self.discontinuity_sequence.saturating_add(1);
+            if let Some(current) = self.gops.back_mut() {
+                current.complete = true;
+            }
+            *waiting_for_sync = true;
+        }
+        self.last_decode_time = Some(frame.decode_time);
+        if frame.is_sync {
+            if let Some(current) = self.gops.back_mut() {
+                current.complete = true;
+            }
+            let msn = self.next_msn;
+            self.next_msn = self.next_msn.saturating_add(1);
+            self.gops.push_back(Gop {
+                msn,
+                discontinuity_sequence: self.discontinuity_sequence,
+                frames: Vec::new(),
+                payload_bytes: 0,
+                duration_ticks: 0,
+                complete: false,
+            });
+            while self.gops.len() > KEEP_SEGMENTS + 1 {
+                self.gops.pop_front();
+            }
+            *waiting_for_sync = false;
+        }
+        if *waiting_for_sync {
+            return;
+        }
+        if self
+            .gops
+            .back()
+            .is_some_and(|current| current.would_exceed_budget(&frame))
+        {
+            // Drop the whole over-budget epoch exactly once, then ignore
+            // dependent frames until a later sync starts a bounded GOP.
+            self.gops.clear();
+            self.last_decode_time = None;
+            self.discontinuity_sequence = self.discontinuity_sequence.saturating_add(1);
+            *waiting_for_sync = true;
+            return;
+        }
+        let sequence = self.next_seq.wrapping_add(1);
+        self.next_seq = sequence;
+        if let Some(current) = self.gops.back_mut() {
+            current.push(frame, sequence);
+        }
+    }
+
+    fn close(&mut self) {
+        self.gops.clear();
+        self.init = None;
+        self.init_hash = None;
+        self.last_decode_time = None;
+        self.closed = true;
+    }
 }
 
 /// The live playlist state of one stream.
@@ -117,6 +232,7 @@ struct Inner {
 pub struct LiveHls {
     inner: Mutex<Inner>,
     notify: Notify,
+    touched: Notify,
 }
 
 impl LiveHls {
@@ -124,6 +240,7 @@ impl LiveHls {
         Arc::new(Self {
             inner: Mutex::new(Inner::default()),
             notify: Notify::new(),
+            touched: Notify::new(),
         })
     }
 
@@ -131,69 +248,61 @@ impl LiveHls {
         if let Ok(mut inner) = self.inner.lock() {
             inner.last_access = Some(Instant::now());
         }
+        self.touched.notify_one();
     }
 
     /// Feeds frames from `ring` until the ring closes or nobody asks for the
     /// stream for [`IDLE_TIMEOUT`].
-    async fn feed(self: Arc<Self>, ring: LiveRing) {
+    async fn feed(self: Arc<Self>, ring: LiveRing, shutdown: CancellationToken) {
         let mut subscription = ring.subscribe();
         let mut waiting_for_sync = true;
         loop {
-            let frame = match subscription.next().await {
-                Ok(frame) => frame,
-                Err(LiveError::Lagged(_)) => {
-                    waiting_for_sync = true;
-                    if let Ok(mut inner) = self.inner.lock() {
-                        inner.gops.clear();
+            let touched = self.touched.notified();
+            tokio::pin!(touched);
+            touched.as_mut().enable();
+            let idle_deadline = self
+                .inner
+                .lock()
+                .ok()
+                .and_then(|inner| inner.last_access)
+                .unwrap_or_else(Instant::now)
+                + IDLE_TIMEOUT;
+            let next = tokio::select! {
+                biased;
+                () = shutdown.cancelled() => break,
+                () = touched => continue,
+                () = tokio::time::sleep_until(idle_deadline) => {
+                    let expired = self.inner.lock().map_or(true, |inner| {
+                        inner.last_access.is_none_or(|last| {
+                            Instant::now().saturating_duration_since(last) >= IDLE_TIMEOUT
+                        })
+                    });
+                    if expired {
+                        break;
                     }
                     continue;
                 }
+                next = subscription.next() => next,
+            };
+            match next {
+                Ok(frame) => {
+                    let Ok(mut inner) = self.inner.lock() else {
+                        break;
+                    };
+                    inner.accept_frame(frame, &mut waiting_for_sync);
+                }
+                Err(LiveError::Lagged(_)) => {
+                    let Ok(mut inner) = self.inner.lock() else {
+                        break;
+                    };
+                    inner.on_lag(&mut waiting_for_sync);
+                }
                 Err(LiveError::Closed) => break,
-            };
-            let Ok(mut inner) = self.inner.lock() else {
-                break;
-            };
-            if inner
-                .last_access
-                .is_some_and(|t| t.elapsed() > IDLE_TIMEOUT)
-            {
-                break;
             }
-            if inner.init_hash != Some(frame.sample_entry.hash) {
-                inner.init = Some(build_init_segment(&frame.sample_entry));
-                inner.init_hash = Some(frame.sample_entry.hash);
-                inner.gops.clear();
-                waiting_for_sync = true;
-            }
-            if frame.is_sync {
-                if let Some(current) = inner.gops.back_mut() {
-                    current.complete = true;
-                }
-                let msn = inner.next_msn;
-                inner.next_msn += 1;
-                inner.gops.push_back(Gop {
-                    msn,
-                    frames: Vec::new(),
-                    complete: false,
-                });
-                while inner.gops.len() > KEEP_SEGMENTS + 1 {
-                    inner.gops.pop_front();
-                }
-                waiting_for_sync = false;
-            }
-            if waiting_for_sync {
-                continue;
-            }
-            let seq = inner.next_seq.wrapping_add(1);
-            inner.next_seq = seq;
-            if let Some(current) = inner.gops.back_mut() {
-                current.frames.push((frame, seq));
-            }
-            drop(inner);
             self.notify.notify_waiters();
         }
         if let Ok(mut inner) = self.inner.lock() {
-            inner.closed = true;
+            inner.close();
         }
         self.notify.notify_waiters();
     }
@@ -205,7 +314,7 @@ impl LiveHls {
         timeout: Duration,
         mut ready: impl FnMut(&Inner) -> bool,
     ) -> Result<bool, ApiError> {
-        let deadline = tokio::time::Instant::now() + timeout;
+        let deadline = Instant::now() + timeout;
         loop {
             let notified = self.notify.notified();
             tokio::pin!(notified);
@@ -236,7 +345,12 @@ pub struct LiveHlsRegistry {
 impl LiveHlsRegistry {
     /// The state for `key`, starting a feeder on `ring` when there is none
     /// or the previous one stopped.
-    fn get_or_start(&self, key: &StreamKey, ring: LiveRing) -> Arc<LiveHls> {
+    fn get_or_start(
+        &self,
+        key: &StreamKey,
+        ring: LiveRing,
+        shutdown: CancellationToken,
+    ) -> Arc<LiveHls> {
         let mut streams = self.streams.lock().expect("live hls lock");
         if let Some(existing) = streams.get(key)
             && !existing.inner.lock().is_ok_and(|i| i.closed)
@@ -246,7 +360,7 @@ impl LiveHlsRegistry {
         }
         let hls = LiveHls::new();
         hls.touch();
-        tokio::spawn(Arc::clone(&hls).feed(ring));
+        tokio::spawn(Arc::clone(&hls).feed(ring, shutdown));
         streams.insert(key.clone(), Arc::clone(&hls));
         hls
     }
@@ -255,7 +369,10 @@ impl LiveHlsRegistry {
 fn lookup(state: &ApiState, camera: &str, kind: &str) -> Result<Arc<LiveHls>, ApiError> {
     let key = stream_key(camera, kind)?;
     let ring = state.live.get(&key).ok_or(ApiError::NotFound)?;
-    Ok(state.live.hls().get_or_start(&key, ring))
+    Ok(state
+        .live
+        .hls()
+        .get_or_start(&key, ring, state.shutdown.clone()))
 }
 
 /// `_HLS_msn` and `_HLS_part` as they arrive.
@@ -273,13 +390,12 @@ pub(crate) async fn playlist(
     State(state): State<Arc<ApiState>>,
     Path((camera, kind)): Path<(String, String)>,
     Query(params): Query<ReloadParams>,
-    Extension(token): Extension<AuthToken>,
+    Extension(auth): Extension<AuthContext>,
 ) -> Result<Response, ApiError> {
     let hls = lookup(&state, &camera, &kind)?;
     if params.part.is_some() && params.msn.is_none() {
         return Err(ApiError::BadRequest("_HLS_part without _HLS_msn".into()));
     }
-    let token = token.0.clone();
     // A client may ask for a segment up to two beyond the newest; further is an error.
     if let Some(msn) = params.msn {
         let last = hls
@@ -311,14 +427,13 @@ pub(crate) async fn playlist(
             "the live playlist did not advance".into(),
         ));
     }
-    let text = {
-        let inner = hls.inner.lock().map_err(|_| ApiError::NotFound)?;
-        render(&inner, token.as_deref())
-    };
+    let snapshot = hls.inner.lock().map_err(|_| ApiError::NotFound)?.clone();
+    let base_path = format!("/api/streams/{camera}/{kind}/hls");
+    let text = render(&snapshot, &auth, &base_path);
     Ok((
         [
             (header::CONTENT_TYPE, "application/vnd.apple.mpegurl"),
-            (header::CACHE_CONTROL, "no-store"),
+            (header::CACHE_CONTROL, "private, no-store"),
         ],
         text,
     )
@@ -349,9 +464,9 @@ fn reload_satisfied(inner: &Inner, msn: u64, part: Option<usize>) -> bool {
     }
 }
 
-fn uri(path: &str, token: Option<&str>) -> String {
-    match token {
-        Some(t) => format!("{path}?token={}", percent_encode(t)),
+fn uri(path: &str, auth: &AuthContext, base_path: &str) -> String {
+    match auth.capability(&format!("{base_path}/{path}")) {
+        Some(capability) => format!("{path}?token={capability}"),
         None => path.to_owned(),
     }
 }
@@ -361,7 +476,7 @@ fn seconds(ticks: u64) -> f64 {
 }
 
 /// Renders the live playlist. URIs are relative to the playlist's own path.
-fn render(inner: &Inner, token: Option<&str>) -> String {
+fn render(inner: &Inner, auth: &AuthContext, base_path: &str) -> String {
     let target_ticks = inner
         .gops
         .iter()
@@ -372,6 +487,10 @@ fn render(inner: &Inner, token: Option<&str>) -> String {
     let target = target_ticks.div_ceil(u64::from(TIMESCALE)).max(1);
     let part_target = seconds(PART_TARGET_TICKS);
     let first_msn = inner.gops.front().map_or(0, |g| g.msn);
+    let first_discontinuity = inner
+        .gops
+        .front()
+        .map_or(inner.discontinuity_sequence, |g| g.discontinuity_sequence);
     let mut out = String::new();
     let _ = writeln!(
         out,
@@ -385,11 +504,20 @@ fn render(inner: &Inner, token: Option<&str>) -> String {
     let _ = writeln!(out, "#EXT-X-PART-INF:PART-TARGET={part_target:.3}");
     let _ = writeln!(
         out,
-        "#EXT-X-MEDIA-SEQUENCE:{first_msn}\n#EXT-X-INDEPENDENT-SEGMENTS"
+        "#EXT-X-MEDIA-SEQUENCE:{first_msn}\n#EXT-X-DISCONTINUITY-SEQUENCE:{first_discontinuity}\n#EXT-X-INDEPENDENT-SEGMENTS"
     );
-    let _ = writeln!(out, "#EXT-X-MAP:URI=\"{}\"", uri("init.mp4", token));
+    let _ = writeln!(
+        out,
+        "#EXT-X-MAP:URI=\"{}\"",
+        uri("init.mp4", auth, base_path)
+    );
     let with_parts_from = inner.gops.len().saturating_sub(SEGMENTS_WITH_PARTS);
+    let mut discontinuity_sequence = first_discontinuity;
     for (i, gop) in inner.gops.iter().enumerate() {
+        if gop.discontinuity_sequence != discontinuity_sequence {
+            out.push_str("#EXT-X-DISCONTINUITY\n");
+            discontinuity_sequence = gop.discontinuity_sequence;
+        }
         if let Some((first, _)) = gop.frames.first()
             && i == 0
         {
@@ -404,7 +532,11 @@ fn render(inner: &Inner, token: Option<&str>) -> String {
                     out,
                     "#EXT-X-PART:DURATION={:.5},URI=\"{}\"",
                     seconds(duration),
-                    uri(&format!("part/{}/{}/part.m4s", gop.msn, part.index), token)
+                    uri(
+                        &format!("part/{}/{}/part.m4s", gop.msn, part.index),
+                        auth,
+                        base_path,
+                    )
                 );
                 if independent {
                     out.push_str(",INDEPENDENT=YES");
@@ -417,14 +549,18 @@ fn render(inner: &Inner, token: Option<&str>) -> String {
                 out,
                 "#EXTINF:{:.5},\n{}",
                 seconds(gop.duration_ticks()),
-                uri(&format!("seg/{}/media.m4s", gop.msn), token)
+                uri(&format!("seg/{}/media.m4s", gop.msn), auth, base_path)
             );
         } else {
             let next = gop.parts().into_iter().filter(|p| p.complete).count();
             let _ = writeln!(
                 out,
                 "#EXT-X-PRELOAD-HINT:TYPE=PART,URI=\"{}\"",
-                uri(&format!("part/{}/{}/part.m4s", gop.msn, next), token)
+                uri(
+                    &format!("part/{}/{}/part.m4s", gop.msn, next),
+                    auth,
+                    base_path,
+                )
             );
         }
     }
@@ -457,6 +593,12 @@ pub(crate) async fn init(
     if !ready {
         return Err(ApiError::Unavailable("no frames yet".into()));
     }
+    let permit = media_admission::shared(
+        state
+            .stats
+            .try_media_response()
+            .ok_or_else(|| ApiError::Unavailable("media serving is busy".into()))?,
+    );
     let init = hls
         .inner
         .lock()
@@ -464,7 +606,7 @@ pub(crate) async fn init(
         .init
         .clone()
         .ok_or(ApiError::NotFound)?;
-    Ok(media(init))
+    Ok(media(init, permit))
 }
 
 /// `GET .../hls/seg/{msn}`: a complete media segment, waiting for it to
@@ -483,16 +625,25 @@ pub(crate) async fn segment(
     if !ready {
         return Err(ApiError::Unavailable("segment not complete".into()));
     }
-    let bytes = {
+    let permit = media_admission::shared(
+        state
+            .stats
+            .try_media_response()
+            .ok_or_else(|| ApiError::Unavailable("media serving is busy".into()))?,
+    );
+    let frames = {
         let inner = hls.inner.lock().map_err(|_| ApiError::NotFound)?;
         let gop = inner
             .gops
             .iter()
             .find(|g| g.msn == msn)
             .ok_or(ApiError::NotFound)?;
-        encode(&gop.frames)?
+        gop.frames.clone()
     };
-    Ok(media(bytes))
+    let bytes = media_admission::blocking(&permit, move || encode(&frames))
+        .await
+        .map_err(|error| ApiError::Io(std::io::Error::other(error)))??;
+    Ok(media(bytes, permit))
 }
 
 /// `GET .../hls/part/{msn}/{index}`: a partial segment, waiting for it to
@@ -514,7 +665,13 @@ pub(crate) async fn part(
     if !ready {
         return Err(ApiError::Unavailable("part not complete".into()));
     }
-    let bytes = {
+    let permit = media_admission::shared(
+        state
+            .stats
+            .try_media_response()
+            .ok_or_else(|| ApiError::Unavailable("media serving is busy".into()))?,
+    );
+    let frames = {
         let inner = hls.inner.lock().map_err(|_| ApiError::NotFound)?;
         let gop = inner
             .gops
@@ -526,13 +683,22 @@ pub(crate) async fn part(
             .into_iter()
             .nth(index)
             .ok_or(ApiError::NotFound)?;
-        encode(&gop.frames[part.range])?
+        gop.frames[part.range].to_vec()
     };
-    Ok(media(bytes))
+    let bytes = media_admission::blocking(&permit, move || encode(&frames))
+        .await
+        .map_err(|error| ApiError::Io(std::io::Error::other(error)))??;
+    Ok(media(bytes, permit))
 }
 
 fn encode(frames: &[(Arc<LiveFrame>, u32)]) -> Result<Bytes, ApiError> {
     let mut out = Vec::new();
+    let estimated = frames.iter().try_fold(0usize, |total, (frame, _)| {
+        total.checked_add(frame.data.len().saturating_add(512))
+    });
+    let estimated = estimated.ok_or_else(|| ApiError::Unavailable("media is too large".into()))?;
+    out.try_reserve_exact(estimated)
+        .map_err(|_| ApiError::Unavailable("media allocation unavailable".into()))?;
     for (frame, seq) in frames {
         let fragment = encode_live_fragment(frame, *seq)
             .map_err(|e| ApiError::Io(std::io::Error::other(e.to_string())))?;
@@ -541,13 +707,13 @@ fn encode(frames: &[(Arc<LiveFrame>, u32)]) -> Result<Bytes, ApiError> {
     Ok(Bytes::from(out))
 }
 
-fn media(bytes: Bytes) -> Response {
+fn media(bytes: Bytes, permit: Arc<tokio::sync::OwnedSemaphorePermit>) -> Response {
     (
         [
             (header::CONTENT_TYPE, "video/iso.segment"),
-            (header::CACHE_CONTROL, "no-store"),
+            (header::CACHE_CONTROL, "private, no-store"),
         ],
-        bytes,
+        admitted_media_bytes(bytes, permit),
     )
         .into_response()
 }
@@ -558,6 +724,15 @@ mod tests {
     use iris_mp4::init::SampleEntry;
 
     fn frame(decode_time: u64, is_sync: bool) -> Arc<LiveFrame> {
+        frame_with(
+            decode_time,
+            is_sync,
+            Bytes::from_static(&[0, 0, 0, 2, 0x26, 1]),
+            3000,
+        )
+    }
+
+    fn frame_with(decode_time: u64, is_sync: bool, data: Bytes, duration: u32) -> Arc<LiveFrame> {
         Arc::new(LiveFrame {
             key: StreamKey {
                 camera: "cam1".parse().unwrap(),
@@ -569,8 +744,8 @@ mod tests {
                 16,
                 16,
             )),
-            data: Bytes::from_static(&[0, 0, 0, 2, 0x26, 1]),
-            duration: 3000,
+            data,
+            duration,
             is_sync,
             decode_time,
             wall: WallUs::new(
@@ -579,12 +754,77 @@ mod tests {
         })
     }
 
+    async fn assert_feed_budget_breach(frames: Vec<Arc<LiveFrame>>) {
+        let ring = LiveRing::new(MAX_GOP_FRAMES + 8);
+        let hls = LiveHls::new();
+        let shutdown = CancellationToken::new();
+        hls.touch();
+        let task = tokio::spawn(Arc::clone(&hls).feed(ring.clone(), shutdown.clone()));
+        tokio::task::yield_now().await;
+        for frame in frames {
+            hls.touch();
+            ring.publish(frame);
+            tokio::task::yield_now().await;
+        }
+        for _ in 0..100 {
+            let breached = hls.inner.lock().unwrap().discontinuity_sequence == 1;
+            if breached {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        {
+            let inner = hls.inner.lock().unwrap();
+            assert_eq!(inner.discontinuity_sequence, 1);
+            assert!(inner.gops.is_empty());
+        }
+
+        hls.touch();
+        ring.publish(frame(20_000_000, false));
+        tokio::task::yield_now().await;
+        {
+            let inner = hls.inner.lock().unwrap();
+            assert_eq!(inner.discontinuity_sequence, 1);
+            assert!(inner.gops.is_empty());
+        }
+
+        hls.touch();
+        ring.publish(frame(20_003_000, true));
+        for _ in 0..100 {
+            if !hls.inner.lock().unwrap().gops.is_empty() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        {
+            let inner = hls.inner.lock().unwrap();
+            assert_eq!(inner.gops.len(), 1);
+            assert_eq!(inner.gops[0].discontinuity_sequence, 1);
+            assert!(inner.gops[0].frames[0].0.is_sync);
+        }
+
+        shutdown.cancel();
+        task.await.unwrap();
+        assert_eq!(ring.subscriber_count(), 0);
+        let inner = hls.inner.lock().unwrap();
+        assert!(inner.closed);
+        assert!(inner.gops.is_empty());
+        assert!(inner.init.is_none());
+    }
+
     fn gop(msn: u64, frames: usize, complete: bool) -> Gop {
+        let frames: Vec<_> = (0..frames)
+            .map(|i| (frame(i as u64 * 3000, i == 0), i as u32 + 1))
+            .collect();
         Gop {
             msn,
-            frames: (0..frames)
-                .map(|i| (frame(i as u64 * 3000, i == 0), i as u32 + 1))
-                .collect(),
+            discontinuity_sequence: 0,
+            payload_bytes: frames.iter().map(|(frame, _)| frame.data.len()).sum(),
+            duration_ticks: frames
+                .iter()
+                .map(|(frame, _)| u64::from(frame.duration))
+                .sum(),
+            frames,
             complete,
         }
     }
@@ -609,25 +849,43 @@ mod tests {
         inner.gops.push_back(gop(8, 60, true));
         inner.gops.push_back(gop(9, 20, false));
         inner.next_msn = 10;
-        let text = render(&inner, Some("t k"));
+        let auth = AuthContext::for_test("root bearer", 1_234_567);
+        let base = "/api/streams/cam1/main/hls";
+        let text = render(&inner, &auth, base);
         assert!(text.contains("#EXT-X-TARGETDURATION:2\n"), "{text}");
         assert!(text.contains("#EXT-X-SERVER-CONTROL:CAN-BLOCK-RELOAD=YES,PART-HOLD-BACK=1.500\n"));
         assert!(text.contains("#EXT-X-PART-INF:PART-TARGET=0.500\n"));
         assert!(text.contains("#EXT-X-MEDIA-SEQUENCE:7\n"));
-        assert!(text.contains("#EXT-X-MAP:URI=\"init.mp4?token=t%20k\"\n"));
+        let init = auth.capability(&format!("{base}/init.mp4")).unwrap();
+        assert!(text.contains(&format!("#EXT-X-MAP:URI=\"init.mp4?token={init}\"\n")));
         assert!(text.contains("#EXT-X-PROGRAM-DATE-TIME:"));
-        assert!(text.contains(
-            "#EXT-X-PART:DURATION=0.50000,URI=\"part/7/0/part.m4s?token=t%20k\",INDEPENDENT=YES\n"
-        ));
-        assert!(text.contains("#EXTINF:2.00000,\nseg/7/media.m4s?token=t%20k\n"));
-        assert!(text.contains(
-            "#EXT-X-PART:DURATION=0.50000,URI=\"part/9/0/part.m4s?token=t%20k\",INDEPENDENT=YES\n"
-        ));
+        let part = auth
+            .capability(&format!("{base}/part/7/0/part.m4s"))
+            .unwrap();
+        assert!(text.contains(&format!(
+            "#EXT-X-PART:DURATION=0.50000,URI=\"part/7/0/part.m4s?token={part}\",INDEPENDENT=YES\n"
+        )));
+        let segment = auth.capability(&format!("{base}/seg/7/media.m4s")).unwrap();
+        assert!(text.contains(&format!(
+            "#EXTINF:2.00000,\nseg/7/media.m4s?token={segment}\n"
+        )));
+        let current_part = auth
+            .capability(&format!("{base}/part/9/0/part.m4s"))
+            .unwrap();
+        assert!(text.contains(&format!(
+            "#EXT-X-PART:DURATION=0.50000,URI=\"part/9/0/part.m4s?token={current_part}\",INDEPENDENT=YES\n"
+        )));
         assert!(!text.contains("part/9/1/part.m4s\""), "{text}");
+        let preload = auth
+            .capability(&format!("{base}/part/9/1/part.m4s"))
+            .unwrap();
         assert!(
-            text.ends_with("#EXT-X-PRELOAD-HINT:TYPE=PART,URI=\"part/9/1/part.m4s?token=t%20k\"\n"),
+            text.ends_with(&format!(
+                "#EXT-X-PRELOAD-HINT:TYPE=PART,URI=\"part/9/1/part.m4s?token={preload}\"\n"
+            )),
             "{text}"
         );
+        assert!(!text.contains("root bearer"));
         assert!(!text.contains("ENDLIST"));
     }
 
@@ -645,5 +903,110 @@ mod tests {
         // Gone from the playlist: satisfied, the whole playlist is returned.
         assert!(reload_satisfied(&inner, 1, None));
         assert!(!reload_satisfied(&inner, 5, None));
+    }
+
+    #[test]
+    fn discontinuity_sequence_survives_window_eviction() {
+        let mut inner = Inner::default();
+        inner.gops.push_back(gop(7, 60, true));
+        let mut restarted = gop(8, 60, true);
+        restarted.discontinuity_sequence = 1;
+        inner.gops.push_back(restarted);
+        let auth = AuthContext::disabled();
+        let text = render(&inner, &auth, "/api/streams/cam1/main/hls");
+        assert!(text.contains("#EXT-X-DISCONTINUITY-SEQUENCE:0\n"));
+        assert_eq!(text.matches("#EXT-X-DISCONTINUITY\n").count(), 1);
+        assert!(text.contains("seg/7/media.m4s\n#EXT-X-DISCONTINUITY\n"));
+        inner.gops.pop_front();
+        let text = render(&inner, &auth, "/api/streams/cam1/main/hls");
+        assert!(text.contains("#EXT-X-DISCONTINUITY-SEQUENCE:1\n"));
+        assert!(!text.contains("#EXT-X-DISCONTINUITY\n"));
+    }
+
+    #[test]
+    fn each_gop_budget_rejects_its_next_frame_independently() {
+        let incoming = frame(0, false);
+        let mut payload = gop(0, 0, false);
+        payload.payload_bytes = MAX_GOP_PAYLOAD_BYTES;
+        assert!(payload.would_exceed_budget(&incoming));
+
+        let frames = gop(0, MAX_GOP_FRAMES, false);
+        assert!(frames.would_exceed_budget(&incoming));
+
+        let mut duration = gop(0, 0, false);
+        duration.duration_ticks = MAX_GOP_DURATION_TICKS;
+        assert!(duration.would_exceed_budget(&incoming));
+    }
+
+    #[tokio::test]
+    async fn payload_budget_caps_a_continuously_touched_feeder() {
+        let oversized = Bytes::from(vec![0_u8; MAX_GOP_PAYLOAD_BYTES + 1]);
+        assert_feed_budget_breach(vec![frame_with(0, true, oversized, 3000)]).await;
+    }
+
+    #[tokio::test]
+    async fn frame_budget_caps_a_continuously_touched_feeder() {
+        let frames = (0..=MAX_GOP_FRAMES)
+            .map(|index| frame(index as u64 * 3000, index == 0))
+            .collect();
+        assert_feed_budget_breach(frames).await;
+    }
+
+    #[tokio::test]
+    async fn duration_budget_caps_a_continuously_touched_feeder() {
+        let duration = u32::try_from(MAX_GOP_DURATION_TICKS + 1).unwrap();
+        assert_feed_budget_breach(vec![frame_with(
+            0,
+            true,
+            Bytes::from_static(&[0, 0, 0, 2, 0x26, 1]),
+            duration,
+        )])
+        .await;
+    }
+
+    #[test]
+    fn budget_breach_advances_once_and_recovers_at_the_next_sync() {
+        let mut inner = Inner::default();
+        let mut waiting_for_sync = true;
+        inner.accept_frame(frame(0, true), &mut waiting_for_sync);
+        inner.gops.back_mut().unwrap().payload_bytes = MAX_GOP_PAYLOAD_BYTES;
+        inner.accept_frame(frame(3000, false), &mut waiting_for_sync);
+        assert!(waiting_for_sync);
+        assert!(inner.gops.is_empty());
+        assert_eq!(inner.discontinuity_sequence, 1);
+
+        inner.accept_frame(frame(6000, false), &mut waiting_for_sync);
+        assert_eq!(inner.discontinuity_sequence, 1);
+        assert!(inner.gops.is_empty());
+
+        inner.accept_frame(frame(9000, true), &mut waiting_for_sync);
+        assert!(!waiting_for_sync);
+        assert_eq!(inner.gops.len(), 1);
+        assert_eq!(inner.gops[0].discontinuity_sequence, 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn silent_feeder_expires_and_touches_extend_one_subscription() {
+        let ring = LiveRing::new(8);
+        let hls = LiveHls::new();
+        let shutdown = CancellationToken::new();
+        hls.touch();
+        let task = tokio::spawn(Arc::clone(&hls).feed(ring.clone(), shutdown));
+        tokio::task::yield_now().await;
+        assert_eq!(ring.subscriber_count(), 1);
+
+        tokio::time::advance(IDLE_TIMEOUT.saturating_sub(Duration::from_secs(1))).await;
+        hls.touch();
+        tokio::time::advance(IDLE_TIMEOUT.saturating_sub(Duration::from_secs(1))).await;
+        tokio::task::yield_now().await;
+        assert_eq!(ring.subscriber_count(), 1);
+
+        tokio::time::advance(Duration::from_secs(2)).await;
+        task.await.unwrap();
+        assert_eq!(ring.subscriber_count(), 0);
+        let inner = hls.inner.lock().unwrap();
+        assert!(inner.closed);
+        assert!(inner.gops.is_empty());
+        assert!(inner.init.is_none());
     }
 }

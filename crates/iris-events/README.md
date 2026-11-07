@@ -14,10 +14,12 @@ pull-point subscriptions. Both normalise what they receive into the shared
 - `run_onvif_pullpoint` — creates a pull-point subscription, pulls messages in a loop, renews
   the subscription before it expires, and resubscribes with backoff on failure.
 - `CameraEndpoint` — how to reach one camera's HTTP interface (host, port, TLS, credentials;
-  the password is redacted from `Debug`).
+  the password is redacted from `Debug`). Hosts are bare names or IP addresses; `base_url`
+  adds brackets around IPv6 when building the HTTP authority.
 - `EventSink` — the trait the sources deliver to; implementations must not block.
 - `EventStats` — lock-free counters per source: events, messages (heartbeats and empty pulls
-  included), reconnects, renewals, errors, pull latency, time of the last event and message.
+  included), failed-session retry cycles, renewals, failed sessions, pull latency, time of the
+  last event and message.
 - `dahua` — parsing and normalisation of CGI event parts (`parse_part`, `normalize`, code and
   action mapping).
 - `onvif` — topic mapping, notification normalisation, and ISO 8601 parsing for pull-point
@@ -58,27 +60,60 @@ Addresses in examples use the RFC 5737 range, for example `host: "192.0.2.10".in
   (`docs/research/05-ingest-events.md §3`).
 - CGI feed: heartbeat every 5 s, a stall after 2 × heartbeat + 5 s without a part, a 30 s pause
   after an authentication failure so a wrong password cannot lock the account out, parts bounded
-  at 256 KiB.
-- ONVIF: subscription lifetime 10 min renewed every 8 min; `PullMessages` with a 5 s timeout,
-  100 messages per pull, a 0.75 s cooldown between pulls, and a 20 s deadline on every call,
-  because the HTTP transport underneath bounds each request at 10 s. WS-Security tokens are
-  signed with the camera's measured clock offset, and with host time as the fallback for
-  cameras that misreport UTC yet check tokens against their true clock.
-- Reconnection backoff: 1 s doubling to 30 s with ±20 % jitter, reset after a minute of healthy
-  session.
+  at 256 KiB. A 10 s deadline covers attachment and digest authentication through receipt of
+  response headers; the streaming body uses an absolute deadline since the last completed part.
+  Multipart scanning is linear across transport fragmentation and bounds body plus syntax before
+  appending.
+- ONVIF: requests a 10 min subscription and renews at 80 % of the lifetime granted by the
+  camera, clamped between a 0.75 s anti-spin floor and the measured 8 min cadence. Zero or tiny
+  leases use the floor; missing, malformed, or reversed lease times use the 8 min fallback.
+  Renewal deadlines remain active while a pull or cooldown is pending.
+  `PullMessages` uses a 5 s timeout, 100 messages per pull, a 0.75 s
+  cooldown, and a 20 s outer deadline because the HTTP transport bounds each request at 10 s.
+  WS-Security tokens use the camera's measured clock offset. Host time is retried only after a
+  structured clock-authentication fault whose code, subcode, or reason identifies the clock
+  rejection; free-form Fault Detail is diagnostic only. HTTP 401 and authentication failures
+  identified by those structured fields wait at least 30 s.
+- Both sources apply `CameraEndpoint::tls_verify` to HTTPS calls. ONVIF uses a configurable
+  SOAP transport with the same 10 s HTTP request bound and digest authentication as the
+  upstream transport; normal certificate verification remains enabled unless the endpoint
+  explicitly disables it. Camera-advertised URLs must match the configured scheme, host, and
+  effective port, may not carry userinfo or fragments, and authenticated SOAP follows no
+  redirects. Every SOAP response is capped at 1 MiB; XML depth, nodes, attributes, and retained
+  text are independently capped at 64, 16,384, 32,768, and 1 MiB in the vendored `oxvif`
+  parser.
+- Cancellation after subscription performs one unsubscribe attempt bounded to 5 s and clears
+  connected state. Reconnection backoff is 1 s doubling to 30 s with independently seeded
+  ±20 % jitter, reset only after a minute of actual connection.
+- Event payloads are valid JSON text. Invalid vendor text is quoted, structured ONVIF
+  `ElementItem` content (including child-adjacent mixed-content whitespace) is retained without
+  interpreting its analytics schema, Dahua indexes are retained, and an encoding beyond 64 KiB
+  becomes `{"truncated":true}`.
 - The sources never open RTSP sessions; the per-camera limit of three RTSP sessions in the
   root `AGENTS.md` is unaffected by them, but a wrong password against ONVIF counts toward some
   cameras' lockout counters.
 
 ## Tests and measurements
 
-Unit tests cover CGI part parsing and code mapping (`dahua`), the multipart reader whole and
-byte by byte with runaway-part bounds (`multipart`), digest responses against the RFC 2617
-and RFC 7616 examples (`digest`), ONVIF topic and state mapping and ISO 8601 variants
-(`onvif`), backoff pacing (`backoff`), and the counters (`stats`). Hardware validation of
+Unit tests cover CGI part parsing and valid JSON normalisation (`dahua`), multipart exact limits
+and linear work across fragmentation (`multipart`), digest responses and debug redaction
+(`digest`), ONVIF origin policy, cancellation cleanup, granted leases, topic/property semantics,
+structured items, and strict ISO 8601 parsing (`onvif`), backoff pacing (`backoff`), and the
+counters (`stats`). Hardware validation of
 both sources, including the clock-offset fallback and the 5 s pull timeout, is recorded in
 `docs/research/11-multi-camera-results.md`; the daemon's `events` statistics line is
 described in `docs/research/07-architecture.md §9`.
+
+Loopback HTTP tests cover a connected server withholding attachment headers, HTTP digest
+authentication, bounded SOAP bodies on every status, redirect refusal, and SOAP fault forwarding.
+A TLS fixture generates a temporary self-signed certificate and checks both certificate policies
+through the ONVIF session.
+
+The SOAP adapter uses `async-trait` (MIT OR Apache-2.0) for the locally hardened, vendored
+`oxvif` 0.17.0 transport interface (MIT) and `diqwest` (MIT) to preserve digest authentication.
+Test-only `rcgen` and
+`tokio-rustls` (both MIT OR Apache-2.0) provide ephemeral certificates and the loopback TLS
+server without external programs or stored private keys.
 
 ## Further reading
 

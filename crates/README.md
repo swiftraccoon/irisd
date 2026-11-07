@@ -16,7 +16,7 @@ root applies to all of them.
 | `iris-api` | HTTP API: HLS, live WebSocket, export, snapshots, events, metrics |
 | `irisd` | the binary: `run`, `record`, `inspect`, `recover`, `hls`, `serve` |
 | `iris-replay` | RTSP replay server: recordings as synthetic cameras for benchmarks and fault injection |
-| `iris-gui` | the Linux viewer: a GTK 4 grid of live tiles decoded by GStreamer from the daemon's feed |
+| `iris-gui` | Linux viewer: GTK 4 live grid, focus, playback timeline, event retention, thumbnails, export |
 | `iris-tools` | the tools binary: log summaries, the soak sampler and report, the benchmark driver, camera probes, signed commits |
 
 ## The rest of the repository

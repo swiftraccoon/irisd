@@ -4,7 +4,6 @@ use std::sync::Arc;
 
 use axum::Json;
 use axum::extract::State;
-use iris_core::time::WallUs;
 use serde::Serialize;
 
 use crate::state::ApiState;
@@ -20,7 +19,7 @@ pub(crate) struct Health {
 pub(crate) async fn health(State(state): State<Arc<ApiState>>) -> Json<Health> {
     Json(Health {
         status: "ok",
-        uptime_s: WallUs::now().micros_since(state.started) / 1_000_000,
+        uptime_s: i64::try_from(state.started_monotonic.elapsed().as_secs()).unwrap_or(i64::MAX),
         version: env!("CARGO_PKG_VERSION"),
     })
 }

@@ -13,9 +13,44 @@ Scope: this crate only. Read the root `AGENTS.md` first.
   `docs/research/07-architecture.md §6` and `packaging/README.md`.
 - The watchdog ping is gated on every stream having made progress since the last check
   (`all_streams_progressed`); never ping unconditionally.
-- Retention order and bounds (free-space floor, quota, age; oldest sealed first; at most 512
-  deletions per pass) follow `docs/research/04-storage-format.md §8`.
-- Shutdown order is ingest tasks, writer, API, catalog, with every open file sealed.
+- Retention order and bounds (event maintenance, free-space floor, quota, age; oldest sealed
+  first; at most 512 attempts, 64 pages, 1,024 raw scanned candidate rows, or one second per pass) follow
+  `docs/research/04-storage-format.md §8`. Protection projection is separately bounded to
+  2,048 minimal rows and 100 ms and continues by `(retain_until, event id)`.
+- Free-space retention selects files beneath the pressured root; quota retention spans
+  roots. Indexed candidate SQL caps raw input before active-protection filtering and returns
+  scan progress even for an empty filtered page. Pagination uses `(wall_start, segment id)`;
+  the atomic mutation repeats protection authorization. The first root rotates between passes
+  so a root cannot monopolize the shared work budget. Separate exact-root, quota, and
+  stream-age cursors advance through handled candidates and adopt the raw page end only after
+  complete candidate consumption. Budget exits retain the last handled candidate, satisfied
+  root/quota policies reset, and age wraps only after raw-query exhaustion. Policy
+  reconciliation includes the free-space floor and prunes or resets bounded state.
+- Startup resolves durable root identities synchronously before the sandbox or threads, rejects
+  marker/physical aliases, and only visits `ApprovedRoot`s. Catalog rows are paged; root walks
+  are streaming and no-follow; one elapsed heartbeat covers every reconciliation phase. A writing
+  row on an unavailable root or behind a filesystem lookup error is preserved; only confirmed
+  absence under its exact admitted persisted root permits cleanup.
+- Startup registers configured roots and completes durable deletion intents on available roots
+  before writing recovery and adoption. Retention unlinks only after
+  `mark_deleting_if_unprotected` returns `Marked`; `Protected` and `NotFound` do not mutate the
+  filesystem. It removes the row only after the directory barrier; failed transitions count
+  neither deletion nor quota progress.
+- Empty writing rows enter durable deletion intent before descriptor-relative pair removal.
+  Every destructive startup/retention operation uses its exact approved root and keeps a row or
+  tombstone until both names are absent and the directory barrier succeeds.
+- Shutdown has one absolute budget: cancel once, await all producers against one shared grace,
+  abort and observe every remainder, then attempt writer, API, and catalog closure exactly once
+  while preserving the first failure. Periodic maintenance and self-check owners participate in
+  the same bound.
+- The API listener is bound successfully before recording tasks and `READY=1`; serving consumes
+  that same listener. A bind failure must not emit readiness or leave recording work running.
+- Offline HLS treats a bounded sidecar only as a cache physically bound to the selected media,
+  rejects generated-file/source aliases and reserved basenames, validates playlist text, and
+  publishes through exclusive temporaries plus atomic rename. It excludes each trailer separately;
+  continuation segments cannot claim independent decoding.
+- An API task consumed by the monitor is removed before ordered shutdown; a completed
+  join handle cannot be polled twice.
 - Configuration keys are the ones in `config/cameras.example.toml`; a change to the schema
   updates that file and `docs/research/07-architecture.md §10`.
 
@@ -55,8 +90,11 @@ A change to the statistics lines is checked by feeding a log to
 
 ## Pitfalls
 
-- Anything awaited inside the monitor loop delays the statistics, watchdog, and retention
-  ticks; long work goes to `spawn_blocking` or its own task (the self-check does this).
+- Anything awaited inside the monitor loop delays signals and watchdog ticks. Reporting,
+  retention, and self-check work stays single-flight, separately owned, cancellable, and bounded;
+  blocking filesystem calls run off the current-thread runtime. An uninterruptible raw filesystem
+  call may detach only while its single-flight owner forces bounded process exit; never relaunch
+  that owner, and preserve deletion intent so late completion is retry-safe.
 - The select arms in `monitor` borrow disjoint fields of `Daemon`; a helper that takes the
   whole struct will not compile.
 - `start_recording` opens two RTSP sessions per camera; the limit is three per camera, and

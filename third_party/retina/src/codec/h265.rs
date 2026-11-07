@@ -24,6 +24,61 @@ use crate::inputs::Input as _;
 
 use super::VideoFrame;
 
+/// Maximum payload/output bytes accumulated for one H.265 access unit.
+const MAX_ACCESS_UNIT_BYTES: usize = 64 * 1024 * 1024;
+const ACCESS_UNIT_TOO_LARGE: &str = "H.265 access unit exceeds 64 MiB";
+
+#[derive(Debug)]
+struct AccessUnitBudget {
+    pinned_payload: usize,
+    projected_output: usize,
+    limit: usize,
+}
+
+impl AccessUnitBudget {
+    fn new() -> Self {
+        Self {
+            pinned_payload: 0,
+            projected_output: 0,
+            limit: MAX_ACCESS_UNIT_BYTES,
+        }
+    }
+
+    fn add_pinned_payload(&mut self, bytes: usize) -> Result<(), String> {
+        self.pinned_payload = bounded_sum(self.pinned_payload, bytes, self.limit)?;
+        Ok(())
+    }
+
+    fn add_projected_output(&mut self, bytes: usize) -> Result<(), String> {
+        self.projected_output = bounded_sum(self.projected_output, bytes, self.limit)?;
+        Ok(())
+    }
+
+    fn ensure_output(&self, bytes: usize) -> Result<(), String> {
+        if bytes > self.limit {
+            Err(ACCESS_UNIT_TOO_LARGE.to_owned())
+        } else {
+            Ok(())
+        }
+    }
+
+    fn reset(&mut self) {
+        self.pinned_payload = 0;
+        self.projected_output = 0;
+    }
+}
+
+fn bounded_sum(current: usize, additional: usize, limit: usize) -> Result<usize, String> {
+    let projected = current
+        .checked_add(additional)
+        .ok_or_else(|| ACCESS_UNIT_TOO_LARGE.to_owned())?;
+    if projected > limit {
+        Err(ACCESS_UNIT_TOO_LARGE.to_owned())
+    } else {
+        Ok(projected)
+    }
+}
+
 /// A [super::Depacketizer] implementation which finds access unit boundaries
 /// and produces unfragmented NAL units as specified in [RFC
 /// 7798](https://tools.ietf.org/html/rfc7798).
@@ -57,6 +112,9 @@ pub(crate) struct Depacketizer {
     /// In state `PreMark`, an entry for each NAL.
     /// Kept around (empty) in other states to re-use the backing allocation.
     nals: Vec<Nal>,
+
+    /// Payload pinned and output projected for the access unit in progress.
+    au_budget: AccessUnitBudget,
 
     /// True if we've seen a FU sequence where the NAL headers differ between
     /// fragments.
@@ -148,6 +206,7 @@ impl Depacketizer {
             mark: None,
             pieces: Vec::new(),
             nals: Vec::new(),
+            au_budget: AccessUnitBudget::new(),
             parameters,
             seen_inconsistent_fu_nal_hdr: false,
             seen_single_fragment_fu: false,
@@ -182,6 +241,8 @@ impl Depacketizer {
             assert!(self.nals.is_empty());
             assert!(self.pieces.is_empty());
             assert!(self.mark.is_none());
+            assert_eq!(self.au_budget.pinned_payload, 0);
+            assert_eq!(self.au_budget.projected_output, 0);
         }
     }
 
@@ -189,6 +250,7 @@ impl Depacketizer {
         self.nals.clear();
         self.pieces.clear();
         self.mark = None;
+        self.au_budget.reset();
     }
 
     pub(super) fn parameters(&self) -> Option<super::ParametersRef<'_>> {
@@ -315,6 +377,8 @@ impl Depacketizer {
         if payload_len < 2 {
             return Err("Short NAL".into());
         }
+        self.au_budget
+            .add_pinned_payload(usize::from(payload_len))?;
         if self.mark.is_none() {
             self.mark = Some(pkt.mark());
         }
@@ -332,6 +396,8 @@ impl Depacketizer {
                         "Non-fragmented NAL {hdr:?} while fragment in progress"
                     ));
                 }
+                self.au_budget
+                    .add_projected_output(4 + usize::from(payload_len))?;
                 let next_piece_idx = self.add_piece(BufRange {
                     pos: payload_pos + 2,
                     len: payload_len - 2,
@@ -369,6 +435,8 @@ impl Depacketizer {
                     }
                     let nal_hdr_bytes = payload.peek_array::<2>();
                     let nal_hdr = nal::Header::try_from(nal_hdr_bytes).map_err(|e| e.0)?;
+                    self.au_budget
+                        .add_projected_output(4 + usize::from(nal_len))?;
                     let next_piece_idx = self.add_piece(BufRange {
                         pos: pos + 2,
                         len: nal_len - 2,
@@ -421,6 +489,8 @@ impl Depacketizer {
                             );
                             self.seen_single_fragment_fu = true;
                         }
+                        self.au_budget
+                            .add_projected_output(6 + usize::from(frag_len))?;
                         let pieces = self.add_piece(BufRange {
                             pos: payload_pos + 3,
                             len: frag_len,
@@ -433,6 +503,7 @@ impl Depacketizer {
                         access_unit.in_fu = !end;
                     }
                     (false, true) => {
+                        self.au_budget.add_projected_output(usize::from(frag_len))?;
                         let pieces = self.add_piece(BufRange {
                             pos: payload_pos + 3,
                             len: frag_len,
@@ -610,7 +681,11 @@ impl Depacketizer {
                 nal.hdr.unit_type(),
                 nal::UnitType::VpsNut | nal::UnitType::SpsNut | nal::UnitType::PpsNut
             ) {
-                retained_len += 4usize + crate::to_usize(nal.len);
+                retained_len = bounded_sum(
+                    retained_len,
+                    4usize + crate::to_usize(nal.len),
+                    self.au_budget.limit,
+                )?;
             }
             piece_idx = next_piece_idx;
         }
@@ -656,9 +731,17 @@ impl Depacketizer {
             };
         if prepend_params && let Some(ref p) = self.parameters {
             // 4-byte prefix + VPS + 4-byte prefix + SPS + 4-byte prefix + PPS
-            retained_len += 4 + p.vps_nal.len() + 4 + p.sps_nal.len() + 4 + p.pps_nal.len();
+            let parameter_len = 4usize
+                .checked_add(p.vps_nal.len())
+                .and_then(|length| length.checked_add(4))
+                .and_then(|length| length.checked_add(p.sps_nal.len()))
+                .and_then(|length| length.checked_add(4))
+                .and_then(|length| length.checked_add(p.pps_nal.len()))
+                .ok_or_else(|| ACCESS_UNIT_TOO_LARGE.to_owned())?;
+            retained_len = bounded_sum(retained_len, parameter_len, self.au_budget.limit)?;
         }
 
+        self.au_budget.ensure_output(retained_len)?;
         let mut data = Vec::with_capacity(retained_len);
 
         // Prepend parameter sets if requested.
@@ -706,6 +789,7 @@ impl Depacketizer {
         self.nals.clear();
         self.pieces.clear();
         self.mark = None;
+        self.au_budget.reset();
 
         Ok(VideoFrame {
             has_new_parameters,
@@ -1046,6 +1130,105 @@ mod tests {
         buf.extend(payload);
         buf.advance_unparsed(buf.end());
         d.push(&PacketRef::new(meta, buf, pos, payload.len() as u16))
+    }
+
+    fn packet_meta(sequence_number: u16, mark: bool) -> crate::rtp::PacketMeta {
+        crate::rtp::PacketMeta {
+            ctx: PacketContext::dummy(),
+            stream_id: 0,
+            timestamp: crate::Timestamp {
+                timestamp: 0,
+                clock_rate: NonZeroU32::new(90_000).unwrap(),
+                start: 0,
+            },
+            ssrc: 0,
+            sequence_number,
+            loss: 0,
+            mark,
+        }
+    }
+
+    fn assert_au_released(d: &super::Depacketizer) {
+        assert!(d.mark.is_none());
+        assert!(d.nals.is_empty());
+        assert!(d.pieces.is_empty());
+        assert_eq!(d.au_budget.pinned_payload, 0);
+        assert_eq!(d.au_budget.projected_output, 0);
+    }
+
+    #[test]
+    fn access_unit_budget_accepts_the_limit_and_rejects_integer_overflow() {
+        let mut budget = super::AccessUnitBudget::new();
+        budget
+            .add_pinned_payload(super::MAX_ACCESS_UNIT_BYTES)
+            .unwrap();
+        budget
+            .add_projected_output(super::MAX_ACCESS_UNIT_BYTES)
+            .unwrap();
+        assert!(budget.add_pinned_payload(1).is_err());
+        assert!(budget.add_projected_output(1).is_err());
+        assert!(super::bounded_sum(usize::MAX, 1, usize::MAX).is_err());
+    }
+
+    #[test]
+    fn many_complete_nals_release_the_access_unit_at_the_budget() {
+        let mut d = super::Depacketizer::new(90_000, None).unwrap();
+        d.au_budget.limit = 20;
+        let mut buf = MarkBuf::new(128);
+        for sequence in 0..2 {
+            push_via_buf(
+                &mut d,
+                packet_meta(sequence, false),
+                b"\x02\x01abcd",
+                &mut buf,
+            )
+            .unwrap();
+        }
+        let error =
+            push_via_buf(&mut d, packet_meta(2, false), b"\x02\x01abcd", &mut buf).unwrap_err();
+        assert_eq!(error, super::ACCESS_UNIT_TOO_LARGE);
+        assert_au_released(&d);
+    }
+
+    #[test]
+    fn indefinitely_extended_fu_releases_the_access_unit_at_the_budget() {
+        let mut d = super::Depacketizer::new(90_000, None).unwrap();
+        d.au_budget.limit = 28;
+        let mut buf = MarkBuf::new(128);
+        push_via_buf(&mut d, packet_meta(0, false), b"\x62\x01\x81abcd", &mut buf).unwrap();
+        for sequence in 1..4 {
+            push_via_buf(
+                &mut d,
+                packet_meta(sequence, false),
+                b"\x62\x01\x01abcd",
+                &mut buf,
+            )
+            .unwrap();
+        }
+        let error =
+            push_via_buf(&mut d, packet_meta(4, false), b"\x62\x01\x01abcd", &mut buf).unwrap_err();
+        assert_eq!(error, super::ACCESS_UNIT_TOO_LARGE);
+        assert_au_released(&d);
+    }
+
+    #[test]
+    fn completed_access_unit_obeys_the_exact_output_limit() {
+        let payload = b"\x02\x01abcd";
+        let mut buf = MarkBuf::new(128);
+        let mut exact = super::Depacketizer::new(90_000, None).unwrap();
+        exact.au_budget.limit = 10;
+        push_via_buf(&mut exact, packet_meta(0, true), payload, &mut buf).unwrap();
+        let Some(Ok(CodecItem::VideoFrame(frame))) = exact.pull() else {
+            panic!("expected a frame at the exact limit");
+        };
+        assert_eq!(frame.data().len(), 10);
+        assert_au_released(&exact);
+
+        let mut over = super::Depacketizer::new(90_000, None).unwrap();
+        over.au_budget.limit = 9;
+        let error = push_via_buf(&mut over, packet_meta(0, true), payload, &mut buf).unwrap_err();
+        assert_eq!(error, super::ACCESS_UNIT_TOO_LARGE);
+        assert_au_released(&over);
     }
 
     #[test]

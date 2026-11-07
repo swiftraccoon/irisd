@@ -21,7 +21,7 @@ async fn frames_round_trip_through_a_retina_client() {
         trail_len: 3_000,
         ..Plan::default()
     };
-    let media = Arc::new(Media::from_bytes(synth::recording(plan)).unwrap());
+    let media = Arc::new(Media::from_bytes(synth::recording(plan).unwrap()).unwrap());
     let mut mounts = HashMap::new();
     mounts.insert("cam".to_owned(), Arc::clone(&media));
     let server = Server::bind("127.0.0.1:0".parse().unwrap(), mounts, Options::default())

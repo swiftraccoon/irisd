@@ -58,7 +58,7 @@ mod source;
 mod stats;
 
 pub use live::{LiveError, LiveFrame, LiveRing, LiveSubscription};
-pub use session::{ReadTicker, run_stream};
+pub use session::{ReadTicker, deliver_fragment, run_stream};
 pub use sink::{FragmentSink, SinkError};
 pub use source::{IngestOptions, StreamSource};
 pub use stats::StreamStats;

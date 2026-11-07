@@ -16,8 +16,10 @@ use tracing::{info, warn};
 use crate::live::{self, Feed};
 use crate::stage::{BranchEvent, Stage};
 
-/// Bytes `appsrc` may hold before it blocks the feed; a few seconds of a sub stream.
-const SOURCE_QUEUE_BYTES: u64 = 16 << 20;
+/// Maximum queued bytes; exceeding it reconnects from an init segment and sync frame.
+pub(crate) const SOURCE_QUEUE_BYTES: u64 = 16 << 20;
+/// Maximum queued buffers. At 30 fps this permits more than 17 seconds of backlog.
+const SOURCE_QUEUE_BUFFERS: u64 = 512;
 
 /// The branch description. `qtdemux` consumes the daemon's fragmented MP4
 /// byte stream, `decodebin3` picks the highest-ranked decoder, `glupload`
@@ -40,14 +42,25 @@ pub enum TileEvent {
 }
 
 /// The feed's handle on the branch input, usable from any thread.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct Source {
     src: gst_app::AppSrc,
 }
 
 impl Source {
-    /// Pushes a chunk of the byte stream.
+    /// Pushes a complete live payload without blocking the runtime. A full queue
+    /// fails the session so reconnection starts a decodable byte stream.
     pub fn push(&self, bytes: &[u8]) -> anyhow::Result<()> {
+        anyhow::ensure!(!bytes.is_empty(), "live input payload is empty");
+        let queued = self.src.current_level_bytes();
+        anyhow::ensure!(
+            bytes.len() as u64 <= SOURCE_QUEUE_BYTES.saturating_sub(queued),
+            "live input queue exceeded its byte limit"
+        );
+        anyhow::ensure!(
+            self.src.property::<u64>("current-level-buffers") < SOURCE_QUEUE_BUFFERS,
+            "live input queue exceeded its buffer limit"
+        );
         let buffer = gst::Buffer::from_slice(bytes.to_vec());
         self.src
             .push_buffer(buffer)
@@ -138,6 +151,7 @@ impl Tile {
             .and_then(|e| e.downcast::<gst_app::AppSrc>().ok())
             .context("appsrc missing")?;
         src.set_max_bytes(SOURCE_QUEUE_BYTES);
+        src.set_property("max-buffers", SOURCE_QUEUE_BUFFERS);
         let sink = bin.by_name("sink").context("sink missing")?;
         let paintable = sink.property::<gdk::Paintable>("paintable");
         self.picture.set_paintable(Some(&paintable));
@@ -206,5 +220,69 @@ impl Tile {
 impl Drop for Tile {
     fn drop(&mut self) {
         self.stop();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_stalled_source_rejects_payloads_beyond_the_byte_limit() {
+        gst::init().unwrap();
+        let source = Source {
+            src: gst_app::AppSrc::builder()
+                .max_bytes(SOURCE_QUEUE_BYTES)
+                .build(),
+        };
+        let payload = vec![0; 1 << 20];
+        for _ in 0..16 {
+            source.push(&payload).unwrap();
+        }
+        assert!(source.push(&payload).is_err());
+        assert_eq!(source.src.current_level_bytes(), SOURCE_QUEUE_BYTES);
+    }
+
+    #[test]
+    fn an_oversized_payload_is_rejected_before_copying() {
+        gst::init().unwrap();
+        let source = Source {
+            src: gst_app::AppSrc::builder().build(),
+        };
+        assert!(
+            source
+                .push(&vec![0; SOURCE_QUEUE_BYTES as usize + 1])
+                .is_err()
+        );
+        assert_eq!(source.src.current_level_bytes(), 0);
+    }
+
+    #[test]
+    fn empty_and_excess_buffers_are_rejected_before_allocation() {
+        gst::init().unwrap();
+        let src = gst_app::AppSrc::builder()
+            .max_bytes(SOURCE_QUEUE_BYTES)
+            .build();
+        src.set_property("max-buffers", SOURCE_QUEUE_BUFFERS);
+        let source = Source { src };
+        assert_eq!(
+            source.src.property::<u64>("max-buffers"),
+            SOURCE_QUEUE_BUFFERS
+        );
+        assert!(source.push(&[]).is_err());
+        assert_eq!(source.src.property::<u64>("current-level-buffers"), 0);
+
+        for _ in 0..SOURCE_QUEUE_BUFFERS {
+            source.push(&[1]).unwrap();
+        }
+        assert_eq!(
+            source.src.property::<u64>("current-level-buffers"),
+            SOURCE_QUEUE_BUFFERS
+        );
+        assert!(source.push(&[1]).is_err());
+        assert_eq!(
+            source.src.property::<u64>("current-level-buffers"),
+            SOURCE_QUEUE_BUFFERS
+        );
     }
 }

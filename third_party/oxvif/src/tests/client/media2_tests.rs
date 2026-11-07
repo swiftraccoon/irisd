@@ -1,0 +1,1732 @@
+//! Unit tests for the Media2 (ver20) methods on `OnvifClient`
+//! (`src/client/media2.rs`).
+
+use super::*;
+use crate::tests::common::*;
+
+#[tokio::test]
+async fn set_synchronization_point_media2_wire_contract() {
+    let response = r#"<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope" xmlns:tr2="http://www.onvif.org/ver20/media/wsdl"><s:Body><tr2:SetSynchronizationPointResponse/></s:Body></s:Envelope>"#;
+    let (transport, captured) = RecordingTransport::new(response);
+    let client = OnvifClient::new("http://device.invalid").with_transport(transport);
+    client
+        .set_synchronization_point_media2("http://media.invalid/service", " Profile<&同步 ")
+        .await
+        .unwrap();
+    let call = captured.lock().unwrap();
+    assert_eq!(call.url, "http://media.invalid/service");
+    assert_eq!(
+        call.action,
+        "http://www.onvif.org/ver20/media/wsdl/SetSynchronizationPoint"
+    );
+    assert!(call.body.contains("<tr2:SetSynchronizationPoint><tr2:ProfileToken> Profile&lt;&amp;同步 </tr2:ProfileToken></tr2:SetSynchronizationPoint>"), "{}", call.body);
+    let body = parse_soap_body(&call.body).unwrap();
+    assert_eq!(body.children.len(), 1);
+    assert_eq!(body.children[0].children.len(), 1);
+    assert_eq!(
+        body.children[0].child("ProfileToken").unwrap().text(),
+        "Profile<&同步" // Legacy client DOM trims; exact wire assertion above preserves spaces.
+    );
+}
+
+#[tokio::test]
+async fn set_synchronization_point_media2_fault_and_wrong_wrapper() {
+    let fault = make_soap_fault_xml("s:Receiver", "sync-device-failure-817");
+    let client = OnvifClient::new("http://device.invalid").with_transport(mock(&fault));
+    let error = client
+        .set_synchronization_point_media2("http://media.invalid/service", "missing")
+        .await
+        .unwrap_err();
+    assert_fault(error, "s:Receiver", "sync-device-failure-817");
+    let wrong = empty_response_xml("OtherResponse");
+    let client = OnvifClient::new("http://device.invalid").with_transport(mock(&wrong));
+    let error = client
+        .set_synchronization_point_media2("http://media.invalid/service", "p")
+        .await
+        .unwrap_err();
+    match error {
+        OnvifError::Soap(error) => assert_eq!(
+            error,
+            crate::soap::SoapError::UnexpectedResponse("SetSynchronizationPointResponse".into())
+        ),
+        other => panic!("unexpected error: {other:?}"),
+    }
+}
+
+// ── Media2 fixtures ───────────────────────────────────────────────────────
+
+/// Two profiles in the shape `tr2:ConfigurationSet` actually declares.
+///
+/// **Every member is the whole configuration, not a token reference.** Each one
+/// is typed as the full configuration — `VideoSource` is
+/// `tt:VideoSourceConfiguration`, the same type `tt:Profile` inlines — so a
+/// bare `<tr2:VideoSource token="VSC_1"/>`, which this fixture and the mock both
+/// sent until 0.15, is a document no conformant device produces. It also made
+/// `video_source_token` untestable, because that field is read from a
+/// `SourceToken` *inside* the configuration.
+///
+/// `Name` is `tr2:`, not `tt:`: `tr2:MediaProfile` declares it locally and
+/// `media2.wsdl` is `elementFormDefault="qualified"`. The bodies are `tt:`
+/// because the *types* come from `onvif.xsd`. `XmlNode` strips prefixes, so
+/// either passes — which is exactly why the fixture has to be right.
+fn profiles_media2_xml() -> &'static str {
+    r#"<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope"
+                      xmlns:tr2="http://www.onvif.org/ver20/media/wsdl"
+                      xmlns:tt="http://www.onvif.org/ver10/schema">
+          <s:Body>
+            <tr2:GetProfilesResponse>
+              <tr2:Profiles token="Profile_A" fixed="true">
+                <tr2:Name>mainStream</tr2:Name>
+                <tr2:Configurations>
+                  <tr2:VideoSource token="VSC_1">
+                    <tt:Name>VideoSourceConfig_1</tt:Name>
+                    <tt:UseCount>2</tt:UseCount>
+                    <tt:SourceToken>VS_1</tt:SourceToken>
+                    <tt:Bounds x="0" y="0" width="2592" height="1944"/>
+                  </tr2:VideoSource>
+                  <tr2:VideoEncoder token="VEC_1">
+                    <tt:Name>MainEncoder</tt:Name>
+                    <tt:UseCount>1</tt:UseCount>
+                    <tt:Encoding>H265</tt:Encoding>
+                    <tt:Resolution><tt:Width>2592</tt:Width><tt:Height>1944</tt:Height></tt:Resolution>
+                    <tt:Quality>5</tt:Quality>
+                  </tr2:VideoEncoder>
+                </tr2:Configurations>
+              </tr2:Profiles>
+              <tr2:Profiles token="Profile_B" fixed="false">
+                <tr2:Name>subStream</tr2:Name>
+              </tr2:Profiles>
+            </tr2:GetProfilesResponse>
+          </s:Body>
+        </s:Envelope>"#
+}
+
+fn stream_uri_media2_xml() -> &'static str {
+    r#"<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope"
+                      xmlns:tr2="http://www.onvif.org/ver20/media/wsdl">
+          <s:Body>
+            <tr2:GetStreamUriResponse>
+              <tr2:Uri>rtsp://192.168.1.1:554/h265/ch1</tr2:Uri>
+            </tr2:GetStreamUriResponse>
+          </s:Body>
+        </s:Envelope>"#
+}
+
+fn video_encoder_configurations_media2_xml() -> &'static str {
+    r#"<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope"
+                      xmlns:tr2="http://www.onvif.org/ver20/media/wsdl"
+                      xmlns:tt="http://www.onvif.org/ver10/schema">
+          <s:Body>
+            <tr2:GetVideoEncoderConfigurationsResponse>
+              <tr2:Configurations token="VEC_H265" GovLength="60" Profile="Main">
+                <tt:Name>H265Stream</tt:Name>
+                <tt:UseCount>1</tt:UseCount>
+                <tt:Encoding>H265</tt:Encoding>
+                <tt:Resolution><tt:Width>3840</tt:Width><tt:Height>2160</tt:Height></tt:Resolution>
+                <tt:Quality>7</tt:Quality>
+                <tt:RateControl>
+                  <tt:FrameRateLimit>30</tt:FrameRateLimit>
+                  <tt:BitrateLimit>8192</tt:BitrateLimit>
+                </tt:RateControl>
+              </tr2:Configurations>
+            </tr2:GetVideoEncoderConfigurationsResponse>
+          </s:Body>
+        </s:Envelope>"#
+}
+
+fn video_encoder_configuration_options_media2_xml() -> &'static str {
+    r#"<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope"
+                      xmlns:tr2="http://www.onvif.org/ver20/media/wsdl"
+                      xmlns:tt="http://www.onvif.org/ver10/schema">
+          <s:Body>
+            <tr2:GetVideoEncoderConfigurationOptionsResponse>
+              <tr2:Options ProfilesSupported="Main" FrameRatesSupported="30 15" GovLengthRange="1 120">
+                <tt:Encoding>H264</tt:Encoding>
+                <tt:QualityRange><tt:Min>1</tt:Min><tt:Max>10</tt:Max></tt:QualityRange>
+                <tt:ResolutionsAvailable><tt:Width>1920</tt:Width><tt:Height>1080</tt:Height></tt:ResolutionsAvailable>
+                <tt:BitrateRange><tt:Min>32</tt:Min><tt:Max>16384</tt:Max></tt:BitrateRange>
+              </tr2:Options>
+              <tr2:Options ProfilesSupported="Main Main10" FrameRatesSupported="60 30 12.5" GovLengthRange="1 240">
+                <tt:Encoding>H265</tt:Encoding>
+                <tt:QualityRange><tt:Min>1</tt:Min><tt:Max>10</tt:Max></tt:QualityRange>
+                <tt:ResolutionsAvailable><tt:Width>3840</tt:Width><tt:Height>2160</tt:Height></tt:ResolutionsAvailable>
+                <tt:BitrateRange><tt:Min>64</tt:Min><tt:Max>32768</tt:Max></tt:BitrateRange>
+              </tr2:Options>
+            </tr2:GetVideoEncoderConfigurationOptionsResponse>
+          </s:Body>
+        </s:Envelope>"#
+}
+
+/// `tr2:EncoderInstanceInfo` declares `Codec` (`[0..*]`) then `Total`, and
+/// `tr2:EncoderInstance` declares `Encoding` then `Number` — **every one of
+/// them `tr2:`**, because `media2.wsdl`'s inline schema is
+/// `elementFormDefault="qualified"`.
+///
+/// This fixture had all four wrong until 0.15.0: it named the wrapper
+/// `Encoding` after its own first child, put everything in `tt:`, and put
+/// `Total` first. Only the wrapper name mattered to the parser, which is why it
+/// stayed green — and why `encodings` came back empty from a real device.
+fn video_encoder_instances_xml() -> &'static str {
+    r#"<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope"
+                      xmlns:tr2="http://www.onvif.org/ver20/media/wsdl">
+          <s:Body>
+            <tr2:GetVideoEncoderInstancesResponse>
+              <tr2:Info>
+                <tr2:Codec>
+                  <tr2:Encoding>H264</tr2:Encoding>
+                  <tr2:Number>2</tr2:Number>
+                </tr2:Codec>
+                <tr2:Codec>
+                  <tr2:Encoding>H265</tr2:Encoding>
+                  <tr2:Number>3</tr2:Number>
+                </tr2:Codec>
+                <tr2:Total>4</tr2:Total>
+              </tr2:Info>
+            </tr2:GetVideoEncoderInstancesResponse>
+          </s:Body>
+        </s:Envelope>"#
+}
+
+// ── Media2 tests ──────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn test_get_profiles_media2_returns_correct_fields() {
+    let (transport, captured) = RecordingTransport::new(profiles_media2_xml());
+    let client =
+        OnvifClient::new("http://192.168.1.1/onvif/device_service").with_transport(transport);
+
+    let profiles = client
+        .get_profiles_media2("http://192.168.1.1/onvif/media2_service")
+        .await
+        .unwrap();
+
+    let request = captured.lock().unwrap();
+    assert_eq!(request.url, "http://192.168.1.1/onvif/media2_service");
+    assert_eq!(
+        request.action,
+        "http://www.onvif.org/ver20/media/wsdl/GetProfiles"
+    );
+    assert!(
+        request
+            .body
+            .contains("<tr2:GetProfiles><tr2:Type>All</tr2:Type></tr2:GetProfiles>"),
+        "the full-profile API must explicitly request configurations"
+    );
+
+    assert_eq!(profiles.len(), 2);
+    assert_eq!(profiles[0].token, "Profile_A");
+    assert_eq!(profiles[0].name, "mainStream");
+    assert!(profiles[0].fixed);
+    assert_eq!(
+        profiles[0].video_source_config_token.as_deref(),
+        Some("VSC_1")
+    );
+    assert_eq!(profiles[0].video_encoder_token.as_deref(), Some("VEC_1"));
+    // The physical source behind the bound configuration. Read from
+    // `VideoSource/SourceToken`, so it is `None` for as long as the response
+    // carries a token reference instead of the configuration — which is what
+    // this fixture sent until 0.15, and why nothing asserted it.
+    assert_eq!(profiles[0].video_source_token.as_deref(), Some("VS_1"));
+    assert_eq!(profiles[1].token, "Profile_B");
+    assert!(!profiles[1].fixed);
+    // A profile with no `Configurations` at all: every binding must be absent
+    // rather than defaulted, so the two rows disagree on all five.
+    assert_eq!(profiles[1].video_source_config_token, None);
+    assert_eq!(profiles[1].video_source_token, None);
+    assert_eq!(profiles[1].video_encoder_token, None);
+}
+
+#[tokio::test]
+async fn test_get_stream_uri_media2_returns_string() {
+    let client = OnvifClient::new("http://192.168.1.1/onvif/device_service")
+        .with_transport(mock(stream_uri_media2_xml()));
+
+    let uri = client
+        .get_stream_uri_media2("http://192.168.1.1/onvif/media2_service", "Profile_A")
+        .await
+        .unwrap();
+
+    assert_eq!(uri, "rtsp://192.168.1.1:554/h265/ch1");
+}
+
+#[tokio::test]
+async fn test_get_video_encoder_configurations_media2_parses_h265() {
+    let client = OnvifClient::new("http://192.168.1.1/onvif/device_service")
+        .with_transport(mock(video_encoder_configurations_media2_xml()));
+
+    let cfgs = client
+        .get_video_encoder_configurations_media2("http://192.168.1.1/onvif/media2_service")
+        .await
+        .unwrap();
+
+    assert_eq!(cfgs.len(), 1);
+    assert_eq!(cfgs[0].token, "VEC_H265");
+    assert_eq!(cfgs[0].encoding, crate::types::VideoEncoding::H265);
+    assert_eq!(cfgs[0].gov_length, Some(60));
+    assert_eq!(cfgs[0].profile.as_deref(), Some("Main"));
+    let rc = cfgs[0].rate_control.as_ref().unwrap();
+    assert_eq!(rc.frame_rate_limit, 30.0);
+    assert_eq!(rc.bitrate_limit, 8192);
+}
+
+#[tokio::test]
+async fn test_get_video_encoder_configuration_options_media2_parses_options() {
+    let client = OnvifClient::new("http://192.168.1.1/onvif/device_service")
+        .with_transport(mock(video_encoder_configuration_options_media2_xml()));
+
+    let opts = client
+        .get_video_encoder_configuration_options_media2(
+            "http://192.168.1.1/onvif/media2_service",
+            "VEC_1",
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(opts.options.len(), 2);
+    assert_eq!(opts.options[0].encoding, crate::types::VideoEncoding::H264);
+    assert_eq!(opts.options[1].encoding, crate::types::VideoEncoding::H265);
+
+    // The three list/range members are attributes, and the two `Options` blocks
+    // disagree on every one of them — so reading the wrong block, or reading
+    // elements that are not there, cannot produce this.
+    assert_eq!(opts.options[0].profiles, ["Main"]);
+    assert_eq!(opts.options[1].profiles, ["Main", "Main10"]);
+    assert_eq!(opts.options[0].gov_length_range.unwrap().max, 120);
+    assert_eq!(opts.options[1].gov_length_range.unwrap().max, 240);
+    assert_eq!(opts.options[0].frame_rates.len(), 2);
+    assert_eq!(opts.options[1].frame_rates.len(), 3);
+    assert!((opts.options[1].frame_rates[2] - 12.5).abs() < 1e-5);
+}
+
+#[tokio::test]
+async fn test_get_video_encoder_instances_parses_total() {
+    let client = OnvifClient::new("http://192.168.1.1/onvif/device_service")
+        .with_transport(mock(video_encoder_instances_xml()));
+
+    let inst = client
+        .get_video_encoder_instances_media2("http://192.168.1.1/onvif/media2_service", "VSC_1")
+        .await
+        .unwrap();
+
+    assert_eq!(inst.total, 4);
+    assert_eq!(inst.encodings.len(), 2);
+    assert_eq!(
+        inst.encodings[0].encoding,
+        crate::types::VideoEncoding::H264
+    );
+    assert_eq!(inst.encodings[0].number, 2);
+    // The two codecs disagree on `Number` (2 against 3), so a parser reading
+    // the first entry for both, or reading `Total` into either, goes red here.
+    assert_eq!(
+        inst.encodings[1].encoding,
+        crate::types::VideoEncoding::H265
+    );
+    assert_eq!(inst.encodings[1].number, 3);
+}
+
+// ── Round 2 new-field coverage tests ─────────────────────────────────────────
+
+/// The audio encoder member of `tr2:ConfigurationSet` is named `AudioEncoder`.
+///
+/// This fixture said `Audio` until 2026-08-03, because it was written to match
+/// `MediaProfile2::vec_from_xml`, which looked for `Audio`, and the mock was
+/// written to match both — parser, fixture and mock agreeing with each other
+/// and with no conformant device. The consequence was that
+/// `audio_encoder_token` was `None` from **every real Media2 camera** while this
+/// test stayed green. Sixth instance of the class in `CLAUDE.md`.
+///
+/// The element names and prefixes here are the ones a conformant device sends,
+/// not the ones oxvif happens to accept: the parser is namespace-blind
+/// (`XmlNode` strips prefixes), so a fixture that gets the namespace wrong
+/// passes just as well and teaches the next reader the wrong shape.
+///
+/// **And so is the nesting.** Every member of `tr2:ConfigurationSet` is typed as
+/// the *whole* configuration, so the five bare `<tr2:X token="…"/>` elements this
+/// fixture used to carry were the same mistake one level down: a shape that
+/// happened to satisfy this parser and no schema. The members are also in
+/// declaration order — `VideoSource, AudioSource, VideoEncoder, AudioEncoder,
+/// …, PTZ` — which interleaves the media rather than grouping them.
+#[tokio::test]
+async fn test_get_profiles_media2_parses_audio_ptz_tokens() {
+    let xml = r#"<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope"
+                     xmlns:tr2="http://www.onvif.org/ver20/media/wsdl"
+                     xmlns:tt="http://www.onvif.org/ver10/schema">
+         <s:Body>
+           <tr2:GetProfilesResponse>
+             <tr2:Profiles token="Profile_1" fixed="false">
+               <tr2:Name>main</tr2:Name>
+               <tr2:Configurations>
+                 <tr2:VideoSource token="VideoSrc_1">
+                   <tt:Name>vsc</tt:Name>
+                   <tt:UseCount>1</tt:UseCount>
+                   <tt:SourceToken>VS_9</tt:SourceToken>
+                   <tt:Bounds x="0" y="0" width="1280" height="720"/>
+                 </tr2:VideoSource>
+                 <tr2:AudioSource token="AudioSrc_1">
+                   <tt:Name>asc</tt:Name>
+                   <tt:UseCount>1</tt:UseCount>
+                   <tt:SourceToken>AS_9</tt:SourceToken>
+                 </tr2:AudioSource>
+                 <tr2:VideoEncoder token="VideoEnc_1">
+                   <tt:Name>vec</tt:Name>
+                   <tt:UseCount>1</tt:UseCount>
+                   <tt:Encoding>H264</tt:Encoding>
+                   <tt:Resolution><tt:Width>1280</tt:Width><tt:Height>720</tt:Height></tt:Resolution>
+                   <tt:Quality>4</tt:Quality>
+                 </tr2:VideoEncoder>
+                 <tr2:AudioEncoder token="AudioEnc_1">
+                   <tt:Name>aec</tt:Name>
+                   <tt:UseCount>1</tt:UseCount>
+                   <tt:Encoding>AAC</tt:Encoding>
+                   <tt:Bitrate>64</tt:Bitrate>
+                   <tt:SampleRate>16</tt:SampleRate>
+                 </tr2:AudioEncoder>
+                 <tr2:PTZ token="PTZConfig_1">
+                   <tt:Name>ptz</tt:Name>
+                   <tt:UseCount>1</tt:UseCount>
+                   <tt:NodeToken>PTZNode_9</tt:NodeToken>
+                 </tr2:PTZ>
+               </tr2:Configurations>
+             </tr2:Profiles>
+           </tr2:GetProfilesResponse>
+         </s:Body>
+       </s:Envelope>"#;
+    let client =
+        OnvifClient::new("http://192.168.1.1/onvif/device_service").with_transport(mock(xml));
+    let profiles = client
+        .get_profiles_media2("http://192.168.1.1/onvif/media2_service")
+        .await
+        .unwrap();
+    let p = &profiles[0];
+    assert_eq!(p.video_source_config_token.as_deref(), Some("VideoSrc_1"));
+    assert_eq!(p.video_encoder_token.as_deref(), Some("VideoEnc_1"));
+    assert_eq!(p.audio_source_token.as_deref(), Some("AudioSrc_1"));
+    assert_eq!(p.audio_encoder_token.as_deref(), Some("AudioEnc_1"));
+    assert_eq!(p.ptz_config_token.as_deref(), Some("PTZConfig_1"));
+    // The one field the token-only shape could never produce. `VS_9` is
+    // deliberately unlike the configuration token above it, so a parser reading
+    // the wrong attribute cannot land on it by accident.
+    assert_eq!(p.video_source_token.as_deref(), Some("VS_9"));
+}
+
+// ── Media2 AddConfiguration / RemoveConfiguration ─────────────────────────
+
+#[tokio::test]
+async fn test_add_configuration_media2_sends_type_and_token() {
+    let xml = empty_response_xml("AddConfigurationResponse");
+    let (transport, captured) = RecordingTransport::new(&xml);
+    let client =
+        OnvifClient::new("http://192.168.1.1/onvif/device_service").with_transport(transport);
+
+    client
+        .add_configuration_media2(
+            "http://192.168.1.1/onvif/media2",
+            "Profile_1",
+            "VideoEncoder",
+            "VEC_1",
+        )
+        .await
+        .unwrap();
+
+    let body = captured.lock().unwrap().body.clone();
+    assert!(body.contains("Profile_1"));
+    assert!(body.contains("VideoEncoder"));
+    assert!(body.contains("VEC_1"));
+}
+
+#[tokio::test]
+async fn test_remove_configuration_media2_sends_type_and_token() {
+    let xml = empty_response_xml("RemoveConfigurationResponse");
+    let (transport, captured) = RecordingTransport::new(&xml);
+    let client =
+        OnvifClient::new("http://192.168.1.1/onvif/device_service").with_transport(transport);
+
+    client
+        .remove_configuration_media2(
+            "http://192.168.1.1/onvif/media2",
+            "Profile_1",
+            "Metadata",
+            "MetaConf_1",
+        )
+        .await
+        .unwrap();
+
+    let body = captured.lock().unwrap().body.clone();
+    assert!(body.contains("Metadata"));
+    assert!(body.contains("MetaConf_1"));
+}
+
+// ── Media2 Metadata configurations ────────────────────────────────────────
+
+fn metadata_configs_xml() -> &'static str {
+    r#"<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope"
+                    xmlns:tr2="http://www.onvif.org/ver20/media/wsdl"
+                    xmlns:tt="http://www.onvif.org/ver10/schema">
+          <s:Body>
+            <tr2:GetMetadataConfigurationsResponse>
+              <tr2:Configurations token="MetaConf_1">
+                <tt:Name>MetadataConfig</tt:Name>
+                <tt:UseCount>1</tt:UseCount>
+                <tt:PTZStatus>
+                  <tt:Status>false</tt:Status>
+                  <tt:Position>true</tt:Position>
+                </tt:PTZStatus>
+                <tt:Analytics>true</tt:Analytics>
+                <tt:Multicast><tt:Address><tt:Type>IPv6</tt:Type><tt:IPv6Address>ff15::97</tt:IPv6Address></tt:Address><tt:Port>4097</tt:Port><tt:TTL>7</tt:TTL><tt:AutoStart>true</tt:AutoStart></tt:Multicast>
+                <tt:SessionTimeout>PT97S</tt:SessionTimeout>
+              </tr2:Configurations>
+            </tr2:GetMetadataConfigurationsResponse>
+          </s:Body>
+        </s:Envelope>"#
+}
+
+#[tokio::test]
+async fn test_get_metadata_configurations_parses_response() {
+    let client = OnvifClient::new("http://192.168.1.1/onvif/device_service")
+        .with_transport(mock(metadata_configs_xml()));
+
+    let configs = client
+        .get_metadata_configurations_media2("http://192.168.1.1/onvif/media2", None, None)
+        .await
+        .unwrap();
+
+    assert_eq!(configs.len(), 1);
+    assert_eq!(configs[0].token, "MetaConf_1");
+    assert!(configs[0].analytics);
+    assert!(configs[0].ptz_position);
+    assert!(!configs[0].ptz_status);
+}
+
+#[tokio::test]
+async fn test_get_metadata_configurations_missing_token_returns_err() {
+    let xml = r#"<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope"
+                    xmlns:tr2="http://www.onvif.org/ver20/media/wsdl">
+          <s:Body>
+            <tr2:GetMetadataConfigurationsResponse>
+              <tr2:Configurations>
+                <tt:Name xmlns:tt="http://www.onvif.org/ver10/schema">NoToken</tt:Name>
+              </tr2:Configurations>
+            </tr2:GetMetadataConfigurationsResponse>
+          </s:Body>
+        </s:Envelope>"#;
+    let client =
+        OnvifClient::new("http://192.168.1.1/onvif/device_service").with_transport(mock(xml));
+
+    let err = client
+        .get_metadata_configurations_media2("http://192.168.1.1/onvif/media2", None, None)
+        .await
+        .unwrap_err();
+    assert_missing_field(err, "MetadataConfiguration/@token");
+}
+
+// ── Media2 Audio decoder / output configurations ──────────────────────────
+
+fn audio_decoder_xml() -> &'static str {
+    r#"<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope"
+                    xmlns:tr2="http://www.onvif.org/ver20/media/wsdl"
+                    xmlns:tt="http://www.onvif.org/ver10/schema">
+          <s:Body>
+            <tr2:GetAudioDecoderConfigurationsResponse>
+              <tr2:Configurations token="ADC_1">
+                <tt:Name>AudioDecoder</tt:Name>
+                <tt:UseCount>1</tt:UseCount>
+              </tr2:Configurations>
+            </tr2:GetAudioDecoderConfigurationsResponse>
+          </s:Body>
+        </s:Envelope>"#
+}
+
+#[tokio::test]
+async fn test_get_audio_decoder_configurations_parses_response() {
+    let client = OnvifClient::new("http://192.168.1.1/onvif/device_service")
+        .with_transport(mock(audio_decoder_xml()));
+
+    let configs = client
+        .get_audio_decoder_configurations_media2("http://192.168.1.1/onvif/media2")
+        .await
+        .unwrap();
+
+    assert_eq!(configs.len(), 1);
+    assert_eq!(configs[0].token, "ADC_1");
+    assert_eq!(configs[0].name, "AudioDecoder");
+}
+
+fn audio_output_xml() -> &'static str {
+    r#"<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope"
+                    xmlns:tr2="http://www.onvif.org/ver20/media/wsdl"
+                    xmlns:tt="http://www.onvif.org/ver10/schema">
+          <s:Body>
+            <tr2:GetAudioOutputConfigurationsResponse>
+              <tr2:Configurations token="AOC_1">
+                <tt:Name>AudioOutput</tt:Name>
+                <tt:UseCount>1</tt:UseCount>
+                <tt:OutputToken>AudioOut_1</tt:OutputToken>
+                <tt:OutputLevel>50</tt:OutputLevel>
+              </tr2:Configurations>
+            </tr2:GetAudioOutputConfigurationsResponse>
+          </s:Body>
+        </s:Envelope>"#
+}
+
+#[tokio::test]
+async fn test_get_audio_output_configurations_parses_response() {
+    let client = OnvifClient::new("http://192.168.1.1/onvif/device_service")
+        .with_transport(mock(audio_output_xml()));
+
+    let configs = client
+        .get_audio_output_configurations_media2("http://192.168.1.1/onvif/media2")
+        .await
+        .unwrap();
+
+    assert_eq!(configs.len(), 1);
+    assert_eq!(configs[0].token, "AOC_1");
+    assert_eq!(configs[0].output_token, "AudioOut_1");
+    assert_eq!(configs[0].output_level, Some(50));
+}
+
+// ── Media2 Video source modes ─────────────────────────────────────────────
+
+fn video_source_modes_xml() -> &'static str {
+    r#"<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope"
+                    xmlns:tr2="http://www.onvif.org/ver20/media/wsdl"
+                    xmlns:tt="http://www.onvif.org/ver10/schema">
+          <s:Body>
+            <tr2:GetVideoSourceModesResponse>
+              <tr2:VideoSourceModes token="Mode_1">
+                <tt:MaxFramerate>30</tt:MaxFramerate>
+                <tt:MaxResolution>
+                  <tt:Width>1920</tt:Width>
+                  <tt:Height>1080</tt:Height>
+                </tt:MaxResolution>
+                <tt:Encodings>H264 H265</tt:Encodings>
+                <tt:Reboot>false</tt:Reboot>
+              </tr2:VideoSourceModes>
+            </tr2:GetVideoSourceModesResponse>
+          </s:Body>
+        </s:Envelope>"#
+}
+
+#[tokio::test]
+async fn test_get_video_source_modes_parses_response() {
+    let client = OnvifClient::new("http://192.168.1.1/onvif/device_service")
+        .with_transport(mock(video_source_modes_xml()));
+
+    let modes = client
+        .get_video_source_modes_media2("http://192.168.1.1/onvif/media2", "VS_1")
+        .await
+        .unwrap();
+
+    assert_eq!(modes.len(), 1);
+    assert_eq!(modes[0].token, "Mode_1");
+    assert_eq!(modes[0].max_framerate, 30.0);
+    assert_eq!(modes[0].max_resolution_width, 1920);
+    assert_eq!(modes[0].max_resolution_height, 1080);
+    assert_eq!(modes[0].encodings, ["H264", "H265"]);
+    assert!(!modes[0].reboot);
+}
+
+#[tokio::test]
+async fn test_set_video_source_mode_sends_tokens() {
+    let xml = r#"<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope"
+                    xmlns:tr2="http://www.onvif.org/ver20/media/wsdl">
+          <s:Body>
+            <tr2:SetVideoSourceModeResponse>
+              <tr2:Reboot>true</tr2:Reboot>
+            </tr2:SetVideoSourceModeResponse>
+          </s:Body>
+        </s:Envelope>"#;
+    let (transport, captured) = RecordingTransport::new(xml);
+    let client =
+        OnvifClient::new("http://192.168.1.1/onvif/device_service").with_transport(transport);
+
+    let reboot = client
+        .set_video_source_mode_media2("http://192.168.1.1/onvif/media2", "VS_1", "Mode_1")
+        .await
+        .unwrap();
+
+    assert!(reboot);
+    let body = captured.lock().unwrap().body.clone();
+    assert!(body.contains("VS_1"));
+    assert!(body.contains("Mode_1"));
+}
+
+// ── Stage 4: positives for the Media2 methods that had none ───────────────
+//
+// Read methods assert the parsed field values the fixture chose; write methods
+// assert the SOAPAction URI *and* the exact operation fragment put on the wire.
+
+#[tokio::test]
+async fn test_create_profile_media2_returns_token_and_sends_name() {
+    let xml = r#"<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope"
+                    xmlns:tr2="http://www.onvif.org/ver20/media/wsdl">
+          <s:Body>
+            <tr2:CreateProfileResponse>
+              <tr2:Token>Profile_new_1</tr2:Token>
+            </tr2:CreateProfileResponse>
+          </s:Body>
+        </s:Envelope>"#;
+    let (transport, captured) = RecordingTransport::new(xml);
+    let client =
+        OnvifClient::new("http://192.168.1.1/onvif/device_service").with_transport(transport);
+
+    let token = client
+        .create_profile_media2("http://192.168.1.1/onvif/media2", "NightProfile")
+        .await
+        .unwrap();
+
+    assert_eq!(token, "Profile_new_1");
+    let c = captured.lock().unwrap();
+    assert_eq!(
+        c.action,
+        "http://www.onvif.org/ver20/media/wsdl/CreateProfile"
+    );
+    assert!(
+        c.body
+            .contains("<tr2:CreateProfile><tr2:Name>NightProfile</tr2:Name></tr2:CreateProfile>"),
+        "CreateProfile body drifted: {}",
+        c.body
+    );
+}
+
+#[tokio::test]
+async fn test_delete_profile_media2_sends_action_and_token_element() {
+    let xml = empty_response_xml("DeleteProfileResponse");
+    let (transport, captured) = RecordingTransport::new(&xml);
+    let client =
+        OnvifClient::new("http://192.168.1.1/onvif/device_service").with_transport(transport);
+
+    client
+        .delete_profile_media2("http://192.168.1.1/onvif/media2", "Profile_9")
+        .await
+        .unwrap();
+
+    let c = captured.lock().unwrap();
+    assert_eq!(
+        c.action,
+        "http://www.onvif.org/ver20/media/wsdl/DeleteProfile"
+    );
+    assert!(
+        c.body
+            .contains("<tr2:DeleteProfile><tr2:Token>Profile_9</tr2:Token></tr2:DeleteProfile>"),
+        "DeleteProfile body drifted: {}",
+        c.body
+    );
+}
+
+#[tokio::test]
+async fn test_get_snapshot_uri_media2_returns_string() {
+    let xml = r#"<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope"
+                    xmlns:tr2="http://www.onvif.org/ver20/media/wsdl">
+          <s:Body>
+            <tr2:GetSnapshotUriResponse>
+              <tr2:Uri>http://192.168.1.1/snapshot/media2?Profile_B</tr2:Uri>
+            </tr2:GetSnapshotUriResponse>
+          </s:Body>
+        </s:Envelope>"#;
+    let client =
+        OnvifClient::new("http://192.168.1.1/onvif/device_service").with_transport(mock(xml));
+
+    let uri = client
+        .get_snapshot_uri_media2("http://192.168.1.1/onvif/media2", "Profile_B")
+        .await
+        .unwrap();
+
+    assert_eq!(uri, "http://192.168.1.1/snapshot/media2?Profile_B");
+}
+
+fn video_source_configurations_media2_xml() -> &'static str {
+    r#"<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope"
+                    xmlns:tr2="http://www.onvif.org/ver20/media/wsdl"
+                    xmlns:tt="http://www.onvif.org/ver10/schema">
+          <s:Body>
+            <tr2:GetVideoSourceConfigurationsResponse>
+              <tr2:Configurations token="VSC_M2_1">
+                <tt:Name>Media2Source</tt:Name>
+                <tt:UseCount>4</tt:UseCount>
+                <tt:SourceToken>VS_M2</tt:SourceToken>
+                <tt:Bounds x="8" y="4" width="3840" height="2160"/>
+              </tr2:Configurations>
+            </tr2:GetVideoSourceConfigurationsResponse>
+          </s:Body>
+        </s:Envelope>"#
+}
+
+#[tokio::test]
+async fn test_get_video_source_configurations_media2_returns_fields() {
+    let client = OnvifClient::new("http://192.168.1.1/onvif/device_service")
+        .with_transport(mock(video_source_configurations_media2_xml()));
+
+    let cfgs = client
+        .get_video_source_configurations_media2("http://192.168.1.1/onvif/media2")
+        .await
+        .unwrap();
+
+    assert_eq!(cfgs.len(), 1);
+    assert_eq!(cfgs[0].token, "VSC_M2_1");
+    assert_eq!(cfgs[0].name, "Media2Source");
+    assert_eq!(cfgs[0].use_count, 4);
+    assert_eq!(cfgs[0].source_token, "VS_M2");
+    assert_eq!(cfgs[0].bounds.width, 3840);
+    assert_eq!(cfgs[0].bounds.height, 2160);
+}
+
+fn video_source_configuration_options_media2_xml() -> &'static str {
+    r#"<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope"
+                    xmlns:tr2="http://www.onvif.org/ver20/media/wsdl"
+                    xmlns:tt="http://www.onvif.org/ver10/schema">
+          <s:Body>
+            <tr2:GetVideoSourceConfigurationOptionsResponse>
+              <tr2:Options MaximumNumberOfProfiles="9">
+                <tt:BoundsRange>
+                  <tt:XRange><tt:Min>0</tt:Min><tt:Max>1920</tt:Max></tt:XRange>
+                  <tt:YRange><tt:Min>0</tt:Min><tt:Max>1080</tt:Max></tt:YRange>
+                  <tt:WidthRange><tt:Min>640</tt:Min><tt:Max>3840</tt:Max></tt:WidthRange>
+                  <tt:HeightRange><tt:Min>360</tt:Min><tt:Max>2160</tt:Max></tt:HeightRange>
+                </tt:BoundsRange>
+                <tt:VideoSourceTokensAvailable>VS_M2</tt:VideoSourceTokensAvailable>
+              </tr2:Options>
+            </tr2:GetVideoSourceConfigurationOptionsResponse>
+          </s:Body>
+        </s:Envelope>"#
+}
+
+#[tokio::test]
+async fn test_get_video_source_configuration_options_media2_returns_ranges() {
+    let client = OnvifClient::new("http://192.168.1.1/onvif/device_service")
+        .with_transport(mock(video_source_configuration_options_media2_xml()));
+
+    let opts = client
+        .get_video_source_configuration_options_media2("http://192.168.1.1/onvif/media2", "VSC_1")
+        .await
+        .unwrap();
+
+    assert_eq!(opts.max_limit, Some(9));
+    assert_eq!(opts.source_tokens, vec!["VS_M2"]);
+    let br = opts.bounds_range.expect("BoundsRange must be parsed");
+    assert_eq!(br.x_range.max, 1920);
+    assert_eq!(br.y_range.max, 1080);
+    assert_eq!(br.width_range.min, 640);
+    assert_eq!(br.width_range.max, 3840);
+    assert_eq!(br.height_range.min, 360);
+    assert_eq!(br.height_range.max, 2160);
+}
+
+#[tokio::test]
+async fn test_get_video_encoder_configuration_media2_returns_first_configuration() {
+    let xml = r#"<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope"
+                    xmlns:tr2="http://www.onvif.org/ver20/media/wsdl"
+                    xmlns:tt="http://www.onvif.org/ver10/schema">
+          <s:Body>
+            <tr2:GetVideoEncoderConfigurationsResponse>
+              <tr2:Configurations token="VEC_M2_1" GovLength="45" Profile="High">
+                <tt:Name>Media2Encoder</tt:Name>
+                <tt:UseCount>2</tt:UseCount>
+                <tt:Encoding>H264</tt:Encoding>
+                <tt:Resolution><tt:Width>1280</tt:Width><tt:Height>720</tt:Height></tt:Resolution>
+                <tt:Quality>4</tt:Quality>
+                <tt:RateControl>
+                  <tt:FrameRateLimit>15</tt:FrameRateLimit>
+                  <tt:BitrateLimit>2048</tt:BitrateLimit>
+                </tt:RateControl>
+              </tr2:Configurations>
+            </tr2:GetVideoEncoderConfigurationsResponse>
+          </s:Body>
+        </s:Envelope>"#;
+    let client =
+        OnvifClient::new("http://192.168.1.1/onvif/device_service").with_transport(mock(xml));
+
+    let cfg = client
+        .get_video_encoder_configuration_media2("http://192.168.1.1/onvif/media2", "VEC_M2_1")
+        .await
+        .unwrap();
+
+    assert_eq!(cfg.token, "VEC_M2_1");
+    assert_eq!(cfg.name, "Media2Encoder");
+    assert_eq!(cfg.use_count, 2);
+    assert_eq!(cfg.encoding, crate::types::VideoEncoding::H264);
+    assert_eq!(cfg.resolution.width, 1280);
+    assert_eq!(cfg.resolution.height, 720);
+    assert_eq!(cfg.gov_length, Some(45));
+    assert_eq!(cfg.profile.as_deref(), Some("High"));
+    let rc = cfg
+        .rate_control
+        .as_ref()
+        .expect("RateControl must be parsed");
+    assert_eq!(rc.frame_rate_limit, 15.0);
+    assert_eq!(rc.bitrate_limit, 2048);
+}
+
+#[tokio::test]
+async fn test_get_audio_source_configurations_media2_returns_fields() {
+    let xml = r#"<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope"
+                    xmlns:tr2="http://www.onvif.org/ver20/media/wsdl"
+                    xmlns:tt="http://www.onvif.org/ver10/schema">
+          <s:Body>
+            <tr2:GetAudioSourceConfigurationsResponse>
+              <tr2:Configurations token="ASC_M2">
+                <tt:Name>Media2AudioSource</tt:Name>
+                <tt:UseCount>2</tt:UseCount>
+                <tt:SourceToken>AudioSource_2</tt:SourceToken>
+              </tr2:Configurations>
+            </tr2:GetAudioSourceConfigurationsResponse>
+          </s:Body>
+        </s:Envelope>"#;
+    let client =
+        OnvifClient::new("http://192.168.1.1/onvif/device_service").with_transport(mock(xml));
+
+    let cfgs = client
+        .get_audio_source_configurations_media2("http://192.168.1.1/onvif/media2")
+        .await
+        .unwrap();
+
+    assert_eq!(cfgs.len(), 1);
+    assert_eq!(cfgs[0].token, "ASC_M2");
+    assert_eq!(cfgs[0].name, "Media2AudioSource");
+    assert_eq!(cfgs[0].use_count, 2);
+    assert_eq!(cfgs[0].source_token, "AudioSource_2");
+}
+
+#[tokio::test]
+async fn test_get_audio_encoder_configurations_media2_returns_fields() {
+    let xml = r#"<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope"
+                    xmlns:tr2="http://www.onvif.org/ver20/media/wsdl"
+                    xmlns:tt="http://www.onvif.org/ver10/schema">
+          <s:Body>
+            <tr2:GetAudioEncoderConfigurationsResponse>
+              <tr2:Configurations token="AEC_M2">
+                <tt:Name>Media2AudioEncoder</tt:Name>
+                <tt:UseCount>1</tt:UseCount>
+                <tt:Encoding>AAC</tt:Encoding>
+                <tt:Bitrate>128</tt:Bitrate>
+                <tt:SampleRate>48</tt:SampleRate>
+                <tt:Channels>2</tt:Channels>
+              </tr2:Configurations>
+            </tr2:GetAudioEncoderConfigurationsResponse>
+          </s:Body>
+        </s:Envelope>"#;
+    let client =
+        OnvifClient::new("http://192.168.1.1/onvif/device_service").with_transport(mock(xml));
+
+    let cfgs = client
+        .get_audio_encoder_configurations_media2("http://192.168.1.1/onvif/media2")
+        .await
+        .unwrap();
+
+    assert_eq!(cfgs.len(), 1);
+    assert_eq!(cfgs[0].token, "AEC_M2");
+    assert_eq!(cfgs[0].encoding.as_str(), "AAC");
+    assert_eq!(cfgs[0].bitrate, 128);
+    assert_eq!(cfgs[0].sample_rate, 48);
+    assert_eq!(cfgs[0].channels, Some(2));
+}
+
+#[tokio::test]
+async fn test_get_audio_encoder_configuration_options_media2_returns_lists() {
+    let xml = r#"<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope"
+                    xmlns:tr2="http://www.onvif.org/ver20/media/wsdl"
+                    xmlns:tt="http://www.onvif.org/ver10/schema">
+          <s:Body>
+            <tr2:GetAudioEncoderConfigurationOptionsResponse>
+              <tr2:Options>
+                <tt:Encoding>G726</tt:Encoding>
+                <tt:BitrateList><tt:Items>16 32</tt:Items></tt:BitrateList>
+                <tt:SampleRateList><tt:Items>8</tt:Items></tt:SampleRateList>
+              </tr2:Options>
+              <tr2:Options>
+                <tt:Encoding>AAC</tt:Encoding>
+                <tt:BitrateList><tt:Items>64 128 192</tt:Items></tt:BitrateList>
+                <tt:SampleRateList><tt:Items>16 48</tt:Items></tt:SampleRateList>
+              </tr2:Options>
+            </tr2:GetAudioEncoderConfigurationOptionsResponse>
+          </s:Body>
+        </s:Envelope>"#;
+    let client =
+        OnvifClient::new("http://192.168.1.1/onvif/device_service").with_transport(mock(xml));
+
+    let opts = client
+        .get_audio_encoder_configuration_options_media2("http://192.168.1.1/onvif/media2", "AEC_1")
+        .await
+        .unwrap();
+
+    assert_eq!(opts.options.len(), 2);
+    assert_eq!(opts.options[0].encoding.as_str(), "G726");
+    assert_eq!(opts.options[0].bitrate_list, vec![16, 32]);
+    assert_eq!(opts.options[0].sample_rate_list, vec![8]);
+    assert_eq!(opts.options[1].encoding.as_str(), "AAC");
+    assert_eq!(opts.options[1].bitrate_list, vec![64, 128, 192]);
+    assert_eq!(opts.options[1].sample_rate_list, vec![16, 48]);
+}
+
+#[tokio::test]
+async fn test_get_metadata_configuration_options_media2_returns_flags() {
+    let xml = r#"<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope"
+                    xmlns:tr2="http://www.onvif.org/ver20/media/wsdl"
+                    xmlns:tt="http://www.onvif.org/ver10/schema">
+          <s:Body>
+            <tr2:GetMetadataConfigurationOptionsResponse>
+              <tr2:Options>
+                <tt:PTZStatusFilterOptions>
+                  <tt:PanTiltStatusSupported>true</tt:PanTiltStatusSupported>
+                  <tt:ZoomStatusSupported>false</tt:ZoomStatusSupported>
+                </tt:PTZStatusFilterOptions>
+              </tr2:Options>
+            </tr2:GetMetadataConfigurationOptionsResponse>
+          </s:Body>
+        </s:Envelope>"#;
+    let client =
+        OnvifClient::new("http://192.168.1.1/onvif/device_service").with_transport(mock(xml));
+
+    let opts = client
+        .get_metadata_configuration_options_media2("http://192.168.1.1/onvif/media2", None, None)
+        .await
+        .unwrap();
+
+    assert!(opts.ptz_status_filter_supported);
+    // The two required booleans disagree in this fixture, so a parser that
+    // returned a constant for either would fail on one of them.
+    assert!(opts.pan_tilt_status_supported);
+    assert!(!opts.zoom_status_supported);
+}
+
+#[tokio::test]
+async fn test_set_metadata_configuration_media2_sends_action_and_exact_body() {
+    let xml = empty_response_xml("SetMetadataConfigurationResponse");
+    let (transport, captured) = RecordingTransport::new(&xml);
+    let client =
+        OnvifClient::new("http://192.168.1.1/onvif/device_service").with_transport(transport);
+
+    let cfg = crate::types::MetadataConfiguration {
+        token: "MetaConf_9".to_string(),
+        name: "MetaCfg".to_string(),
+        use_count: 2,
+        analytics: true,
+        ptz_status: false,
+        ptz_position: true,
+        multicast: crate::MulticastConfiguration {
+            address: "ff15::97".into(),
+            port: 4097,
+            ttl: 7,
+            auto_start: false,
+        },
+        session_timeout: "PT97S".into(),
+    };
+
+    client
+        .set_metadata_configuration_media2("http://192.168.1.1/onvif/media2", &cfg)
+        .await
+        .unwrap();
+
+    let c = captured.lock().unwrap();
+    assert_eq!(
+        c.action,
+        "http://www.onvif.org/ver20/media/wsdl/SetMetadataConfiguration"
+    );
+    let expected = concat!(
+        "<tr2:SetMetadataConfiguration>",
+        r#"<tr2:Configuration token="MetaConf_9">"#,
+        "<tt:Name>MetaCfg</tt:Name>",
+        "<tt:UseCount>2</tt:UseCount>",
+        "<tt:PTZStatus><tt:Status>false</tt:Status><tt:Position>true</tt:Position></tt:PTZStatus>",
+        "<tt:Analytics>true</tt:Analytics>",
+        "<tt:Multicast><tt:Address><tt:Type>IPv6</tt:Type><tt:IPv6Address>ff15::97</tt:IPv6Address></tt:Address><tt:Port>4097</tt:Port><tt:TTL>7</tt:TTL><tt:AutoStart>false</tt:AutoStart></tt:Multicast>",
+        "<tt:SessionTimeout>PT97S</tt:SessionTimeout>",
+        "</tr2:Configuration>",
+        "</tr2:SetMetadataConfiguration>",
+    );
+    assert!(
+        c.body.contains(expected),
+        "SetMetadataConfiguration body drifted.\nexpected fragment:\n{expected}\nactual body:\n{}",
+        c.body
+    );
+}
+
+// ── NET 2: emitted request-body shapes ────────────────────────────────────────
+//
+// Stage 1b rewrites `src/types/audio.rs`, `src/types/video.rs` and
+// `src/client/media2.rs`. These tests pin the *exact* fragment each setter puts
+// on the wire today, so any unintended change to element names, element order,
+// namespace prefixes or values fails loudly.
+//
+// Assertions are on complete operation fragments, not on incidental substrings:
+// a fragment like `<trt:SetAudioEncoderConfiguration>…</trt:SetAudioEncoder…>`
+// cannot appear by accident.
+//
+// This module pairs each Media1 setter with its Media2 counterpart, so it spans
+// two services; it lives with Media2 because `src/client/media2.rs` is the file
+// Stage 1b rewrites and the pinned bugs are all on the Media2 side.
+
+mod request_body_shapes {
+    use super::*;
+    use crate::types::{
+        AudioEncoderConfiguration, AudioEncoding, H264Configuration, MulticastConfiguration,
+        Resolution, SourceBounds, VideoEncoderConfiguration, VideoEncoderConfiguration2,
+        VideoEncoding, VideoRateControl, VideoRateControl2, VideoSourceConfiguration,
+    };
+
+    const MEDIA: &str = "http://192.168.1.1/onvif/media_service";
+    const MEDIA2: &str = "http://192.168.1.1/onvif/media2_service";
+
+    fn envelope(inner: &str) -> String {
+        format!(
+            r#"<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope"
+                            xmlns:trt="http://www.onvif.org/ver10/media/wsdl"
+                            xmlns:tr2="http://www.onvif.org/ver20/media/wsdl">
+                 <s:Body>{inner}</s:Body>
+               </s:Envelope>"#
+        )
+    }
+
+    /// A configuration as a **Media1** device reports it: `Multicast` and
+    /// `SessionTimeout` are required members of `tt:AudioEncoderConfiguration`,
+    /// so a real one always has them, and a `Set` that drops them is invalid.
+    fn audio_cfg() -> AudioEncoderConfiguration {
+        AudioEncoderConfiguration {
+            token: "AEC_1".into(),
+            name: "AudioEncoder".into(),
+            use_count: 1,
+            encoding: AudioEncoding::G711,
+            bitrate: 64,
+            sample_rate: 8,
+            multicast: Some(MulticastConfiguration {
+                address: "239.0.0.7".into(),
+                port: 40004,
+                ttl: 4,
+                auto_start: false,
+            }),
+            session_timeout: Some("PT60S".into()),
+            channels: None,
+        }
+    }
+
+    /// The serialised audio-encoder fragment Media1 emits — `trt:`-prefixed,
+    /// `Multicast` then `SessionTimeout` after `SampleRate`.
+    const AUDIO_CFG_FRAGMENT: &str = concat!(
+        r#"<trt:Configuration token="AEC_1">"#,
+        "<tt:Name>AudioEncoder</tt:Name>",
+        "<tt:UseCount>1</tt:UseCount>",
+        "<tt:Encoding>G711</tt:Encoding>",
+        "<tt:Bitrate>64</tt:Bitrate>",
+        "<tt:SampleRate>8</tt:SampleRate>",
+        "<tt:Multicast>",
+        "<tt:Address><tt:Type>IPv4</tt:Type><tt:IPv4Address>239.0.0.7</tt:IPv4Address></tt:Address>",
+        "<tt:Port>40004</tt:Port>",
+        "<tt:TTL>4</tt:TTL>",
+        "<tt:AutoStart>false</tt:AutoStart>",
+        "</tt:Multicast>",
+        "<tt:SessionTimeout>PT60S</tt:SessionTimeout>",
+        "</trt:Configuration>",
+    );
+
+    /// The Media2 fragment. **Not the same order**, and not just a prefix
+    /// change: `tt:AudioEncoder2Configuration` puts `Multicast` *before*
+    /// `Bitrate` and has no `SessionTimeout` member at all.
+    const AUDIO_CFG_FRAGMENT_MEDIA2: &str = concat!(
+        r#"<tr2:Configuration token="AEC_1">"#,
+        "<tt:Name>AudioEncoder</tt:Name>",
+        "<tt:UseCount>1</tt:UseCount>",
+        "<tt:Encoding>G711</tt:Encoding>",
+        "<tt:Multicast>",
+        "<tt:Address><tt:Type>IPv4</tt:Type><tt:IPv4Address>239.0.0.7</tt:IPv4Address></tt:Address>",
+        "<tt:Port>40004</tt:Port>",
+        "<tt:TTL>4</tt:TTL>",
+        "<tt:AutoStart>false</tt:AutoStart>",
+        "</tt:Multicast>",
+        "<tt:Bitrate>64</tt:Bitrate>",
+        "<tt:SampleRate>8</tt:SampleRate>",
+        "</tr2:Configuration>",
+    );
+
+    fn video_enc_cfg() -> VideoEncoderConfiguration {
+        VideoEncoderConfiguration {
+            token: "VEC_1".into(),
+            name: "MainStream".into(),
+            use_count: 1,
+            encoding: VideoEncoding::H264,
+            resolution: Resolution {
+                width: 1920,
+                height: 1080,
+            },
+            quality: 5.0,
+            rate_control: Some(VideoRateControl {
+                frame_rate_limit: 25,
+                encoding_interval: 1,
+                bitrate_limit: 4096,
+            }),
+            h264: Some(H264Configuration {
+                gov_length: 25,
+                profile: "Main".into(),
+            }),
+            h265: None,
+            multicast: None,
+            session_timeout: Some("PT60S".into()),
+            guaranteed_frame_rate: None,
+        }
+    }
+
+    fn video_enc_cfg2() -> VideoEncoderConfiguration2 {
+        VideoEncoderConfiguration2 {
+            token: "VEC_1".into(),
+            name: "MainStream".into(),
+            use_count: 1,
+            encoding: VideoEncoding::H265,
+            resolution: Resolution {
+                width: 1920,
+                height: 1080,
+            },
+            quality: 5.0,
+            rate_control: Some(VideoRateControl2 {
+                frame_rate_limit: 25.0,
+                bitrate_limit: 4096,
+            }),
+            gov_length: Some(50),
+            profile: Some("Main".into()),
+        }
+    }
+
+    fn video_src_cfg() -> VideoSourceConfiguration {
+        VideoSourceConfiguration {
+            token: "VSC_1".into(),
+            name: "VSConfig1".into(),
+            use_count: 2,
+            source_token: "VS_1".into(),
+            bounds: SourceBounds {
+                x: 0,
+                y: 0,
+                width: 1920,
+                height: 1080,
+            },
+        }
+    }
+
+    /// Media1 `SetAudioEncoderConfiguration` emits a `trt:`-prefixed
+    /// `<Configuration>` wrapped in a `trt:` operation element, plus
+    /// `ForcePersistence` (which Media2 does not have). This is the correct
+    /// Media1 shape and Stage 1b must not disturb it.
+    #[tokio::test]
+    async fn set_audio_encoder_configuration_media1_emits_trt_configuration() {
+        let (transport, captured) =
+            RecordingTransport::new(&envelope("<trt:SetAudioEncoderConfigurationResponse/>"));
+        let client =
+            OnvifClient::new("http://192.168.1.1/onvif/device_service").with_transport(transport);
+
+        client
+            .set_audio_encoder_configuration(MEDIA, &audio_cfg())
+            .await
+            .unwrap();
+
+        let c = captured.lock().unwrap();
+        assert_eq!(
+            c.action,
+            "http://www.onvif.org/ver10/media/wsdl/SetAudioEncoderConfiguration"
+        );
+        let expected = format!(
+            "<trt:SetAudioEncoderConfiguration>{AUDIO_CFG_FRAGMENT}\
+             <trt:ForcePersistence>true</trt:ForcePersistence>\
+             </trt:SetAudioEncoderConfiguration>"
+        );
+        assert!(
+            c.body.contains(&expected),
+            "Media1 audio body drifted.\nexpected fragment:\n{expected}\nactual body:\n{}",
+            c.body
+        );
+        assert!(
+            !c.body.contains("<tr2:Configuration"),
+            "Media1 must never emit a tr2:-prefixed Configuration: {}",
+            c.body
+        );
+    }
+
+    /// D3 target: Media2 `SetAudioEncoderConfiguration` must wrap a
+    /// `tr2:`-prefixed `<Configuration>`, not the Media1 `trt:` one.
+    ///
+    /// (This test previously pinned the bug and expected `trt:`; Stage 1b flips
+    /// it, which is why it is listed as the stage's red-before-green target.)
+    #[tokio::test]
+    async fn set_audio_encoder_configuration_media2_emits_tr2_configuration() {
+        let (transport, captured) =
+            RecordingTransport::new(&envelope("<tr2:SetAudioEncoderConfigurationResponse/>"));
+        let client =
+            OnvifClient::new("http://192.168.1.1/onvif/device_service").with_transport(transport);
+
+        client
+            .set_audio_encoder_configuration_media2(MEDIA2, &audio_cfg())
+            .await
+            .unwrap();
+
+        let c = captured.lock().unwrap();
+        assert_eq!(
+            c.action,
+            "http://www.onvif.org/ver20/media/wsdl/SetAudioEncoderConfiguration"
+        );
+        let expected = format!(
+            "<tr2:SetAudioEncoderConfiguration>{AUDIO_CFG_FRAGMENT_MEDIA2}\
+             </tr2:SetAudioEncoderConfiguration>"
+        );
+        assert!(
+            c.body.contains(&expected),
+            "Media2 audio body drifted.\nexpected fragment:\n{expected}\nactual body:\n{}",
+            c.body
+        );
+        assert!(
+            !c.body.contains("trt:"),
+            "Media2 must not carry any Media1 trt: prefix: {}",
+            c.body
+        );
+        assert!(
+            !c.body.contains("ForcePersistence"),
+            "Media2 must not send ForcePersistence: {}",
+            c.body
+        );
+    }
+
+    /// Negative for `set_audio_encoder_configuration_media2`: a device Fault
+    /// must surface as `SoapError::Fault` carrying the device's code and
+    /// reason — not as `UnexpectedResponse` or `MissingField`.
+    #[tokio::test]
+    async fn set_audio_encoder_configuration_media2_soap_fault_returns_fault() {
+        let client =
+            OnvifClient::new("http://192.168.1.1/onvif/device_service").with_transport(mock(
+                &make_soap_fault_xml("s:Sender", "Media2 audio encoder rejected"),
+            ));
+
+        let err = client
+            .set_audio_encoder_configuration_media2(MEDIA2, &audio_cfg())
+            .await
+            .unwrap_err();
+
+        match err {
+            OnvifError::Soap(crate::soap::SoapError::Fault { code, reason, .. }) => {
+                assert_eq!(code, "s:Sender");
+                assert_eq!(reason, "Media2 audio encoder rejected");
+            }
+            other => panic!("expected SoapError::Fault, got {other:?}"),
+        }
+    }
+
+    /// Negative for the Media1 `set_audio_encoder_configuration` twin.
+    #[tokio::test]
+    async fn set_audio_encoder_configuration_media1_soap_fault_returns_fault() {
+        let client =
+            OnvifClient::new("http://192.168.1.1/onvif/device_service").with_transport(mock(
+                &make_soap_fault_xml("s:Receiver", "Media1 audio encoder rejected"),
+            ));
+
+        let err = client
+            .set_audio_encoder_configuration(MEDIA, &audio_cfg())
+            .await
+            .unwrap_err();
+
+        match err {
+            OnvifError::Soap(crate::soap::SoapError::Fault { code, reason, .. }) => {
+                assert_eq!(code, "s:Receiver");
+                assert_eq!(reason, "Media1 audio encoder rejected");
+            }
+            other => panic!("expected SoapError::Fault, got {other:?}"),
+        }
+    }
+
+    /// Media1 `SetVideoEncoderConfiguration`: full element sequence, including
+    /// the schema-mandated `Quality` before `RateControl`.
+    #[tokio::test]
+    async fn set_video_encoder_configuration_media1_body_is_exact() {
+        let (transport, captured) =
+            RecordingTransport::new(&envelope("<trt:SetVideoEncoderConfigurationResponse/>"));
+        let client =
+            OnvifClient::new("http://192.168.1.1/onvif/device_service").with_transport(transport);
+
+        client
+            .set_video_encoder_configuration(MEDIA, &video_enc_cfg())
+            .await
+            .unwrap();
+
+        let c = captured.lock().unwrap();
+        assert_eq!(
+            c.action,
+            "http://www.onvif.org/ver10/media/wsdl/SetVideoEncoderConfiguration"
+        );
+        let expected = concat!(
+            "<trt:SetVideoEncoderConfiguration>",
+            r#"<trt:Configuration token="VEC_1">"#,
+            "<tt:Name>MainStream</tt:Name>",
+            "<tt:UseCount>1</tt:UseCount>",
+            "<tt:Encoding>H264</tt:Encoding>",
+            "<tt:Resolution><tt:Width>1920</tt:Width><tt:Height>1080</tt:Height></tt:Resolution>",
+            "<tt:Quality>5</tt:Quality>",
+            "<tt:RateControl>",
+            "<tt:FrameRateLimit>25</tt:FrameRateLimit>",
+            "<tt:EncodingInterval>1</tt:EncodingInterval>",
+            "<tt:BitrateLimit>4096</tt:BitrateLimit>",
+            "</tt:RateControl>",
+            "<tt:H264><tt:GovLength>25</tt:GovLength><tt:H264Profile>Main</tt:H264Profile></tt:H264>",
+            "<tt:SessionTimeout>PT60S</tt:SessionTimeout>",
+            "</trt:Configuration>",
+            "<trt:ForcePersistence>true</trt:ForcePersistence>",
+            "</trt:SetVideoEncoderConfiguration>",
+        );
+        assert!(
+            c.body.contains(expected),
+            "Media1 video encoder body drifted.\nexpected fragment:\n{expected}\nactual body:\n{}",
+            c.body
+        );
+        assert!(
+            !c.body.contains("<tr2:"),
+            "Media1 must not emit tr2: elements: {}",
+            c.body
+        );
+    }
+
+    /// Media2 `SetVideoEncoderConfiguration`: `tr2:`-prefixed Configuration,
+    /// `GovLength` + `Profile` as **attributes** of it, no `EncodingInterval`,
+    /// no `ForcePersistence`.
+    ///
+    /// `tt:VideoEncoder2Configuration` declares both names as `xs:attribute`.
+    /// Until 0.15 this asserted them as child elements between `RateControl` and
+    /// `Quality` — a shape no conformant device accepts, and the assertion was
+    /// written to agree with the serialiser rather than with the schema.
+    #[tokio::test]
+    async fn set_video_encoder_configuration_media2_body_is_exact() {
+        let (transport, captured) =
+            RecordingTransport::new(&envelope("<tr2:SetVideoEncoderConfigurationResponse/>"));
+        let client =
+            OnvifClient::new("http://192.168.1.1/onvif/device_service").with_transport(transport);
+
+        client
+            .set_video_encoder_configuration_media2(MEDIA2, &video_enc_cfg2())
+            .await
+            .unwrap();
+
+        let c = captured.lock().unwrap();
+        assert_eq!(
+            c.action,
+            "http://www.onvif.org/ver20/media/wsdl/SetVideoEncoderConfiguration"
+        );
+        let expected = concat!(
+            "<tr2:SetVideoEncoderConfiguration>",
+            r#"<tr2:Configuration token="VEC_1" GovLength="50" Profile="Main">"#,
+            "<tt:Name>MainStream</tt:Name>",
+            "<tt:UseCount>1</tt:UseCount>",
+            "<tt:Encoding>H265</tt:Encoding>",
+            "<tt:Resolution><tt:Width>1920</tt:Width><tt:Height>1080</tt:Height></tt:Resolution>",
+            "<tt:RateControl>",
+            "<tt:FrameRateLimit>25</tt:FrameRateLimit>",
+            "<tt:BitrateLimit>4096</tt:BitrateLimit>",
+            "</tt:RateControl>",
+            "<tt:Quality>5</tt:Quality>",
+            "</tr2:Configuration>",
+            "</tr2:SetVideoEncoderConfiguration>",
+        );
+        assert!(
+            c.body.contains(expected),
+            "Media2 video encoder body drifted.\nexpected fragment:\n{expected}\nactual body:\n{}",
+            c.body
+        );
+        // The `contains` above would still hold if the serialiser *also* wrote
+        // the pre-0.15 element form somewhere else in the body, so name it.
+        assert!(
+            !c.body.contains("<tt:GovLength>") && !c.body.contains("<tt:Profile>"),
+            "Media2 must send GovLength/Profile as attributes only: {}",
+            c.body
+        );
+        assert!(
+            !c.body.contains("ForcePersistence"),
+            "Media2 must not send ForcePersistence: {}",
+            c.body
+        );
+    }
+
+    /// Media1 `SetVideoSourceConfiguration`: `trt:` Configuration + Bounds
+    /// attributes + ForcePersistence.
+    #[tokio::test]
+    async fn set_video_source_configuration_media1_body_is_exact() {
+        let (transport, captured) =
+            RecordingTransport::new(&envelope("<trt:SetVideoSourceConfigurationResponse/>"));
+        let client =
+            OnvifClient::new("http://192.168.1.1/onvif/device_service").with_transport(transport);
+
+        client
+            .set_video_source_configuration(MEDIA, &video_src_cfg())
+            .await
+            .unwrap();
+
+        let c = captured.lock().unwrap();
+        assert_eq!(
+            c.action,
+            "http://www.onvif.org/ver10/media/wsdl/SetVideoSourceConfiguration"
+        );
+        let expected = concat!(
+            "<trt:SetVideoSourceConfiguration>",
+            r#"<trt:Configuration token="VSC_1">"#,
+            "<tt:Name>VSConfig1</tt:Name>",
+            "<tt:UseCount>2</tt:UseCount>",
+            "<tt:SourceToken>VS_1</tt:SourceToken>",
+            r#"<tt:Bounds x="0" y="0" width="1920" height="1080"/>"#,
+            "</trt:Configuration>",
+            "<trt:ForcePersistence>true</trt:ForcePersistence>",
+            "</trt:SetVideoSourceConfiguration>",
+        );
+        assert!(
+            c.body.contains(expected),
+            "Media1 video source body drifted.\nexpected fragment:\n{expected}\nactual body:\n{}",
+            c.body
+        );
+        assert!(
+            !c.body.contains("<tr2:Configuration"),
+            "Media1 must never emit a tr2:-prefixed Configuration: {}",
+            c.body
+        );
+    }
+
+    /// Media2 `SetVideoSourceConfiguration`: identical children, `tr2:` prefix
+    /// on the Configuration element, and no ForcePersistence.
+    #[tokio::test]
+    async fn set_video_source_configuration_media2_body_is_exact() {
+        let (transport, captured) =
+            RecordingTransport::new(&envelope("<tr2:SetVideoSourceConfigurationResponse/>"));
+        let client =
+            OnvifClient::new("http://192.168.1.1/onvif/device_service").with_transport(transport);
+
+        client
+            .set_video_source_configuration_media2(MEDIA2, &video_src_cfg())
+            .await
+            .unwrap();
+
+        let c = captured.lock().unwrap();
+        assert_eq!(
+            c.action,
+            "http://www.onvif.org/ver20/media/wsdl/SetVideoSourceConfiguration"
+        );
+        let expected = concat!(
+            "<tr2:SetVideoSourceConfiguration>",
+            r#"<tr2:Configuration token="VSC_1">"#,
+            "<tt:Name>VSConfig1</tt:Name>",
+            "<tt:UseCount>2</tt:UseCount>",
+            "<tt:SourceToken>VS_1</tt:SourceToken>",
+            r#"<tt:Bounds x="0" y="0" width="1920" height="1080"/>"#,
+            "</tr2:Configuration>",
+            "</tr2:SetVideoSourceConfiguration>",
+        );
+        assert!(
+            c.body.contains(expected),
+            "Media2 video source body drifted.\nexpected fragment:\n{expected}\nactual body:\n{}",
+            c.body
+        );
+        assert!(
+            !c.body.contains("ForcePersistence"),
+            "Media2 must not send ForcePersistence: {}",
+            c.body
+        );
+    }
+}
+
+// ── media2_get_service_capabilities ───────────────────────────────────────────
+//
+// `<tr2:Capabilities>` copied verbatim from
+// `crate::mock::services::media2::resp_service_capabilities_media2`
+// (src/mock/services/media2.rs) — feature-gated there, so keep in step by hand.
+// The schema type is `tr2:Capabilities2`; the *element* is still
+// `Capabilities`, which is why the parser looks for the unsuffixed name.
+
+fn media2_service_capabilities_xml() -> &'static str {
+    r#"<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope"
+                      xmlns:tr2="http://www.onvif.org/ver20/media/wsdl">
+          <s:Body>
+            <tr2:GetServiceCapabilitiesResponse>
+              <tr2:Capabilities SnapshotUri="true"
+                                Rotation="false"
+                                VideoSourceMode="true"
+                                OSD="false"
+                                Mask="false"
+                                SourceMask="false"
+                                WebRTC="0">
+                <tr2:ProfileCapabilities MaximumNumberOfProfiles="8"
+                                         ConfigurationsSupported="VideoSource VideoEncoder AudioSource AudioEncoder Metadata"/>
+                <tr2:StreamingCapabilities RTSPStreaming="true"
+                                           RTPMulticast="false"
+                                           RTP_RTSP_TCP="true"
+                                           NonAggregateControl="false"
+                                           AutoStartMulticast="false"/>
+              </tr2:Capabilities>
+            </tr2:GetServiceCapabilitiesResponse>
+          </s:Body>
+        </s:Envelope>"#
+}
+
+#[tokio::test]
+async fn media2_service_capabilities_parses_webrtc_count() {
+    let client = OnvifClient::new("http://192.168.1.1/onvif/device_service")
+        .with_transport(mock(media2_service_capabilities_xml()));
+
+    let caps = client
+        .media2_get_service_capabilities("http://192.168.1.1/onvif/media2")
+        .await
+        .unwrap();
+
+    // `WebRTC` is an `xs:int` session count. A parser that reads it as a
+    // boolean turns `"0"` into `Some(false)` — supported, with the number
+    // gone.
+    assert_eq!(caps.webrtc, Some(0));
+    assert!(caps.webrtc_codecs.is_empty());
+
+    // The Media1/Media2 tripwire. Media1's fixture says `false` for
+    // `VideoSourceMode` and sends `TemporaryOSDText`; this one says `true` and
+    // omits it. Cross the two services' parsers or share one struct between
+    // them and exactly these two lines fail.
+    assert_eq!(caps.video_source_mode, Some(true));
+    assert_eq!(caps.temporary_osd_text, None);
+
+    assert_eq!(caps.snapshot_uri, Some(true));
+    assert_eq!(caps.osd, Some(false));
+    assert_eq!(caps.mask, Some(false));
+
+    assert_eq!(caps.profile.maximum_number_of_profiles, Some(8));
+    assert_eq!(
+        caps.profile.configurations_supported,
+        [
+            "VideoSource",
+            "VideoEncoder",
+            "AudioSource",
+            "AudioEncoder",
+            "Metadata"
+        ]
+    );
+
+    assert_eq!(caps.streaming.rtsp_streaming, Some(true));
+    assert_eq!(caps.streaming.rtp_rtsp_tcp, Some(true));
+    assert_eq!(caps.streaming.auto_start_multicast, Some(false));
+    assert_eq!(caps.streaming.secure_rtsp_streaming, None);
+    assert_eq!(caps.streaming.rtsp_web_socket_uri, None);
+}
+
+#[tokio::test]
+async fn media2_service_capabilities_fault() {
+    let xml = make_soap_fault_xml("ter:ActionNotSupported", "NoServiceCapabilities-tr2-2270");
+    let client =
+        OnvifClient::new("http://192.168.1.1/onvif/device_service").with_transport(mock(&xml));
+
+    let err = client
+        .media2_get_service_capabilities("http://192.168.1.1/onvif/media2")
+        .await
+        .unwrap_err();
+    assert_fault(
+        err,
+        "ter:ActionNotSupported",
+        "NoServiceCapabilities-tr2-2270",
+    );
+}
+
+#[tokio::test]
+async fn metadata_multicast_and_timeout_survive_read() {
+    let client = OnvifClient::new("http://mock").with_transport(mock(metadata_configs_xml()));
+    let c = client
+        .get_metadata_configurations_media2("http://mock", None, None)
+        .await
+        .unwrap()
+        .remove(0);
+    assert_eq!(
+        (
+            &*c.multicast.address,
+            c.multicast.port,
+            c.multicast.ttl,
+            c.multicast.auto_start
+        ),
+        ("ff15::97", 4097, 7, true)
+    );
+    assert_eq!(c.session_timeout, "PT97S");
+}
+#[tokio::test]
+async fn metadata_required_fields_report_exact_paths() {
+    for (remove, path) in [
+        ("<tt:TTL>7</tt:TTL>", "MetadataConfiguration/Multicast/TTL"),
+        (
+            "<tt:AutoStart>true</tt:AutoStart>",
+            "MetadataConfiguration/Multicast/AutoStart",
+        ),
+        (
+            "<tt:SessionTimeout>PT97S</tt:SessionTimeout>",
+            "MetadataConfiguration/SessionTimeout",
+        ),
+    ] {
+        let xml = metadata_configs_xml().replace(remove, "");
+        let client = OnvifClient::new("http://mock").with_transport(mock(&xml));
+        let err = client
+            .get_metadata_configurations_media2("http://mock", None, None)
+            .await
+            .unwrap_err();
+        assert_missing_field(err, path);
+    }
+}
+#[tokio::test]
+async fn metadata_invalid_values_report_payload_and_never_send() {
+    let reader = OnvifClient::new("http://mock").with_transport(mock(metadata_configs_xml()));
+    let original = reader
+        .get_metadata_configurations_media2("http://mock", None, None)
+        .await
+        .unwrap()
+        .remove(0);
+    for (field, value) in [
+        ("address", "bad-973"),
+        ("port", "65536"),
+        ("ttl", "256"),
+        ("duration", "PTbroken-973"),
+    ] {
+        let mut cfg = original.clone();
+        let path = match field {
+            "address" => {
+                cfg.multicast.address = value.into();
+                "MetadataConfiguration/Multicast/Address"
+            }
+            "port" => {
+                cfg.multicast.port = 65536;
+                "MetadataConfiguration/Multicast/Port"
+            }
+            "ttl" => {
+                cfg.multicast.ttl = 256;
+                "MetadataConfiguration/Multicast/TTL"
+            }
+            _ => {
+                cfg.session_timeout = value.into();
+                "MetadataConfiguration/SessionTimeout"
+            }
+        };
+        let (transport, captured) =
+            RecordingTransport::new(&empty_response_xml("SetMetadataConfigurationResponse"));
+        let client = OnvifClient::new("http://mock").with_transport(transport);
+        let err = client
+            .set_metadata_configuration_media2("http://mock", &cfg)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            crate::soap::SoapError::invalid(path, value).to_string()
+        );
+        assert!(
+            captured.lock().unwrap().action.is_empty(),
+            "invalid candidate reached transport"
+        );
+    }
+}
+#[cfg(feature = "serde")]
+#[tokio::test]
+async fn metadata_json_requires_explicit_migration() {
+    let client = OnvifClient::new("http://mock").with_transport(mock(metadata_configs_xml()));
+    let cfg = client
+        .get_metadata_configurations_media2("http://mock", None, None)
+        .await
+        .unwrap()
+        .remove(0);
+    let mut value = serde_json::to_value(&cfg).unwrap();
+    let decoded: crate::MetadataConfiguration = serde_json::from_value(value.clone()).unwrap();
+    assert_eq!(decoded.multicast, cfg.multicast);
+    assert_eq!(decoded.session_timeout, cfg.session_timeout);
+    let map = value.as_object_mut().unwrap();
+    map.remove("multicast");
+    map.remove("session_timeout");
+    map.insert("multicast_address".into(), serde_json::json!("ff15::97"));
+    map.insert("multicast_port".into(), serde_json::json!(4097));
+    assert_eq!(
+        serde_json::from_value::<crate::MetadataConfiguration>(value)
+            .unwrap_err()
+            .to_string(),
+        "missing field `multicast`"
+    );
+}

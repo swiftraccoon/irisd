@@ -39,6 +39,8 @@ const SETUP_TIMEOUT: Duration = Duration::from_secs(15);
 const HEALTHY_SESSION: Duration = Duration::from_secs(60);
 /// A hold of at least this many ticks (one second) is logged as a gap.
 const GAP_HOLD_TICKS: i64 = 90_000;
+/// A recorder realtime step larger than this ends the run.
+const CLOCK_STEP_US: u64 = 2_000_000;
 
 /// Why a session ended.
 #[derive(Debug, Error)]
@@ -56,6 +58,8 @@ enum SessionError {
     Inactivity(Duration),
     #[error("camera closed the stream")]
     EndOfStream,
+    #[error("recorder realtime clock stepped")]
+    ClockStep,
 }
 
 /// Runs the stream until `shutdown` is cancelled, reconnecting after failures.
@@ -67,15 +71,15 @@ pub async fn run_stream(
     shutdown: CancellationToken,
 ) {
     let mut backoff = Duration::from_secs(1);
+    let mut attempt = 0u64;
     loop {
         if shutdown.is_cancelled() {
             return;
         }
         let started = Instant::now();
-        let outcome = tokio::select! {
-            () = shutdown.cancelled() => return,
-            outcome = run_session(&source, &options, sink.as_ref(), &stats, &shutdown) => outcome,
-        };
+        // The session owns cancellation once it starts so its pending fragment
+        // is flushed before the session state can be dropped.
+        let outcome = run_session(&source, &options, sink.as_ref(), &stats, &shutdown).await;
         stats.set_connected(false);
         match outcome {
             Ok(()) => return,
@@ -84,23 +88,49 @@ pub async fn run_stream(
                 stats.record_reconnect();
             }
         }
-        if started.elapsed() >= HEALTHY_SESSION {
-            backoff = Duration::from_secs(1);
-        }
-        let delay = jittered(backoff);
+        let delay = next_retry_delay(
+            &source.key,
+            &mut backoff,
+            &mut attempt,
+            started.elapsed() >= HEALTHY_SESSION,
+        );
         tokio::select! {
             () = shutdown.cancelled() => return,
             () = tokio::time::sleep(delay) => {}
         }
-        backoff = (backoff * 2).min(MAX_BACKOFF);
     }
 }
 
-/// Applies ±20 % jitter derived from the clock's sub-second bits.
-fn jittered(base: Duration) -> Duration {
-    let nanos =
-        u64::from(Instant::now().elapsed().subsec_nanos()).wrapping_mul(0x9e37_79b9_7f4a_7c15);
-    let unit = (nanos % 401) as i64 - 200; // -200..=200
+fn next_retry_delay(
+    key: &StreamKey,
+    backoff: &mut Duration,
+    attempt: &mut u64,
+    healthy: bool,
+) -> Duration {
+    if healthy {
+        *backoff = Duration::from_secs(1);
+        *attempt = 0;
+    }
+    let delay = jittered(*backoff, key, *attempt);
+    *attempt = attempt.wrapping_add(1);
+    *backoff = (*backoff * 2).min(MAX_BACKOFF);
+    delay
+}
+
+/// Applies deterministic ±20 % jitter from stream identity and retry attempt.
+fn jittered(base: Duration, key: &StreamKey, attempt: u64) -> Duration {
+    let mut seed = 0xcbf2_9ce4_8422_2325u64;
+    for byte in key.camera.as_str().bytes().chain(key.kind.as_str().bytes()) {
+        seed ^= u64::from(byte);
+        seed = seed.wrapping_mul(0x100_0000_01b3);
+    }
+    seed ^= attempt.wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    seed ^= seed >> 30;
+    seed = seed.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    seed ^= seed >> 27;
+    seed = seed.wrapping_mul(0x94d0_49bb_1331_11eb);
+    seed ^= seed >> 31;
+    let unit = (seed % 401) as i64 - 200; // -200..=200
     let scale = 1000 + unit; // per-mille: 800..=1200
     let micros = base.as_micros() as u64 * scale as u64 / 1000;
     Duration::from_micros(micros)
@@ -115,6 +145,92 @@ async fn run_session(
     stats: &StreamStats,
     shutdown: &CancellationToken,
 ) -> Result<(), SessionError> {
+    let Some(StartedSession {
+        mut demuxed,
+        nominal,
+        stream_index,
+    }) = start_session(source, options, shutdown).await?
+    else {
+        return Ok(());
+    };
+    stats.set_connected(true);
+    info!(stream = %source.key, "playing");
+
+    let mut session_state = SessionState {
+        clock: WallClock::new(),
+        assembler: None,
+        nominal,
+        snaps_seen: 0,
+        holds_seen: (0, 0),
+        previous_frame: stats.last_frame_wall(),
+        stream_index,
+        sink_loss: false,
+        last_live_decode_time: None,
+    };
+
+    let mut last_item = Instant::now();
+    let outcome = 'session: loop {
+        if shutdown.is_cancelled() {
+            break Ok(());
+        }
+        let item = if let Some(interval) = options.read_interval {
+            let Poll::Ready(item) = poll_now(&mut demuxed) else {
+                tokio::select! {
+                    () = shutdown.cancelled() => break 'session Ok(()),
+                    () = next_tick(options.ticker.as_ref(), interval) => {}
+                }
+                if last_item.elapsed() >= options.inactivity_timeout {
+                    break Err(SessionError::Inactivity(options.inactivity_timeout));
+                }
+                continue;
+            };
+            item
+        } else {
+            tokio::select! {
+                () = shutdown.cancelled() => break 'session Ok(()),
+                item = tokio::time::timeout(options.inactivity_timeout, demuxed.next()) => match item {
+                    Ok(item) => item,
+                    Err(_elapsed) => {
+                        break 'session Err(SessionError::Inactivity(options.inactivity_timeout));
+                    }
+                },
+            }
+        };
+        last_item = Instant::now();
+        let Some(item) = item else {
+            break Err(SessionError::EndOfStream);
+        };
+        let item = match item {
+            Ok(item) => item,
+            Err(error) => break Err(SessionError::Rtsp(error)),
+        };
+        let result = match item {
+            CodecItem::VideoFrame(frame) => {
+                session_state.on_frame(frame, &demuxed, source, options, sink, stats)
+            }
+            CodecItem::Rtcp(packet) => session_state.on_rtcp(&packet, stats),
+            _ => Ok(()),
+        };
+        if let Err(error) = result {
+            break Err(error);
+        }
+    };
+    session_state.flush(sink, source, stats);
+    outcome
+}
+
+struct StartedSession {
+    demuxed: Demuxed,
+    nominal: Option<u32>,
+    stream_index: usize,
+}
+
+/// Returns no stream when cancellation interrupts setup.
+async fn start_session(
+    source: &StreamSource,
+    options: &IngestOptions,
+    shutdown: &CancellationToken,
+) -> Result<Option<StartedSession>, SessionError> {
     let session_options = SessionOptions::default()
         .creds(Some(Credentials {
             username: source.username.clone(),
@@ -124,11 +240,13 @@ async fn run_session(
         // Cameras with small session tables free a torn-down session at once but
         // keep a silently closed one until its timeout, so always say goodbye.
         .teardown(TeardownPolicy::Always);
-    let mut session = tokio::time::timeout(
-        SETUP_TIMEOUT,
-        Session::describe(source.url.clone(), session_options),
-    )
-    .await
+    let mut session = tokio::select! {
+        () = shutdown.cancelled() => return Ok(None),
+        described = tokio::time::timeout(
+            SETUP_TIMEOUT,
+            Session::describe(source.url.clone(), session_options),
+        ) => described,
+    }
     .map_err(|_| SessionError::SetupTimeout("DESCRIBE"))??;
     let stream_index = session
         .streams()
@@ -138,16 +256,18 @@ async fn run_session(
     let declared_nominal = session.streams()[stream_index]
         .framerate()
         .and_then(nominal_from_fps);
-    tokio::time::timeout(
-        SETUP_TIMEOUT,
-        session.setup(
-            stream_index,
-            SetupOptions::default()
-                .transport(Transport::Tcp(TcpTransportOptions::default()))
-                .frame_format(FrameFormat::MP4),
-        ),
-    )
-    .await
+    tokio::select! {
+        () = shutdown.cancelled() => return Ok(None),
+        setup = tokio::time::timeout(
+            SETUP_TIMEOUT,
+            session.setup(
+                stream_index,
+                SetupOptions::default()
+                    .transport(Transport::Tcp(TcpTransportOptions::default()))
+                    .frame_format(FrameFormat::MP4),
+            ),
+        ) => setup,
+    }
     .map_err(|_| SessionError::SetupTimeout("SETUP"))??;
     let max_jump = NonZeroU32::new(options.max_jump_secs.max(1)).expect("non-zero");
     let mut play_options = PlayOptions::default().enforce_timestamps_with_max_jump_secs(max_jump);
@@ -159,65 +279,16 @@ async fn run_session(
     // wake-ups fire per arriving segment while a socket sits above the
     // low-water mark, thousands per second across the streams, all unused.
     play_options = play_options.detach_from_reactor(options.read_interval.is_some());
-    let playing = tokio::time::timeout(SETUP_TIMEOUT, session.play(play_options))
-        .await
-        .map_err(|_| SessionError::SetupTimeout("PLAY"))??;
-    let mut demuxed = playing.demuxed()?;
-    stats.set_connected(true);
-    info!(stream = %source.key, "playing");
-
-    let mut session_state = SessionState {
-        clock: WallClock::new(),
-        assembler: None,
-        nominal: declared_nominal,
-        snaps_seen: 0,
-        holds_seen: (0, 0),
-        previous_frame: stats.last_frame_wall(),
-        stream_index,
-    };
-
-    let mut last_item = Instant::now();
-    loop {
-        let item = if let Some(interval) = options.read_interval {
-            let Poll::Ready(item) = poll_now(&mut demuxed) else {
-                tokio::select! {
-                    () = shutdown.cancelled() => {
-                        session_state.flush(sink, source, stats);
-                        return Ok(());
-                    }
-                    () = next_tick(options.ticker.as_ref(), interval) => {}
-                }
-                if last_item.elapsed() >= options.inactivity_timeout {
-                    return Err(SessionError::Inactivity(options.inactivity_timeout));
-                }
-                continue;
-            };
-            item
-        } else {
-            tokio::select! {
-                () = shutdown.cancelled() => {
-                    session_state.flush(sink, source, stats);
-                    return Ok(());
-                }
-                item = tokio::time::timeout(options.inactivity_timeout, demuxed.next()) => match item {
-                    Ok(item) => item,
-                    Err(_elapsed) => return Err(SessionError::Inactivity(options.inactivity_timeout)),
-                },
-            }
-        };
-        last_item = Instant::now();
-        let Some(item) = item else {
-            return Err(SessionError::EndOfStream);
-        };
-        let item = item?;
-        match item {
-            CodecItem::VideoFrame(frame) => {
-                session_state.on_frame(frame, &demuxed, source, options, sink, stats)?;
-            }
-            CodecItem::Rtcp(packet) => session_state.on_rtcp(&packet, stats),
-            _ => {}
-        }
+    let playing = tokio::select! {
+        () = shutdown.cancelled() => return Ok(None),
+        played = tokio::time::timeout(SETUP_TIMEOUT, session.play(play_options)) => played,
     }
+    .map_err(|_| SessionError::SetupTimeout("PLAY"))??;
+    Ok(Some(StartedSession {
+        demuxed: playing.demuxed()?,
+        nominal: declared_nominal,
+        stream_index,
+    }))
 }
 
 /// Waits for the shared ticker when the caller provided one, else for this
@@ -308,26 +379,69 @@ struct SessionState {
     /// of this session reports the gap.
     previous_frame: Option<WallUs>,
     stream_index: usize,
+    /// Whether a rejected recording fragment has not been followed by an accepted run.
+    sink_loss: bool,
+    /// Decode time used to keep live publication moving while recording waits for sync.
+    last_live_decode_time: Option<u64>,
 }
 
 impl SessionState {
-    /// Delivers the pending fragment at shutdown.
+    /// Delivers and accounts for the pending fragment at every session exit.
     fn flush(&mut self, sink: &dyn FragmentSink, source: &StreamSource, stats: &StreamStats) {
         if let Some(fragment) = self.assembler.as_mut().and_then(FragmentAssembler::flush) {
-            stats.record_fragment_size(fragment.payload_len(), fragment.duration());
-            deliver(sink, &source.key, fragment, stats);
+            self.close_fragment(fragment, sink, source, stats);
+        }
+    }
+
+    fn close_fragment(
+        &mut self,
+        fragment: iris_mp4::fragment::Fragment,
+        sink: &dyn FragmentSink,
+        source: &StreamSource,
+        stats: &StreamStats,
+    ) {
+        let assembler = self
+            .assembler
+            .as_mut()
+            .expect("a fragment can only close after assembler creation");
+        let snaps = assembler.snap_count();
+        if snaps > self.snaps_seen {
+            stats.add_snaps(snaps - self.snaps_seen);
+            self.snaps_seen = snaps;
+        }
+        note_closed_fragment(
+            &mut self.holds_seen,
+            assembler,
+            &fragment,
+            &source.key,
+            stats,
+        );
+        if deliver_fragment(sink, &source.key, fragment, stats) {
+            self.sink_loss = false;
+        } else {
+            if !self.sink_loss {
+                info!(stream = %source.key, cause = "sink_rejected", "gap");
+                stats.record_gap();
+            }
+            self.sink_loss = true;
+            assembler.mark_sink_rejection();
         }
     }
 
     /// Records the camera clock offset carried by RTCP sender reports.
-    fn on_rtcp(&self, packet: &retina::rtcp::ReceivedCompoundPacket, stats: &StreamStats) {
-        let nvr = self.clock.wall_at(packet.ctx().received());
+    fn on_rtcp(
+        &mut self,
+        packet: &retina::rtcp::ReceivedCompoundPacket,
+        stats: &StreamStats,
+    ) -> Result<(), SessionError> {
+        let nvr = self.clock.wall_at(packet.ctx().received())?;
         for pkt in packet.pkts() {
             if let Ok(Some(report)) = pkt.as_sender_report() {
                 let camera = WallUs::from_ntp64(report.ntp_timestamp().0);
                 stats.record_sender_report(camera.micros_since(nvr));
             }
         }
+        Ok(())
     }
 
     fn on_frame(
@@ -339,7 +453,7 @@ impl SessionState {
         sink: &dyn FragmentSink,
         stats: &StreamStats,
     ) -> Result<(), SessionError> {
-        let wall = self.clock.wall_at(frame.start_ctx().received());
+        let wall = self.clock.wall_at(frame.start_ctx().received())?;
         if let Some(previous) = self.previous_frame.take() {
             log_reconnect_gap(&source.key, previous, wall, stats);
         }
@@ -353,6 +467,7 @@ impl SessionState {
         let data = framed_data(frame.into_data());
         stats.record_frame(data.len() as u64, wall, lost);
 
+        let mut retarget_nominal = None;
         if self.assembler.is_none() || has_new_parameters {
             let Some(video) = video_parameters(demuxed, self.stream_index) else {
                 if is_sync {
@@ -368,8 +483,13 @@ impl SessionState {
             if let Some(live) = &options.live {
                 live.set_init_segment(build_init_segment(&entry));
             }
+            let parameter_nominal = video.frame_rate().and_then(nominal_from_rate);
+            if self.assembler.is_some() {
+                retarget_nominal =
+                    changed_parameter_nominal(self.nominal, parameter_nominal, has_new_parameters);
+            }
             if self.nominal.is_none() {
-                self.nominal = video.frame_rate().and_then(nominal_from_rate);
+                self.nominal = parameter_nominal;
             }
             if self.assembler.is_none() {
                 tracing::info!(
@@ -402,9 +522,17 @@ impl SessionState {
             is_sync,
             new_params: has_new_parameters,
         });
+        if let Some(nominal) = retarget_nominal {
+            assembler.retarget_timing(nominal);
+            self.nominal = Some(nominal);
+        }
+        let live_decode_time = assembler.last_provisional_decode_time().or_else(|| {
+            self.last_live_decode_time
+                .map(|decode_time| decode_time.saturating_add(u64::from(assembler.nominal())))
+        });
         if let Some(live) = &options.live
             && let Some(data) = live_data
-            && let Some(decode_time) = assembler.last_provisional_decode_time()
+            && let Some(decode_time) = live_decode_time
         {
             live.publish(Arc::new(LiveFrame {
                 key: source.key.clone(),
@@ -415,21 +543,10 @@ impl SessionState {
                 decode_time,
                 wall,
             }));
-        }
-        let snaps = assembler.snap_count();
-        if snaps > self.snaps_seen {
-            stats.add_snaps(snaps - self.snaps_seen);
-            self.snaps_seen = snaps;
+            self.last_live_decode_time = Some(decode_time);
         }
         if let Some(fragment) = completed {
-            note_closed_fragment(
-                &mut self.holds_seen,
-                assembler,
-                &fragment,
-                &source.key,
-                stats,
-            );
-            deliver(sink, &source.key, fragment, stats);
+            self.close_fragment(fragment, sink, source, stats);
         }
         Ok(())
     }
@@ -487,17 +604,21 @@ fn note_closed_fragment(
     stats.record_fragment_size(fragment.payload_len(), fragment.duration());
 }
 
-fn deliver(
+/// Hands one complete fragment to `sink` and records its acceptance in `stats`.
+///
+/// This is the delivery/accounting seam used by [`run_stream`].
+pub fn deliver_fragment(
     sink: &dyn FragmentSink,
     key: &StreamKey,
     fragment: iris_mp4::fragment::Fragment,
     stats: &StreamStats,
-) {
+) -> bool {
     let accepted = sink.send(key, fragment).is_ok();
     if !accepted {
         warn!(stream = %key, "sink rejected a fragment; dropping it");
     }
     stats.record_fragment(accepted);
+    accepted
 }
 
 /// Strips any in-band parameter sets as a safety net; the frame format
@@ -553,8 +674,20 @@ fn nominal_from_rate((a, b): (u32, u32)) -> Option<u32> {
     Some((90_000.0 / fps).round() as u32)
 }
 
-/// Maps monotonic receive instants to wall time by a fixed offset taken when
-/// the session started playing.
+fn changed_parameter_nominal(
+    current: Option<u32>,
+    parsed: Option<u32>,
+    has_new_parameters: bool,
+) -> Option<u32> {
+    if has_new_parameters && parsed.is_some() && parsed != current {
+        parsed
+    } else {
+        None
+    }
+}
+
+/// Maps monotonic receive instants through fresh realtime correlations and
+/// detects clock steps before they enter a run's wall timeline.
 struct WallClock {
     instant: Instant,
     wall: WallUs,
@@ -568,19 +701,164 @@ impl WallClock {
         }
     }
 
-    fn wall_at(&self, received: Instant) -> WallUs {
-        let micros = if received >= self.instant {
-            i64::try_from(received.duration_since(self.instant).as_micros()).unwrap_or(i64::MAX)
-        } else {
-            -i64::try_from(self.instant.duration_since(received).as_micros()).unwrap_or(i64::MAX)
-        };
-        self.wall.offset(micros)
+    fn wall_at(&mut self, received: Instant) -> Result<WallUs, SessionError> {
+        self.wall_at_sample(received, Instant::now(), WallUs::now())
+    }
+
+    fn wall_at_sample(
+        &mut self,
+        received: Instant,
+        instant: Instant,
+        wall: WallUs,
+    ) -> Result<WallUs, SessionError> {
+        let expected = self.wall.offset(signed_micros(instant, self.instant));
+        if wall.micros_since(expected).unsigned_abs() > CLOCK_STEP_US {
+            return Err(SessionError::ClockStep);
+        }
+        self.instant = instant;
+        self.wall = wall;
+        Ok(wall.offset(signed_micros(received, instant)))
+    }
+}
+
+fn signed_micros(at: Instant, anchor: Instant) -> i64 {
+    if at >= anchor {
+        i64::try_from(at.duration_since(anchor).as_micros()).unwrap_or(i64::MAX)
+    } else {
+        -i64::try_from(anchor.duration_since(at).as_micros()).unwrap_or(i64::MAX)
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use iris_core::config::TimestampMode;
+    use iris_core::time::MediaTicks;
+    use iris_mp4::fragment::Fragment;
+    use tokio::io::AsyncReadExt as _;
+    use tokio::net::TcpListener;
+    use tokio::sync::oneshot;
+
     use super::*;
+
+    fn stream_key(camera: &str) -> StreamKey {
+        StreamKey {
+            camera: camera.parse().expect("camera id"),
+            kind: iris_core::id::StreamKind::Main,
+        }
+    }
+
+    struct CountingSink {
+        calls: AtomicUsize,
+        reject: bool,
+    }
+
+    impl FragmentSink for CountingSink {
+        fn send(&self, _key: &StreamKey, _fragment: Fragment) -> Result<(), crate::SinkError> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            if self.reject {
+                Err(crate::SinkError)
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    fn sample_entry_for_test() -> Arc<SampleEntry> {
+        Arc::new(SampleEntry::new(
+            Bytes::from_static(b"\0\0\0\x08hvc1"),
+            "hvc1".into(),
+            16,
+            16,
+        ))
+    }
+
+    fn session_state_with_timing(nominal: u32, tolerance_ms: i64) -> SessionState {
+        let options = IngestOptions::default();
+        let regularizer = Regularizer::new(
+            TimestampMode::Regularize,
+            Some(nominal),
+            MediaTicks::from_millis(tolerance_ms),
+        );
+        SessionState {
+            clock: WallClock::new(),
+            assembler: Some(FragmentAssembler::new(
+                &options,
+                regularizer,
+                sample_entry_for_test(),
+            )),
+            nominal: Some(nominal),
+            snaps_seen: 0,
+            holds_seen: (0, 0),
+            previous_frame: None,
+            stream_index: 0,
+            sink_loss: false,
+            last_live_decode_time: None,
+        }
+    }
+
+    fn source_for_test() -> StreamSource {
+        StreamSource {
+            key: stream_key("cam1"),
+            url: "rtsp://192.0.2.1/video".parse().expect("URL"),
+            username: String::new(),
+            password: String::new(),
+        }
+    }
+
+    fn pending_frame(raw_ts: i64, index: i64) -> Frame {
+        Frame {
+            data: Bytes::from_static(b"\0\0\0\x02\x26\x01"),
+            raw_ts,
+            wall: WallUs::new(1_000_000 + index * 33_333),
+            is_sync: index == 0,
+            new_params: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn shutdown_interrupts_an_unanswered_describe() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (request_seen, request_received) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0; 4_096];
+            assert!(socket.read(&mut request).await.unwrap() > 0);
+            request_seen.send(()).unwrap();
+            std::future::pending::<()>().await;
+        });
+        let shutdown = CancellationToken::new();
+        let source = StreamSource {
+            key: StreamKey {
+                camera: "cam1".parse().unwrap(),
+                kind: iris_core::id::StreamKind::Main,
+            },
+            url: format!("rtsp://{address}/video").parse().unwrap(),
+            username: String::new(),
+            password: String::new(),
+        };
+        let task = tokio::spawn({
+            let shutdown = shutdown.clone();
+            async move { start_session(&source, &IngestOptions::default(), &shutdown).await }
+        });
+        tokio::time::timeout(Duration::from_secs(2), request_received)
+            .await
+            .unwrap()
+            .unwrap();
+        shutdown.cancel();
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), task)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap()
+                .is_none()
+        );
+        server.abort();
+    }
 
     #[tokio::test]
     async fn the_ticker_wakes_waiters_at_each_interval() {
@@ -612,25 +890,194 @@ mod tests {
         assert_eq!(nominal_from_rate((1, 15)), Some(6000));
         assert_eq!(nominal_from_rate((1001, 30000)), Some(3003));
         assert_eq!(nominal_from_rate((0, 7)), None);
+        assert_eq!(nominal_from_rate((1, 241)), None);
+        assert_eq!(
+            changed_parameter_nominal(None, Some(6000), true),
+            Some(6000)
+        );
+        assert_eq!(
+            changed_parameter_nominal(Some(3000), Some(6000), true),
+            Some(6000)
+        );
+        assert_eq!(
+            changed_parameter_nominal(Some(3000), Some(3000), true),
+            None
+        );
+        assert_eq!(changed_parameter_nominal(Some(3000), None, true), None);
+        assert_eq!(changed_parameter_nominal(None, None, true), None);
+        assert_eq!(
+            changed_parameter_nominal(Some(3000), Some(6000), false),
+            None
+        );
     }
 
     #[test]
-    fn jitter_stays_within_twenty_percent() {
-        for _ in 0..50 {
-            let d = jittered(Duration::from_secs(10)).as_millis();
-            assert!((8_000..=12_000).contains(&d), "{d} ms");
+    fn jitter_stays_bounded_and_varies_by_stream_and_attempt() {
+        let mut values = HashSet::new();
+        for camera in ["cam1", "cam2", "cam3", "cam4"] {
+            let key = stream_key(camera);
+            for attempt in 0..64 {
+                let millis = jittered(Duration::from_secs(10), &key, attempt).as_millis();
+                assert!((8_000..=12_000).contains(&millis), "{millis} ms");
+                values.insert(millis);
+            }
         }
+        assert!(values.len() > 100, "only {} jitter values", values.len());
+    }
+
+    #[test]
+    fn healthy_session_resets_backoff_and_jitter_attempt() {
+        let key = stream_key("cam1");
+        let mut backoff = MAX_BACKOFF;
+        let mut attempt = 40;
+        let delay = next_retry_delay(&key, &mut backoff, &mut attempt, true);
+        assert_eq!(delay, jittered(Duration::from_secs(1), &key, 0));
+        assert_eq!(backoff, Duration::from_secs(2));
+        assert_eq!(attempt, 1);
     }
 
     #[test]
     fn wall_clock_maps_instants_in_both_directions() {
-        let clock = WallClock::new();
+        let mut clock = WallClock::new();
+        let anchor = clock.instant;
+        let wall = clock.wall;
         let later = clock.instant + Duration::from_millis(5);
-        assert_eq!(clock.wall_at(later).micros_since(clock.wall), 5_000);
+        assert_eq!(
+            clock
+                .wall_at_sample(later, anchor, wall)
+                .unwrap()
+                .micros_since(wall),
+            5_000
+        );
         let earlier = clock
             .instant
             .checked_sub(Duration::from_millis(3))
             .expect("process uptime exceeds 3 ms");
-        assert_eq!(clock.wall_at(earlier).micros_since(clock.wall), -3_000);
+        assert_eq!(
+            clock
+                .wall_at_sample(earlier, anchor, wall)
+                .unwrap()
+                .micros_since(wall),
+            -3_000
+        );
+    }
+
+    #[test]
+    fn wall_clock_tracks_realtime_steps_after_the_session_starts() {
+        let now = Instant::now();
+        let realtime = WallUs::now();
+        // The saved correlation predates a 60 s forward realtime step.
+        for step in [-60_000_000, 60_000_000] {
+            let mut clock = WallClock {
+                instant: now.checked_sub(Duration::from_secs(10)).unwrap(),
+                wall: realtime.offset(-10_000_000),
+            };
+            assert!(matches!(
+                clock.wall_at_sample(now, now, realtime.offset(step)),
+                Err(SessionError::ClockStep)
+            ));
+        }
+    }
+
+    #[test]
+    fn wall_clock_refreshes_slew_and_preserves_receipt_age() {
+        let instant = Instant::now();
+        let wall = WallUs::new(1_000_000_000);
+        let mut clock = WallClock { instant, wall };
+        let sample = instant + Duration::from_secs(10);
+        let received = sample.checked_sub(Duration::from_millis(20)).unwrap();
+        let realtime = wall.offset(10_005_000);
+        assert_eq!(
+            clock.wall_at_sample(received, sample, realtime).unwrap(),
+            realtime.offset(-20_000)
+        );
+        assert_eq!(clock.wall, realtime);
+        assert_eq!(clock.instant, sample);
+    }
+
+    #[test]
+    fn final_flush_accounts_for_holds_and_is_exactly_once() {
+        let mut session = session_state_with_timing(3000, 500);
+        for (index, raw_ts) in [0, 3000, 100_000].into_iter().enumerate() {
+            assert!(
+                session
+                    .assembler
+                    .as_mut()
+                    .expect("assembler")
+                    .push(pending_frame(raw_ts, index as i64))
+                    .is_none()
+            );
+        }
+        let sink = CountingSink {
+            calls: AtomicUsize::new(0),
+            reject: false,
+        };
+        let stats = StreamStats::new();
+        let source = source_for_test();
+        session.flush(&sink, &source, &stats);
+        assert_eq!(sink.calls.load(Ordering::Relaxed), 1);
+        assert_eq!(stats.fragments(), 1);
+        assert_eq!(stats.dropped_sink(), 0);
+        assert_eq!((stats.holds(), stats.hold_ticks()), (31, 93_000));
+        assert_eq!(stats.gaps(), 1);
+        assert_eq!(stats.snaps(), 0);
+        assert_eq!(stats.nominal_ticks(), Some(3000));
+        assert_eq!(stats.error_ticks(), -910);
+        assert_eq!(stats.fragment_bytes_peak().get(), 18);
+        assert_eq!(stats.fragment_ticks_peak().get(), 102_090);
+
+        session.flush(&sink, &source, &stats);
+        assert_eq!(sink.calls.load(Ordering::Relaxed), 1);
+        assert_eq!(stats.fragments(), 1);
+        assert_eq!(
+            (stats.holds(), stats.hold_ticks(), stats.gaps()),
+            (31, 93_000, 1)
+        );
+    }
+
+    #[test]
+    fn final_flush_accounts_for_snap_and_sink_rejection_once() {
+        let mut session = session_state_with_timing(45_000, 150);
+        for (index, raw_ts) in [0, 45_000, 90_000, 200_000].into_iter().enumerate() {
+            assert!(
+                session
+                    .assembler
+                    .as_mut()
+                    .expect("assembler")
+                    .push(pending_frame(raw_ts, index as i64))
+                    .is_none()
+            );
+        }
+        let sink = CountingSink {
+            calls: AtomicUsize::new(0),
+            reject: true,
+        };
+        let stats = StreamStats::new();
+        let source = source_for_test();
+        session.flush(&sink, &source, &stats);
+        assert_eq!(sink.calls.load(Ordering::Relaxed), 1);
+        assert_eq!((stats.fragments(), stats.dropped_sink()), (1, 1));
+        assert_eq!((stats.holds(), stats.hold_ticks()), (1, 65_000));
+        assert_eq!((stats.gaps(), stats.snaps()), (1, 1));
+        assert_eq!(stats.nominal_ticks(), Some(45_000));
+        assert_eq!(stats.error_ticks(), 0);
+        assert_eq!(stats.fragment_ticks_peak().get(), 245_000);
+
+        session.flush(&sink, &source, &stats);
+        assert_eq!(sink.calls.load(Ordering::Relaxed), 1);
+        assert_eq!((stats.fragments(), stats.dropped_sink()), (1, 1));
+    }
+
+    #[test]
+    fn final_flush_without_pending_frames_is_a_no_op() {
+        let mut session = session_state_with_timing(3000, 500);
+        let sink = CountingSink {
+            calls: AtomicUsize::new(0),
+            reject: false,
+        };
+        let stats = StreamStats::new();
+        session.flush(&sink, &source_for_test(), &stats);
+        assert_eq!(sink.calls.load(Ordering::Relaxed), 0);
+        assert_eq!(stats.fragments(), 0);
     }
 }

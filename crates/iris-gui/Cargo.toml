@@ -14,8 +14,10 @@ path = "src/main.rs"
 [dependencies]
 anyhow = { workspace = true }
 async-channel = { workspace = true }
+axum = { workspace = true }
 clap = { workspace = true, features = ["env"] }
 futures = { workspace = true }
+getrandom = "0.4"
 gst = { package = "gstreamer", version = "0.25" }
 gst_app = { package = "gstreamer-app", version = "0.25" }
 gst_video = { package = "gstreamer-video", version = "0.25" }
@@ -30,6 +32,9 @@ tokio-util = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 url = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
 
 [lints]
 workspace = true

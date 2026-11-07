@@ -7,15 +7,18 @@ use std::time::Duration;
 use axum::extract::{Path, State};
 use axum::http::header;
 use axum::response::{IntoResponse, Response};
+use bytes::Bytes;
+use futures_util::StreamExt as _;
 use iris_core::id::CameraId;
 use iris_core::time::WallUs;
 
 use crate::error::ApiError;
-use crate::state::ApiState;
+use crate::state::{ApiState, SnapshotSource};
 
 /// Largest snapshot accepted from a camera.
 const MAX_SNAPSHOT_LEN: usize = 8 << 20;
 const SNAPSHOT_PATH: &str = "/cgi-bin/snapshot.cgi?channel=1";
+const SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(5);
 
 static CNONCE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -25,15 +28,30 @@ pub(crate) async fn snapshot(
 ) -> Result<Response, ApiError> {
     let id = CameraId::try_new(&camera).map_err(|e| ApiError::BadRequest(e.to_string()))?;
     let source = state.snapshot_sources.get(&id).ok_or(ApiError::NotFound)?;
-    let scheme = if source.https { "https" } else { "http" };
-    let url = format!("{scheme}://{}:{}{SNAPSHOT_PATH}", source.host, source.port);
+    let body = fetch_snapshot(source).await?;
+    Ok(snapshot_response(body))
+}
+
+async fn fetch_snapshot(source: &SnapshotSource) -> Result<Bytes, ApiError> {
+    fetch_snapshot_with_timeout(source, SNAPSHOT_TIMEOUT).await
+}
+
+async fn fetch_snapshot_with_timeout(
+    source: &SnapshotSource,
+    timeout: Duration,
+) -> Result<Bytes, ApiError> {
+    let url = snapshot_url(source);
     let client = reqwest::Client::builder()
         .danger_accept_invalid_certs(!source.tls_verify)
-        .timeout(Duration::from_secs(5))
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(timeout)
         .build()
-        .map_err(|e| ApiError::Upstream(e.to_string()))?;
-    let upstream = |e: reqwest::Error| ApiError::Upstream(e.to_string());
-    let first = client.get(&url).send().await.map_err(upstream)?;
+        .map_err(|error| redacted_upstream_error(&error))?;
+    let first = client
+        .get(&url)
+        .send()
+        .await
+        .map_err(|error| redacted_upstream_error(&error))?;
     let response = if first.status().as_u16() == 401 {
         let challenge = first
             .headers()
@@ -55,7 +73,7 @@ pub(crate) async fn snapshot(
             .header(header::AUTHORIZATION, authorization)
             .send()
             .await
-            .map_err(upstream)?
+            .map_err(|error| redacted_upstream_error(&error))?
     } else {
         first
     };
@@ -71,24 +89,429 @@ pub(crate) async fn snapshot(
     {
         return Err(ApiError::Upstream("snapshot too large".into()));
     }
-    let content_type = response
-        .headers()
-        .get(header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("image/jpeg")
-        .to_owned();
-    let body = response.bytes().await.map_err(upstream)?;
-    if body.len() > MAX_SNAPSHOT_LEN {
-        return Err(ApiError::Upstream("snapshot too large".into()));
+    let body = collect_snapshot(response).await?;
+    if !is_jpeg(&body) {
+        return Err(ApiError::Upstream("camera returned an invalid JPEG".into()));
     }
-    Ok((
+    Ok(body)
+}
+
+fn snapshot_response(body: Bytes) -> Response {
+    (
         [
-            (header::CONTENT_TYPE, content_type),
-            (header::CACHE_CONTROL, "no-store".to_owned()),
+            (header::CONTENT_TYPE, "image/jpeg"),
+            (header::CACHE_CONTROL, "no-store"),
+            (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
         ],
         body,
     )
-        .into_response())
+        .into_response()
+}
+
+async fn collect_snapshot(response: reqwest::Response) -> Result<Bytes, ApiError> {
+    let initial_capacity = response
+        .content_length()
+        .and_then(|len| usize::try_from(len).ok())
+        .unwrap_or(0)
+        .min(MAX_SNAPSHOT_LEN);
+    let mut body = Vec::new();
+    body.try_reserve_exact(initial_capacity)
+        .map_err(|_| ApiError::Upstream("snapshot allocation failed".into()))?;
+    let mut chunks = response.bytes_stream();
+    while let Some(chunk) = chunks.next().await {
+        let chunk = chunk.map_err(|error| redacted_upstream_error(&error))?;
+        let Some(next_len) = body.len().checked_add(chunk.len()) else {
+            return Err(ApiError::Upstream("snapshot too large".into()));
+        };
+        if next_len > MAX_SNAPSHOT_LEN {
+            return Err(ApiError::Upstream("snapshot too large".into()));
+        }
+        body.try_reserve(chunk.len())
+            .map_err(|_| ApiError::Upstream("snapshot allocation failed".into()))?;
+        body.extend_from_slice(&chunk);
+    }
+    Ok(Bytes::from(body))
+}
+
+fn is_jpeg(body: &[u8]) -> bool {
+    body.len() >= 4 && body.starts_with(&[0xff, 0xd8]) && body.ends_with(&[0xff, 0xd9])
+}
+
+fn redacted_upstream_error(error: &reqwest::Error) -> ApiError {
+    tracing::warn!(
+        timeout = error.is_timeout(),
+        connect = error.is_connect(),
+        status = ?error.status(),
+        "camera snapshot request failed"
+    );
+    ApiError::Upstream("snapshot request failed".into())
+}
+
+fn snapshot_url(source: &SnapshotSource) -> String {
+    let scheme = if source.https { "https" } else { "http" };
+    // Config supplies bare hosts; IPv6 needs brackets in an HTTP authority.
+    if source.host.contains(':') {
+        format!(
+            "{scheme}://[{}]:{}{SNAPSHOT_PATH}",
+            source.host, source.port
+        )
+    } else {
+        format!("{scheme}://{}:{}{SNAPSHOT_PATH}", source.host, source.port)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::future::Future;
+    use std::net::SocketAddr;
+
+    use tokio::io::AsyncReadExt as _;
+    use tokio::io::AsyncWriteExt as _;
+    use tokio::net::TcpListener;
+    use tokio::net::TcpStream;
+
+    use super::*;
+
+    fn source(address: SocketAddr) -> SnapshotSource {
+        SnapshotSource {
+            host: address.ip().to_string(),
+            port: address.port(),
+            https: false,
+            tls_verify: true,
+            username: String::new(),
+            password: String::new(),
+        }
+    }
+
+    async fn read_request(socket: &mut TcpStream) {
+        let mut request = Vec::new();
+        let mut chunk = [0_u8; 1024];
+        while request.len() < 16 * 1024 {
+            let read = socket.read(&mut chunk).await.expect("read request");
+            if read == 0 {
+                break;
+            }
+            request.extend_from_slice(&chunk[..read]);
+            if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                break;
+            }
+        }
+        assert!(
+            request.windows(4).any(|window| window == b"\r\n\r\n"),
+            "complete request headers"
+        );
+    }
+
+    async fn test_server<Handler, HandlerFuture>(
+        handler: Handler,
+    ) -> (SnapshotSource, tokio::task::JoinHandle<()>)
+    where
+        Handler: FnOnce(TcpStream) -> HandlerFuture + Send + 'static,
+        HandlerFuture: Future<Output = ()> + Send + 'static,
+    {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback server");
+        let address = listener.local_addr().expect("loopback address");
+        let task = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept request");
+            read_request(&mut socket).await;
+            handler(socket).await;
+        });
+        (source(address), task)
+    }
+
+    async fn serve_body(body: Vec<u8>, content_type: &str) -> SnapshotSource {
+        let content_type = content_type.to_owned();
+        let (source, _task) = test_server(move |mut socket| async move {
+            let headers = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            socket
+                .write_all(headers.as_bytes())
+                .await
+                .expect("write response headers");
+            let _ = socket.write_all(&body).await;
+        })
+        .await;
+        source
+    }
+
+    fn jpeg_with_len(len: usize) -> Vec<u8> {
+        assert!(len >= 4);
+        let mut body = vec![0_u8; len];
+        body[..2].copy_from_slice(&[0xff, 0xd8]);
+        body[len - 2..].copy_from_slice(&[0xff, 0xd9]);
+        body
+    }
+
+    fn upstream_text(error: ApiError) -> String {
+        match error {
+            ApiError::Upstream(text) => text,
+            other => panic!("expected upstream error, got {other}"),
+        }
+    }
+
+    #[test]
+    fn snapshot_urls_bracket_ipv6_and_preserve_other_hosts() {
+        for host in ["2001:db8::1", "192.0.2.7", "camera.example"] {
+            for (https, scheme, port) in [(false, "http", 8080), (true, "https", 8443)] {
+                let source = SnapshotSource {
+                    host: host.into(),
+                    port,
+                    https,
+                    tls_verify: true,
+                    username: String::new(),
+                    password: String::new(),
+                };
+                let authority = if host.contains(':') {
+                    format!("[{host}]")
+                } else {
+                    host.into()
+                };
+                let url = snapshot_url(&source);
+                assert_eq!(url, format!("{scheme}://{authority}:{port}{SNAPSHOT_PATH}"));
+                let request = reqwest::Client::new().get(url).build().unwrap();
+                assert_eq!(request.url().scheme(), scheme);
+                assert_eq!(request.url().port(), Some(port));
+                assert_eq!(request.url().path(), "/cgi-bin/snapshot.cgi");
+                assert_eq!(request.url().query(), Some("channel=1"));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn accepts_exact_limit_and_sets_fixed_safe_headers() {
+        let source = serve_body(jpeg_with_len(MAX_SNAPSHOT_LEN), "text/html").await;
+        let body = fetch_snapshot(&source).await.expect("exact limit succeeds");
+        assert_eq!(body.len(), MAX_SNAPSHOT_LEN);
+
+        let response = snapshot_response(body);
+        assert_eq!(response.headers()[header::CONTENT_TYPE], "image/jpeg");
+        assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+        assert_eq!(
+            response.headers()[header::X_CONTENT_TYPE_OPTIONS],
+            "nosniff"
+        );
+    }
+
+    #[tokio::test]
+    async fn rejects_declared_limit_plus_one_before_reading_the_body() {
+        let (source, server) = test_server(|mut socket| async move {
+            let headers = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                MAX_SNAPSHOT_LEN + 1
+            );
+            socket
+                .write_all(headers.as_bytes())
+                .await
+                .expect("write oversized headers");
+        })
+        .await;
+        assert_eq!(
+            upstream_text(fetch_snapshot(&source).await.expect_err("must reject")),
+            "snapshot too large"
+        );
+        server.await.expect("server task");
+    }
+
+    #[tokio::test]
+    async fn rejects_limit_plus_one_from_a_chunked_body_without_a_length() {
+        let body = jpeg_with_len(MAX_SNAPSHOT_LEN + 1);
+        let (source, server) = test_server(move |mut socket| async move {
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .expect("write chunked headers");
+            for chunk in body.chunks(64 * 1024) {
+                let header = format!("{:x}\r\n", chunk.len());
+                if socket.write_all(header.as_bytes()).await.is_err()
+                    || socket.write_all(chunk).await.is_err()
+                    || socket.write_all(b"\r\n").await.is_err()
+                {
+                    return;
+                }
+            }
+            let _ = socket.write_all(b"0\r\n\r\n").await;
+        })
+        .await;
+        assert_eq!(
+            upstream_text(fetch_snapshot(&source).await.expect_err("must reject")),
+            "snapshot too large"
+        );
+        server.await.expect("server task");
+    }
+
+    #[tokio::test]
+    async fn concurrent_oversized_snapshots_are_each_rejected_at_the_header() {
+        const REQUESTS: usize = 4;
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback server");
+        let source = source(listener.local_addr().expect("loopback address"));
+        let server = tokio::spawn(async move {
+            let mut tasks = Vec::new();
+            for _ in 0..REQUESTS {
+                let (mut socket, _) = listener.accept().await.expect("accept request");
+                tasks.push(tokio::spawn(async move {
+                    read_request(&mut socket).await;
+                    let headers = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        MAX_SNAPSHOT_LEN + 1
+                    );
+                    socket
+                        .write_all(headers.as_bytes())
+                        .await
+                        .expect("write oversized headers");
+                }));
+            }
+            for task in tasks {
+                task.await.expect("connection task");
+            }
+        });
+        let results =
+            futures_util::future::join_all((0..REQUESTS).map(|_| fetch_snapshot(&source))).await;
+        for result in results {
+            assert_eq!(
+                upstream_text(result.expect_err("must reject")),
+                "snapshot too large"
+            );
+        }
+        server.await.expect("server task");
+    }
+
+    #[tokio::test]
+    async fn rejects_non_jpeg_bodies_regardless_of_upstream_media_type() {
+        let source = serve_body(
+            b"<script>document.body.textContent='active'</script>".to_vec(),
+            "text/html",
+        )
+        .await;
+        assert_eq!(
+            upstream_text(fetch_snapshot(&source).await.expect_err("must reject")),
+            "camera returned an invalid JPEG"
+        );
+    }
+
+    #[tokio::test]
+    async fn truncated_body_failure_is_redacted() {
+        let (source, server) = test_server(|mut socket| async move {
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\nConnection: close\r\n\r\n\xff\xd8\xff\xd9",
+                )
+                .await
+                .expect("write truncated response");
+        })
+        .await;
+        let text = upstream_text(fetch_snapshot(&source).await.expect_err("must reject"));
+        assert_eq!(text, "snapshot request failed");
+        assert!(!text.contains(&source.host));
+        assert!(!text.contains(&source.port.to_string()));
+        assert!(!text.contains("snapshot.cgi"));
+        server.await.expect("server task");
+    }
+
+    #[tokio::test]
+    async fn slow_body_hits_the_request_deadline_with_a_redacted_error() {
+        let (source, server) = test_server(|mut socket| async move {
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n2\r\n\xff\xd8\r\n",
+                )
+                .await
+                .expect("write first chunk");
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            let _ = socket.write_all(b"2\r\n\xff\xd9\r\n0\r\n\r\n").await;
+        })
+        .await;
+        let text = upstream_text(
+            fetch_snapshot_with_timeout(&source, Duration::from_millis(50))
+                .await
+                .expect_err("slow body must time out"),
+        );
+        assert_eq!(text, "snapshot request failed");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn a_slow_snapshot_can_be_cancelled_without_waiting_for_the_camera_timeout() {
+        let (source, server) = test_server(|mut socket| async move {
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n2\r\n\xff\xd8\r\n",
+                )
+                .await
+                .expect("write first chunk");
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            let _ = socket.write_all(b"2\r\n\xff\xd9\r\n0\r\n\r\n").await;
+        })
+        .await;
+        let cancelled =
+            tokio::time::timeout(Duration::from_millis(50), fetch_snapshot(&source)).await;
+        assert!(cancelled.is_err(), "caller deadline cancels the body read");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn redirects_are_never_followed() {
+        for kind in [
+            "same-origin",
+            "cross-host",
+            "cross-port",
+            "cross-scheme",
+            "loop",
+        ] {
+            let target = TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind redirect target");
+            let target_address = target.local_addr().expect("target address");
+            let source_listener = TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind redirect source");
+            let source_address = source_listener.local_addr().expect("source address");
+            let location = match kind {
+                "same-origin" => "/another-snapshot".to_owned(),
+                "cross-host" => format!("http://localhost:{}/target", source_address.port()),
+                "cross-port" => format!("http://127.0.0.1:{}/target", target_address.port()),
+                "cross-scheme" => {
+                    format!("https://127.0.0.1:{}/target", source_address.port())
+                }
+                "loop" => format!("http://{source_address}{SNAPSHOT_PATH}"),
+                _ => unreachable!(),
+            };
+            let source_task = tokio::spawn(async move {
+                let (mut socket, _) = source_listener.accept().await.expect("accept redirect");
+                read_request(&mut socket).await;
+                let response = format!(
+                    "HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                );
+                socket
+                    .write_all(response.as_bytes())
+                    .await
+                    .expect("write redirect");
+                drop(socket);
+                tokio::time::timeout(Duration::from_millis(150), source_listener.accept())
+                    .await
+                    .is_ok()
+            });
+            let target_task = tokio::spawn(async move {
+                tokio::time::timeout(Duration::from_millis(150), target.accept())
+                    .await
+                    .is_ok()
+            });
+
+            let error = fetch_snapshot(&source(source_address))
+                .await
+                .expect_err("redirect is not a snapshot response");
+            assert_eq!(upstream_text(error), "camera returned 302 Found");
+            assert!(!source_task.await.expect("redirect source task"), "{kind}");
+            assert!(!target_task.await.expect("redirect target task"), "{kind}");
+        }
+    }
 }
 
 fn cnonce() -> String {

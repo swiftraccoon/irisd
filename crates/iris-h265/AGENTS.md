@@ -9,6 +9,8 @@ Scope: this crate only. Read the root `AGENTS.md` first.
 - No function panics on any input: this crate faces camera bytes and has a fuzz target
   (`fuzz/fuzz_targets/access_unit.rs`); a crash reproducer becomes a unit test here.
 - `NalType` is `#[non_exhaustive]`; an added variant keeps `code` exact and breaks no caller.
+- Classification treats every type code below 32 as VCL, including reserved types 24..=31.
+- Framing errors report the prefix-start offset even when the prefix itself is incomplete.
 - The crate stays decode-free: no bitstream parsing beyond the NAL header. Dimensions and
   profiles come from the RTSP client's parameters, not from here.
 

@@ -13,15 +13,15 @@ use iris_catalog::TimeRange;
 use iris_core::time::WallUs;
 use iris_mp4::fragment::{FragmentHeader, Sample, encode_fragment};
 use iris_mp4::index::{FLAG_STARTS_WITH_SYNC, IndexRecord};
-use iris_mp4::reader::parse_fragment;
 use serde::Deserialize;
 use tokio::io::{AsyncReadExt as _, AsyncSeekExt as _};
 
 use crate::error::ApiError;
-use crate::hls::load_fragments;
+use crate::hls::{MAX_FRAGMENT_BYTES, MAX_INIT_BYTES, load_fragments, validate_fragment_record};
+use crate::media_admission;
 use crate::query::parse_time;
 use crate::segments::stream_key;
-use crate::state::ApiState;
+use crate::state::{ApiState, admitted_media_bytes};
 
 /// How far back from `t` the sync sample may lie: longer than any fragment
 /// the store writes, so a sync sample inside a recording is always found.
@@ -35,23 +35,36 @@ pub(crate) struct KeyframeParams {
 
 /// `GET /api/streams/{camera}/{kind}/keyframe?t=`: a playable MP4 of one
 /// frame, the sync sample at or before `t` (default: the newest).
+/// Returns HTTP 400 if the lookback or exclusive range end cannot be represented.
 pub(crate) async fn keyframe(
     State(state): State<Arc<ApiState>>,
     Path((camera, kind)): Path<(String, String)>,
     Query(params): Query<KeyframeParams>,
 ) -> Result<Response, ApiError> {
+    let permit = media_admission::shared(
+        state
+            .stats
+            .try_media_response()
+            .ok_or_else(|| ApiError::Unavailable("too many concurrent media responses".into()))?,
+    );
     let key = stream_key(&camera, &kind)?;
+    let implicit_newest = params.t.is_none();
     let t = match &params.t {
         Some(raw) => {
             parse_time(raw).ok_or_else(|| ApiError::BadRequest(format!("bad 't' {raw:?}")))?
         }
         None => WallUs::now(),
     };
-    let range = TimeRange {
-        from: t.offset(-LOOKBACK_US),
-        to: t.offset(1),
+    let (Some(from), Some(to)) = (t.get().checked_sub(LOOKBACK_US), t.get().checked_add(1)) else {
+        return Err(ApiError::BadRequest(
+            "'t' is outside the supported keyframe lookup range".into(),
+        ));
     };
-    let segments = load_fragments(&state, &key, range).await?;
+    let range = TimeRange {
+        from: WallUs::new(from),
+        to: WallUs::new(to),
+    };
+    let segments = load_fragments(&state, &key, range, &permit).await?;
     let Some((path, init_len, record)) = segments
         .iter()
         .flat_map(|seg| {
@@ -59,17 +72,30 @@ pub(crate) async fn keyframe(
                 .iter()
                 .map(move |r| (seg.row.path.clone(), seg.row.init_len, r))
         })
-        .filter(|(_, _, r)| r.flags & FLAG_STARTS_WITH_SYNC != 0 && r.wall <= t)
+        .filter(|(_, _, r)| {
+            r.flags & FLAG_STARTS_WITH_SYNC != 0 && r.wall >= range.from && r.wall <= t
+        })
         .max_by_key(|(_, _, r)| r.wall)
     else {
         return Err(ApiError::NotFound);
     };
     let record = *record;
-    let body = build(&path, init_len, &record).await?;
+    let body = media_admission::spawn(
+        &permit,
+        async move { build(&path, init_len, &record).await },
+    )
+    .await
+    .map_err(io::Error::other)??;
+    let body = admitted_media_bytes(body, permit);
+    let cache_control = if implicit_newest {
+        "private, no-store"
+    } else {
+        "private, max-age=3600"
+    };
     Ok((
         [
             (header::CONTENT_TYPE, "video/mp4".to_owned()),
-            (header::CACHE_CONTROL, "private, max-age=3600".to_owned()),
+            (header::CACHE_CONTROL, cache_control.to_owned()),
             (
                 "x-iris-wall-us".parse().expect("static header name"),
                 record.wall.get().to_string(),
@@ -87,14 +113,34 @@ async fn build(
     init_len: u32,
     record: &IndexRecord,
 ) -> Result<Bytes, ApiError> {
+    if u64::from(init_len) > MAX_INIT_BYTES || u64::from(record.len) > MAX_FRAGMENT_BYTES {
+        return Err(ApiError::Unavailable(
+            "keyframe source exceeds the serving budget".into(),
+        ));
+    }
     let mut file = tokio::fs::File::open(path).await?;
-    let mut init = vec![0u8; init_len as usize];
+    let mut init = Vec::new();
+    init.try_reserve_exact(init_len as usize).map_err(|error| {
+        ApiError::Unavailable(format!("cannot reserve keyframe initialization: {error}"))
+    })?;
+    init.resize(init_len as usize, 0);
     file.read_exact(&mut init).await?;
     file.seek(SeekFrom::Start(record.offset)).await?;
-    let mut fragment = vec![0u8; record.len as usize];
+    let mut fragment = Vec::new();
+    fragment
+        .try_reserve_exact(record.len as usize)
+        .map_err(|error| {
+            ApiError::Unavailable(format!("cannot reserve keyframe fragment: {error}"))
+        })?;
+    fragment.resize(record.len as usize, 0);
     file.read_exact(&mut fragment).await?;
-    let info = parse_fragment(&fragment)
-        .ok_or_else(|| ApiError::Io(io::Error::other("unparseable fragment")))?;
+    let info = validate_fragment_record(&fragment, record)?;
+    if !info.starts_with_sync {
+        return Err(ApiError::Io(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "keyframe source is not a sync fragment",
+        )));
+    }
     let (Some(&size), Some(&duration)) = (info.sample_sizes.first(), info.sample_durations.first())
     else {
         return Err(ApiError::Io(io::Error::other("fragment without samples")));
@@ -116,6 +162,14 @@ async fn build(
     };
     let encoded = encode_fragment(&header, std::slice::from_ref(&sample))
         .map_err(|e| ApiError::Io(io::Error::other(e.to_string())))?;
+    init.try_reserve(
+        encoded
+            .prefix
+            .len()
+            .saturating_add(sample.data.len())
+            .saturating_add(encoded.trailer.len()),
+    )
+    .map_err(|error| ApiError::Unavailable(format!("cannot reserve keyframe response: {error}")))?;
     let mut out = init;
     out.extend_from_slice(&encoded.prefix);
     out.extend_from_slice(&sample.data);

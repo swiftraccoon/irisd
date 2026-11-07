@@ -4,7 +4,9 @@
 //! yield an error, never a panic.
 #![no_main]
 
-use iris_mp4::export::{rebase_fragment, with_edit_list};
+use iris_core::time::{MediaTicks, WallUs};
+use iris_mp4::export::{rebase_fragment, trim_fragment_end, with_edit_list};
+use iris_mp4::fragment::FragmentHeader;
 use iris_mp4::reader::parse_fragment;
 use libfuzzer_sys::fuzz_target;
 
@@ -19,5 +21,20 @@ fuzz_target!(|data: &[u8]| {
     }
     if let Ok(init) = with_edit_list(data, 45_000, 5_500) {
         assert_eq!(init.len(), data.len() + 44);
+    }
+    let limit = parse_fragment(data).map_or(1, |info| i64::from(info.duration) / 2 + 1);
+    if let Ok(trimmed) = trim_fragment_end(
+        data.to_vec(),
+        FragmentHeader {
+            sequence: 7,
+            decode_time: 0,
+            wall: WallUs::new(0),
+        },
+        MediaTicks::new(limit),
+    ) {
+        let info = parse_fragment(&trimmed).expect("trimmed fragment parses");
+        assert_eq!(info.sequence, 7);
+        assert_eq!(info.decode_time, 0);
+        assert!(i64::from(info.duration) <= limit);
     }
 });

@@ -79,13 +79,62 @@ impl Stage {
         bin: &gst::Bin,
         events: async_channel::Sender<BranchEvent>,
     ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            bin.parent().is_none(),
+            "adding {name}: bin already has a parent"
+        );
+        anyhow::ensure!(
+            !self.listeners.borrow().contains_key(name),
+            "adding {name}: branch name is already in use"
+        );
+        let original_name = bin.name().to_string();
+        let (_, original_state, _) = bin.state(gst::ClockTime::ZERO);
         bin.set_property("name", name);
+        if let Err(error) = self.pipeline.add(bin) {
+            bin.set_property("name", &original_name);
+            return Err(error).with_context(|| format!("adding {name} to the stage"));
+        }
         self.listeners.borrow_mut().insert(name.to_owned(), events);
-        self.pipeline
-            .add(bin)
-            .with_context(|| format!("adding {name} to the stage"))?;
-        bin.sync_state_with_parent()
-            .with_context(|| format!("starting {name}"))?;
+        if let Err(error) = bin.sync_state_with_parent() {
+            let rollback = self.rollback_add(name, bin, &original_name, original_state);
+            return match rollback {
+                Ok(()) => Err(error).with_context(|| format!("starting {name}")),
+                Err(rollback) => Err(anyhow::anyhow!(
+                    "starting {name}: {error}; rolling back the failed branch: {rollback:#}"
+                )),
+            };
+        }
+        Ok(())
+    }
+
+    fn rollback_add(
+        &self,
+        name: &str,
+        bin: &gst::Bin,
+        original_name: &str,
+        original_state: gst::State,
+    ) -> anyhow::Result<()> {
+        let mut failures = Vec::new();
+        if let Err(error) = bin.set_state(gst::State::Null) {
+            failures.push(format!("stopping partially added {name}: {error}"));
+        }
+        if let Err(error) = self.pipeline.remove(bin) {
+            failures.push(format!("removing partially added {name}: {error}"));
+        }
+        self.listeners.borrow_mut().remove(name);
+        if bin.parent().is_none() {
+            bin.set_property("name", original_name);
+            if original_state != gst::State::Null
+                && let Err(error) = bin.set_state(original_state)
+            {
+                failures.push(format!("restoring {original_name} state: {error}"));
+            }
+        } else {
+            failures.push(format!("partially added {name} remains parented"));
+        }
+        if !failures.is_empty() {
+            anyhow::bail!(failures.join("; "));
+        }
         Ok(())
     }
 
@@ -139,5 +188,65 @@ fn notify(
 ) {
     if let Some(sender) = listeners.borrow().get(name) {
         let _ = sender.try_send(event);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn add_is_transactional_across_failure_modes() {
+        gst::init().unwrap();
+        let stage = Stage::new().unwrap();
+
+        {
+            let owner = gst::Pipeline::new();
+            let bin = gst::Bin::new();
+            let original_name = bin.name().to_string();
+            owner.add(&bin).unwrap();
+            let (events, _) = async_channel::unbounded();
+
+            assert!(stage.add("candidate", &bin, events).is_err());
+            assert_eq!(bin.name(), original_name);
+            assert_eq!(bin.parent().as_ref(), Some(owner.upcast_ref()));
+            assert!(!stage.listeners.borrow().contains_key("candidate"));
+        }
+
+        {
+            let first = gst::Bin::new();
+            let second = gst::Bin::new();
+            let second_name = second.name().to_string();
+            let (first_tx, first_rx) = async_channel::unbounded();
+            stage.add("duplicate", &first, first_tx).unwrap();
+            let (second_tx, second_rx) = async_channel::unbounded();
+
+            assert!(stage.add("duplicate", &second, second_tx).is_err());
+            notify(&stage.listeners, "duplicate", BranchEvent::Ready);
+            assert_eq!(first_rx.try_recv().unwrap(), BranchEvent::Ready);
+            assert!(second_rx.try_recv().is_err());
+            assert_eq!(second.name(), second_name);
+            assert!(second.parent().is_none());
+            stage.remove(&first);
+        }
+
+        {
+            let bin = gst::parse::bin_from_description(
+                "fakesink async=false state-error=paused-to-playing",
+                false,
+            )
+            .unwrap();
+            bin.set_state(gst::State::Ready).unwrap();
+            let original_name = bin.name().to_string();
+            let (events, _) = async_channel::unbounded();
+
+            assert!(stage.add("failing", &bin, events).is_err());
+            let (_, restored_state, _) = bin.state(gst::ClockTime::ZERO);
+            assert_eq!(bin.name(), original_name);
+            assert_eq!(restored_state, gst::State::Ready);
+            assert!(bin.parent().is_none());
+            assert!(!stage.listeners.borrow().contains_key("failing"));
+            bin.set_state(gst::State::Null).unwrap();
+        }
     }
 }

@@ -18,8 +18,9 @@
 //!   a writer lays around the samples with one vectored write; the trailer codec
 //!   and the format constants live here too.
 //! - [`reader`]: [`reader::scan`], a forward walk that validates boxes, sample
-//!   accounting, and trailers and reports the valid length ([`reader::ScanReport`])
-//!   and why it stopped ([`reader::ScanStop`]).
+//!   accounting, and trailers, plus [`reader::scan_from_offset`] for a caller-validated
+//!   fragment tail; both report the valid length ([`reader::ScanReport`]) and why they
+//!   stopped ([`reader::ScanStop`]).
 //! - [`index`]: the sidecar `.idx` codec ([`index::IndexHeader`],
 //!   [`index::IndexRecord`]) and file ([`index::IndexWriter`], [`index::read_index`]).
 //! - [`hls`]: [`hls::media_playlist`] and [`hls::master_playlist`] over one file.

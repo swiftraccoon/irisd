@@ -1,0 +1,608 @@
+use super::{xml_bool, xml_str};
+use crate::error::OnvifError;
+use crate::soap::{SoapError, XmlNode};
+
+// ── MediaProfile ──────────────────────────────────────────────────────────────
+
+/// A single media profile returned by `GetProfiles`.
+///
+/// Pass `token` to [`get_stream_uri`](crate::client::OnvifClient::get_stream_uri)
+/// to retrieve the RTSP URI for this profile.
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[derive(Debug, Clone)]
+pub struct MediaProfile {
+    /// Opaque identifier used in subsequent media service calls.
+    pub token: String,
+    /// Human-readable profile name (e.g. `"mainStream"`, `"subStream"`).
+    pub name: String,
+    /// `true` if the profile is fixed and cannot be deleted.
+    pub fixed: bool,
+    /// Token of the bound `VideoSourceConfiguration`, if any.
+    pub video_source_config_token: Option<String>,
+    /// Token of the underlying `VideoSource` (the `<SourceToken>` inside
+    /// `VideoSourceConfiguration`). Pass this to the Imaging service.
+    pub video_source_token: Option<String>,
+    /// Token of the bound `VideoEncoderConfiguration`, if any.
+    pub video_encoder_token: Option<String>,
+    /// Token of the bound `AudioSourceConfiguration`, if any.
+    pub audio_source_token: Option<String>,
+    /// Token of the bound `AudioEncoderConfiguration`, if any.
+    pub audio_encoder_token: Option<String>,
+    /// Token of the bound `PTZConfiguration`, if any.
+    pub ptz_config_token: Option<String>,
+}
+
+impl MediaProfile {
+    /// Parse a single `<Profile>` node (e.g. from `CreateProfileResponse` or
+    /// `GetProfileResponse`).
+    pub(crate) fn from_xml(p: &XmlNode) -> Result<Self, OnvifError> {
+        let token = p
+            .attr("token")
+            .filter(|t| !t.is_empty())
+            .ok_or_else(|| SoapError::missing("Profile/@token"))?
+            .to_string();
+        let vsc = p.child("VideoSourceConfiguration");
+        Ok(Self {
+            token,
+            fixed: p.attr("fixed") == Some("true"),
+            name: xml_str(p, "Name").unwrap_or_default(),
+            video_source_config_token: vsc.and_then(|n| n.attr("token")).map(str::to_string),
+            video_source_token: vsc.and_then(|n| xml_str(n, "SourceToken")),
+            video_encoder_token: p
+                .child("VideoEncoderConfiguration")
+                .and_then(|n| n.attr("token"))
+                .map(str::to_string),
+            audio_source_token: p
+                .child("AudioSourceConfiguration")
+                .and_then(|n| n.attr("token"))
+                .map(str::to_string),
+            audio_encoder_token: p
+                .child("AudioEncoderConfiguration")
+                .and_then(|n| n.attr("token"))
+                .map(str::to_string),
+            ptz_config_token: p
+                .child("PTZConfiguration")
+                .and_then(|n| n.attr("token"))
+                .map(str::to_string),
+        })
+    }
+
+    /// Parse all `<trt:Profiles>` children from a `GetProfilesResponse` node.
+    /// Returns an empty `Vec` if the response contains no profiles.
+    pub(crate) fn vec_from_xml(resp: &XmlNode) -> Result<Vec<Self>, OnvifError> {
+        resp.children_named("Profiles")
+            .map(Self::from_xml)
+            .collect()
+    }
+}
+
+// ── StreamUri ─────────────────────────────────────────────────────────────────
+
+/// RTSP stream URI returned by `GetStreamUri`.
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[derive(Debug, Clone)]
+pub struct StreamUri {
+    /// The RTSP URI to open with a media player (e.g. `rtsp://…/stream`).
+    pub uri: String,
+    /// If `true`, the URI becomes invalid after the first RTSP connection.
+    pub invalid_after_connect: bool,
+    /// If `true`, the URI becomes invalid after the device reboots.
+    pub invalid_after_reboot: bool,
+    /// ISO 8601 duration until the URI expires (e.g. `"PT0S"` = no expiry).
+    pub timeout: String,
+}
+
+impl StreamUri {
+    /// Parse from a `GetStreamUriResponse` node.
+    pub(crate) fn from_xml(resp: &XmlNode) -> Result<Self, OnvifError> {
+        let media_uri = resp
+            .child("MediaUri")
+            .ok_or_else(|| SoapError::missing("MediaUri"))?;
+
+        let uri = media_uri
+            .child("Uri")
+            .map(|n| n.text().to_string())
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| SoapError::missing("Uri"))?;
+
+        Ok(Self {
+            uri,
+            invalid_after_connect: xml_bool(media_uri, "InvalidAfterConnect"),
+            invalid_after_reboot: xml_bool(media_uri, "InvalidAfterReboot"),
+            timeout: xml_str(media_uri, "Timeout").unwrap_or_default(),
+        })
+    }
+}
+
+// ── SnapshotUri ───────────────────────────────────────────────────────────────
+
+/// HTTP snapshot URI returned by `GetSnapshotUri`.
+///
+/// Fetch the URI with any HTTP client to retrieve a JPEG image.
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[derive(Debug, Clone)]
+pub struct SnapshotUri {
+    /// HTTP URL of the JPEG snapshot endpoint.
+    pub uri: String,
+    /// If `true`, the URI becomes invalid after the first HTTP request.
+    pub invalid_after_connect: bool,
+    /// If `true`, the URI becomes invalid after the device reboots.
+    pub invalid_after_reboot: bool,
+    /// ISO 8601 duration until the URI expires (e.g. `"PT0S"` = no expiry).
+    pub timeout: String,
+}
+
+impl SnapshotUri {
+    /// Parse from a `GetSnapshotUriResponse` node.
+    pub(crate) fn from_xml(resp: &XmlNode) -> Result<Self, OnvifError> {
+        let media_uri = resp
+            .child("MediaUri")
+            .ok_or_else(|| SoapError::missing("MediaUri"))?;
+
+        let uri = media_uri
+            .child("Uri")
+            .map(|n| n.text().to_string())
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| SoapError::missing("Uri"))?;
+
+        Ok(Self {
+            uri,
+            invalid_after_connect: xml_bool(media_uri, "InvalidAfterConnect"),
+            invalid_after_reboot: xml_bool(media_uri, "InvalidAfterReboot"),
+            timeout: xml_str(media_uri, "Timeout").unwrap_or_default(),
+        })
+    }
+}
+
+// ── MediaProfile2 ─────────────────────────────────────────────────────────────
+
+/// A Media2 profile returned by `GetProfiles` (Media2).
+///
+/// Compared with [`MediaProfile`], this carries optional references to the
+/// configurations currently bound to the profile.
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[derive(Debug, Clone)]
+pub struct MediaProfile2 {
+    /// Opaque profile token; the handle passed to every other Media2 call.
+    pub token: String,
+    /// Human-readable profile name (e.g. `"MainStream"`).
+    pub name: String,
+    /// `true` for a factory profile the device will not let you delete or
+    /// reconfigure.
+    pub fixed: bool,
+    /// Token of the bound `VideoSourceConfiguration`, if any.
+    pub video_source_config_token: Option<String>,
+    /// Token of the underlying `VideoSource` (the `<SourceToken>` inside
+    /// `VideoSourceConfiguration`). Pass this to the Imaging service.
+    pub video_source_token: Option<String>,
+    /// Token of the bound `VideoEncoderConfiguration2`, if any.
+    pub video_encoder_token: Option<String>,
+    /// Token of the bound `AudioSourceConfiguration`, if any.
+    pub audio_source_token: Option<String>,
+    /// Token of the bound `AudioEncoderConfiguration`, if any.
+    pub audio_encoder_token: Option<String>,
+    /// Token of the bound `PTZConfiguration`, if any.
+    pub ptz_config_token: Option<String>,
+}
+
+impl MediaProfile2 {
+    pub(crate) fn vec_from_xml(resp: &XmlNode) -> Result<Vec<Self>, OnvifError> {
+        resp.children_named("Profiles")
+            .map(|p| {
+                let token = p
+                    .attr("token")
+                    .filter(|t| !t.is_empty())
+                    .ok_or_else(|| SoapError::missing("Profile/@token"))?
+                    .to_string();
+                let vsc = p.path(&["Configurations", "VideoSource"]);
+                Ok(Self {
+                    token,
+                    name: xml_str(p, "Name").unwrap_or_default(),
+                    fixed: p.attr("fixed") == Some("true"),
+                    video_source_config_token: vsc
+                        .and_then(|n| n.attr("token"))
+                        .map(str::to_string),
+                    video_source_token: vsc.and_then(|n| xml_str(n, "SourceToken")),
+                    video_encoder_token: p
+                        .path(&["Configurations", "VideoEncoder"])
+                        .and_then(|n| n.attr("token"))
+                        .map(str::to_string),
+                    audio_source_token: p
+                        .path(&["Configurations", "AudioSource"])
+                        .and_then(|n| n.attr("token"))
+                        .map(str::to_string),
+                    audio_encoder_token: p
+                        .path(&["Configurations", "AudioEncoder"])
+                        .and_then(|n| n.attr("token"))
+                        .map(str::to_string),
+                    ptz_config_token: p
+                        .path(&["Configurations", "PTZ"])
+                        .and_then(|n| n.attr("token"))
+                        .map(str::to_string),
+                })
+            })
+            .collect()
+    }
+}
+
+// ── MetadataConfiguration ─────────────────────────────────────────────────────
+
+/// Metadata stream configuration returned by `GetMetadataConfigurations` (Media2).
+///
+/// Retains structured multicast (including address family, TTL and readonly
+/// AutoStart) and the required session timeout. The previous flattened
+/// multicast_address/multicast_port fields are removed: migrate Rust literals
+/// and JSON using known values, not invented TTL or streaming state.
+///
+/// This models PTZ and analytics flags, not arbitrary Events filters, compression,
+/// analytics-engine configuration or vendor extensions. It is not a lossless
+/// editor for those optional fields. Reads require an explicit valid IP address;
+/// an address-less IPAddress block cannot be represented by this type.
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[derive(Debug, Clone)]
+pub struct MetadataConfiguration {
+    /// Opaque token for this configuration.
+    pub token: String,
+    /// Human-readable name. Many devices simply echo the token here.
+    pub name: String,
+    /// Number of profiles referencing this configuration.
+    pub use_count: u32,
+    /// Whether analytics events are embedded in the metadata stream.
+    pub analytics: bool,
+    /// ONVIF `tt:PTZFilter/Status` — include PTZ move-status in metadata.
+    pub ptz_status: bool,
+    /// ONVIF `tt:PTZFilter/Position` — include PTZ position in metadata.
+    pub ptz_position: bool,
+    /// Complete required multicast configuration. Replaces flattened address/port
+    /// fields in 0.17; old JSON must be explicitly migrated.
+    pub multicast: super::MulticastConfiguration,
+    /// Required wire duration, preserved on roundtrip (deprecated/ignored by Media2).
+    pub session_timeout: String,
+}
+
+impl MetadataConfiguration {
+    pub(crate) fn from_xml(n: &XmlNode) -> Result<Self, OnvifError> {
+        let token = n
+            .attr("token")
+            .filter(|t| !t.is_empty())
+            .ok_or_else(|| SoapError::missing("MetadataConfiguration/@token"))?
+            .to_string();
+        let name = metadata_scalar(n, "Name", "MetadataConfiguration/Name")?.to_string();
+        let count = metadata_scalar(n, "UseCount", "MetadataConfiguration/UseCount")?;
+        let use_count = count
+            .parse::<u32>()
+            .map_err(|_| SoapError::invalid("MetadataConfiguration/UseCount", count))?;
+        let boolean =
+            |node: &XmlNode, name: &str, path: &'static str| -> Result<bool, OnvifError> {
+                match metadata_scalar(node, name, path)? {
+                    "true" | "1" => Ok(true),
+                    "false" | "0" => Ok(false),
+                    value => Err(SoapError::invalid(path, value).into()),
+                }
+            };
+        let analytics = if n.child("Analytics").is_some() {
+            boolean(n, "Analytics", "MetadataConfiguration/Analytics")?
+        } else {
+            false
+        };
+        let (ptz_status, ptz_position) = if n.child("PTZStatus").is_some() {
+            let ptz = metadata_node(n, "PTZStatus", "MetadataConfiguration/PTZStatus")?;
+            (
+                boolean(ptz, "Status", "MetadataConfiguration/PTZStatus/Status")?,
+                boolean(ptz, "Position", "MetadataConfiguration/PTZStatus/Position")?,
+            )
+        } else {
+            (false, false)
+        };
+        let multicast = super::MulticastConfiguration::from_xml_strict(metadata_node(
+            n,
+            "Multicast",
+            "MetadataConfiguration/Multicast",
+        )?)?;
+        let session_timeout =
+            metadata_scalar(n, "SessionTimeout", "MetadataConfiguration/SessionTimeout")?
+                .to_string();
+        let result = Self {
+            token,
+            name,
+            use_count,
+            analytics,
+            ptz_status,
+            ptz_position,
+            multicast,
+            session_timeout,
+        };
+        result.validate()?;
+        Ok(result)
+    }
+    pub(crate) fn vec_from_xml(resp: &XmlNode) -> Result<Vec<Self>, OnvifError> {
+        resp.children_named("Configurations")
+            .map(Self::from_xml)
+            .collect()
+    }
+    fn validate(&self) -> Result<(), OnvifError> {
+        if self.token.is_empty() {
+            return Err(SoapError::missing("MetadataConfiguration/@token").into());
+        }
+        self.multicast.validate_metadata()?;
+        if !valid_metadata_duration(&self.session_timeout) {
+            return Err(SoapError::invalid(
+                "MetadataConfiguration/SessionTimeout",
+                &self.session_timeout,
+            )
+            .into());
+        }
+        Ok(())
+    }
+    pub(crate) fn to_xml_body(&self) -> Result<String, OnvifError> {
+        self.validate()?;
+        Ok(format!(
+            "<tr2:Configuration token=\"{}\"><tt:Name>{}</tt:Name><tt:UseCount>{}</tt:UseCount><tt:PTZStatus><tt:Status>{}</tt:Status><tt:Position>{}</tt:Position></tt:PTZStatus><tt:Analytics>{}</tt:Analytics>{}<tt:SessionTimeout>{}</tt:SessionTimeout></tr2:Configuration>",
+            super::xml_escape(&self.token),
+            super::xml_escape(&self.name),
+            self.use_count,
+            self.ptz_status,
+            self.ptz_position,
+            self.analytics,
+            self.multicast.to_xml_body(),
+            super::xml_escape(&self.session_timeout)
+        ))
+    }
+}
+
+pub(super) fn metadata_node<'a>(
+    n: &'a XmlNode,
+    name: &str,
+    path: &'static str,
+) -> Result<&'a XmlNode, OnvifError> {
+    if n.children_named(name).count() > 1 {
+        return Err(SoapError::invalid(path, "duplicate field").into());
+    }
+    n.child(name).ok_or_else(|| SoapError::missing(path).into())
+}
+pub(super) fn metadata_scalar<'a>(
+    n: &'a XmlNode,
+    name: &str,
+    path: &'static str,
+) -> Result<&'a str, OnvifError> {
+    let value = metadata_node(n, name, path)?;
+    if !value.children.is_empty() {
+        return Err(SoapError::invalid(path, "non-scalar value").into());
+    }
+    Ok(value.text())
+}
+
+/// Nonnegative duration lexical check; preserves the caller's spelling.
+pub(crate) fn valid_metadata_duration(value: &str) -> bool {
+    let Some(mut rest) = value.strip_prefix('P') else {
+        return false;
+    };
+    let mut time = false;
+    let mut last = 0;
+    let mut any = false;
+    let mut time_any = false;
+    while !rest.is_empty() {
+        if rest.starts_with('T') {
+            if time {
+                return false;
+            }
+            time = true;
+            last = 0;
+            rest = &rest[1..];
+            continue;
+        }
+        let end = rest
+            .find(|c: char| !c.is_ascii_digit() && c != '.')
+            .unwrap_or(rest.len());
+        if end == 0 || end == rest.len() {
+            return false;
+        }
+        let number = &rest[..end];
+        let unit = rest.as_bytes()[end];
+        let index = match (time, unit) {
+            (false, b'Y') | (true, b'H') => 1,
+            (false, b'M') | (true, b'M') => 2,
+            (false, b'D') | (true, b'S') => 3,
+            _ => return false,
+        };
+        if index <= last
+            || number.starts_with('.')
+            || number.ends_with('.')
+            || number.matches('.').count() > 1
+            || (number.contains('.') && (!time || unit != b'S'))
+        {
+            return false;
+        }
+        last = index;
+        any = true;
+        time_any |= time;
+        rest = &rest[end + 1..];
+    }
+    any && (!time || time_any)
+}
+
+// ── MetadataConfigurationOptions ──────────────────────────────────────────────
+
+/// Valid ranges for metadata configuration returned by
+/// `GetMetadataConfigurationOptions` (Media2).
+///
+/// This type used to carry an `analytics_supported` flag read from
+/// `Options/Extension/AnalyticsSupported`. **No such element or attribute is
+/// declared anywhere in the ONVIF schema set** — `tt:MetadataConfigurationOptionsExtension`
+/// declares only `CompressionType` and a further `Extension` — so the field was
+/// `false` from every conformant device. Analytics support is reported by
+/// `GetCapabilities`, as `tt:AnalyticsCapabilities/AnalyticsModuleSupport`.
+/// The two booleans `tt:PTZStatusFilterOptions` actually requires replace it.
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[derive(Debug, Clone)]
+pub struct MetadataConfigurationOptions {
+    /// The device sent a `tt:PTZStatusFilterOptions` block — i.e. `ptz_status` /
+    /// `ptz_position` on [`MetadataConfiguration`] are settable. The schema
+    /// makes the block required, so a conformant device always sends it.
+    pub ptz_status_filter_supported: bool,
+    /// `tt:PTZStatusFilterOptions/PanTiltStatusSupported` — the metadata stream
+    /// can carry pan/tilt move status.
+    pub pan_tilt_status_supported: bool,
+    /// `tt:PTZStatusFilterOptions/ZoomStatusSupported` — the metadata stream can
+    /// carry zoom move status.
+    pub zoom_status_supported: bool,
+}
+
+impl MetadataConfigurationOptions {
+    pub(crate) fn from_xml(resp: &XmlNode) -> Result<Self, OnvifError> {
+        let opts = resp.child("Options").unwrap_or(resp);
+        let ptz = opts.child("PTZStatusFilterOptions");
+        Ok(Self {
+            ptz_status_filter_supported: ptz.is_some(),
+            pan_tilt_status_supported: ptz.is_some_and(|p| xml_bool(p, "PanTiltStatusSupported")),
+            zoom_status_supported: ptz.is_some_and(|p| xml_bool(p, "ZoomStatusSupported")),
+        })
+    }
+}
+
+// ── AudioDecoderConfiguration ─────────────────────────────────────────────────
+
+/// Audio decoder configuration for backchannel (audio output) returned by
+/// `GetAudioDecoderConfigurations` (Media2).
+///
+/// ONVIF Media2 WSDL — Profile T §8.13 (conditional).
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[derive(Debug, Clone)]
+pub struct AudioDecoderConfiguration {
+    /// Opaque token for this configuration.
+    pub token: String,
+    /// Human-readable name. Many devices simply echo the token here.
+    pub name: String,
+    /// Number of profiles referencing this configuration.
+    pub use_count: u32,
+}
+
+impl AudioDecoderConfiguration {
+    pub(crate) fn from_xml(n: &XmlNode) -> Result<Self, OnvifError> {
+        let token = n
+            .attr("token")
+            .filter(|t| !t.is_empty())
+            .ok_or_else(|| SoapError::missing("AudioDecoderConfiguration/@token"))?
+            .to_string();
+        Ok(Self {
+            token,
+            name: xml_str(n, "Name").unwrap_or_default(),
+            use_count: n
+                .child("UseCount")
+                .and_then(|c| c.text().parse().ok())
+                .unwrap_or(0),
+        })
+    }
+
+    pub(crate) fn vec_from_xml(resp: &XmlNode) -> Result<Vec<Self>, OnvifError> {
+        resp.children_named("Configurations")
+            .map(Self::from_xml)
+            .collect()
+    }
+}
+
+// ── AudioOutputConfiguration ──────────────────────────────────────────────────
+
+/// Audio output configuration returned by `GetAudioOutputConfigurations` (Media2).
+///
+/// ONVIF Media2 WSDL — Profile T §8.13 (conditional).
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[derive(Debug, Clone)]
+pub struct AudioOutputConfiguration {
+    /// Opaque token for this configuration.
+    pub token: String,
+    /// Human-readable name. Many devices simply echo the token here.
+    pub name: String,
+    /// Number of profiles referencing this configuration.
+    pub use_count: u32,
+    /// Token of the physical `AudioOutput` (speaker) this config drives.
+    pub output_token: String,
+    /// Output volume, `0`–`100`. `None` when the device does not report one.
+    pub output_level: Option<u32>,
+}
+
+impl AudioOutputConfiguration {
+    pub(crate) fn from_xml(n: &XmlNode) -> Result<Self, OnvifError> {
+        let token = n
+            .attr("token")
+            .filter(|t| !t.is_empty())
+            .ok_or_else(|| SoapError::missing("AudioOutputConfiguration/@token"))?
+            .to_string();
+        Ok(Self {
+            token,
+            name: xml_str(n, "Name").unwrap_or_default(),
+            use_count: n
+                .child("UseCount")
+                .and_then(|c| c.text().parse().ok())
+                .unwrap_or(0),
+            output_token: xml_str(n, "OutputToken").unwrap_or_default(),
+            output_level: n.child("OutputLevel").and_then(|c| c.text().parse().ok()),
+        })
+    }
+
+    pub(crate) fn vec_from_xml(resp: &XmlNode) -> Result<Vec<Self>, OnvifError> {
+        resp.children_named("Configurations")
+            .map(Self::from_xml)
+            .collect()
+    }
+}
+
+// ── VideoSourceMode ───────────────────────────────────────────────────────────
+
+/// A video source mode returned by `GetVideoSourceModes` (Media2).
+///
+/// ONVIF Media2 WSDL — Profile T §8.7 (conditional).
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[derive(Debug, Clone)]
+pub struct VideoSourceMode {
+    /// Opaque token identifying this mode; pass it to `SetVideoSourceMode`.
+    pub token: String,
+    /// Highest frame rate, in frames per second, available in this mode.
+    pub max_framerate: f32,
+    /// Width in pixels of the largest resolution this mode offers.
+    pub max_resolution_width: u32,
+    /// Height in pixels of the largest resolution this mode offers.
+    pub max_resolution_height: u32,
+    /// Video encodings usable in this mode, as the device spelled them
+    /// (`"H264"`, `"JPEG"`, …).
+    pub encodings: Vec<String>,
+    /// `true` if switching to this mode reboots the device — the stream drops
+    /// and the device is unreachable until it comes back.
+    pub reboot: bool,
+}
+
+impl VideoSourceMode {
+    pub(crate) fn from_xml(n: &XmlNode) -> Result<Self, OnvifError> {
+        let token = n
+            .attr("token")
+            .filter(|t| !t.is_empty())
+            .ok_or_else(|| SoapError::missing("VideoSourceMode/@token"))?
+            .to_string();
+        Ok(Self {
+            token,
+            max_framerate: n
+                .child("MaxFramerate")
+                .and_then(|c| c.text().parse().ok())
+                .unwrap_or(0.0),
+            max_resolution_width: n
+                .path(&["MaxResolution", "Width"])
+                .and_then(|c| c.text().parse().ok())
+                .unwrap_or(0),
+            max_resolution_height: n
+                .path(&["MaxResolution", "Height"])
+                .and_then(|c| c.text().parse().ok())
+                .unwrap_or(0),
+            encodings: n
+                .child("Encodings")
+                .map(|e| e.text().split_whitespace().map(str::to_string).collect())
+                .unwrap_or_default(),
+            reboot: xml_bool(n, "Reboot"),
+        })
+    }
+
+    pub(crate) fn vec_from_xml(resp: &XmlNode) -> Result<Vec<Self>, OnvifError> {
+        resp.children_named("VideoSourceModes")
+            .map(Self::from_xml)
+            .collect()
+    }
+}

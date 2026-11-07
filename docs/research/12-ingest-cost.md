@@ -8,6 +8,16 @@ CPU and wake-ups (voluntary context switches of the runtime thread) are read fro
 Live figures come from the seven-camera soak (14 streams, 100 Mbit/s) through
 `iris-tools soak-sample`.
 
+The harness computes payload rate from differences between timestamped stream counters,
+then intersects the streams' coverage with process samples after the 20 s warm-up.
+Payload bytes, CPU ticks, and voluntary context switches interpolate to the same two
+endpoints and divide by that interval. At least two stream statistics snapshots and a
+positive shared interval are required; shorten `--stats-interval` or lengthen the run
+when these are absent. Counter resets invalidate the run. Terminal cumulative byte
+counts cannot be divided by a process-sample interval that begins after recording starts.
+The dated tables below retain their measurement provenance; bitrate and cost per megabit
+require remeasurement with this window calculation before reuse as validated budgets.
+
 ## 1. The live cost and its shape
 
 | Source | Streams | Mbit/s | CPU % of one core (user / system) | % per Mbit/s | Wake-ups/s |
@@ -32,6 +42,13 @@ Paced per-packet delivery reproduces the live cost per megabit (0.167 against 0.
 the harness setting for cost measurements. The wake-up column is lower than live because
 the replay's packets for all sessions leave one process in lock step and the loopback
 device coalesces them; the per-megabit cost, not the wake-up count, is the figure to compare.
+
+Replay admission fails closed before this delivery path: mounts must be CRC-clean through
+exact EOF with complete access units, an initial sync sample, compatible `hvcC`, and a checked
+nonoverlapping timeline; MTU is limited to 256–65,535 and packetization streams one packet at a
+time. RTSP binds a session to one mount and its negotiated channels, and samples each RTCP
+wall/RTP clock pair at one instant. These guards leave the valid-media packet order, per-packet
+writes, pacing, and the deliberate post-stall catch-up burst used by the measurements unchanged.
 
 ## 3. Timer-driven reads (`ingest.read_interval_ms`)
 

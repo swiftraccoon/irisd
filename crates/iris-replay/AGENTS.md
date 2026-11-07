@@ -9,11 +9,20 @@ Scope: this crate only. Read the root `AGENTS.md` first.
   `docs/research/12-ingest-cost.md §2` records why; a change that alters delivery re-runs
   the fidelity comparison there.
 - RFC 7798 layout is pinned by the `rtp` tests (header bits, start and end flags, marker on
-  the last packet of an access unit).
+  the last packet of an access unit). MTU admission is `256..=65535`; packetization and
+  interleaving are fallible and packetization stays streaming.
 - The server is a test instrument, not a product: no authentication, TCP only, bounded to
   what the recorder's client needs.
 - Synthetic recordings are real irisd files (scanner and CRC clean); `synth` must track the
-  format in `iris-mp4`.
+  format in `iris-mp4`. Its public builders are fallible and enforce their documented GOP,
+  frame, payload, NAL, duration, and clock bounds before allocating the recording.
+- Normal mounts fail closed unless CRC-clean through exact EOF with complete nonempty access
+  units, an initial sync sample, a representable nonoverlapping timeline, and a compatible
+  version-1/four-byte-length `hvcC` carrying VPS, SPS, and PPS.
+- The RTSP surface is one DESCRIBE/SETUP/PLAY lifecycle bound to one mount, negotiated TCP
+  channels, and the issued Session. `PAUSE` and replaying a started/finished session stay
+  unsupported; `TEARDOWN` must preserve preceding control responses, discard stale queued media,
+  and acknowledge its terminal response only after the socket write completes.
 
 ## Where things are
 
@@ -42,6 +51,8 @@ and `--pace` modes and compared with the live figures in `docs/research/12-inges
 ## Pitfalls
 
 - `--stall-after` resumes with a burst on purpose; do not "fix" it by shifting the clock.
+- Sender reports still sample their wall/RTP clock pair at one instant across that stall;
+  do not derive the SR RTP field from the delayed media frame.
 - Over loopback a whole frame written at once arrives as one segment; per-packet writes are
   what make the harness representative.
 - The RTSP parser must skip interleaved frames from the client (RTCP receiver reports) or a

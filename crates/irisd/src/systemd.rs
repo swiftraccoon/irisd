@@ -36,11 +36,36 @@ pub fn extend_timeout(by: Duration) {
 /// Returns how often the daemon should ping the watchdog: half of
 /// `WatchdogSec`, or `None` when no watchdog is configured.
 pub fn watchdog_interval() -> Option<Duration> {
-    sd_notify::watchdog_enabled().map(|timeout| timeout / 2)
+    watchdog_interval_from_timeout(sd_notify::watchdog_enabled())
+}
+
+fn watchdog_interval_from_timeout(timeout: Option<Duration>) -> Option<Duration> {
+    timeout
+        .map(|duration| duration / 2)
+        .filter(|duration| !duration.is_zero())
 }
 
 fn send(state: &[NotifyState<'_>]) {
     if let Err(err) = sd_notify::notify(state) {
         debug!(%err, "sd_notify failed");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn zero_or_derived_zero_watchdogs_are_disabled() {
+        assert_eq!(watchdog_interval_from_timeout(None), None);
+        assert_eq!(watchdog_interval_from_timeout(Some(Duration::ZERO)), None);
+        assert_eq!(
+            watchdog_interval_from_timeout(Some(Duration::from_nanos(1))),
+            None
+        );
+        assert_eq!(
+            watchdog_interval_from_timeout(Some(Duration::from_nanos(2))),
+            Some(Duration::from_nanos(1))
+        );
     }
 }
