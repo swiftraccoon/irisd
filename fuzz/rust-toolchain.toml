@@ -1,0 +1,5 @@
+# cargo-fuzz instruments the targets with nightly-only compiler flags. CI builds the targets with
+# this toolchain; `cargo +nightly fuzz` overrides it with the floating nightly.
+[toolchain]
+channel = "nightly-2026-10-27"
+profile = "minimal"

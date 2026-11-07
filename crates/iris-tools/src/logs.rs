@@ -2,6 +2,71 @@
 //! timestamp and level split off, and `key=value` pairs read.
 
 use std::collections::BTreeMap;
+use std::io::{BufRead, Read as _};
+
+/// Longest input line the report tools accept; the daemon's lines are far shorter.
+pub const MAX_LINE_BYTES: usize = 1 << 20;
+
+/// One line from a [`LineReader`].
+#[derive(Debug, PartialEq, Eq)]
+pub struct InputLine<'a> {
+    /// The 1-based line number.
+    pub number: usize,
+    /// The line without its `\n` or `\r\n` terminator.
+    pub bytes: &'a [u8],
+    /// Whether a newline ended the line; only a final line can lack one.
+    pub terminated: bool,
+}
+
+/// Reads input one line at a time into one reused buffer, so a report holds
+/// only what it keeps from each line rather than the whole file.
+pub struct LineReader<R> {
+    reader: R,
+    buffer: Vec<u8>,
+    number: usize,
+}
+
+impl<R: BufRead> LineReader<R> {
+    /// Reads lines from `reader`.
+    pub fn new(reader: R) -> Self {
+        Self {
+            reader,
+            buffer: Vec::new(),
+            number: 0,
+        }
+    }
+
+    /// The next line, `None` at the end of the input. A line longer than
+    /// [`MAX_LINE_BYTES`] is an `InvalidData` error.
+    pub fn next_line(&mut self) -> std::io::Result<Option<InputLine<'_>>> {
+        self.buffer.clear();
+        let limit = MAX_LINE_BYTES as u64 + 1;
+        let read = (&mut self.reader)
+            .take(limit)
+            .read_until(b'\n', &mut self.buffer)?;
+        if read == 0 {
+            return Ok(None);
+        }
+        self.number += 1;
+        let terminated = self.buffer.last() == Some(&b'\n');
+        if terminated {
+            self.buffer.pop();
+            if self.buffer.last() == Some(&b'\r') {
+                self.buffer.pop();
+            }
+        } else if read > MAX_LINE_BYTES {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("line {} exceeds {MAX_LINE_BYTES} bytes", self.number),
+            ));
+        }
+        Ok(Some(InputLine {
+            number: self.number,
+            bytes: &self.buffer,
+            terminated,
+        }))
+    }
+}
 
 /// Removes complete ECMA-48 escape strings and makes the remaining text safe
 /// to print to a terminal.  In particular, an unterminated control string can
@@ -217,6 +282,48 @@ pub fn rates(rows: &[(f64, BTreeMap<String, String>)]) -> Vec<f64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn line_reader_matches_str_lines_and_bounds_each_line() {
+        let text = "a\nb\r\n\nc\r";
+        let mut reader = LineReader::new(text.as_bytes());
+        let mut lines = Vec::new();
+        while let Some(line) = reader.next_line().unwrap() {
+            lines.push((
+                line.number,
+                String::from_utf8(line.bytes.to_vec()).unwrap(),
+                line.terminated,
+            ));
+        }
+        assert_eq!(
+            lines,
+            [
+                (1, "a".to_owned(), true),
+                (2, "b".to_owned(), true),
+                (3, String::new(), true),
+                (4, "c\r".to_owned(), false)
+            ]
+        );
+        assert_eq!(
+            lines
+                .iter()
+                .map(|(_, text, _)| text.as_str())
+                .collect::<Vec<_>>(),
+            text.lines().collect::<Vec<_>>()
+        );
+
+        let mut exact = vec![b'x'; MAX_LINE_BYTES];
+        exact.push(b'\n');
+        exact.resize(exact.len() + MAX_LINE_BYTES + 1, b'y');
+        let mut reader = LineReader::new(exact.as_slice());
+        assert_eq!(
+            reader.next_line().unwrap().unwrap().bytes.len(),
+            MAX_LINE_BYTES
+        );
+        let error = reader.next_line().unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("line 2"), "{error}");
+    }
 
     #[test]
     fn splits_lines_and_reads_pairs() {

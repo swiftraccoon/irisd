@@ -19,6 +19,14 @@ Scope: this crate only. Read the root `AGENTS.md` first.
   aligned with `05-ingest-events.md §1–2` and the provenance note in `third_party/README.md`.
 - Session policy (TCP interleaved, 15 s setup timeout, 30 s inactivity, `TEARDOWN` always,
   10 s jump limit, backoff) implements `05-ingest-events.md §1`.
+- Nothing a camera controls may block the runtime thread or reach another host. The patched
+  Retina never blocks on a detached write, bounds camera-supplied fields, sends a fresh
+  `TEARDOWN` only to the session's own peer address, stops a background `TEARDOWN` after
+  min(session timeout, 60 s), and runs at most 64 of them per process. These are local
+  contracts listed in `third_party/README.md`; keep `05 §1` in step with them.
+- Camera-supplied text reaches a log line only through `LogSafe` (escaped, at most 512
+  characters) or as one of Retina's bounded excerpts; never log a `retina::Error`, an SDP,
+  or a header value with `%` or `?` directly. `StreamSource`'s `Debug` stays redacting.
 - The read policy (noop-waker drain, the shared `ReadTicker`, the socket detached from
   the reactor after `PLAY`) and the low-water mark are measured decisions in
   `12-ingest-cost.md §3–4, §6`; a change needs measurements from
@@ -52,7 +60,11 @@ Scope: this crate only. Read the root `AGENTS.md` first.
 - `tests/replay.rs`, `tests/data/` — the recorded-timeline regression test.
 - `tests/replay_server.rs` — end-to-end recording from `iris-replay` in both read modes.
 - `tests/adversarial_rtsp.rs` — bounded loopback regressions for terminal flushes, wall
-  placement, network allocation limits, and sink-loss continuity in both read modes.
+  placement, network allocation limits, and sink-loss continuity in both read modes, and
+  hostile cameras that stop reading or advertise another host.
+- `tests/log_bounds.rs` — the daemon's log subscriber against hostile `DESCRIBE` answers;
+  `tests/teardown_bound.rs` — the process-wide bound on background `TEARDOWN`s. Each owns
+  process-wide state, so each is a test binary of its own.
 
 ## How to verify a change
 
@@ -77,8 +89,13 @@ recording from `iris-replay` on a loopback port. Never point a test at a live ca
   epoch loses the single shared wake-up. A timer per stream, even at the same instant,
   costs one runtime unpark per stream per tick: use the ticker.
 - A detached socket (`PlayOptions::detach_from_reactor`) must only be polled by the
-  timer loop: an ordinary `.await` on the demuxer would never be woken. The packet-driven
-  mode never detaches.
+  timer loop: an ordinary `.await` on the demuxer would never be woken, neither for a read
+  nor for the rest of a keepalive the camera has not yet accepted. The packet-driven mode
+  never detaches.
+- The hostile-camera tests run their cameras on OS threads with blocking sockets so they
+  keep going if the runtime under test blocks; a camera closes its stalled connection after
+  a fixed hold, which also releases a blocked writer, so a regression fails instead of
+  hanging. Keep that shape for any test whose peer stops reading.
 - The inactivity timeout in timer mode is measured from the last item, not from the last
   readiness; keep `last_item` updated for every item kind, RTCP included.
 - Hold accounting is a delta against the assembler's totals (`holds_seen`); reading the

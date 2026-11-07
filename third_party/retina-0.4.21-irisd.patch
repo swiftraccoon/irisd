@@ -46,7 +46,23 @@
 diff -ruN src/client/mod.rs src/client/mod.rs
 --- src/client/mod.rs
 +++ src/client/mod.rs
-@@ -700,9 +700,24 @@
+@@ -27,13 +27,14 @@
+ 
+ use crate::client::parse::SessionHeader;
+ use crate::codec::CodecItem;
++use crate::mostly_ascii::Excerpt;
+ use crate::{
+     Error, ErrorInt, RtspMessageContext, StreamContext, StreamContextInner, TcpStreamContext,
+     UdpStreamContext,
+ };
+ 
+ mod channel_mapping;
+-mod parse;
++pub(crate) mod parse;
+ 
+ /// Internal API, public for a benchmark only.
+ #[doc(hidden)]
+@@ -700,9 +701,24 @@
      initial_seq: InitialSequenceNumberPolicy,
      enforce_timestamps_with_max_jump_secs: Option<NonZeroU32>,
      unknown_rtcp_ssrc: UnknownRtcpSsrcPolicy,
@@ -71,7 +87,7 @@ diff -ruN src/client/mod.rs src/client/mod.rs
      /// Sets the policy for handling the `rtptime` parameter normally seem in the `RTP-Info` header.
      pub fn initial_timestamp(self, initial_timestamp: InitialTimestampPolicy) -> Self {
          Self {
-@@ -753,6 +768,18 @@
+@@ -753,6 +769,18 @@
              ..self
          }
      }
@@ -90,7 +106,129 @@ diff -ruN src/client/mod.rs src/client/mod.rs
  }
  
  #[derive(Debug)]
-@@ -1931,6 +1958,18 @@
+@@ -783,9 +811,10 @@
+     }
+ }
+ 
++/// Writes the server-supplied value quoted, escaped, and cut at 512 bytes.
+ impl std::fmt::Debug for Tool {
+     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+-        std::fmt::Debug::fmt(&*self.0, f)
++        write!(f, "\"{}\"", Excerpt::of(&self.0))
+     }
+ }
+ 
+@@ -997,12 +1026,23 @@
+ }
+ 
+ /// Username and password authentication credentials.
+-#[derive(Clone, Debug, Eq, PartialEq)]
++///
++/// The `Debug` output redacts both fields.
++#[derive(Clone, Eq, PartialEq)]
+ pub struct Credentials {
+     pub username: String,
+     pub password: String,
+ }
+ 
++impl Debug for Credentials {
++    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        f.debug_struct("Credentials")
++            .field("username", &"<redacted>")
++            .field("password", &"<redacted>")
++            .finish()
++    }
++}
++
+ /// Marker trait for the state of a [Session].
+ /// This doesn't closely match [RFC 2326
+ /// A.1](https://tools.ietf.org/html/rfc2326#appendix-A.1). In practice, we've
+@@ -1108,6 +1148,11 @@
+     /// exception is during drop.
+     conn: Option<RtspConnection>,
+ 
++    /// The address the session's connection reached. A `TEARDOWN` on a fresh
++    /// connection goes here, never to a host the server advertised, so
++    /// credentials are only ever sent to the server the caller chose.
++    peer_addr: SocketAddr,
++
+     options: SessionOptions,
+     requested_auth: Option<http_auth::PasswordClient>,
+     presentation: Presentation,
+@@ -1160,6 +1205,10 @@
+     /// Set if an `OPTIONS` request has completed and advertised supported for
+     /// `GET_PARAMETER`.
+     GetParameterSupported = 0x10,
++
++    /// Set once a request received in state `Playing` has been logged; later
++    /// ones are logged at trace level only.
++    PlayingRequestLogged = 0x20,
+ }
+ 
+ impl RtspConnection {
+@@ -1170,12 +1219,26 @@
+         let inner = crate::tokio::Connection::connect(host, port)
+             .await
+             .map_err(|e| wrap!(ErrorInt::ConnectError(e)))?;
+-        Ok(Self {
++        Ok(Self::new(inner))
++    }
++
++    /// Connects to `peer` itself, with no name lookup.
++    async fn connect_peer(peer: SocketAddr) -> Result<Self, Error> {
++        let stream = tokio::net::TcpStream::connect(peer)
++            .await
++            .map_err(|e| wrap!(ErrorInt::ConnectError(e)))?;
++        let inner = crate::tokio::Connection::from_stream(stream)
++            .map_err(|e| wrap!(ErrorInt::ConnectError(e)))?;
++        Ok(Self::new(inner))
++    }
++
++    fn new(inner: crate::tokio::Connection) -> Self {
++        Self {
+             inner,
+             channels: ChannelMappings::default(),
+             next_cseq: 1,
+             seen_unassigned: false,
+-        })
++        }
+     }
+ 
+     fn validate_url(url: &Url) -> Result<url::Host<&str>, String> {
+@@ -1301,6 +1364,20 @@
+                     })
+                 }
+                 let www_authenticate: &str = www_authenticate;
++                if www_authenticate.len() > parse::MAX_WWW_AUTHENTICATE_BYTES {
++                    bail!(ErrorInt::RtspResponseError {
++                        conn_ctx: *self.inner.ctx(),
++                        msg_ctx,
++                        method: req.method().clone(),
++                        cseq,
++                        status: resp.status_code,
++                        description: format!(
++                            "WWW-Authenticate of {} bytes exceeds the {}-byte limit",
++                            www_authenticate.len(),
++                            parse::MAX_WWW_AUTHENTICATE_BYTES
++                        ),
++                    })
++                }
+                 *requested_auth = match http_auth::PasswordClient::try_from(www_authenticate) {
+                     Ok(c) => Some(c),
+                     Err(e) => bail!(ErrorInt::RtspResponseError {
+@@ -1502,9 +1579,11 @@
+             })?;
+         let describe_status = response.status_code;
+         let sdp = resp_body;
++        let peer_addr = conn.inner.ctx().peer_addr;
+         Ok(Session(
+             Box::pin(SessionInner {
+                 conn: Some(conn),
++                peer_addr,
+                 options,
+                 requested_auth,
+                 presentation,
+@@ -1931,6 +2010,18 @@
              };
          }
          *inner.keepalive_timer = Some(Box::pin(tokio::time::sleep(keepalive_interval(session))));
@@ -109,6 +247,342 @@ diff -ruN src/client/mod.rs src/client/mod.rs
          Ok(Session(self.0, Playing(())))
      }
  }
+@@ -2603,10 +2694,23 @@
+                         continue;
+                     }
+                     msg::Message::Request(request) => {
+-                        warn!(
+-                            "Received RTSP request in Playing state. Responding unimplemented.\n{:#?}",
+-                            request
+-                        );
++                        // Server-chosen text, logged once per session and bounded.
++                        let method = Excerpt::of(&request.method);
++                        if self.0.flags & (SessionFlag::PlayingRequestLogged as u8) == 0 {
++                            self.0.flags |= SessionFlag::PlayingRequestLogged as u8;
++                            warn!(
++                                "Ignoring a {method} request received in Playing state \
++                                 ({} headers, {}-byte body); later requests on this session \
++                                 are logged at trace level",
++                                request.headers.iter().count(),
++                                msg.body_len,
++                            );
++                        } else {
++                            trace!("Ignoring a {method} request received in Playing state");
++                        }
++                        // As after any other message: what follows may
++                        // already be buffered, with no wake-up to come.
++                        continue;
+                     }
+                 },
+                 Poll::Ready(Some(Err(e))) => {
+@@ -2683,9 +2787,19 @@
+             None => return,
+         };
+ 
+-        // For now, assume the whole timeout is left.
++        let Some(slot) = teardown::Slot::acquire() else {
++            warn!(
++                "Not tearing down a dropped session: {MAX_BACKGROUND_TEARDOWNS} background \
++                 TEARDOWNs are already running"
++            );
++            return;
++        };
++
++        // Assume the whole timeout is left. The server chooses the timeout, up
++        // to about 136 years, so retries end at `MAX_LIFETIME`.
+         let expires = tokio::time::Instant::now()
+-            + std::time::Duration::from_secs(session.timeout_sec.into());
++            + std::time::Duration::from_secs(session.timeout_sec.into())
++                .min(teardown::MAX_LIFETIME);
+ 
+         // Track the session, if there is a group.
+         let (teardown_tx, teardown_rx) = tokio::sync::watch::channel(None);
+@@ -2711,9 +2825,10 @@
+             None
+         };
+ 
+-        tokio::spawn(teardown::background_teardown(
++        let teardown = teardown::background_teardown(
+             seqnum,
+             this.presentation.base_url.clone(),
++            *this.peer_addr,
+             this.presentation.tool.take(),
+             session.id,
+             just_try_once,
+@@ -2722,10 +2837,31 @@
+             this.conn.take(),
+             teardown_tx,
+             expires,
+-        ));
++        );
++        tokio::spawn(async move {
++            // Held until the task ends or is dropped with its runtime.
++            let _slot = slot;
++            teardown.await;
++        });
+     }
+ }
+ 
++/// The most background `TEARDOWN` tasks that run at once in a process.
++///
++/// A dropped [`Session`] whose [`TeardownPolicy`] asks for a `TEARDOWN` gets
++/// a background task, which lives until the `TEARDOWN` succeeds or the
++/// session expires (at most a minute). Beyond this many tasks, a dropped
++/// session is not torn down and a warning is logged instead, so a server
++/// that never answers cannot make sessions accumulate tasks, sockets, and
++/// memory without bound.
++pub const MAX_BACKGROUND_TEARDOWNS: usize = 64;
++
++/// Returns how many background `TEARDOWN` tasks are running in this process,
++/// at most [`MAX_BACKGROUND_TEARDOWNS`].
++pub fn background_teardowns() -> usize {
++    teardown::Slot::in_use()
++}
++
+ impl futures::Stream for Session<Playing> {
+     type Item = Result<PacketItem, Error>;
+ 
+@@ -3662,4 +3798,240 @@
+             Some(crate::rtcp::TypedPacketRef::ReceiverReport(_))
+         ));
+     }
++
++    #[test]
++    fn credentials_debug_redacts_both_fields() {
++        let creds = Credentials {
++            username: "distinctive-user".to_owned(),
++            password: "distinctive-password".to_owned(),
++        };
++        for rendered in [format!("{creds:?}"), format!("{creds:#?}")] {
++            assert!(rendered.contains("<redacted>"), "{rendered}");
++            assert!(!rendered.contains("distinctive-user"), "{rendered}");
++            assert!(!rendered.contains("distinctive-password"), "{rendered}");
++        }
++    }
++
++    #[test]
++    fn tool_debug_is_a_bounded_excerpt() {
++        let tool = Tool::new(&format!("LIVE555\n{}", "v".repeat(4096)));
++        let rendered = format!("{tool:?}");
++        assert!(rendered.starts_with("\"LIVE555\\nvvv"), "{rendered:.40}");
++        assert!(rendered.len() < 600, "{} bytes", rendered.len());
++    }
++
++    /// A server may announce any session timeout; the background `TEARDOWN`
++    /// gives up after a minute all the same.
++    #[tokio::test(start_paused = true)]
++    async fn teardown_lifetime_is_at_most_a_minute() {
++        let (conn, mut server) = connect_to_mock().await;
++        let url = Url::parse("rtsp://127.0.0.1:554/cam").unwrap();
++        let group = Arc::new(SessionGroup::default());
++        let (session, _) = tokio::join!(
++            Session::describe_with_conn(
++                conn,
++                SessionOptions::default()
++                    .session_group(group.clone())
++                    .teardown(TeardownPolicy::Always),
++                url
++            ),
++            req_response(
++                &mut server,
++                msg::Method::DESCRIBE,
++                response(include_bytes!("testdata/reolink_describe.txt"))
++            ),
++        );
++        let mut session = session.unwrap();
++        tokio::join!(
++            async {
++                session.setup(0, SetupOptions::default()).await.unwrap();
++            },
++            req_response(
++                &mut server,
++                msg::Method::SETUP,
++                response(
++                    b"RTSP/1.0 200 OK\r\nCSeq: 2\r\nSession: clamp;timeout=4294967295\r\n\
++                      Transport: RTP/AVP/TCP;unicast;interleaved=0-1\r\n\r\n"
++                )
++            ),
++        );
++        let (session, _) = tokio::join!(
++            session.play(PlayOptions::default()),
++            req_response(
++                &mut server,
++                msg::Method::PLAY,
++                response(include_bytes!("testdata/reolink_play.txt"))
++            ),
++        );
++        let session = session.unwrap();
++        let dropped = tokio::time::Instant::now();
++        drop(session);
++        server.close().await.unwrap();
++
++        let stale = group.stale_sessions();
++        assert_eq!(stale.num_sessions, 1);
++        assert_eq!(
++            stale.max_expires,
++            Some(dropped + std::time::Duration::from_secs(60))
++        );
++        tokio::time::timeout(
++            std::time::Duration::from_secs(120),
++            group.await_stale_sessions(&stale),
++        )
++        .await
++        .expect("the TEARDOWN gives up at its one-minute limit");
++        assert_eq!(group.stale_sessions().num_sessions, 0);
++    }
++
++    /// A server's requests in state `Playing` are ignored; the first is logged
++    /// once, without its content, and the stream goes on.
++    #[test]
++    fn requests_in_playing_state_are_logged_once() {
++        let runtime = tokio::runtime::Builder::new_current_thread()
++            .enable_all()
++            .build()
++            .unwrap();
++        let ((), records) = crate::testutil::capture_logs(|| {
++            runtime.block_on(async {
++                let (conn, mut server) = connect_to_mock().await;
++                let url = Url::parse("rtsp://127.0.0.1:554/cam").unwrap();
++                let (session, _) = tokio::join!(
++                    Session::describe_with_conn(
++                        conn,
++                        SessionOptions::default().teardown(TeardownPolicy::Never),
++                        url
++                    ),
++                    req_response(
++                        &mut server,
++                        msg::Method::DESCRIBE,
++                        response(include_bytes!("testdata/reolink_describe.txt"))
++                    ),
++                );
++                let mut session = session.unwrap();
++                tokio::join!(
++                    async {
++                        session.setup(0, SetupOptions::default()).await.unwrap();
++                    },
++                    req_response(
++                        &mut server,
++                        msg::Method::SETUP,
++                        response(include_bytes!("testdata/reolink_setup.txt"))
++                    ),
++                );
++                let (session, _) = tokio::join!(
++                    session.play(PlayOptions::default()),
++                    req_response(
++                        &mut server,
++                        msg::Method::PLAY,
++                        response(include_bytes!("testdata/reolink_play.txt"))
++                    ),
++                );
++                let session = session.unwrap();
++                tokio::pin!(session);
++                session.0.keepalive_timer = None;
++                tokio::join!(
++                    async {
++                        let item = tokio::time::timeout(
++                            std::time::Duration::from_secs(10),
++                            session.next(),
++                        )
++                        .await
++                        .expect("the packet after the requests");
++                        match item {
++                            Some(Ok(PacketItem::Rtp(p))) => assert_eq!(p.payload(), b"hello world"),
++                            o => panic!("unexpected item: {o:#?}"),
++                        }
++                    },
++                    async {
++                        for _ in 0..3 {
++                            server
++                                .send(OwnedMessage::Request {
++                                    head: msg::Request {
++                                        method: msg::Method::SET_PARAMETER,
++                                        request_uri: None,
++                                        headers: [(
++                                            msg::HeaderName::try_from("X-Marker").unwrap(),
++                                            msg::HeaderValue::try_from("distinctive-marker")
++                                                .unwrap(),
++                                        )]
++                                        .into(),
++                                    },
++                                    body: Bytes::new(),
++                                })
++                                .await
++                                .unwrap();
++                        }
++                        let pkt = b"\x80\x60\x41\xd4\x00\x00\x00\x00\xdc\xc4\xa0\xd8hello world";
++                        server
++                            .send(OwnedMessage::Data {
++                                channel_id: 0,
++                                body: Bytes::from_static(pkt),
++                            })
++                            .await
++                            .unwrap();
++                    },
++                );
++            })
++        });
++        let playing: Vec<_> = records
++            .iter()
++            .filter(|(_, message)| message.contains("in Playing state"))
++            .collect();
++        assert_eq!(playing.len(), 3, "{records:?}");
++        let warned = playing
++            .iter()
++            .filter(|(level, _)| *level == log::Level::Warn)
++            .count();
++        assert_eq!(warned, 1, "{playing:?}");
++        for (_, message) in playing {
++            assert!(!message.contains("distinctive-marker"), "{message}");
++            assert!(!message.contains('\n'), "{message}");
++        }
++    }
++
++    #[tokio::test]
++    async fn oversized_www_authenticate_fails_the_request() {
++        let (conn, mut server) = connect_to_mock().await;
++        let url = Url::parse("rtsp://127.0.0.1:554/cam").unwrap();
++        let realm = "r".repeat(parse::MAX_WWW_AUTHENTICATE_BYTES);
++        let creds = Credentials {
++            username: "user".to_owned(),
++            password: "secret".to_owned(),
++        };
++        let (session, _) = tokio::join!(
++            Session::describe_with_conn(conn, SessionOptions::default().creds(Some(creds)), url),
++            async {
++                let msg = server.next().await.unwrap().unwrap();
++                let msg::Message::Request(request) = msg.msg else {
++                    panic!("expected DESCRIBE");
++                };
++                let cseq = request.headers.get("CSeq").unwrap().to_string();
++                let challenge = format!("Digest realm=\"{realm}\", nonce=\"n\"");
++                server
++                    .send(OwnedMessage::Response {
++                        head: msg::Response {
++                            status_code: StatusCode::UNAUTHORIZED,
++                            reason_phrase: "Unauthorized".to_owned(),
++                            headers: [
++                                (
++                                    msg::HeaderName::CSEQ,
++                                    msg::HeaderValue::try_from(cseq).unwrap(),
++                                ),
++                                (
++                                    msg::HeaderName::WWW_AUTHENTICATE,
++                                    msg::HeaderValue::try_from(challenge).unwrap(),
++                                ),
++                            ]
++                            .into(),
++                        },
++                        body: Bytes::new(),
++                    })
++                    .await
++                    .unwrap();
++            },
++        );
++        let error = session.err().expect("an oversized challenge").to_string();
++        assert!(error.contains("WWW-Authenticate of "), "{error}");
++        assert!(error.contains("exceeds the 4096-byte limit"), "{error}");
++    }
+ }
 diff -ruN src/tokio.rs src/tokio.rs
 --- src/tokio.rs
 +++ src/tokio.rs
@@ -121,10 +595,10 @@ diff -ruN src/tokio.rs src/tokio.rs
 +enum Io {
 +    /// A tokio stream: reads and writes wake through `epoll`.
 +    Reactor(TcpStream),
-+    /// A plain non-blocking socket. Reads that would block return `Pending`
-+    /// without registering a waker, so the caller must poll again on its own
-+    /// timer; writes block briefly (RTSP messages are small). Nothing wakes
-+    /// `epoll` for this socket any more.
++    /// A plain non-blocking socket. Reads and writes that would block return
++    /// `Pending` without registering a waker, so the caller must poll again on
++    /// its own timer; a write keeps its unsent remainder for that next poll.
++    /// Nothing wakes `epoll` for this socket any more, and nothing blocks.
 +    Detached(std::net::TcpStream),
 +    /// Transient state while detaching; never observed by callers.
 +    Detaching,
@@ -149,7 +623,7 @@ diff -ruN src/tokio.rs src/tokio.rs
      ctx: ConnectionContext,
      parser: crate::rtsp::parse::Parser,
      read_buf: MarkBuf,
-@@ -46,7 +73,8 @@
+@@ -46,13 +73,16 @@
          let local_addr = stream.local_addr()?;
          let peer_addr = stream.peer_addr()?;
          Ok(Self {
@@ -159,7 +633,16 @@ diff -ruN src/tokio.rs src/tokio.rs
              ctx: ConnectionContext {
                  local_addr,
                  peer_addr,
-@@ -62,6 +90,52 @@
+                 established_wall,
+             },
+-            parser: crate::rtsp::parse::Parser::default(),
++            parser: crate::rtsp::parse::Parser::builder()
++                .max_message_size(crate::rtsp::parse::MAX_CONTROL_MESSAGE_BYTES)
++                .build(),
+             read_buf: MarkBuf::new(DEFAULT_READ_CAPACITY),
+             write_buf: Vec::new(),
+         })
+@@ -62,6 +92,71 @@
          &self.ctx
      }
  
@@ -169,7 +652,8 @@ diff -ruN src/tokio.rs src/tokio.rs
 +    /// packet. Only meaningful once data flows continuously (after `PLAY`);
 +    /// set earlier, small RTSP responses would never trigger readiness.
 +    pub(crate) fn set_recv_low_water(&self, bytes: u32) -> std::io::Result<()> {
-+        let value = libc::c_int::try_from(bytes).map_err(|_| std::io::Error::other("value too large"))?;
++        let value =
++            libc::c_int::try_from(bytes).map_err(|_| std::io::Error::other("value too large"))?;
 +        // SAFETY: `fd` is a valid, open socket owned by `self.stream` for the
 +        // duration of the call, and `value` outlives the call.
 +        let rc = unsafe {
@@ -188,10 +672,10 @@ diff -ruN src/tokio.rs src/tokio.rs
 +        }
 +    }
 +
-+    /// Takes the socket out of tokio's reactor. From then on reads that would
-+    /// block return `Pending` without a waker and never wake `epoll`; the
-+    /// caller polls the connection on its own timer. Writes block briefly.
-+    /// Idempotent.
++    /// Takes the socket out of tokio's reactor. From then on reads and writes
++    /// that would block return `Pending` without a waker and never wake
++    /// `epoll`; the caller polls the connection on its own timer, and a flush
++    /// continues from its unsent remainder on each poll. Idempotent.
 +    pub(crate) fn detach_from_reactor(&mut self) -> std::io::Result<()> {
 +        if let Io::Reactor(_) = self.stream {
 +            let Io::Reactor(reactor) = std::mem::replace(&mut self.stream, Io::Detaching) else {
@@ -209,10 +693,28 @@ diff -ruN src/tokio.rs src/tokio.rs
 +        Ok(())
 +    }
 +
++    /// Undoes the playing-state socket policy for a request whose caller
++    /// awaits it, such as a `TEARDOWN`: resets the receive low-water mark to
++    /// one byte and returns a detached socket to tokio's reactor, so the
++    /// request's writes and its short response wake the calling task. Must
++    /// be called within a tokio runtime. Idempotent.
++    pub(crate) fn return_to_reactor(&mut self) -> std::io::Result<()> {
++        self.set_recv_low_water(1)?;
++        if let Io::Detached(_) = self.stream {
++            let Io::Detached(std_stream) = std::mem::replace(&mut self.stream, Io::Detaching)
++            else {
++                unreachable!("checked above");
++            };
++            self.stream = Io::Reactor(TcpStream::from_std(std_stream)?);
++            self.drained = false;
++        }
++        Ok(())
++    }
++
      pub(crate) fn read_buf(&self) -> &MarkBuf {
          &self.read_buf
      }
-@@ -177,6 +251,15 @@
+@@ -177,6 +272,15 @@
              // Try decoding from existing buffered data.
              match try_decode(&mut this.parser, &mut this.read_buf, false) {
                  Ok(Some(msg)) => return std::task::Poll::Ready(Some(Ok(msg))),
@@ -228,7 +730,7 @@ diff -ruN src/tokio.rs src/tokio.rs
                  Ok(None) => {}
                  Err(e) => {
                      return std::task::Poll::Ready(Some(Err(codec_err_to_error(
-@@ -190,28 +273,39 @@
+@@ -190,28 +294,55 @@
  
              // Need more data. Read from the stream into the ring buffer
              // using vectored I/O to fill both halves of the ring.
@@ -264,10 +766,29 @@ diff -ruN src/tokio.rs src/tokio.rs
                  }
 -                std::task::Poll::Pending => return std::task::Poll::Pending,
              }
-             let (first, second) = this.read_buf.spare_capacity(4096);
+-            let (first, second) = this.read_buf.spare_capacity(4096);
++            let buffered = this.read_buf.unparsed_len();
++            let remaining = this.parser.max_buffered_bytes().saturating_sub(buffered);
++            if remaining == 0 {
++                let error = CodecError::ParseError {
++                    description: "RTSP control message exceeds 1 MiB".to_owned(),
++                    pos: this.parser.stream_pos() + buffered as u64,
++                };
++                return std::task::Poll::Ready(Some(Err(codec_err_to_error(
++                    &this.ctx,
++                    &this.parser,
++                    &this.read_buf,
++                    error,
++                ))));
++            }
++            let (first, second) = this.read_buf.spare_capacity(remaining.min(4096));
++            let first_len = first.len().min(remaining);
++            let second_len = second.len().min(remaining - first_len);
              let mut bufs = [
-                 std::io::IoSliceMut::new(first),
-                 std::io::IoSliceMut::new(second),
+-                std::io::IoSliceMut::new(first),
+-                std::io::IoSliceMut::new(second),
++                std::io::IoSliceMut::new(&mut first[..first_len]),
++                std::io::IoSliceMut::new(&mut second[..second_len]),
              ];
 -            match this.stream.try_read_vectored(&mut bufs) {
 +            let offered = bufs[0].len() + bufs[1].len();
@@ -283,7 +804,7 @@ diff -ruN src/tokio.rs src/tokio.rs
                  Ok(0) => {
                      // EOF. Try decode with eof=true.
                      return match try_decode(&mut this.parser, &mut this.read_buf, true) {
-@@ -227,11 +321,16 @@
+@@ -227,11 +358,16 @@
                  }
                  Ok(n) => {
                      this.read_buf.advance_end(n);
@@ -302,21 +823,54 @@ diff -ruN src/tokio.rs src/tokio.rs
                  }
                  Err(error) => {
                      let pos = this.parser.stream_pos() + this.read_buf.unparsed_len() as u64;
-@@ -304,7 +403,12 @@
+@@ -283,9 +419,15 @@
+ 
+     fn poll_ready(
+         self: std::pin::Pin<&mut Self>,
+-        _cx: &mut std::task::Context<'_>,
++        cx: &mut std::task::Context<'_>,
+     ) -> std::task::Poll<Result<(), Self::Error>> {
+-        std::task::Poll::Ready(Ok(()))
++        // `start_send` replaces the buffer, so first finish the previous
++        // message: a `TEARDOWN` must not follow half a keepalive.
++        if self.write_buf.is_empty() {
++            std::task::Poll::Ready(Ok(()))
++        } else {
++            self.poll_flush(cx)
++        }
+     }
+ 
+     fn start_send(
+@@ -304,7 +446,27 @@
      ) -> std::task::Poll<Result<(), Self::Error>> {
          let this = &mut *self;
          while !this.write_buf.is_empty() {
 -            match std::pin::Pin::new(&mut this.stream).poll_write(cx, &this.write_buf) {
 +            let written = match &mut this.stream {
 +                Io::Reactor(stream) => std::pin::Pin::new(stream).poll_write(cx, &this.write_buf),
-+                Io::Detached(stream) => std::task::Poll::Ready(blocking_write(stream, &this.write_buf)),
-+                Io::Detaching => std::task::Poll::Ready(Err(std::io::Error::other("connection is detaching"))),
++                Io::Detached(stream) => {
++                    use std::io::Write as _;
++                    // Never block: a peer that stops reading must not stall
++                    // the caller's thread. The unsent remainder stays in
++                    // `write_buf` for the caller's next poll on its timer.
++                    match stream.write(&this.write_buf) {
++                        Ok(0) => std::task::Poll::Ready(Err(std::io::ErrorKind::WriteZero.into())),
++                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
++                            std::task::Poll::Pending
++                        }
++                        Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
++                        written => std::task::Poll::Ready(written),
++                    }
++                }
++                Io::Detaching => {
++                    std::task::Poll::Ready(Err(std::io::Error::other("connection is detaching")))
++                }
 +            };
 +            match written {
                  std::task::Poll::Ready(Ok(n)) => {
                      this.write_buf.drain(..n);
                  }
-@@ -317,7 +421,11 @@
+@@ -317,7 +479,11 @@
                  std::task::Poll::Pending => return std::task::Poll::Pending,
              }
          }
@@ -329,34 +883,218 @@ diff -ruN src/tokio.rs src/tokio.rs
              std::task::Poll::Ready(Ok(())) => std::task::Poll::Ready(Ok(())),
              std::task::Poll::Ready(Err(e)) => std::task::Poll::Ready(Err(ErrorInt::WriteError {
                  conn_ctx: this.ctx,
-@@ -336,7 +444,12 @@
+@@ -336,7 +502,14 @@
              other => return other,
          }
          let this = &mut *self;
 -        match std::pin::Pin::new(&mut this.stream).poll_shutdown(cx) {
 +        let shut = match &mut this.stream {
 +            Io::Reactor(stream) => std::pin::Pin::new(stream).poll_shutdown(cx),
-+            Io::Detached(stream) => std::task::Poll::Ready(stream.shutdown(std::net::Shutdown::Write)),
++            Io::Detached(stream) => {
++                std::task::Poll::Ready(stream.shutdown(std::net::Shutdown::Write))
++            }
 +            Io::Detaching => std::task::Poll::Ready(Ok(())),
 +        };
 +        match shut {
              std::task::Poll::Ready(Ok(())) => std::task::Poll::Ready(Ok(())),
              std::task::Poll::Ready(Err(e)) => std::task::Poll::Ready(Err(ErrorInt::WriteError {
                  conn_ctx: this.ctx,
-@@ -347,6 +460,16 @@
-     }
- }
+@@ -369,6 +542,12 @@
  
-+/// Writes all of `buf` to a detached socket, blocking for the duration: RTSP
-+/// messages are a few hundred bytes into an otherwise idle send buffer.
-+fn blocking_write(stream: &mut std::net::TcpStream, buf: &[u8]) -> std::io::Result<usize> {
-+    use std::io::Write as _;
-+    stream.set_nonblocking(false)?;
-+    let result = stream.write_all(buf).map(|()| buf.len());
-+    stream.set_nonblocking(true)?;
-+    result
-+}
+ #[cfg(test)]
+ mod tests {
++    use std::time::Duration;
 +
- /// tokio-specific version of [`crate::UdpPair`].
- pub(crate) struct UdpPair {
-     pub(crate) rtp_port: u16,
++    use futures::StreamExt as _;
++    use tokio::io::AsyncWriteExt as _;
++    use tokio::net::TcpListener;
++
+     use super::*;
+ 
+     #[test]
+@@ -406,4 +585,185 @@
+         assert_eq!(msg.body_len, 0);
+         assert_eq!(read_buf.unparsed_len(), 0);
+     }
++
++    #[tokio::test]
++    async fn production_limit_accepts_an_exact_control_message() {
++        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
++        let address = listener.local_addr().unwrap();
++        let server = tokio::spawn(async move {
++            let (mut socket, _) = listener.accept().await.unwrap();
++            let mut body_len = crate::rtsp::parse::MAX_CONTROL_MESSAGE_BYTES;
++            let head = loop {
++                let head =
++                    format!("RTSP/1.0 200 OK\r\nCSeq: 1\r\nContent-Length: {body_len}\r\n\r\n");
++                let adjusted = crate::rtsp::parse::MAX_CONTROL_MESSAGE_BYTES - head.len();
++                if adjusted == body_len {
++                    break head;
++                }
++                body_len = adjusted;
++            };
++            socket.write_all(head.as_bytes()).await.unwrap();
++            socket.write_all(&vec![b'x'; body_len]).await.unwrap();
++            body_len
++        });
++
++        let stream = TcpStream::connect(address).await.unwrap();
++        let mut connection = Connection::from_stream(stream).unwrap();
++        let message = tokio::time::timeout(Duration::from_secs(2), connection.next())
++            .await
++            .unwrap()
++            .unwrap()
++            .unwrap();
++        let body_len = server.await.unwrap();
++        assert_eq!(message.body_len as usize, body_len);
++        assert_eq!(
++            connection.parser.stream_pos() as usize,
++            crate::rtsp::parse::MAX_CONTROL_MESSAGE_BYTES
++        );
++    }
++
++    /// A connection whose peer has a small receive buffer and reads nothing
++    /// until told to; the connection's own send buffer is small too, so a
++    /// large write cannot complete while the peer stalls.
++    async fn stalled_peer() -> (Connection, std::net::TcpStream) {
++        let socket =
++            socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None).unwrap();
++        socket.set_recv_buffer_size(4096).unwrap();
++        let address: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
++        socket.bind(&address.into()).unwrap();
++        socket.listen(1).unwrap();
++        let listener: std::net::TcpListener = socket.into();
++        let stream = TcpStream::connect(listener.local_addr().unwrap())
++            .await
++            .unwrap();
++        socket2::SockRef::from(&stream)
++            .set_send_buffer_size(4096)
++            .unwrap();
++        let (peer, _) = listener.accept().unwrap();
++        peer.set_read_timeout(Some(Duration::from_secs(10)))
++            .unwrap();
++        (Connection::from_stream(stream).unwrap(), peer)
++    }
++
++    /// Polls once with a waker that does nothing, as a timer-driven caller does.
++    fn poll_once<T>(
++        connection: &mut Connection,
++        poll: impl FnOnce(
++            std::pin::Pin<&mut Connection>,
++            &mut std::task::Context<'_>,
++        ) -> std::task::Poll<T>,
++    ) -> std::task::Poll<T> {
++        let mut cx = std::task::Context::from_waker(futures::task::noop_waker_ref());
++        poll(std::pin::Pin::new(connection), &mut cx)
++    }
++
++    fn pattern(len: usize) -> Vec<u8> {
++        (0..len).map(|i| (i % 251) as u8).collect()
++    }
++
++    #[tokio::test]
++    async fn detached_flush_never_blocks_and_keeps_the_unsent_remainder() {
++        let (mut connection, mut peer) = stalled_peer().await;
++        connection.detach_from_reactor().unwrap();
++        let message = pattern(1 << 20);
++        connection.write_buf = message.clone();
++        // Should a flush block, this starts reading after 10 s, which lets the
++        // blocked write finish, so the test fails instead of hanging.
++        let (done, watchdog) = std::sync::mpsc::channel::<()>();
++        let mut stalled = peer.try_clone().unwrap();
++        std::thread::spawn(move || {
++            use std::io::Read as _;
++            if watchdog.recv_timeout(Duration::from_secs(10)).is_err() {
++                let mut sink = vec![0; 64 * 1024];
++                while matches!(stalled.read(&mut sink), Ok(n) if n > 0) {}
++            }
++        });
++
++        for _ in 0..5 {
++            let started = Instant::now();
++            assert!(poll_once(&mut connection, |c, cx| c.poll_flush(cx)).is_pending());
++            assert!(poll_once(&mut connection, |c, cx| c.poll_ready(cx)).is_pending());
++            assert!(
++                started.elapsed() < Duration::from_millis(100),
++                "a flush to a stalled peer took {:?}",
++                started.elapsed()
++            );
++            tokio::time::sleep(Duration::from_millis(10)).await;
++        }
++        let unsent = connection.write_buf.len();
++        assert!(
++            0 < unsent && unsent < message.len(),
++            "{unsent} bytes unsent"
++        );
++        assert!(
++            connection.write_buf == message[message.len() - unsent..],
++            "the unsent bytes are not the message's tail"
++        );
++        done.send(()).unwrap();
++
++        let reader = std::thread::spawn(move || {
++            use std::io::Read as _;
++            let mut received = Vec::new();
++            peer.read_to_end(&mut received).map(|_| received)
++        });
++        let deadline = Instant::now() + Duration::from_secs(10);
++        while poll_once(&mut connection, |c, cx| c.poll_flush(cx)).is_pending() {
++            assert!(Instant::now() < deadline, "the flush never finished");
++            tokio::time::sleep(Duration::from_millis(1)).await;
++        }
++        assert!(connection.write_buf.is_empty());
++        assert!(matches!(
++            poll_once(&mut connection, |c, cx| c.poll_close(cx)),
++            std::task::Poll::Ready(Ok(()))
++        ));
++        let received = reader.join().unwrap().unwrap();
++        assert!(received == message, "the peer received other bytes");
++    }
++
++    #[tokio::test]
++    async fn returning_to_the_reactor_wakes_for_writes_and_a_short_response() {
++        let (mut connection, mut peer) = stalled_peer().await;
++        connection.set_recv_low_water(32 * 1024).unwrap();
++        connection.detach_from_reactor().unwrap();
++        let message = pattern(256 * 1024);
++        connection.write_buf = message.clone();
++        // The peer starts reading when told to, or after 10 s, which also
++        // ends a write that blocks, so the test fails instead of hanging.
++        let (go, gate) = std::sync::mpsc::channel::<()>();
++        let expected = message.len();
++        let peer = std::thread::spawn(move || {
++            use std::io::{Read as _, Write as _};
++            let _ = gate.recv_timeout(Duration::from_secs(10));
++            let mut received = vec![0; expected];
++            peer.read_exact(&mut received)?;
++            peer.write_all(b"RTSP/1.0 200 OK\r\nCSeq: 1\r\n\r\n")?;
++            // Hold the connection open until the client closes it.
++            let mut rest = Vec::new();
++            peer.read_to_end(&mut rest)?;
++            Ok::<_, std::io::Error>(received)
++        });
++        assert!(poll_once(&mut connection, |c, cx| c.poll_flush(cx)).is_pending());
++
++        connection.return_to_reactor().unwrap();
++        let _ = go.send(());
++        // No timer polls here: only the reactor's wake-ups make progress.
++        tokio::time::timeout(
++            Duration::from_secs(10),
++            std::future::poll_fn(|cx| std::pin::Pin::new(&mut connection).poll_ready(cx)),
++        )
++        .await
++        .expect("the reactor woke the flush")
++        .unwrap();
++        let response = tokio::time::timeout(Duration::from_secs(10), connection.next())
++            .await
++            .expect("a short response wakes the reader")
++            .unwrap()
++            .unwrap();
++        assert!(matches!(
++            response.msg,
++            crate::rtsp::msg::Message::Response(_)
++        ));
++        drop(connection);
++        assert!(peer.join().unwrap().unwrap() == message);
++    }
+ }

@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-exclude = ["fuzz"]
+exclude = ["fuzz", "third_party/retina", "third_party/oxvif"]
 members = [
     "crates/iris-core",
     "crates/iris-h265",
@@ -72,10 +72,13 @@ landlock = "0.4"
 tokio-stream = "0.1"
 tokio-rustls = "0.26"
 http-body-util = "0.1"
+hyper = { version = "1", features = ["http1", "server"] }
+hyper-util = { version = "0.1", features = ["tokio", "service"] }
 tower = "0.5"
 futures-util = "0.3"
 getrandom = "0.4"
 oxvif = "0.17"
+socket2 = { version = "0.6", features = ["all"] }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

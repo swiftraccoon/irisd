@@ -9,8 +9,9 @@ fault-tested without hardware: cost measurements, chaos runs, and the integratio
 
 - The `iris-replay` binary: `--mount NAME=PATH` serves a recording at
   `rtsp://<listen>/NAME`; `--synth NAME[=GOPS]` serves a synthetic 1080p stream built from
-  real parameter sets and dummy slices; `--listen` (default `127.0.0.1:8554`), `--mtu`,
-  `--once`, `--burst`, `--pace`, `--drop-every N`, `--stall-after DURATION`,
+  real parameter sets and dummy slices; `--listen` (default `127.0.0.1:8554`; an address
+  outside loopback also needs `--allow-remote`), `--max-connections N` (default 256),
+  `--mtu`, `--once`, `--burst`, `--pace`, `--drop-every N`, `--stall-after DURATION`,
   `--stall-for DURATION`.
 - `media` — `Media` loads a recording into memory, extracts VPS, SPS, and PPS from its
   `hvcC`, and indexes every frame with its decode time (relative to the file's first
@@ -23,7 +24,8 @@ fault-tested without hardware: cost measurements, chaos runs, and the integratio
   replay is start-once so its advertised RTP state remains truthful.
 - `sdp` — the session description with `sprop-vps`, `sprop-sps`, `sprop-pps`.
 - `server` — `Server` binds a listener and runs one session per connection; `Options`
-  carries the delivery and fault settings.
+  carries the delivery and fault settings, the connection cap, and the request and idle
+  deadlines.
 - `synth` — `Plan` and fallible `recording` build a bounded, valid irisd recording in
   memory.
 
@@ -58,7 +60,15 @@ the two-mode recording test in `iris-ingest` do.
   network stall would deliver them. Sender reports sample wall and RTP clocks at the same
   instant; this does not change the intentional catch-up burst.
 - Only TCP interleaved transport is accepted (`SETUP` without it gets `461`); there is no
-  authentication. A connection must select one mount, complete a valid `SETUP`, and return
+  authentication, so the binary refuses a `--listen` address outside loopback unless
+  `--allow-remote` accepts serving every mount to whoever connects. At most
+  `--max-connections` (default 256, the most cameras `replay-bench` drives) connections are
+  served at once; the listener closes further connections as it accepts them. Before `PLAY`,
+  each request must arrive complete within 10 s of the previous one, or of the connection,
+  however slowly its bytes trickle in; after `PLAY`, a connection that sends no request or
+  interleaved frame for 120 s is closed, four times the recorder's keepalive period (retina
+  sends one every 30 s for the default 60-s session timeout). A connection must select one
+  mount, complete a valid `SETUP`, and return
   the issued `Session` before `PLAY`; cross-mount and repeated/finished plays fail closed,
   and `TEARDOWN` preserves prior control replies but bypasses stale queued media on a bounded,
   delivery-acknowledged terminal path.
@@ -74,7 +84,10 @@ the two-mode recording test in `iris-ingest` do.
 
 Unit tests cover strict `hvcC`, CRC/EOF/AU and timeline admission; RTP MTU, streaming
 fragmentation, rollover and interleaving boundaries; RTSP mount/session/channel/state and
-TEARDOWN behavior; grouped SDP parameter sets; and every synthetic plan ceiling.
+TEARDOWN behavior; grouped SDP parameter sets; every synthetic plan ceiling; the remote-bind
+opt-in; and, over loopback with shortened deadlines, the connection cap, partial and trickled
+requests closed at the pre-`PLAY` deadline, and a playing session kept by keepalives and
+closed once they stop.
 `tests/loopback.rs` serves a synthetic recording and receives it through the recorder's own
 RTSP client, checking bytes, sync flags, and timestamps. The fidelity of the replay against
 live cameras and the measurements it enabled are in `docs/research/12-ingest-cost.md`.

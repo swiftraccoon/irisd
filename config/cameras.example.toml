@@ -1,6 +1,8 @@
 # irisd configuration (example). Copy to a private file such as
 # /etc/irisd/irisd.toml (service) or config/cameras.local.toml (development;
-# gitignored). It holds camera credentials, so keep it mode 0600/0640.
+# gitignored). It holds camera credentials and API tokens, so keep it mode 0600,
+# or 0640 with the service account's group; the daemon warns when other users can
+# read it. Values outside the stated ranges are rejected at load.
 #
 # Addresses below use the RFC 5737 documentation range.
 
@@ -11,20 +13,24 @@ video_roots = ["/srv/irisd/video"]
 # Catalog database and other small state (an SSD is ideal).
 state_dir = "/var/lib/irisd"
 # Retention deletes the oldest sealed recordings while a root has less free space than this.
-# Range: 0..=100; zero disables the free-space floor.
+# Range: 0..=50; zero disables the free-space floor.
 min_free_percent = 5
 # Optional cap on the catalogued recordings in GiB, for a disk shared with other data; the
 # oldest sealed recordings go first. Unset means free space and age limits alone apply.
+# Range: at least 1 when set.
 # quota_gib = 2000
-# Power-loss window: open files are flushed this often (milliseconds).
+# Power-loss window: open files are flushed this often (milliseconds). Range: 100..=60000.
 sync_interval_ms = 5000
 # Longest fragment; a GOP longer than this (plus a quarter of slack) is split.
 # Range: 1..=60000.
 max_fragment_ms = 2000
-# Space reserved ahead of each file's written length (bytes).
+# Space reserved ahead of each file's written length (bytes). Range: 0 up to the smaller
+# of rotate_bytes and 4294967296 (4 GiB); zero disables preallocation.
 preallocate_bytes = 268435456
 # Seal at the next sync fragment after either limit is reached.
+# rotate_bytes range: 67108864..=68719476736 (64 MiB to 64 GiB).
 rotate_bytes = 1073741824
+# rotate_secs range: 60..=86400 (one minute to one day).
 rotate_secs = 3600
 # Complete fragments queued per stream before the writer records a gap. Range: 0..=4096;
 # zero retains one queue slot so a configured stream can still make progress.
@@ -44,8 +50,23 @@ recv_low_water_kib = 32
 [api]
 # Address the HTTP API listens on. Bind a LAN address only behind a VPN or firewall.
 listen = "127.0.0.1:8554"
-# Bearer tokens accepted by the API. Empty means unauthenticated (development only).
+# Bearer tokens accepted by the API: each at least 32 visible ASCII characters. Generate
+# one with `openssl rand -hex 16`; the daemon rejects this placeholder.
 tokens = ["replace-with-a-long-random-token"]
+# Development only: serve the API without authentication. Requires an empty token list
+# and a loopback listen address.
+# allow_unauthenticated = true
+# TCP connections served at once, WebSockets included (16 to 65536). Further clients wait
+# in the kernel's listen backlog until a connection closes.
+max_connections = 256
+# Media responses served at once, in two classes (each 1 to 1024). Streaming: whole or
+# open-ended recording files, ranges above 1 MiB, and exports. Bounded: VOD playlists,
+# keyframes, LL-HLS init/segment/part resources, and ranges of at most 1 MiB. A full class
+# answers HTTP 503 with Retry-After: 1.
+max_streaming_media = 8
+max_bounded_media = 32
+# Serve /metrics without a token. False requires the root bearer token for scrapes.
+public_metrics = false
 
 # One [[camera]] table per camera. Field names follow the original test
 # configuration. `rtsp_url` is the main stream; `sub_url` defaults to the same
@@ -67,5 +88,5 @@ https = false               # use HTTPS for CGI and ONVIF
 tls_verify = true           # verify camera TLS certificates; false permits self-signed devices
 record = ["main", "sub"]    # supported video kinds; each may appear only once per camera
 timestamp_mode = "regularize" # regularize camera jitter, or "passthrough" for diagnostics
-retention_days = 21         # range 0..=106751991; delete after this many days
+retention_days = 21         # range 1..=106751991; delete after this many days
 events = ["dahua_cgi"]      # distinct event sources: dahua_cgi, onvif_pull_point

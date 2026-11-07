@@ -5,6 +5,7 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Context;
 use gst::prelude::*;
@@ -39,6 +40,14 @@ const BRANCH: &str = "appsrc name=src is-live=true stream-type=stream \
 pub enum TileEvent {
     /// The feed reconnected; the branch must start afresh for the new init segment.
     Restart,
+    /// A live frame exceeded the protocol's message ceiling; the feed retries
+    /// after `retry_in`, doubling the pause while the condition lasts.
+    Oversized {
+        /// The pause before the next attempt.
+        retry_in: Duration,
+    },
+    /// The feed delivers video again after an oversized frame.
+    Live,
 }
 
 /// The feed's handle on the branch input, usable from any thread.
@@ -73,6 +82,31 @@ impl Source {
         let _ = self.src.send_event(gst::event::FlushStart::new());
         let _ = self.src.send_event(gst::event::FlushStop::new(true));
     }
+
+    /// A source with the tile's queue limits outside any pipeline, for feed tests.
+    #[cfg(test)]
+    pub(crate) fn for_tests() -> Self {
+        let src = gst_app::AppSrc::builder()
+            .max_bytes(SOURCE_QUEUE_BYTES)
+            .build();
+        src.set_property("max-buffers", SOURCE_QUEUE_BUFFERS);
+        Self { src }
+    }
+
+    /// Bytes queued in the source.
+    #[cfg(test)]
+    pub(crate) fn queued_bytes(&self) -> u64 {
+        self.src.current_level_bytes()
+    }
+}
+
+/// The label of a tile whose stream carries frames above the live message ceiling.
+fn oversized_label(name: &str, camera: &str, retry_in: Duration) -> String {
+    format!(
+        "{name} ({camera}): a live frame exceeds the {} MiB limit; retrying in {} s",
+        SOURCE_QUEUE_BYTES >> 20,
+        retry_in.as_secs()
+    )
 }
 
 /// A running branch and the feed task that fills it.
@@ -195,17 +229,45 @@ impl Tile {
         glib::spawn_future_local({
             let bin = bin.clone();
             let label = self.label.clone();
+            let name = self.name.clone();
+            let camera = self.camera.clone();
             async move {
-                while let Ok(TileEvent::Restart) = events_rx.recv().await {
-                    if let Err(error) = Stage::restart(&bin) {
-                        warn!(%error, "branch restart failed");
-                        label.set_label(&format!("restart failed: {error}"));
+                while let Ok(event) = events_rx.recv().await {
+                    match event {
+                        TileEvent::Restart => {
+                            if let Err(error) = Stage::restart(&bin) {
+                                warn!(%error, "branch restart failed");
+                                label.set_label(&format!("restart failed: {error}"));
+                            }
+                        }
+                        TileEvent::Oversized { retry_in } => {
+                            label.set_label(&oversized_label(&name, &camera, retry_in));
+                        }
+                        TileEvent::Live => label.set_label(&format!("{name} ({camera})")),
                     }
                 }
             }
         });
         *self.running.borrow_mut() = Some(Running { bin, feed: cancel });
         Ok(())
+    }
+
+    /// Shows why the tile has no feed; [`Tile::start`] restores the label.
+    pub fn idle(&self, reason: &str) {
+        self.label
+            .set_label(&format!("{} ({}): {reason}", self.name, self.camera));
+    }
+
+    /// Whether a branch and feed are running.
+    #[cfg(test)]
+    pub(crate) fn is_running(&self) -> bool {
+        self.running.borrow().is_some()
+    }
+
+    /// The text under the picture.
+    #[cfg(test)]
+    pub(crate) fn label_text(&self) -> String {
+        self.label.text().to_string()
     }
 
     /// Stops the feed and removes the branch; the last frame stays on screen.
@@ -226,6 +288,14 @@ impl Drop for Tile {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_oversized_state_names_the_limit_and_the_retry() {
+        assert_eq!(
+            oversized_label("Front", "cam1", Duration::from_secs(8)),
+            "Front (cam1): a live frame exceeds the 16 MiB limit; retrying in 8 s"
+        );
+    }
 
     #[test]
     fn a_stalled_source_rejects_payloads_beyond_the_byte_limit() {

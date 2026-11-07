@@ -2,6 +2,7 @@
 name = "iris-fuzz"
 version = "0.0.0"
 edition = "2024"
+license = "GPL-3.0-or-later"
 publish = false
 
 [package.metadata]
@@ -16,10 +17,13 @@ iris-core = { path = "../crates/iris-core" }
 iris-events = { path = "../crates/iris-events", features = ["fuzzing"] }
 iris-replay = { path = "../crates/iris-replay" }
 iris-tools = { path = "../crates/iris-tools" }
+log = "0.4"
 oxvif = "0.17"
+retina = { version = "0.4.21", features = ["h265"] }
 
 [patch.crates-io]
 oxvif = { path = "../third_party/oxvif" }
+retina = { path = "../third_party/retina" }
 
 [[bin]]
 name = "api_time"
@@ -106,6 +110,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "rtsp_message"
+path = "fuzz_targets/rtsp_message.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "export_rebase"
 path = "fuzz_targets/export_rebase.rs"
 test = false
@@ -115,6 +126,13 @@ bench = false
 [[bin]]
 name = "tools_protocol"
 path = "fuzz_targets/tools_protocol.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "describe_diagnostics"
+path = "fuzz_targets/describe_diagnostics.rs"
 test = false
 doc = false
 bench = false

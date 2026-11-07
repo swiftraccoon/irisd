@@ -2,9 +2,7 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use oxvif::soap::xml::{
-    MAX_XML_ATTRIBUTES, MAX_XML_DEPTH, MAX_XML_NODES, MAX_XML_TEXT_BYTES,
-};
+use oxvif::soap::xml::{MAX_XML_ATTRIBUTES, MAX_XML_DEPTH, MAX_XML_NODES, MAX_XML_TEXT_BYTES};
 use oxvif::soap::{XmlNode, parse_soap_body};
 
 fn assert_resource_invariants(root: &XmlNode) {

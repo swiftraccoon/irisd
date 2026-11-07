@@ -4,10 +4,100 @@
 use bytes::Bytes;
 use log::{debug, warn};
 use sdp_types::Media;
-use std::{net::IpAddr, num::NonZeroU16};
+use std::{borrow::Cow, net::IpAddr, num::NonZeroU16};
 use url::Url;
 
 use super::{Presentation, Stream};
+use crate::mostly_ascii::Excerpt;
+
+/// Longest URL accepted from a server, as `Content-Base`, `Content-Location`,
+/// or a joined control URL. Requests carry these as their Request-URI (and
+/// digest authentication repeats it), so the limit bounds every request built
+/// from a server's answers.
+pub(crate) const MAX_URL_BYTES: usize = 2048;
+
+/// Longest `Session` identifier accepted from a `SETUP` response; keepalives
+/// and `TEARDOWN` repeat it.
+pub(crate) const MAX_SESSION_ID_BYTES: usize = 512;
+
+/// Longest `WWW-Authenticate` value accepted; a digest response repeats its
+/// realm, nonce, and opaque values.
+pub(crate) const MAX_WWW_AUTHENTICATE_BYTES: usize = 4096;
+
+/// Most media sections accepted in one SDP.
+pub(crate) const MAX_MEDIA_SECTIONS: usize = 64;
+
+/// Problems found while interpreting one `DESCRIBE` response. They are
+/// reported together, as one bounded line, however many there are.
+#[derive(Default)]
+struct DescribeNotes {
+    count: usize,
+    first: Option<String>,
+}
+
+impl DescribeNotes {
+    /// Counts a problem; only the first one's description is formatted.
+    fn note(&mut self, description: impl FnOnce() -> String) {
+        self.count += 1;
+        if self.first.is_none() {
+            self.first = Some(description());
+        }
+    }
+}
+
+/// Returns `sdp` with each line that is not in `<type>=<value>` form emptied
+/// and noted, lines split as `sdp-types` splits them. Empty lines are skipped
+/// but still counted, so later line numbers stay true.
+///
+/// `sdp-types` 0.1.8 cannot be given such a line: its peek discards the
+/// line's error and parsing resumes at the following line, which an assertion
+/// then requires to start a media section, so any other line there panics.
+/// Where the following line is `m=`, it ignores the bad line, which is what
+/// emptying it here does in every case.
+fn without_malformed_lines<'a>(sdp: &'a [u8], notes: &mut DescribeNotes) -> Cow<'a, [u8]> {
+    let mut kept: Option<Vec<u8>> = None;
+    let mut start = 0;
+    let mut number = 0;
+    while start < sdp.len() {
+        number += 1;
+        let end = sdp[start..]
+            .iter()
+            .position(|&b| b == b'\n')
+            .map_or(sdp.len(), |i| start + i + 1);
+        let whole = &sdp[start..end];
+        let line = match whole.strip_suffix(b"\n") {
+            Some(line) => line.strip_suffix(b"\r").unwrap_or(line),
+            None => whole,
+        };
+        if !line.is_empty() && line.iter().position(|&b| b == b'=') != Some(1) {
+            let kept = kept.get_or_insert_with(|| sdp[..start].to_vec());
+            if whole.ends_with(b"\n") {
+                kept.push(b'\n');
+            }
+            notes.note(|| {
+                format!(
+                    "ignoring SDP line {number}, which is not in type=value form: \"{}\"",
+                    Excerpt(line)
+                )
+            });
+        } else if let Some(kept) = &mut kept {
+            kept.extend_from_slice(whole);
+        }
+        start = end;
+    }
+    kept.map_or(Cow::Borrowed(sdp), Cow::Owned)
+}
+
+/// Fails unless `url` is at most [`MAX_URL_BYTES`] long.
+fn check_url_len(what: &str, url: &Url) -> Result<(), String> {
+    let len = url.as_str().len();
+    if len > MAX_URL_BYTES {
+        return Err(format!(
+            "{what} of {len} bytes exceeds the {MAX_URL_BYTES}-byte limit"
+        ));
+    }
+    Ok(())
+}
 
 /// A static payload type in the [RTP parameters
 /// registry](https://www.iana.org/assignments/rtp-parameters/rtp-parameters.xhtml#rtp-parameters-1).
@@ -191,11 +281,18 @@ fn join_control(base_url: &Url, control: &str) -> Result<Url, String> {
     if control == "*" {
         return Ok(base_url.clone());
     }
+    if control.len() > MAX_URL_BYTES {
+        return Err(format!(
+            "control URL of {} bytes exceeds the {MAX_URL_BYTES}-byte limit",
+            control.len()
+        ));
+    }
     if let Ok(absolute_url) = Url::parse(control) {
+        check_url_len("control URL", &absolute_url)?;
         return Ok(absolute_url);
     }
 
-    Url::parse(&format!(
+    let joined = Url::parse(&format!(
         "{}{}{}",
         base_url.as_str(),
         if base_url.as_str().ends_with('/') {
@@ -205,7 +302,14 @@ fn join_control(base_url: &Url, control: &str) -> Result<Url, String> {
         },
         control
     ))
-    .map_err(|e| format!("unable to join base url {base_url} with control url {control:?}: {e}"))
+    .map_err(|e| {
+        format!(
+            "unable to join base url {base_url} with control url \"{}\": {e}",
+            Excerpt::of(control)
+        )
+    })?;
+    check_url_len("control URL", &joined)?;
+    Ok(joined)
 }
 
 /// Returns the `CSeq` from an RTSP response as a `u32`, or `None` if missing/unparseable.
@@ -217,9 +321,13 @@ pub(crate) fn get_cseq(response: &crate::rtsp::msg::Response) -> Option<u32> {
 }
 
 /// Parses a [MediaDescription] to a [Stream].
-/// On failure, returns an error which is expected to be supplemented with
-/// the [MediaDescription] debug string and packed into a `RtspResponseError`.
-fn parse_media(base_url: &Url, media_description: &Media) -> Result<Stream, String> {
+/// On failure, returns an error which the caller notes in `notes`; tolerated
+/// problems are noted there directly.
+fn parse_media(
+    base_url: &Url,
+    media_description: &Media,
+    notes: &mut DescribeNotes,
+) -> Result<Stream, String> {
     let media = media_description.media.clone().into_boxed_str();
 
     // https://tools.ietf.org/html/rfc8866#section-5.14 says "If the <proto>
@@ -246,7 +354,7 @@ fn parse_media(base_url: &Url, media_description: &Media) -> Result<Stream, Stri
         .fmt
         .split_ascii_whitespace()
         .next()
-        .unwrap();
+        .ok_or_else(|| "no RTP payload type".to_string())?;
     let rtp_payload_type = u8::from_str_radix(rtp_payload_type_str, 10)
         .map_err(|_| format!("invalid RTP payload type {rtp_payload_type_str:?}"))?;
     if (rtp_payload_type & 0x80) != 0 {
@@ -302,7 +410,7 @@ fn parse_media(base_url: &Url, media_description: &Media) -> Result<Stream, Stri
                 } else {
                     // Ubiquiti cameras sometimes have e.g. "a=fmtp:96": payload
                     // type only, no actual attributes. Don't fail on this.
-                    warn!("ignoring invalid fmtp attribute value {:?}", v);
+                    notes.note(|| format!("ignoring invalid fmtp attribute value \"{v}\""));
                 }
             }
             "control" => {
@@ -385,34 +493,43 @@ fn parse_media(base_url: &Url, media_description: &Media) -> Result<Stream, Stri
     })
 }
 
-use crate::mostly_ascii::MostlyAscii;
-
 /// Parses a successful RTSP `DESCRIBE` response into a [Presentation].
 /// On error, returns a string which is expected to be packed into an `RtspProtocolError`.
+///
+/// Problems that still leave a usable stream are logged together as one
+/// warning; a failure is described by the returned error alone. Either quotes
+/// server-supplied text only as an [`Excerpt`], never the whole SDP.
 pub(crate) fn parse_describe(
     request_url: Url,
     response: &crate::rtsp::msg::Response,
     body: &Bytes,
 ) -> Result<Presentation, String> {
+    let mut notes = DescribeNotes::default();
     match response.headers.get("Content-Type") {
         Some(v) if &**v == "application/sdp" => {}
         Some(v) => {
             return Err(format!(
                 "DESCRIBE response at {} has unexpected content type {}",
                 request_url.as_str(),
-                v,
+                Excerpt::of(v),
             ));
         }
-        None => {
-            warn!(
-                "DESCRIBE response at {} has no content type; trying sdp anyway",
-                request_url.as_str()
-            );
-        }
+        None => notes.note(|| "no content type; trying SDP anyway".to_owned()),
     }
-    let raw_sdp = MostlyAscii::new(&body[..]);
-    let sdp = sdp_types::Session::parse(raw_sdp.bytes)
-        .map_err(|e| format!("Unable to parse SDP: {e}\n\n{raw_sdp:#?}",))?;
+    let well_formed = without_malformed_lines(body, &mut notes);
+    let sdp = sdp_types::Session::parse(&well_formed).map_err(|e| {
+        format!(
+            "Unable to parse SDP: {}; SDP: {}",
+            Excerpt::of(&e.to_string()),
+            Excerpt(body),
+        )
+    })?;
+    if sdp.medias.len() > MAX_MEDIA_SECTIONS {
+        return Err(format!(
+            "SDP has {} media sections; at most {MAX_MEDIA_SECTIONS} are accepted",
+            sdp.medias.len()
+        ));
+    }
 
     // https://tools.ietf.org/html/rfc2326#appendix-C.1.1
     let base_url = response
@@ -426,15 +543,24 @@ pub(crate) fn parse_describe(
                 .map(|v| ("Content-Location", v))
         })
         .map(|(h, v)| {
-            Url::parse(v).or_else(|_| {
+            if v.len() > MAX_URL_BYTES {
+                return Err(format!(
+                    "{h} of {} bytes exceeds the {MAX_URL_BYTES}-byte limit",
+                    v.len()
+                ));
+            }
+            let url = Url::parse(v).or_else(|_| {
                 // Some cameras (e.g. Anjvision) send a Content-Base without a
                 // scheme prefix. Try prepending the request URL's scheme.
                 // See <https://github.com/scottlamb/moonfire-nvr/issues/356>.
                 let fixed = format!("{}://{v}", request_url.scheme());
-                let url = Url::parse(&fixed).map_err(|e| format!("bad {h} {v:?}: {e}"))?;
-                warn!("repaired schemeless {h} {v:?} to {url}");
+                let url = Url::parse(&fixed)
+                    .map_err(|e| format!("bad {h} \"{}\": {e}", Excerpt::of(v)))?;
+                notes.note(|| format!("repaired schemeless {h} \"{v}\" to {url}"));
                 Ok::<_, String>(url)
-            })
+            })?;
+            check_url_len(h, &url)?;
+            Ok(url)
         })
         .unwrap_or_else(|| Ok(request_url.clone()))?;
 
@@ -451,35 +577,43 @@ pub(crate) fn parse_describe(
             tool = a.value.as_deref().map(super::Tool::new);
         }
     }
-    let control = control.unwrap_or(request_url);
+    let control = control.unwrap_or_else(|| request_url.clone());
 
-    let streams: Box<[Stream]> = sdp
-        .medias
-        .iter()
-        .enumerate()
-        .filter_map(|(i, m)| {
-            parse_media(&base_url, m).map_or_else(
-                |e| {
-                    warn!(
-                        "Ignoring unparseable stream {}: {}\nraw SDP: {:#?}",
-                        i, e, raw_sdp
-                    );
-                    None
-                },
-                Some,
-            )
-        })
-        .collect();
+    let mut streams = Vec::with_capacity(sdp.medias.len());
+    let mut first_unparseable = None;
+    for (i, m) in sdp.medias.iter().enumerate() {
+        match parse_media(&base_url, m, &mut notes) {
+            Ok(stream) => streams.push(stream),
+            Err(e) => {
+                if first_unparseable.is_none() {
+                    first_unparseable = Some(format!("stream {i}: {e}"));
+                }
+                notes.note(|| format!("ignoring unparseable stream {i}: {e}"));
+            }
+        }
+    }
 
     if streams.is_empty() {
-        return Err(format!(
-            "No parseable streams (and {} unparseable streams)",
-            sdp.medias.len()
-        ));
+        return Err(match first_unparseable {
+            Some(first) => format!(
+                "No parseable streams among {} media sections; first problem: {}",
+                sdp.medias.len(),
+                Excerpt::of(&first),
+            ),
+            None => "SDP has no media sections".to_owned(),
+        });
+    }
+    if let Some(first) = &notes.first {
+        warn!(
+            "DESCRIBE response at {}: ignored {} SDP problem(s); first: {}",
+            request_url.as_str(),
+            notes.count,
+            Excerpt::of(first),
+        );
     }
 
     Ok(Presentation {
-        streams,
+        streams: streams.into_boxed_slice(),
         base_url,
         control,
         tool,
@@ -530,6 +664,15 @@ pub(crate) fn parse_setup(response: &crate::rtsp::msg::Response) -> Result<Setup
         .get("Session")
         .ok_or_else(|| "Missing Session header".to_string())?;
     let session_str: &str = session;
+    let id = session_str
+        .split_once(';')
+        .map_or(session_str, |(id, _)| id);
+    if id.len() > MAX_SESSION_ID_BYTES {
+        return Err(format!(
+            "Session id of {} bytes exceeds the {MAX_SESSION_ID_BYTES}-byte limit",
+            id.len()
+        ));
+    }
     let session = match session_str.split_once(';') {
         None => SessionHeader {
             id: session_str.into(),
@@ -537,14 +680,14 @@ pub(crate) fn parse_setup(response: &crate::rtsp::msg::Response) -> Result<Setup
         },
         Some((id, timeout_str)) => {
             if let Some(v) = timeout_str.trim().strip_prefix("timeout=") {
-                let timeout_sec =
-                    u32::from_str_radix(v, 10).map_err(|_| format!("Unparseable timeout {v}"))?;
+                let timeout_sec = u32::from_str_radix(v, 10)
+                    .map_err(|_| format!("Unparseable timeout {}", Excerpt::of(v)))?;
 
                 if timeout_sec == 0 {
                     // This would make Retina send keepalives at an absurd rate; reject.
                     return Err(format!(
-                        "Invalid timeout=0 in Session header {:?}",
-                        session_str
+                        "Invalid timeout=0 in Session header \"{}\"",
+                        Excerpt::of(session_str)
                     ));
                 }
                 SessionHeader {
@@ -552,7 +695,10 @@ pub(crate) fn parse_setup(response: &crate::rtsp::msg::Response) -> Result<Setup
                     timeout_sec,
                 }
             } else {
-                return Err(format!("Unparseable Session header {:?}", session_str));
+                return Err(format!(
+                    "Unparseable Session header \"{}\"",
+                    Excerpt::of(session_str)
+                ));
             }
         }
     };
@@ -564,6 +710,7 @@ pub(crate) fn parse_setup(response: &crate::rtsp::msg::Response) -> Result<Setup
     let mut ssrc = None;
     let mut source = None;
     let mut server_port = None;
+    let mut ignored_ssrc = None;
     let transport_str: &str = transport;
     for part in transport_str.split(';') {
         if let Some(v) = part.strip_prefix("ssrc=") {
@@ -575,34 +722,50 @@ pub(crate) fn parse_setup(response: &crate::rtsp::msg::Response) -> Result<Setup
             // when absent, the SSRC is learned from the first RTP packet. So
             // warn and ignore one that does not parse or has four digits or
             // fewer. Fewer than eight is fine otherwise: Hikvision drops a
-            // leading zero (`ssrc= d6d6627`), and its value is real.
+            // leading zero (`ssrc= d6d6627`), and its value is real. One
+            // warning per response, however many `ssrc` parameters it repeats.
             let v = v.trim();
             match u32::from_str_radix(v, 16) {
                 Ok(parsed) if v.len() > 4 => ssrc = Some(parsed),
-                _ => warn!("Ignoring nonconforming ssrc in Transport header {transport_str:?}"),
+                _ => {
+                    ignored_ssrc.get_or_insert(v);
+                }
             }
         } else if let Some(interleaved) = part.strip_prefix("interleaved=") {
             let mut channels = interleaved.splitn(2, '-');
             let n = channels.next().expect("splitn returns at least one part");
-            let n = u8::from_str_radix(n, 10).map_err(|_| format!("bad channel number {n}"))?;
+            let n = u8::from_str_radix(n, 10)
+                .map_err(|_| format!("bad channel number {}", Excerpt::of(n)))?;
             if let Some(m) = channels.next() {
                 let m = u8::from_str_radix(m, 10)
-                    .map_err(|_| format!("bad second channel number {m}"))?;
+                    .map_err(|_| format!("bad second channel number {}", Excerpt::of(m)))?;
                 if n.checked_add(1) != Some(m) {
                     return Err(format!("Expected adjacent channels; got {n}-{m}"));
                 }
             }
             channel_id = Some(n);
         } else if let Some(s) = part.strip_prefix("source=") {
-            source = Some(
-                s.parse()
-                    .map_err(|_| format!("Transport header has unparseable source {s:?}"))?,
-            );
+            source = Some(s.parse().map_err(|_| {
+                format!(
+                    "Transport header has unparseable source \"{}\"",
+                    Excerpt::of(s)
+                )
+            })?);
         } else if let Some(s) = part.strip_prefix("server_port=") {
             server_port = Some(parse_server_port(s).map_err(|()| {
-                format!("Transport header {:?} has bad server_port", &**transport)
+                format!(
+                    "Transport header \"{}\" has bad server_port",
+                    Excerpt::of(transport_str)
+                )
             })?);
         }
+    }
+    if let Some(v) = ignored_ssrc {
+        warn!(
+            "Ignoring nonconforming ssrc \"{}\" in Transport header \"{}\"",
+            Excerpt::of(v),
+            Excerpt::of(transport_str)
+        );
     }
     Ok(SetupResponse {
         session,
@@ -623,6 +786,10 @@ pub(crate) fn parse_play(
         Some(rtsp_info) => rtsp_info,
         None => return Ok(()),
     };
+    // One warning of each kind per response, however many entries repeat it.
+    let mut unknown_streams = 0usize;
+    let mut first_unknown_stream = None;
+    let mut bad_rtptime = None;
     for s in rtp_info.split(',') {
         let s = s.trim();
         let mut parts = s.split(';');
@@ -651,7 +818,8 @@ pub(crate) fn parse_play(
         let stream = match stream {
             Some(s) => s,
             None => {
-                log::warn!("RTP-Info contains unknown stream {}", url);
+                unknown_streams += 1;
+                first_unknown_stream.get_or_insert(url);
                 continue;
             }
         };
@@ -678,13 +846,15 @@ pub(crate) fn parse_play(
                 .ok_or_else(|| "RTP-Info param has no =".to_string())?;
             match key {
                 "seq" => {
-                    let seq =
-                        u16::from_str_radix(value, 10).map_err(|_| format!("bad seq {value:?}"))?;
+                    let seq = u16::from_str_radix(value, 10)
+                        .map_err(|_| format!("bad seq \"{}\"", Excerpt::of(value)))?;
                     state.initial_seq = Some(seq);
                 }
                 "rtptime" => match u32::from_str_radix(value, 10) {
                     Ok(v) => state.initial_rtptime = Some(v),
-                    Err(_) => warn!("Unparseable rtptime in RTP-Info header {:?}", rtp_info),
+                    Err(_) => {
+                        bad_rtptime.get_or_insert(value);
+                    }
                 },
                 // `ssrc` is deliberately not read here. RTSP/1.0 defines no
                 // `ssrc` parameter for `RTP-Info` (RFC 2326 section 12.33);
@@ -700,6 +870,19 @@ pub(crate) fn parse_play(
                 _ => {}
             }
         }
+    }
+    if let Some(url) = first_unknown_stream {
+        warn!(
+            "RTP-Info contains {unknown_streams} unknown stream(s), the first {}",
+            Excerpt::of(url.as_str())
+        );
+    }
+    if let Some(value) = bad_rtptime {
+        warn!(
+            "Unparseable rtptime \"{}\" in RTP-Info header \"{}\"",
+            Excerpt::of(value),
+            Excerpt::of(rtp_info)
+        );
     }
     Ok(())
 }
@@ -1720,6 +1903,312 @@ mod tests {
         assert_eq!(
             p.streams[0].control,
             Some(Url::parse("rtsp://192.168.1.10:554/stream0/trackID=1").unwrap())
+        );
+    }
+
+    /// An SDP with one H.264 stream, for the generated cases below.
+    const SDP_HEAD: &[u8] = b"v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=test\r\nt=0 0\r\n\
+        a=control:*\r\nm=video 0 RTP/AVP 96\r\na=rtpmap:96 H264/90000\r\na=control:trackID=0\r\n";
+
+    /// A `DESCRIBE` response for a generated body, with `extra` headers.
+    fn generated_describe(
+        extra: &[(&str, &str)],
+        body: Vec<u8>,
+    ) -> (crate::rtsp::msg::Response, Bytes) {
+        use crate::rtsp::msg::*;
+        let mut headers: Headers = [(
+            HeaderName::CONTENT_TYPE,
+            HeaderValue::try_from("application/sdp").unwrap(),
+        )]
+        .into();
+        for (name, value) in extra {
+            headers.insert(
+                HeaderName::try_from(*name).unwrap(),
+                HeaderValue::try_from(*value).unwrap(),
+            );
+        }
+        let response = Response {
+            status_code: StatusCode::OK,
+            reason_phrase: "OK".into(),
+            headers,
+        };
+        (response, Bytes::from(body))
+    }
+
+    /// A response with the given headers and no body.
+    fn generated_response(headers: &[(&str, String)]) -> crate::rtsp::msg::Response {
+        use crate::rtsp::msg::*;
+        let mut map = Headers::default();
+        for (name, value) in headers {
+            map.insert(
+                HeaderName::try_from(*name).unwrap(),
+                HeaderValue::try_from(value.as_str()).unwrap(),
+            );
+        }
+        Response {
+            status_code: StatusCode::OK,
+            reason_phrase: "OK".into(),
+            headers: map,
+        }
+    }
+
+    fn loopback_url() -> Url {
+        Url::parse("rtsp://127.0.0.1:554/cam").unwrap()
+    }
+
+    /// The warning-level records in `records`.
+    fn warnings(records: &[(log::Level, String)]) -> Vec<&str> {
+        records
+            .iter()
+            .filter(|(level, _)| *level <= log::Level::Warn)
+            .map(|(_, message)| message.as_str())
+            .collect()
+    }
+
+    /// One printable line short enough for a log.
+    fn assert_bounded_line(text: &str) {
+        assert!(text.len() <= 2048, "{} bytes: {text:.200}", text.len());
+        assert!(!text.bytes().any(|b| b.is_ascii_control()), "{text:?}");
+    }
+
+    #[test]
+    fn describe_problems_make_one_bounded_warning() {
+        let mut sdp = SDP_HEAD.to_vec();
+        // An fmtp attribute without parameters carrying terminal controls.
+        sdp.extend_from_slice(b"a=fmtp:96\x1b]0;forged\x07\x1b[31m\r\n");
+        for _ in 1..MAX_MEDIA_SECTIONS {
+            sdp.extend_from_slice(b"m=a 0 X 0\r\n");
+        }
+        let (response, body) = generated_describe(&[], sdp);
+        let (presentation, records) = crate::testutil::capture_logs(|| {
+            super::parse_describe(loopback_url(), &response, &body)
+        });
+        assert_eq!(presentation.unwrap().streams.len(), 1);
+        let warnings = warnings(&records);
+        assert_eq!(warnings.len(), 1, "{records:?}");
+        assert!(
+            warnings[0].contains(&format!("ignored {MAX_MEDIA_SECTIONS} SDP problem(s)")),
+            "{}",
+            warnings[0]
+        );
+        assert!(
+            warnings[0].contains("\\x1B]0;forged\\x07"),
+            "{}",
+            warnings[0]
+        );
+        assert_bounded_line(warnings[0]);
+    }
+
+    #[test]
+    fn describe_rejects_more_media_sections_than_the_limit() {
+        let mut sdp = SDP_HEAD.to_vec();
+        for _ in 0..10_000 {
+            sdp.extend_from_slice(b"m=a 0 X 0\r\n");
+        }
+        let (response, body) = generated_describe(&[], sdp);
+        let (result, records) = crate::testutil::capture_logs(|| {
+            super::parse_describe(loopback_url(), &response, &body)
+        });
+        let error = result.expect_err("too many media sections");
+        assert!(error.contains("10001 media sections"), "{error}");
+        assert_bounded_line(&error);
+        assert!(warnings(&records).is_empty(), "{records:?}");
+    }
+
+    #[test]
+    fn invalid_sdp_error_quotes_a_bounded_excerpt() {
+        // The version value reaches the parser's error text as sent.
+        let mut sdp = b"v=\x1b]0;forged\x07\r\n<0>forged emergency line\n".to_vec();
+        while sdp.len() < crate::rtsp::parse::MAX_CONTROL_MESSAGE_BYTES - 64 {
+            sdp.extend_from_slice(b"a=pad:xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n");
+        }
+        let (response, body) = generated_describe(&[], sdp);
+        let (result, records) = crate::testutil::capture_logs(|| {
+            super::parse_describe(loopback_url(), &response, &body)
+        });
+        let error = result.expect_err("an invalid SDP");
+        assert!(
+            error
+                .starts_with("Unable to parse SDP: Invalid version at line 1: \\x1B]0;forged\\x07"),
+            "{error:.200}"
+        );
+        assert!(error.contains("\\n<0>forged"), "{error:.600}");
+        assert_bounded_line(&error);
+        assert!(records.is_empty(), "{records:?}");
+    }
+
+    /// `sdp-types` panics on a malformed line followed by any line but `m=`;
+    /// such lines are ignored and noted instead, anywhere in the SDP.
+    #[test]
+    fn malformed_sdp_lines_are_ignored_and_noted() {
+        let mut sdp = b"v=0\r\nnot an sdp line\r\na=tool:x\r\n".to_vec();
+        sdp.extend_from_slice(b"m=video 0 RTP/AVP 96\r\na=rtpmap:96 H264/90000\r\n");
+        sdp.extend_from_slice(b"=no type\r\na=control:trackID=0\r\nab=two\n\n");
+        let (response, body) = generated_describe(&[], sdp);
+        let (presentation, records) = crate::testutil::capture_logs(|| {
+            super::parse_describe(loopback_url(), &response, &body)
+        });
+        let presentation = presentation.unwrap();
+        assert_eq!(presentation.streams.len(), 1);
+        assert_eq!(
+            presentation.streams[0].control.as_ref().map(Url::as_str),
+            Some("rtsp://127.0.0.1:554/cam/trackID=0")
+        );
+        assert_eq!(presentation.tool.as_deref(), Some("x"));
+        let warnings = warnings(&records);
+        assert_eq!(warnings.len(), 1, "{records:?}");
+        assert!(
+            warnings[0].contains("ignored 3 SDP problem(s); first: ignoring SDP line 2"),
+            "{}",
+            warnings[0]
+        );
+    }
+
+    #[test]
+    fn emptied_lines_keep_the_line_numbers() {
+        let mut notes = DescribeNotes::default();
+        let kept = without_malformed_lines(b"v=0\r\nbad\r\no=x\nbad\nt=", &mut notes);
+        assert_eq!(&*kept, &b"v=0\r\n\no=x\n\nt="[..]);
+        assert_eq!(notes.count, 2);
+        let clean = b"v=0\r\nt=0 0\r\n";
+        assert!(matches!(
+            without_malformed_lines(clean, &mut DescribeNotes::default()),
+            Cow::Borrowed(_)
+        ));
+    }
+
+    #[test]
+    fn describe_rejects_an_oversized_content_base() {
+        let base = format!("rtsp://127.0.0.1/{}/", "a".repeat(MAX_URL_BYTES));
+        let (response, body) = generated_describe(&[("Content-Base", &base)], SDP_HEAD.to_vec());
+        let error = super::parse_describe(loopback_url(), &response, &body)
+            .expect_err("an oversized Content-Base");
+        assert!(error.starts_with("Content-Base of "), "{error}");
+        assert!(error.ends_with("exceeds the 2048-byte limit"), "{error}");
+
+        let base = format!("rtsp://127.0.0.1/{}/", "a".repeat(MAX_URL_BYTES - 64));
+        let (response, body) = generated_describe(&[("Content-Base", &base)], SDP_HEAD.to_vec());
+        super::parse_describe(loopback_url(), &response, &body).unwrap();
+    }
+
+    #[test]
+    fn describe_rejects_an_oversized_control_url() {
+        let control = format!("rtsp://127.0.0.1/{}", "c".repeat(MAX_URL_BYTES));
+        let mut sdp = b"v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=test\r\nt=0 0\r\n".to_vec();
+        sdp.extend_from_slice(format!("a=control:{control}\r\n").as_bytes());
+        sdp.extend_from_slice(b"m=video 0 RTP/AVP 96\r\na=rtpmap:96 H264/90000\r\n");
+        let (response, body) = generated_describe(&[], sdp);
+        let error = super::parse_describe(loopback_url(), &response, &body)
+            .expect_err("an oversized presentation control URL");
+        assert!(error.starts_with("control URL of "), "{error}");
+
+        // A stream's own control URL makes that stream unusable.
+        let mut sdp = b"v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=test\r\nt=0 0\r\n".to_vec();
+        sdp.extend_from_slice(b"m=video 0 RTP/AVP 96\r\na=rtpmap:96 H264/90000\r\n");
+        sdp.extend_from_slice(format!("a=control:{}\r\n", "c".repeat(MAX_URL_BYTES)).as_bytes());
+        let (response, body) = generated_describe(&[], sdp);
+        let error =
+            super::parse_describe(loopback_url(), &response, &body).expect_err("no usable stream");
+        assert!(error.contains("stream 0: control URL of "), "{error}");
+    }
+
+    #[test]
+    fn setup_rejects_an_oversized_session_id() {
+        let transport = (
+            "Transport",
+            "RTP/AVP/TCP;unicast;interleaved=0-1".to_owned(),
+        );
+        let longest = "S".repeat(MAX_SESSION_ID_BYTES);
+        let setup = super::parse_setup(&generated_response(&[
+            ("Session", format!("{longest};timeout=60")),
+            transport.clone(),
+        ]))
+        .unwrap();
+        assert_eq!(&*setup.session.id, longest);
+
+        let error = super::parse_setup(&generated_response(&[
+            ("Session", format!("{longest}S;timeout=4294967295")),
+            transport,
+        ]))
+        .expect_err("an oversized session id");
+        assert_eq!(error, "Session id of 513 bytes exceeds the 512-byte limit");
+    }
+
+    #[test]
+    fn setup_warns_once_for_repeated_nonconforming_ssrc() {
+        let transport = format!(
+            "RTP/AVP/TCP;unicast;interleaved=0-1{}",
+            ";ssrc=1".repeat(10_000)
+        );
+        let response = generated_response(&[
+            ("Session", "abc;timeout=60".to_owned()),
+            ("Transport", transport),
+        ]);
+        let (setup, records) = crate::testutil::capture_logs(|| super::parse_setup(&response));
+        assert_eq!(setup.unwrap().ssrc, None);
+        let warnings = warnings(&records);
+        assert_eq!(warnings.len(), 1, "{} warnings", warnings.len());
+        assert!(
+            warnings[0].starts_with("Ignoring nonconforming ssrc \"1\""),
+            "{}",
+            warnings[0]
+        );
+        assert_bounded_line(warnings[0]);
+    }
+
+    #[test]
+    fn play_warns_once_for_repeated_rtp_info_problems() {
+        let mut sdp = SDP_HEAD.to_vec();
+        sdp.extend_from_slice(b"m=video 0 RTP/AVP 96\r\na=rtpmap:96 H264/90000\r\n");
+        sdp.extend_from_slice(b"a=control:trackID=1\r\n");
+        let (response, body) = generated_describe(&[], sdp);
+        let mut p = super::parse_describe(loopback_url(), &response, &body).unwrap();
+        assert_eq!(p.streams.len(), 2);
+        p.streams[0].state = dummy_stream_state_init(None);
+        let entry = "url=rtsp://127.0.0.1:554/cam/trackID=0;seq=1;rtptime=x";
+        let unknown = "url=rtsp://127.0.0.1:554/cam/unknown;seq=1";
+        let rtp_info = [entry; 2_000]
+            .into_iter()
+            .chain([unknown; 2_000])
+            .collect::<Vec<_>>()
+            .join(",");
+        let play = generated_response(&[("RTP-Info", rtp_info)]);
+        let (result, records) = crate::testutil::capture_logs(|| super::parse_play(&play, &mut p));
+        result.unwrap();
+        let warnings = warnings(&records);
+        assert_eq!(warnings.len(), 2, "{} warnings", warnings.len());
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.starts_with("RTP-Info contains 2000 unknown stream(s)")),
+            "{warnings:?}"
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.starts_with("Unparseable rtptime \"x\"")),
+            "{warnings:?}"
+        );
+        for warning in warnings {
+            assert_bounded_line(warning);
+        }
+    }
+
+    #[test]
+    fn media_section_without_a_payload_type_is_unusable() {
+        let mut sdp = SDP_HEAD.to_vec();
+        sdp.extend_from_slice(b"m=video 0 RTP/AVP \t\r\n");
+        let (response, body) = generated_describe(&[], sdp);
+        let (presentation, records) = crate::testutil::capture_logs(|| {
+            super::parse_describe(loopback_url(), &response, &body)
+        });
+        assert_eq!(presentation.unwrap().streams.len(), 1);
+        let warnings = warnings(&records);
+        assert_eq!(warnings.len(), 1, "{records:?}");
+        assert!(
+            warnings[0].contains("ignoring unparseable stream 1: no RTP payload type"),
+            "{}",
+            warnings[0]
         );
     }
 }

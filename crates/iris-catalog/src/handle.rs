@@ -563,6 +563,12 @@ impl CatalogHandle {
     }
 
     /// Segments of a stream overlapping `range`, ordered by start time.
+    ///
+    /// A sealed row covers its recorded interval. An unsealed row is listed only
+    /// once it has a durable fragment, and it extends to the earlier of now and
+    /// [`OPEN_SEGMENT_GRACE`](crate::OPEN_SEGMENT_GRACE) past its last durable
+    /// progress, so an open file whose writer stopped reporting does not claim
+    /// later windows. Each row keeps its recorded `wall_end`.
     pub async fn segments(
         &self,
         key: &StreamKey,
@@ -576,9 +582,11 @@ impl CatalogHandle {
 
     /// At most `limit` segments of a stream overlapping `range`, ordered by start time.
     ///
-    /// The SQL limit is applied before catalog rows and their owned strings are
-    /// materialized, so serving callers can probe with `budget + 1` and reject
-    /// excessive cardinality without first allocating the full result.
+    /// Overlap follows [`CatalogHandle::segments`], including its rule for
+    /// unsealed rows. The SQL limit is applied before catalog rows and their
+    /// owned strings are materialized, so serving callers can probe with
+    /// `budget + 1` and reject excessive cardinality without first allocating
+    /// the full result.
     pub async fn segments_limited(
         &self,
         key: &StreamKey,
@@ -650,7 +658,11 @@ impl CatalogHandle {
         self.query(move |db| db.mark_deleting(id)).await
     }
 
-    /// Durably marks an empty open segment for retryable startup cleanup.
+    /// Durably marks an open segment for retryable startup cleanup, whatever its
+    /// fragment count, and returns [`DeleteMarkResult::Marked`]. Startup uses it
+    /// for an open row whose recording pair is empty or confirmed absent beneath
+    /// its approved root. A sealed, already deleting, or unknown row returns
+    /// [`DeleteMarkResult::NotFound`] and is left unchanged.
     pub async fn mark_empty_writing_deleting(
         &self,
         id: SegmentId,

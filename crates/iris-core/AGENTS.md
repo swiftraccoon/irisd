@@ -13,10 +13,16 @@ Scope: this crate only. Read the root `AGENTS.md` first.
 - Configuration keys and defaults are documented in `config/cameras.example.toml`; an
   added key or a changed default updates that file and the design document that fixes the value.
 - Configuration rejects duplicate camera ids, repeated recorded kinds or event sources per
-  camera, free-space percentages outside 0..=100, fragment durations outside 1..=60,000 ms,
-  queues above 4,096 complete fragments per stream, and retention above 106,751,991 days.
-  Derived queue and media-tick arithmetic is checked before side effects. Parse errors must
-  retain no input or value-bearing parser message, including through `Debug` or error sources.
+  camera, free-space percentages above 50, sync intervals outside 100..=60,000 ms, rotation
+  outside 60..=86,400 s or 64 MiB..=64 GiB, preallocation above the smaller of the rotation
+  size and 4 GiB, a zero quota, fragment durations outside 1..=60,000 ms, queues above 4,096
+  complete fragments per stream, and retention outside 1..=106,751,991 days. The API needs a
+  token of at least 32 visible ASCII characters that is not the example placeholder, or the
+  `allow_unauthenticated` switch with no token on a loopback listener. Derived queue and
+  media-tick arithmetic is checked before side effects. Parse errors must retain no input or
+  value-bearing parser message, including through `Debug` or error sources; token errors name
+  a position, never a value; `CameraConfig`'s hand-written `Debug` redacts the password and
+  destructures every field, so a field added later must be placed explicitly.
 - `CameraConfig::host` returns bare IPv6; HTTP URL authority builders add brackets.
 - `Event` placement uses `nvr_time`; `camera_time` is diagnostic only (`04 §7`).
 - `Event::bounded` keeps data as valid JSON: invalid text is quoted and an encoding beyond

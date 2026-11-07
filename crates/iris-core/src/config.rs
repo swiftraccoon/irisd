@@ -1,9 +1,16 @@
 //! TOML configuration: cameras and storage policy.
 //!
+//! The example serves a development API without authentication on the default
+//! loopback listener; a deployment lists bearer tokens instead, for example
+//! generated with `openssl rand -hex 16`.
+//!
 //! ```
 //! use iris_core::config::Config;
 //!
 //! let config = Config::from_toml_str(r#"
+//! [api]
+//! allow_unauthenticated = true
+//!
 //! [[camera]]
 //! id = "cam1"
 //! name = "Example"
@@ -16,6 +23,7 @@
 //! # Ok::<(), iris_core::config::ConfigError>(())
 //! ```
 
+use std::fmt;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
@@ -78,25 +86,101 @@ pub enum ConfigError {
         /// The source that cannot be configured as a subscription.
         event_source: EventSource,
     },
-    /// The free-space floor is not a percentage.
-    #[error("storage.min_free_percent must be between 0 and 100, got {0}")]
+    /// The free-space floor is above the supported share of a root.
+    #[error("storage.min_free_percent must be between 0 and {MAX_MIN_FREE_PERCENT}, got {0}")]
     InvalidMinFreePercent(u8),
     /// One configured API bearer is empty or contains only whitespace.
     #[error("api.tokens entries must not be blank")]
     BlankApiToken,
+    /// The API has no bearer token and the configuration does not opt into an
+    /// unauthenticated development API.
+    #[error(
+        "api.tokens is empty: add a token of at least {MIN_API_TOKEN_LEN} visible ASCII \
+         characters (for example from `openssl rand -hex 16`), or set \
+         api.allow_unauthenticated = true on a loopback api.listen address for development"
+    )]
+    MissingApiToken,
+    /// An unauthenticated API was requested on an address reachable from the network.
+    #[error("api.allow_unauthenticated requires a loopback api.listen address, got {0}")]
+    UnauthenticatedNonLoopback(SocketAddr),
+    /// Bearer tokens and the unauthenticated switch contradict each other.
+    #[error("api.allow_unauthenticated cannot be combined with api.tokens")]
+    ConflictingApiAuthentication,
+    /// A bearer token is too short or contains characters outside visible ASCII.
+    /// The message names the entry's position, never its value.
+    #[error(
+        "api.tokens entry {index} must be at least {MIN_API_TOKEN_LEN} visible ASCII \
+         characters (0x21 to 0x7e)"
+    )]
+    WeakApiToken {
+        /// Zero-based position of the rejected entry in `api.tokens`.
+        index: usize,
+    },
+    /// A bearer token is the placeholder from the example configuration.
+    #[error(
+        "api.tokens entry {index} is the example placeholder; generate a token, for example \
+         with `openssl rand -hex 16`"
+    )]
+    PlaceholderApiToken {
+        /// Zero-based position of the rejected entry in `api.tokens`.
+        index: usize,
+    },
+    /// The sync interval is outside the supported range.
+    #[error(
+        "storage.sync_interval_ms must be between {MIN_SYNC_INTERVAL_MS} and \
+         {MAX_SYNC_INTERVAL_MS}, got {0}"
+    )]
+    InvalidSyncIntervalMs(u64),
+    /// The rotation age is outside the supported range.
+    #[error("storage.rotate_secs must be between {MIN_ROTATE_SECS} and {MAX_ROTATE_SECS}, got {0}")]
+    InvalidRotateSecs(u64),
+    /// The rotation size is outside the supported range.
+    #[error(
+        "storage.rotate_bytes must be between {MIN_ROTATE_BYTES} and {MAX_ROTATE_BYTES}, got {0}"
+    )]
+    InvalidRotateBytes(u64),
+    /// The preallocation exceeds the rotation size or its own ceiling.
+    #[error(
+        "storage.preallocate_bytes must be between 0 and {max} (the smaller of \
+         storage.rotate_bytes and {MAX_PREALLOCATE_BYTES}), got {value}"
+    )]
+    InvalidPreallocateBytes {
+        /// The rejected preallocation.
+        value: u64,
+        /// The largest preallocation this configuration accepts.
+        max: u64,
+    },
+    /// A size quota of zero would delete every recording.
+    #[error("storage.quota_gib must be at least 1 when set, got {0}")]
+    InvalidQuotaGib(u64),
     /// The fragment duration is zero or exceeds the supported operational bound.
     #[error("storage.max_fragment_ms must be between 1 and {MAX_FRAGMENT_MS}, got {0}")]
     InvalidMaxFragmentMs(u64),
     /// The per-stream writer queue exceeds the supported operational bound.
     #[error("storage.max_queued_fragments must not exceed {MAX_QUEUED_FRAGMENTS}, got {0}")]
     InvalidMaxQueuedFragments(usize),
-    /// A camera retention age cannot be represented safely in microseconds.
-    #[error("camera {camera} retention_days must not exceed {MAX_RETENTION_DAYS}, got {days}")]
+    /// A camera retention age is zero or cannot be represented safely in microseconds.
+    #[error(
+        "camera {camera} retention_days must be between 1 and {MAX_RETENTION_DAYS}, got {days}"
+    )]
     InvalidRetentionDays {
         /// The camera with the invalid age policy.
         camera: CameraId,
         /// The rejected number of days.
         days: u32,
+    },
+    /// The API connection cap is outside its supported range.
+    #[error(
+        "api.max_connections must be between {MIN_API_CONNECTIONS} and {MAX_API_CONNECTIONS}, got {0}"
+    )]
+    InvalidApiMaxConnections(usize),
+    /// A media admission class is outside its supported range.
+    #[error("api.{key} must be between 1 and {MAX_API_MEDIA_RESPONSES}, got {value}")]
+    InvalidApiMediaLimit {
+        /// The configuration key, `max_streaming_media` or `max_bounded_media`.
+        key: &'static str,
+        /// The rejected value.
+        value: usize,
     },
 }
 
@@ -114,6 +198,69 @@ pub const MAX_QUEUED_FRAGMENTS: usize = 4_096;
 
 /// Largest retention age whose microsecond span fits in an [`i64`].
 pub const MAX_RETENTION_DAYS: u32 = 106_751_991;
+
+/// Largest accepted free-space floor, in percent of a root's capacity.
+///
+/// A floor above half the device would delete most recordings to satisfy it.
+pub const MAX_MIN_FREE_PERCENT: u8 = 50;
+
+/// Shortest accepted sync interval, in milliseconds.
+///
+/// Each sync is an `fdatasync` of every open file; below a tenth of a second
+/// the device spends its time flushing.
+pub const MIN_SYNC_INTERVAL_MS: u64 = 100;
+
+/// Longest accepted sync interval, in milliseconds.
+///
+/// The interval bounds the power-loss window and the catalog's progress
+/// reports; one minute is the outer bound.
+pub const MAX_SYNC_INTERVAL_MS: u64 = 60_000;
+
+/// Shortest accepted rotation age, in seconds.
+pub const MIN_ROTATE_SECS: u64 = 60;
+
+/// Longest accepted rotation age, in seconds (one day).
+pub const MAX_ROTATE_SECS: u64 = 86_400;
+
+/// Smallest accepted rotation size: the largest fragment the ingest assembler
+/// accepts (64 MiB) must fit in one file.
+pub const MIN_ROTATE_BYTES: u64 = 64 << 20;
+
+/// Largest accepted rotation size (64 GiB).
+pub const MAX_ROTATE_BYTES: u64 = 64 << 30;
+
+/// Largest accepted preallocation (4 GiB). Reserved space counts as used for
+/// the free-space floor, so it is also capped at the rotation size.
+pub const MAX_PREALLOCATE_BYTES: u64 = 4 << 30;
+
+/// Shortest accepted API bearer token, in bytes of visible ASCII.
+///
+/// Thirty-two characters carry at least 128 bits when generated as documented
+/// (`openssl rand -hex 16`).
+pub const MIN_API_TOKEN_LEN: usize = 32;
+
+/// The placeholder token of `config/cameras.example.toml`, rejected so a copied
+/// example cannot serve the API.
+const EXAMPLE_API_TOKEN: &str = "replace-with-a-long-random-token";
+
+/// Smallest accepted [`ApiConfig::max_connections`].
+pub const MIN_API_CONNECTIONS: usize = 16;
+
+/// Largest accepted [`ApiConfig::max_connections`].
+pub const MAX_API_CONNECTIONS: usize = 65_536;
+
+/// Default [`ApiConfig::max_connections`].
+pub const DEFAULT_API_CONNECTIONS: usize = 256;
+
+/// Largest accepted size of either media admission class
+/// ([`ApiConfig::max_streaming_media`], [`ApiConfig::max_bounded_media`]).
+pub const MAX_API_MEDIA_RESPONSES: usize = 1_024;
+
+/// Default [`ApiConfig::max_streaming_media`].
+pub const DEFAULT_API_STREAMING_MEDIA: usize = 8;
+
+/// Default [`ApiConfig::max_bounded_media`].
+pub const DEFAULT_API_BOUNDED_MEDIA: usize = 32;
 
 /// How camera sockets are read.
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -163,9 +310,12 @@ impl IngestConfig {
 ///
 /// Unknown keys are errors rather than silent defaults, camera ids must be
 /// unique, recorded stream kinds must be distinct supported video kinds, event sources
-/// must be unique per camera,
-/// and the free-space percentage must be in 0..=100. Every section other than
-/// `camera` has a complete default. `config/cameras.example.toml` documents each key.
+/// must be unique per camera, and the storage knobs must lie in the ranges their
+/// fields document. The API needs at least one bearer token of
+/// [`MIN_API_TOKEN_LEN`] visible ASCII characters, or `api.allow_unauthenticated`
+/// with no token on a loopback listener. Every section other than `camera` has a
+/// default, but the default API section has no token, so a configuration states
+/// its API authentication explicitly. `config/cameras.example.toml` documents each key.
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
@@ -205,13 +355,28 @@ impl Config {
     }
 
     fn validate(&self) -> Result<(), ConfigError> {
-        if self.storage.min_free_percent > 100 {
+        if self.storage.min_free_percent > MAX_MIN_FREE_PERCENT {
             return Err(ConfigError::InvalidMinFreePercent(
                 self.storage.min_free_percent,
             ));
         }
         if self.api.tokens.iter().any(|token| token.trim().is_empty()) {
             return Err(ConfigError::BlankApiToken);
+        }
+        self.api.validate_authentication()?;
+        self.storage.validate_ranges()?;
+        if !(MIN_API_CONNECTIONS..=MAX_API_CONNECTIONS).contains(&self.api.max_connections) {
+            return Err(ConfigError::InvalidApiMaxConnections(
+                self.api.max_connections,
+            ));
+        }
+        for (key, value) in [
+            ("max_streaming_media", self.api.max_streaming_media),
+            ("max_bounded_media", self.api.max_bounded_media),
+        ] {
+            if !(1..=MAX_API_MEDIA_RESPONSES).contains(&value) {
+                return Err(ConfigError::InvalidApiMediaLimit { key, value });
+            }
         }
         if self.storage.max_fragment_ms == 0 || self.storage.max_fragment_ms > MAX_FRAGMENT_MS {
             return Err(ConfigError::InvalidMaxFragmentMs(
@@ -229,7 +394,7 @@ impl Config {
                 return Err(ConfigError::DuplicateCamera(camera.id.clone()));
             }
             if let Some(days) = camera.retention_days
-                && days > MAX_RETENTION_DAYS
+                && (days == 0 || days > MAX_RETENTION_DAYS)
             {
                 return Err(ConfigError::InvalidRetentionDays {
                     camera: camera.id.clone(),
@@ -283,21 +448,26 @@ pub struct StorageConfig {
     /// Directory for the catalog database and other small state.
     pub state_dir: PathBuf,
     /// Retention deletes the oldest sealed segments while a root has less free space than this.
-    /// Must be in 0..=100; zero disables the free-space floor.
+    /// Must be in `0..=`[`MAX_MIN_FREE_PERCENT`]; zero disables the free-space floor.
     pub min_free_percent: u8,
     /// Retention also deletes the oldest sealed segments while the catalogued recordings (open
-    /// files at their written length) exceed this many GiB. Unset means no cap.
+    /// files at their written length) exceed this many GiB. Unset means no cap; when set it
+    /// must be at least 1.
     pub quota_gib: Option<u64>,
-    /// How often open files are `fdatasync`ed. Bounds the power-loss window.
+    /// How often open files are `fdatasync`ed. Bounds the power-loss window. Must be in
+    /// [`MIN_SYNC_INTERVAL_MS`]`..=`[`MAX_SYNC_INTERVAL_MS`].
     pub sync_interval_ms: u64,
     /// Longest fragment; a GOP longer than this is split. Must be in
     /// `1..=MAX_FRAGMENT_MS`.
     pub max_fragment_ms: u64,
-    /// Space reserved ahead of the write position with `fallocate`.
+    /// Space reserved ahead of the write position with `fallocate`. Must not exceed the
+    /// smaller of `rotate_bytes` and [`MAX_PREALLOCATE_BYTES`]; zero disables it.
     pub preallocate_bytes: u64,
-    /// A file is sealed and a new one started once it reaches this size …
+    /// A file is sealed and a new one started once it reaches this size … Must be in
+    /// [`MIN_ROTATE_BYTES`]`..=`[`MAX_ROTATE_BYTES`].
     pub rotate_bytes: u64,
-    /// … or this age in seconds, whichever comes first (at the next IRAP).
+    /// … or this age in seconds, whichever comes first (at the next IRAP). Must be in
+    /// [`MIN_ROTATE_SECS`]`..=`[`MAX_ROTATE_SECS`].
     pub rotate_secs: u64,
     /// Fragments queued for the writer per stream before new ones are dropped.
     /// Must not exceed [`MAX_QUEUED_FRAGMENTS`]; zero uses a capacity of one.
@@ -309,6 +479,31 @@ impl StorageConfig {
     #[must_use]
     pub fn quota_bytes(&self) -> Option<u64> {
         self.quota_gib.map(|gib| gib.saturating_mul(1 << 30))
+    }
+
+    /// Checks the knobs whose out-of-range values silently break durability,
+    /// stop recording, or delete every recording.
+    fn validate_ranges(&self) -> Result<(), ConfigError> {
+        if !(MIN_SYNC_INTERVAL_MS..=MAX_SYNC_INTERVAL_MS).contains(&self.sync_interval_ms) {
+            return Err(ConfigError::InvalidSyncIntervalMs(self.sync_interval_ms));
+        }
+        if !(MIN_ROTATE_SECS..=MAX_ROTATE_SECS).contains(&self.rotate_secs) {
+            return Err(ConfigError::InvalidRotateSecs(self.rotate_secs));
+        }
+        if !(MIN_ROTATE_BYTES..=MAX_ROTATE_BYTES).contains(&self.rotate_bytes) {
+            return Err(ConfigError::InvalidRotateBytes(self.rotate_bytes));
+        }
+        let max = self.rotate_bytes.min(MAX_PREALLOCATE_BYTES);
+        if self.preallocate_bytes > max {
+            return Err(ConfigError::InvalidPreallocateBytes {
+                value: self.preallocate_bytes,
+                max,
+            });
+        }
+        if self.quota_gib == Some(0) {
+            return Err(ConfigError::InvalidQuotaGib(0));
+        }
+        Ok(())
     }
 }
 
@@ -329,15 +524,51 @@ impl Default for StorageConfig {
     }
 }
 
-/// HTTP API settings.
-#[derive(Clone, Debug, Deserialize, Serialize)]
+/// HTTP API settings. `Debug` prints the number of tokens, never their values.
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct ApiConfig {
     /// Address to listen on.
     pub listen: SocketAddr,
-    /// Bearer tokens accepted by the API. The list may be empty to disable authentication for
-    /// development, but individual entries must contain a non-whitespace token.
+    /// Bearer tokens accepted by the API. Each entry is at least [`MIN_API_TOKEN_LEN`]
+    /// characters of visible ASCII (0x21 to 0x7e) and is not the example placeholder;
+    /// generate one with `openssl rand -hex 16`. At least one token is required unless
+    /// `allow_unauthenticated` is set.
     pub tokens: Vec<String>,
+    /// Serves the API without authentication, for development. Accepted only with an
+    /// empty token list and a loopback `listen` address. Defaults to false.
+    pub allow_unauthenticated: bool,
+    /// TCP connections served at once, WebSocket connections included; further clients wait
+    /// in the kernel's listen backlog. Must be between [`MIN_API_CONNECTIONS`] and
+    /// [`MAX_API_CONNECTIONS`] (16 to 65,536).
+    pub max_connections: usize,
+    /// Streaming media responses served at once: whole or open-ended recording files, ranges
+    /// above 1 MiB, and exports. Must be between 1 and [`MAX_API_MEDIA_RESPONSES`].
+    pub max_streaming_media: usize,
+    /// Bounded media responses served at once: VOD playlists, keyframes, LL-HLS
+    /// initialization, segment, and part resources, and ranges of at most 1 MiB. Must be
+    /// between 1 and [`MAX_API_MEDIA_RESPONSES`].
+    pub max_bounded_media: usize,
+    /// Serve `/metrics` without authentication. When false, the default, a scrape presents a
+    /// root bearer token like every other protected route.
+    pub public_metrics: bool,
+}
+
+impl fmt::Debug for ApiConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ApiConfig")
+            .field("listen", &self.listen)
+            .field(
+                "tokens",
+                &format_args!("[<redacted>; {}]", self.tokens.len()),
+            )
+            .field("allow_unauthenticated", &self.allow_unauthenticated)
+            .field("max_connections", &self.max_connections)
+            .field("max_streaming_media", &self.max_streaming_media)
+            .field("max_bounded_media", &self.max_bounded_media)
+            .field("public_metrics", &self.public_metrics)
+            .finish()
+    }
 }
 
 impl Default for ApiConfig {
@@ -345,7 +576,42 @@ impl Default for ApiConfig {
         Self {
             listen: "127.0.0.1:8554".parse().expect("valid literal"),
             tokens: Vec::new(),
+            allow_unauthenticated: false,
+            max_connections: DEFAULT_API_CONNECTIONS,
+            max_streaming_media: DEFAULT_API_STREAMING_MEDIA,
+            max_bounded_media: DEFAULT_API_BOUNDED_MEDIA,
+            public_metrics: false,
         }
+    }
+}
+
+impl ApiConfig {
+    /// Requires either well-formed bearer tokens or an explicit unauthenticated
+    /// loopback listener. Errors name a token's position, never its value.
+    fn validate_authentication(&self) -> Result<(), ConfigError> {
+        if self.tokens.is_empty() {
+            if !self.allow_unauthenticated {
+                return Err(ConfigError::MissingApiToken);
+            }
+            if !self.listen.ip().is_loopback() {
+                return Err(ConfigError::UnauthenticatedNonLoopback(self.listen));
+            }
+            return Ok(());
+        }
+        if self.allow_unauthenticated {
+            return Err(ConfigError::ConflictingApiAuthentication);
+        }
+        for (index, token) in self.tokens.iter().enumerate() {
+            if token.len() < MIN_API_TOKEN_LEN
+                || !token.bytes().all(|byte| (0x21..=0x7e).contains(&byte))
+            {
+                return Err(ConfigError::WeakApiToken { index });
+            }
+            if token == EXAMPLE_API_TOKEN {
+                return Err(ConfigError::PlaceholderApiToken { index });
+            }
+        }
+        Ok(())
     }
 }
 
@@ -361,8 +627,8 @@ pub enum TimestampMode {
     Passthrough,
 }
 
-/// One camera.
-#[derive(Clone, Debug, Deserialize, Serialize)]
+/// One camera. Its `Debug` output shows the password as `<redacted>`.
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct CameraConfig {
     /// Stable identifier used in paths and URLs.
@@ -399,12 +665,50 @@ pub struct CameraConfig {
     #[serde(default = "default_true")]
     pub tls_verify: bool,
     /// Delete this camera's recordings after this many days, regardless of free space.
-    /// Must not exceed [`MAX_RETENTION_DAYS`].
+    /// Must be in `1..=`[`MAX_RETENTION_DAYS`]; leave it unset for no age limit.
     #[serde(default)]
     pub retention_days: Option<u32>,
     /// Distinct event sources to subscribe to.
     #[serde(default)]
     pub events: Vec<EventSource>,
+}
+
+impl fmt::Debug for CameraConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Destructured so a field added later cannot bypass this decision.
+        let Self {
+            id,
+            name,
+            rtsp_url,
+            sub_url,
+            username,
+            password: _,
+            vendor,
+            record,
+            timestamp_mode,
+            http_port,
+            https,
+            tls_verify,
+            retention_days,
+            events,
+        } = self;
+        f.debug_struct("CameraConfig")
+            .field("id", id)
+            .field("name", name)
+            .field("rtsp_url", rtsp_url)
+            .field("sub_url", sub_url)
+            .field("username", username)
+            .field("password", &"<redacted>")
+            .field("vendor", vendor)
+            .field("record", record)
+            .field("timestamp_mode", timestamp_mode)
+            .field("http_port", http_port)
+            .field("https", https)
+            .field("tls_verify", tls_verify)
+            .field("retention_days", retention_days)
+            .field("events", events)
+            .finish()
+    }
 }
 
 fn default_true() -> bool {
@@ -543,7 +847,6 @@ mod tests {
 
     #[test]
     fn blank_api_tokens_fail_closed() {
-        assert!(Config::from_toml_str("[api]\ntokens=[]\n").is_ok());
         for tokens in ["['']", "['   ']", "['valid', '']", "[\"valid\", \"\\t\"]"] {
             assert!(matches!(
                 Config::from_toml_str(&format!("[api]\ntokens={tokens}\n")),
@@ -552,18 +855,212 @@ mod tests {
         }
     }
 
+    /// A token of exactly the minimum length, built so no test embeds a usable secret.
+    fn token(fill: char) -> String {
+        std::iter::repeat_n(fill, MIN_API_TOKEN_LEN).collect()
+    }
+
+    #[test]
+    fn an_api_without_tokens_requires_the_explicit_switch() {
+        for text in ["", "[api]\n", "[api]\ntokens=[]\n"] {
+            assert!(
+                matches!(
+                    Config::from_toml_str(text),
+                    Err(ConfigError::MissingApiToken)
+                ),
+                "{text:?}"
+            );
+        }
+        let error = Config::from_toml_str("").unwrap_err().to_string();
+        assert!(error.contains("openssl rand -hex 16"), "{error}");
+        for listen in ["127.0.0.1:8554", "127.0.0.2:9000", "[::1]:8554"] {
+            let config = Config::from_toml_str(&format!(
+                "[api]\nlisten='{listen}'\nallow_unauthenticated=true\n"
+            ))
+            .unwrap();
+            assert!(config.api.allow_unauthenticated);
+            assert_eq!(config.api.tokens, Vec::<String>::new());
+        }
+    }
+
+    #[test]
+    fn an_unauthenticated_api_must_listen_on_loopback() {
+        for listen in [
+            "0.0.0.0:8554",
+            "192.0.2.10:8554",
+            "[::]:8554",
+            "[2001:db8::1]:8554",
+        ] {
+            assert!(
+                matches!(
+                    Config::from_toml_str(&format!(
+                        "[api]\nlisten='{listen}'\nallow_unauthenticated=true\n"
+                    )),
+                    Err(ConfigError::UnauthenticatedNonLoopback(address))
+                        if address == listen.parse::<SocketAddr>().unwrap()
+                ),
+                "{listen}"
+            );
+        }
+    }
+
+    #[test]
+    fn tokens_and_the_unauthenticated_switch_contradict() {
+        assert!(matches!(
+            Config::from_toml_str(&format!(
+                "[api]\ntokens=['{}']\nallow_unauthenticated=true\n",
+                token('a')
+            )),
+            Err(ConfigError::ConflictingApiAuthentication)
+        ));
+    }
+
+    #[test]
+    fn api_tokens_need_thirty_two_visible_ascii_characters() {
+        let valid = token('a');
+        let config = Config::from_toml_str(&format!(
+            "[api]\nlisten='0.0.0.0:8554'\ntokens=['{valid}']\n"
+        ))
+        .unwrap();
+        assert_eq!(config.api.tokens, std::slice::from_ref(&valid));
+        let visible_extremes = format!("!{}~", "a".repeat(MIN_API_TOKEN_LEN - 2));
+        assert!(Config::from_toml_str(&format!("[api]\ntokens=['{visible_extremes}']\n")).is_ok());
+
+        let short = "a".repeat(MIN_API_TOKEN_LEN - 1);
+        let with_space = format!("{} a", "a".repeat(MIN_API_TOKEN_LEN));
+        let with_control = format!("{}\\u0001", "a".repeat(MIN_API_TOKEN_LEN));
+        let non_ascii = format!("{}é", "a".repeat(MIN_API_TOKEN_LEN));
+        for (index, weak) in [short, with_space, with_control, non_ascii]
+            .into_iter()
+            .enumerate()
+        {
+            let text = format!("[api]\ntokens=['{valid}', \"{weak}\"]\n");
+            let error = Config::from_toml_str(&text).unwrap_err();
+            assert!(
+                matches!(error, ConfigError::WeakApiToken { index: 1 }),
+                "case {index}: {error:?}"
+            );
+            let message = format!("{error}\n{error:?}");
+            assert!(!message.contains(&valid), "{message}");
+            assert!(!message.contains("aaaa"), "{message}");
+        }
+    }
+
+    #[test]
+    fn the_example_configuration_loads_once_its_token_is_generated() {
+        let example = include_str!("../../../config/cameras.example.toml");
+        assert!(matches!(
+            Config::from_toml_str(example),
+            Err(ConfigError::PlaceholderApiToken { index: 0 })
+        ));
+        let config = Config::from_toml_str(&example.replace(EXAMPLE_API_TOKEN, &token('c')))
+            .expect("the documented example is otherwise valid");
+        assert_eq!(config.cameras.len(), 1);
+        assert!(!config.api.allow_unauthenticated);
+    }
+
+    #[test]
+    fn the_example_placeholder_token_is_rejected() {
+        assert_eq!(EXAMPLE_API_TOKEN.len(), MIN_API_TOKEN_LEN);
+        let error = Config::from_toml_str(&format!(
+            "[api]\ntokens=['{}', '{EXAMPLE_API_TOKEN}']\n",
+            token('b')
+        ))
+        .unwrap_err();
+        assert!(
+            matches!(error, ConfigError::PlaceholderApiToken { index: 1 }),
+            "{error:?}"
+        );
+        assert!(!error.to_string().contains(EXAMPLE_API_TOKEN));
+    }
+
+    #[test]
+    fn api_debug_redacts_every_token_and_keeps_the_other_fields() {
+        let (first, second) = (token('r'), token('s'));
+        let config = Config::from_toml_str(&format!(
+            "[api]\ntokens=['{first}', '{second}']\nmax_connections=64\n"
+        ))
+        .unwrap();
+        let rendered = format!("{:?}", config.api);
+        assert!(
+            !rendered.contains(&first) && !rendered.contains(&second),
+            "{rendered}"
+        );
+        assert!(rendered.contains("tokens: [<redacted>; 2]"), "{rendered}");
+        for field in [
+            "listen: 127.0.0.1:8554",
+            "max_connections: 64",
+            "max_streaming_media: 8",
+            "max_bounded_media: 32",
+            "public_metrics: false",
+        ] {
+            assert!(rendered.contains(field), "missing {field} in {rendered}");
+        }
+        let pretty = format!("{config:#?}");
+        assert!(
+            !pretty.contains(&first) && !pretty.contains(&second),
+            "{pretty}"
+        );
+    }
+
+    #[test]
+    fn api_admission_limits_have_defaults_and_bounds() {
+        const DEV: &str = "[api]\nallow_unauthenticated=true\n";
+        let defaults = Config::from_toml_str(DEV).unwrap().api;
+        assert_eq!(defaults.max_connections, 256);
+        assert_eq!(defaults.max_streaming_media, 8);
+        assert_eq!(defaults.max_bounded_media, 32);
+        assert!(!defaults.public_metrics);
+
+        let edges = Config::from_toml_str(
+            "[api]\nallow_unauthenticated=true\nmax_connections=16\nmax_streaming_media=1\nmax_bounded_media=1024\npublic_metrics=true\n",
+        )
+        .unwrap()
+        .api;
+        assert_eq!(edges.max_connections, MIN_API_CONNECTIONS);
+        assert_eq!(edges.max_streaming_media, 1);
+        assert_eq!(edges.max_bounded_media, MAX_API_MEDIA_RESPONSES);
+        assert!(edges.public_metrics);
+        assert_eq!(
+            Config::from_toml_str(&format!("{DEV}max_connections=65536\n"))
+                .unwrap()
+                .api
+                .max_connections,
+            MAX_API_CONNECTIONS
+        );
+
+        for connections in [0, 15, 65_537] {
+            assert!(matches!(
+                Config::from_toml_str(&format!("{DEV}max_connections={connections}\n")),
+                Err(ConfigError::InvalidApiMaxConnections(value)) if value == connections
+            ));
+        }
+        for (key, value) in [
+            ("max_streaming_media", 0),
+            ("max_streaming_media", 1_025),
+            ("max_bounded_media", 0),
+            ("max_bounded_media", 1_025),
+        ] {
+            assert!(matches!(
+                Config::from_toml_str(&format!("{DEV}{key}={value}\n")),
+                Err(ConfigError::InvalidApiMediaLimit { key: rejected, value: got })
+                    if rejected == key && got == value
+            ));
+        }
+    }
+
     #[test]
     fn recorded_stream_kinds_are_unique_per_camera() {
         let camera = "[[camera]]\nid='a'\nname=''\nrtsp_url=''\nusername=''\npassword=''\n";
         for kinds in ["['main','main']", "['sub','sub']", "['audio','audio']"] {
-            assert!(Config::from_toml_str(&format!("{camera}record={kinds}\n")).is_err());
+            assert!(parse(&format!("{camera}record={kinds}\n")).is_err());
         }
         assert!(matches!(
-            Config::from_toml_str(&format!("{camera}record=['audio']\n")),
+            parse(&format!("{camera}record=['audio']\n")),
             Err(ConfigError::UnsupportedRecordedKind { .. })
         ));
         for kinds in ["['main','sub']", "[]"] {
-            assert!(Config::from_toml_str(&format!("{camera}record={kinds}\n")).is_ok());
+            assert!(parse(&format!("{camera}record={kinds}\n")).is_ok());
         }
     }
 
@@ -576,19 +1073,19 @@ mod tests {
             "['onvif_pull_point','onvif_pull_point']",
         ] {
             assert!(matches!(
-                Config::from_toml_str(&format!("{camera}events={sources}\n")),
+                parse(&format!("{camera}events={sources}\n")),
                 Err(ConfigError::DuplicateEventSource { .. })
             ));
         }
         for sources in ["[]", "['dahua_cgi']", "['dahua_cgi','onvif_pull_point']"] {
             assert!(
-                Config::from_toml_str(&format!("{camera}events={sources}\n")).is_ok(),
+                parse(&format!("{camera}events={sources}\n")).is_ok(),
                 "sources {sources}"
             );
         }
         for sources in ["['onvif_metadata']", "['manual']"] {
             assert!(matches!(
-                Config::from_toml_str(&format!("{camera}events={sources}\n")),
+                parse(&format!("{camera}events={sources}\n")),
                 Err(ConfigError::UnsupportedEventSource { .. })
             ));
         }
@@ -597,29 +1094,152 @@ mod tests {
             "{camera}events=['dahua_cgi']\n{}events=['dahua_cgi']\n",
             camera.replace("id='a'", "id='b'")
         );
-        assert!(Config::from_toml_str(&two_cameras).is_ok());
+        assert!(parse(&two_cameras).is_ok());
     }
 
     #[test]
-    fn free_space_percentage_is_between_zero_and_one_hundred() {
-        for value in [0, 100, 101, 255] {
-            let result = Config::from_toml_str(&format!("[storage]\nmin_free_percent={value}\n"));
-            assert_eq!(result.is_ok(), value <= 100, "percentage {value}");
+    fn free_space_percentage_is_between_zero_and_fifty() {
+        for value in [0, 1, MAX_MIN_FREE_PERCENT] {
+            assert!(
+                parse(&format!("[storage]\nmin_free_percent={value}\n")).is_ok(),
+                "percentage {value}"
+            );
         }
-        assert!(Config::from_toml_str("").is_ok());
+        for value in [MAX_MIN_FREE_PERCENT + 1, 100, 101, 255] {
+            assert!(
+                matches!(
+                    parse(&format!("[storage]\nmin_free_percent={value}\n")),
+                    Err(ConfigError::InvalidMinFreePercent(v)) if v == value
+                ),
+                "percentage {value}"
+            );
+        }
+        assert!(parse("").is_ok());
+    }
+
+    /// Accepts each value in `accepted` and rejects each in `rejected` for one
+    /// storage key, with the `context` lines and every other key at its default.
+    fn check_storage_range(
+        context: &str,
+        key: &str,
+        accepted: &[u64],
+        rejected: &[u64],
+        is_range_error: impl Fn(&ConfigError, u64) -> bool,
+    ) {
+        for &value in accepted {
+            assert!(
+                parse(&format!("[storage]\n{context}{key}={value}\n")).is_ok(),
+                "{key}={value} must be accepted"
+            );
+        }
+        for &value in rejected {
+            match parse(&format!("[storage]\n{context}{key}={value}\n")) {
+                Err(error) if is_range_error(&error, value) => {}
+                other => panic!("{key}={value} must be rejected, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn sync_interval_is_between_a_tenth_of_a_second_and_a_minute() {
+        check_storage_range(
+            "",
+            "sync_interval_ms",
+            &[MIN_SYNC_INTERVAL_MS, 5_000, MAX_SYNC_INTERVAL_MS],
+            &[
+                0,
+                MIN_SYNC_INTERVAL_MS - 1,
+                MAX_SYNC_INTERVAL_MS + 1,
+                u64::MAX,
+            ],
+            |error, value| matches!(error, ConfigError::InvalidSyncIntervalMs(v) if *v == value),
+        );
+    }
+
+    #[test]
+    fn rotation_age_is_between_a_minute_and_a_day() {
+        check_storage_range(
+            "",
+            "rotate_secs",
+            &[MIN_ROTATE_SECS, 3_600, MAX_ROTATE_SECS],
+            &[0, MIN_ROTATE_SECS - 1, MAX_ROTATE_SECS + 1, u64::MAX],
+            |error, value| matches!(error, ConfigError::InvalidRotateSecs(v) if *v == value),
+        );
+    }
+
+    #[test]
+    fn rotation_size_is_between_one_fragment_cap_and_sixty_four_gib() {
+        check_storage_range(
+            "preallocate_bytes=0\n",
+            "rotate_bytes",
+            &[MIN_ROTATE_BYTES, 1 << 30, MAX_ROTATE_BYTES],
+            &[0, MIN_ROTATE_BYTES - 1, MAX_ROTATE_BYTES + 1, u64::MAX],
+            |error, value| matches!(error, ConfigError::InvalidRotateBytes(v) if *v == value),
+        );
+    }
+
+    #[test]
+    fn preallocation_is_capped_by_rotation_size_and_four_gib() {
+        let default_rotation = StorageConfig::default().rotate_bytes;
+        check_storage_range(
+            "",
+            "preallocate_bytes",
+            &[0, 1, default_rotation],
+            &[default_rotation + 1, MAX_PREALLOCATE_BYTES + 1, u64::MAX],
+            |error, value| {
+                matches!(
+                    error,
+                    ConfigError::InvalidPreallocateBytes { value: v, max }
+                        if *v == value && *max == default_rotation
+                )
+            },
+        );
+        let large_files = format!("rotate_bytes={MAX_ROTATE_BYTES}\n");
+        assert!(
+            parse(&format!(
+                "[storage]\n{large_files}preallocate_bytes={MAX_PREALLOCATE_BYTES}\n"
+            ))
+            .is_ok()
+        );
+        assert!(matches!(
+            parse(&format!(
+                "[storage]\n{large_files}preallocate_bytes={}\n",
+                MAX_PREALLOCATE_BYTES + 1
+            )),
+            Err(ConfigError::InvalidPreallocateBytes { max, .. }) if max == MAX_PREALLOCATE_BYTES
+        ));
+    }
+
+    #[test]
+    fn a_configured_quota_is_at_least_one_gib() {
+        check_storage_range(
+            "",
+            "quota_gib",
+            &[1, 2_000, u64::MAX],
+            &[0],
+            |error, value| matches!(error, ConfigError::InvalidQuotaGib(v) if *v == value),
+        );
+        assert_eq!(parse("").unwrap().storage.quota_gib, None);
+    }
+
+    #[test]
+    fn default_storage_settings_are_in_range() {
+        let storage = StorageConfig::default();
+        assert!(storage.validate_ranges().is_ok());
+        assert!(storage.min_free_percent <= MAX_MIN_FREE_PERCENT);
     }
 
     #[test]
     fn storage_resource_limits_are_profile_independent() {
         for value in [1, MAX_FRAGMENT_MS] {
             assert!(
-                Config::from_toml_str(&format!("[storage]\nmax_fragment_ms={value}\n")).is_ok(),
+                parse(&format!("[storage]\nmax_fragment_ms={value}\n")).is_ok(),
                 "fragment duration {value}"
             );
         }
         for value in [0, MAX_FRAGMENT_MS + 1, u64::MAX] {
             assert!(matches!(
-                Config::from_toml_str(&format!(
+                parse(&format!(
                     "[storage]\nmax_fragment_ms={value}\n"
                 )),
                 Err(ConfigError::InvalidMaxFragmentMs(v)) if v == value
@@ -628,14 +1248,13 @@ mod tests {
 
         for value in [0, 1, MAX_QUEUED_FRAGMENTS] {
             assert!(
-                Config::from_toml_str(&format!("[storage]\nmax_queued_fragments={value}\n"))
-                    .is_ok(),
+                parse(&format!("[storage]\nmax_queued_fragments={value}\n")).is_ok(),
                 "queue bound {value}"
             );
         }
         for value in [MAX_QUEUED_FRAGMENTS + 1, usize::MAX] {
             assert!(matches!(
-                Config::from_toml_str(&format!(
+                parse(&format!(
                     "[storage]\nmax_queued_fragments={value}\n"
                 )),
                 Err(ConfigError::InvalidMaxQueuedFragments(v)) if v == value
@@ -646,15 +1265,15 @@ mod tests {
     #[test]
     fn retention_age_rejects_unrepresentable_microsecond_spans() {
         let camera = "[[camera]]\nid='a'\nname=''\nrtsp_url=''\nusername=''\npassword=''\n";
-        for days in [0, 1, MAX_RETENTION_DAYS] {
+        for days in [1, 2, MAX_RETENTION_DAYS] {
             assert!(
-                Config::from_toml_str(&format!("{camera}retention_days={days}\n")).is_ok(),
+                parse(&format!("{camera}retention_days={days}\n")).is_ok(),
                 "retention age {days}"
             );
         }
-        for days in [MAX_RETENTION_DAYS + 1, 200_000_000, u32::MAX] {
+        for days in [0, MAX_RETENTION_DAYS + 1, 200_000_000, u32::MAX] {
             assert!(matches!(
-                Config::from_toml_str(&format!("{camera}retention_days={days}\n")),
+                parse(&format!("{camera}retention_days={days}\n")),
                 Err(ConfigError::InvalidRetentionDays { days: rejected, .. }) if rejected == days
             ));
         }
@@ -662,12 +1281,11 @@ mod tests {
 
     #[test]
     fn rtsp_authorities_end_before_queries_and_fragments() {
-        let mut camera = Config::from_toml_str(
-            "[[camera]]\nid='a'\nname=''\nrtsp_url=''\nusername=''\npassword=''\n",
-        )
-        .unwrap()
-        .cameras
-        .remove(0);
+        let mut camera =
+            parse("[[camera]]\nid='a'\nname=''\nrtsp_url=''\nusername=''\npassword=''\n")
+                .unwrap()
+                .cameras
+                .remove(0);
         for (authority, host) in [
             ("192.0.2.7", "192.0.2.7"),
             ("camera.example", "camera.example"),
@@ -688,7 +1306,7 @@ mod tests {
 
     #[test]
     fn http_base_brackets_ipv6_hosts() {
-        let mut camera = Config::from_toml_str(
+        let mut camera = parse(
             "[[camera]]\nid='a'\nname=''\nrtsp_url='rtsp://[2001:db8::1]/x'\nusername=''\npassword=''\n",
         )
         .unwrap()
@@ -713,18 +1331,16 @@ mod tests {
 
     #[test]
     fn ingest_read_interval_defaults_to_twenty_milliseconds() {
-        let config = Config::from_toml_str("[[camera]]\nid=\"a\"\nname=\"\"\nrtsp_url=\"rtsp://192.0.2.1/x\"\nusername=\"\"\npassword=\"\"\n").unwrap();
+        let config = parse("[[camera]]\nid=\"a\"\nname=\"\"\nrtsp_url=\"rtsp://192.0.2.1/x\"\nusername=\"\"\npassword=\"\"\n").unwrap();
         assert_eq!(
             config.ingest.read_interval(),
             Some(std::time::Duration::from_millis(20))
         );
         assert_eq!(config.ingest.recv_low_water(), Some(32 * 1024));
-        let config =
-            Config::from_toml_str("[ingest]\nread_interval_ms = 0\nrecv_low_water_kib = 0\n")
-                .unwrap();
+        let config = parse("[ingest]\nread_interval_ms = 0\nrecv_low_water_kib = 0\n").unwrap();
         assert_eq!(config.ingest.read_interval(), None);
         assert_eq!(config.ingest.recv_low_water(), None);
-        let config = Config::from_toml_str("[ingest]\nread_interval_ms = 40\n").unwrap();
+        let config = parse("[ingest]\nread_interval_ms = 40\n").unwrap();
         assert_eq!(
             config.ingest.read_interval(),
             Some(std::time::Duration::from_millis(40))
@@ -743,9 +1359,47 @@ mod tests {
 
     use super::*;
 
+    /// An unauthenticated loopback API section, so a fixture exercises only the
+    /// rule under test.
+    const DEV_API: &str = "[api]\nallow_unauthenticated = true\n";
+
+    fn parse(text: &str) -> Result<Config, ConfigError> {
+        Config::from_toml_str(&format!("{DEV_API}{text}"))
+    }
+
+    #[test]
+    fn debug_redacts_the_camera_password() {
+        let config = parse(
+            "[[camera]]\nid='cam1'\nname='distinctive-name'\n\
+             rtsp_url='rtsp://192.0.2.10/main'\nusername='distinctive-user'\n\
+             password='distinctive-password'\nretention_days=7\n",
+        )
+        .unwrap();
+        let camera = &config.cameras[0];
+        for rendered in [
+            format!("{camera:?}"),
+            format!("{camera:#?}"),
+            format!("{config:?}"),
+        ] {
+            assert!(rendered.contains("password: \"<redacted>\""), "{rendered}");
+            assert!(
+                !rendered.contains("distinctive-password"),
+                "debug leaked the password"
+            );
+            for kept in [
+                "distinctive-name",
+                "distinctive-user",
+                "rtsp://192.0.2.10/main",
+                "retention_days",
+            ] {
+                assert!(rendered.contains(kept), "debug lost {kept}: {rendered}");
+            }
+        }
+    }
+
     #[test]
     fn derives_dahua_sub_url() {
-        let config = Config::from_toml_str(
+        let config = parse(
             r#"
 [[camera]]
 id = "cam1"
@@ -773,7 +1427,7 @@ password = "p"
 
     #[test]
     fn parses_host_from_urls() {
-        let mut camera = Config::from_toml_str(
+        let mut camera = parse(
             "[[camera]]\nid=\"a\"\nname=\"\"\nrtsp_url=\"rtsp://192.0.2.7:554/x\"\nusername=\"\"\npassword=\"\"\n",
         )
         .unwrap()
@@ -788,7 +1442,7 @@ password = "p"
 
     #[test]
     fn https_cameras_default_to_port_443() {
-        let camera = Config::from_toml_str(
+        let camera = parse(
             "[[camera]]\nid=\"a\"\nname=\"\"\nrtsp_url=\"rtsp://192.0.2.7/x\"\nusername=\"\"\npassword=\"\"\nhttps=true\ntls_verify=false\n",
         )
         .unwrap()
@@ -802,12 +1456,9 @@ password = "p"
     #[test]
     fn rejects_duplicate_ids_and_unknown_fields() {
         let dup = "[[camera]]\nid=\"a\"\nname=\"\"\nrtsp_url=\"\"\nusername=\"\"\npassword=\"\"\n[[camera]]\nid=\"a\"\nname=\"\"\nrtsp_url=\"\"\nusername=\"\"\npassword=\"\"\n";
-        assert!(matches!(
-            Config::from_toml_str(dup),
-            Err(ConfigError::DuplicateCamera(_))
-        ));
-        assert!(Config::from_toml_str("[storage]\nbogus = 1\n").is_err());
+        assert!(matches!(parse(dup), Err(ConfigError::DuplicateCamera(_))));
+        assert!(parse("[storage]\nbogus = 1\n").is_err());
         let unsupported_audio = "[[camera]]\nid=\"a\"\nname=\"\"\nrtsp_url=\"\"\nusername=\"\"\npassword=\"\"\naudio=false\n";
-        assert!(Config::from_toml_str(unsupported_audio).is_err());
+        assert!(parse(unsupported_audio).is_err());
     }
 }

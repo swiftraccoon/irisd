@@ -13,32 +13,69 @@ these local hardening changes:
 - ONVIF `ElementItem` payloads retain their name and a bounded, namespace-normalized canonical
   representation, including significant child-adjacent mixed-content whitespace, rather than
   disappearing from notifications.
+- `WsSecurityToken`'s `Debug` output redacts the username, password digest, and nonce.
 
 The workspace uses this copy through `[patch.crates-io]` in the root `Cargo.toml`, so the
-dependency version stays `0.17.0`. Remove the vendored directory and patch entry only when an
-upstream release supplies every contract listed above.
+dependency version stays `0.17.0`, and excludes the directory from its members, so the crate's
+own tests run standalone: `cargo test --locked --manifest-path third_party/oxvif/Cargo.toml`.
+The `Cargo.lock` beside it, generated for those runs, is tracked. Remove the vendored directory
+and patch entry only when an upstream release supplies every contract listed above.
 
 ## retina 0.4.21 (MIT OR Apache-2.0)
 
 `retina/` is the published `retina` 0.4.21 crate (RTSP client, by the Retina Authors,
-<https://github.com/scottlamb/retina>) with the benches and lockfile removed and these
-local changes:
+<https://github.com/scottlamb/retina>) with the benches removed and these local changes:
 
 - `PlayOptions::recv_low_water(bytes)` sets `SO_RCVLOWAT` on the RTSP socket after `PLAY`
   succeeds on a TCP session.
 - `PlayOptions::detach_from_reactor(bool)` takes the socket out of tokio's reactor for
   callers that poll the session on their own timer. Reads that would block return `Pending`
-  without a waker, a short read ends the tick's reads, and writes block briefly.
+  without a waker and a short read ends the tick's reads. Writes never block: a flush that
+  would block returns `Pending`, keeps the unsent bytes, and continues on a later tick, so a
+  server that stops reading fails the session at the next keepalive deadline. A message is
+  started only once the previous one is fully written.
+- A `TEARDOWN` on the session's own connection first returns its socket to the reactor and
+  its low-water mark to one byte, so the request and its short response wake the task and
+  the 5 s attempt deadline holds. `TEARDOWN`s on fresh connections go to the address the
+  session's connection reached, never to the host of an advertised `Content-Base` (which
+  stays the Request-URI), so credentials reach only that server. A background `TEARDOWN`
+  stops after the session timeout or 60 s, whichever is shorter, and at most
+  `client::MAX_BACKGROUND_TEARDOWNS` (64) run in a process; `client::background_teardowns()`
+  reports how many do. A session dropped beyond that bound is not torn down, with a warning.
+- Server-supplied fields are bounded while parsing, and a longer one fails the session with
+  an error naming the field: `Content-Base`, `Content-Location`, and joined control URLs at
+  2,048 bytes, the `Session` identifier at 512, `WWW-Authenticate` at 4,096, and an SDP at 64
+  media sections.
+- Server-supplied text reaches log records and error messages only as escaped excerpts of at
+  most 512 bytes, written on one line (`\n`, `\r`, `\t`, and other control and non-ASCII
+  bytes escaped). Interpreting a `DESCRIBE` logs at most one warning, a count with the first
+  problem, and its error quotes such an excerpt of the SDP, never the whole of it. A `SETUP`
+  or `PLAY` response logs each kind of problem once, and a session logs the first request it
+  receives in state `Playing` once, as its method and sizes; the stream goes on after such a
+  request. The `Debug` output of `Tool` is such an excerpt, and that of `Credentials`
+  redacts both fields.
+- SDP lines not in `type=value` form are ignored and noted rather than passed to
+  `sdp-types` 0.1.8, which panics when one precedes any line but `m=`, and a media section
+  without a payload type is unusable rather than a panic.
 - H.265 depacketization limits both pinned RTP payload and projected access-unit output to
   64 MiB, uses checked accounting for every packetization form, and releases partial access
   unit state on error. This is the ingress form of `iris-ingest`'s 64 MiB frame limit.
 - Production RTSP connections limit one control message, head and body together, to 1 MiB.
   The parser applies the limit while lines and bodies accumulate, and socket reads do not
   reserve beyond the remaining allowance. Interleaved RTP keeps its protocol length limit.
+- The test helpers use the standard library instead of the `pretty_assertions` and `mylog`
+  crates, so the crate's own tests run standalone:
+  `cargo test --locked --manifest-path third_party/retina/Cargo.toml`. `testutil` also
+  exposes `parse_describe_response` for the `describe_diagnostics` fuzz target.
 
 The workspace uses this copy through `[patch.crates-io]` in the root `Cargo.toml`, so the
-dependency version stays `0.4.21` and the patch applies to every crate in the workspace.
-`retina-0.4.21-irisd.patch` carries the socket-policy changes for upstream submission.
+dependency version stays `0.4.21` and the patch applies to every crate in the workspace, and
+excludes the directory from its members. The `Cargo.lock` beside it, generated for standalone
+test runs, is tracked.
+`retina-0.4.21-irisd.patch` carries the local changes to `Cargo.toml`, `src/client/mod.rs`, and
+`src/tokio.rs` (the socket policy, the non-blocking detached writes, the teardown routing and
+bound, and the bounded diagnostics in those files) as a diff against the published crate, for
+upstream submission; regenerate it from the published source after changing those files.
 Remove the vendored directory and patch entry only when an upstream release supplies every
 local contract listed above.
 

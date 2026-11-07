@@ -226,9 +226,11 @@ fn start_scan(path: PathBuf, shutdown: CancellationToken) -> io::Result<ScanWork
     Ok(ScanWorker { result, thread })
 }
 
-/// Scans a file completely, verifying every trailer CRC.
+/// Scans a file completely, verifying every trailer CRC. The open never
+/// follows a final symlink or blocks on a FIFO or device, and the scan accepts
+/// at most the sidecar record limit of fragments.
 fn scan_file(path: &Path, shutdown: CancellationToken) -> io::Result<ScanReport> {
-    let file = std::fs::File::open(path)?;
+    let file = iris_store::open_regular_file(path)?;
     scan(
         io::BufReader::new(CancellableReader {
             inner: file,
@@ -678,6 +680,45 @@ mod tests {
         assert_eq!(check.stats().failed(), 0);
         assert!(closed.load(Ordering::Acquire));
         catalog.shutdown();
+    }
+
+    #[test]
+    fn a_fifo_in_place_of_a_recording_fails_the_scan_promptly() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("recording.mp4");
+        rustix::fs::mkfifoat(
+            rustix::fs::CWD,
+            &path,
+            rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR,
+        )
+        .unwrap();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let scanned = path.clone();
+        std::thread::spawn(move || {
+            let _ = sender.send(scan_file(&scanned, CancellationToken::new()).map(drop));
+        });
+        let Ok(result) = receiver.recv_timeout(Duration::from_secs(2)) else {
+            // Release a reader blocked in open; this never blocks the test.
+            let _ = rustix::fs::openat(
+                rustix::fs::CWD,
+                &path,
+                rustix::fs::OFlags::WRONLY | rustix::fs::OFlags::NONBLOCK,
+                rustix::fs::Mode::empty(),
+            );
+            panic!("the self-check scan blocked on a FIFO");
+        };
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn a_scan_beyond_the_fragment_limit_fails_the_comparison() {
+        let mut limited = report();
+        limited.stop = Some(ScanStop::FragmentLimit {
+            offset: 2_768,
+            limit: 2,
+        });
+        let reason = compare(&row(), &limited).unwrap_err();
+        assert!(reason.contains("FragmentLimit"), "{reason}");
     }
 
     #[test]

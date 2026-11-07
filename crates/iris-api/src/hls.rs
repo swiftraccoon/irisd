@@ -2,7 +2,10 @@
 
 use std::fmt;
 use std::fmt::Write as _;
+use std::fs::File;
 use std::io;
+use std::os::unix::fs::MetadataExt as _;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -17,23 +20,22 @@ use iris_core::time::{TIMESCALE, WallUs};
 use iris_mp4::fragment::{TRAILER_LEN, decode_trailer};
 use iris_mp4::index::{
     FLAG_DISCONTINUITY_BEFORE, FLAG_NEW_PARAMETERS, FLAG_STARTS_WITH_SYNC, IndexHeader,
-    IndexRecord, read_index_bounded,
+    IndexRecord, MAX_PERSISTED_INDEX_RECORDS, read_index_file_bounded,
 };
 use iris_mp4::reader::{FragmentInfo, parse_fragment};
+use iris_store::ApprovedRoot;
 
 use crate::auth::{AuthContext, MAX_VOD_CAPABILITY_TTL};
 use crate::error::ApiError;
 use crate::media_admission::{self, MediaPermit};
 use crate::query::{TimeParams, resolve_range};
 use crate::segments::stream_key;
-use crate::state::{ApiState, admitted_media_bytes};
+use crate::state::{ApiState, MediaClass, admitted_media_bytes};
 
 /// Fragments per HLS media segment (about six seconds at a two-second GOP).
 const FRAGMENTS_PER_MEDIA_SEGMENT: usize = 3;
 /// Maximum catalog rows considered by one time-range response.
 pub(crate) const MAX_SEGMENT_ROWS: usize = 4_096;
-/// Maximum records accepted from one sidecar (about 5 MiB on disk).
-pub(crate) const MAX_INDEX_RECORDS: usize = 131_072;
 /// Maximum selected records retained across a response.
 pub(crate) const MAX_SELECTED_RECORDS: usize = 100_000;
 /// Maximum rendered VOD playlist size.
@@ -54,51 +56,192 @@ const VOD_CAPABILITY_MARGIN: Duration = Duration::from_mins(15);
 pub(crate) struct SegmentFragments {
     pub(crate) row: SegmentRow,
     pub(crate) records: Vec<IndexRecord>,
-    /// Stable complete media-file extent captured with these records.
-    pub(crate) extent: u64,
+    /// The validated media file and the complete extent captured with these records.
+    pub(crate) media: ValidatedMedia,
     /// A catalog discontinuity or a skipped row precedes this item.
     pub(crate) discontinuity_before: bool,
 }
 
-/// A validated sidecar snapshot and the complete published media extent it binds.
+/// A recording file validated beneath its approved root: where it lives, the
+/// physical identity of the inode the sidecar was checked against, and the
+/// complete published extent captured with that sidecar.
+///
+/// Holding this instead of an open descriptor keeps a long selection from
+/// retaining thousands of files; [`ValidatedMedia::reopen`] proves that a later
+/// open still names the validated inode.
+#[derive(Clone, Debug)]
+pub(crate) struct ValidatedMedia {
+    root: ApprovedRoot,
+    path: PathBuf,
+    device: u64,
+    inode: u64,
+    extent: u64,
+}
+
+impl ValidatedMedia {
+    fn from_open(root: ApprovedRoot, path: PathBuf, file: &File, extent: u64) -> io::Result<Self> {
+        let metadata = file.metadata()?;
+        Ok(Self {
+            root,
+            path,
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            extent,
+        })
+    }
+
+    /// The complete media extent captured with the validated sidecar.
+    pub(crate) fn extent(&self) -> u64 {
+        self.extent
+    }
+
+    /// Reopens the recording beneath its approved root without following any
+    /// symlink and requires the validated device and inode and at least the
+    /// captured extent. Blocking.
+    pub(crate) fn reopen(&self) -> io::Result<File> {
+        let file = iris_store::open_segment_beneath(&self.root, &self.path)?;
+        let metadata = file.metadata()?;
+        if (metadata.dev(), metadata.ino()) != (self.device, self.inode) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "recording was replaced after validation",
+            ));
+        }
+        if metadata.len() < self.extent {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "recording is shorter than its validated extent",
+            ));
+        }
+        Ok(file)
+    }
+
+    /// [`ValidatedMedia::reopen`] on the blocking pool, as an asynchronous file.
+    pub(crate) async fn open(&self) -> io::Result<tokio::fs::File> {
+        let media = self.clone();
+        let file = tokio::task::spawn_blocking(move || media.reopen())
+            .await
+            .map_err(io::Error::other)??;
+        Ok(tokio::fs::File::from_std(file))
+    }
+}
+
+#[cfg(test)]
+impl ValidatedMedia {
+    /// Writes `bytes` as one recording beneath a fresh root in `directory` and
+    /// validates it with `extent`.
+    pub(crate) fn for_test(directory: &std::path::Path, bytes: &[u8], extent: u64) -> Self {
+        let root = iris_store::admit_recording_root(
+            &directory.join("video"),
+            iris_store::RootExpectation::Fresh,
+        )
+        .expect("test recording root");
+        let path = root.path().join("cam1/main/2023-11-14/221320.000000Z.mp4");
+        std::fs::create_dir_all(path.parent().expect("layout parent")).expect("layout");
+        std::fs::write(&path, bytes).expect("test recording");
+        let file = File::open(&path).expect("open test recording");
+        Self::from_open(root, path, &file, extent).expect("test recording identity")
+    }
+
+    /// The recording's path beneath its root.
+    pub(crate) fn path(&self) -> &std::path::Path {
+        &self.path
+    }
+}
+
+/// A validated sidecar snapshot, the media descriptor it was checked against,
+/// and the complete published extent it binds.
 #[derive(Debug)]
 pub(crate) struct PublishedIndex {
     pub(crate) records: Vec<IndexRecord>,
-    pub(crate) extent: u64,
+    pub(crate) media: ValidatedMedia,
+    /// The open media file the sidecar was validated against; raw bodies read
+    /// only from it.
+    pub(crate) file: File,
 }
 
-/// Reads and binds a bounded sidecar snapshot to its catalog row and media file.
+/// The approved root that owns `path`: the longest root path that prefixes it.
+fn owning_root<'roots>(
+    roots: &'roots [ApprovedRoot],
+    path: &std::path::Path,
+) -> Option<&'roots ApprovedRoot> {
+    roots
+        .iter()
+        .filter(|root| path.starts_with(root.path()))
+        .max_by_key(|root| root.path().components().count())
+}
+
+/// Opens a row's media and sidecar together beneath the approved root that
+/// owns its path, reads the bounded sidecar from its descriptor, and binds it
+/// to the catalog row and the open media file's length.
+///
+/// A row outside every approved root is counted and answered with
+/// [`ApiError::NotFound`]; symlinks, nested mounts, and non-regular entries
+/// fail the descriptor-relative opens.
 pub(crate) async fn published_index(
+    state: &ApiState,
     row: &SegmentRow,
     permit: &MediaPermit,
-) -> Result<PublishedIndex, io::Error> {
-    let index_path = iris_store::layout::index_path(&row.path);
-    let media_path = row.path.clone();
-    let (header, records, media_len) = media_admission::blocking(permit, move || {
-        let (header, records) = read_index_bounded(&index_path, MAX_INDEX_RECORDS)
-            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-        let media_len = std::fs::metadata(media_path)?.len();
-        Ok::<_, io::Error>((header, records, media_len))
+) -> Result<PublishedIndex, ApiError> {
+    let Some(root) = owning_root(&state.recording_roots, &row.path) else {
+        // Counted rather than warned per row: historical rows of a removed
+        // root could otherwise multiply one range request into thousands of lines.
+        state.stats.record_unapproved_row();
+        tracing::debug!(
+            segment = row.id.0,
+            "recording row is outside every approved root; not serving it"
+        );
+        return Err(ApiError::NotFound);
+    };
+    let root = root.clone();
+    let path = row.path.clone();
+    let (root, path, file, header, records, media_len) =
+        media_admission::blocking(permit, move || {
+            let (file, index) = iris_store::open_segment_pair_beneath(&root, &path)?;
+            let index = index.ok_or_else(|| {
+                io::Error::new(io::ErrorKind::NotFound, "recording has no sidecar")
+            })?;
+            let (header, records) = read_index_file_bounded(index, MAX_PERSISTED_INDEX_RECORDS)
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+            let media_len = file.metadata()?.len();
+            Ok::<_, io::Error>((root, path, file, header, records, media_len))
+        })
+        .await
+        .map_err(io::Error::other)??;
+    let (records, extent) = validate_index_binding(row, &header, records, media_len)?;
+    let media = ValidatedMedia::from_open(root, path, &file, extent)?;
+    Ok(PublishedIndex {
+        records,
+        media,
+        file,
     })
-    .await
-    .map_err(io::Error::other)??;
-    validate_index_binding(row, &header, records, media_len)
 }
 
+/// Checks a sidecar snapshot against its catalog row and media length and
+/// returns the records with their complete extent.
+///
+/// A rebuilt header (crash recovery rewrites the sidecar from a media scan,
+/// and the media carries no run identifier or sample-entry hash) stores zero
+/// for those two facts. Zero is therefore "unknown" and accepted; a nonzero
+/// value must equal the catalog's nonzero value. Every other fact is always
+/// checked.
 fn validate_index_binding(
     row: &SegmentRow,
     header: &IndexHeader,
     records: Vec<IndexRecord>,
     media_len: u64,
-) -> Result<PublishedIndex, io::Error> {
+) -> Result<(Vec<IndexRecord>, u64), io::Error> {
     let invalid = |reason| io::Error::new(io::ErrorKind::InvalidData, reason);
     if header.timescale != TIMESCALE || header.flags != 0 || header.init_len != row.init_len {
         return Err(invalid("sidecar header does not match the recording"));
     }
-    if row.run_seq != 0 && header.run_id != row.run_seq {
+    if row.run_seq != 0 && header.run_id != 0 && header.run_id != row.run_seq {
         return Err(invalid("sidecar run does not match the catalog"));
     }
-    if row.sample_entry_hash != 0 && header.sample_entry_hash != row.sample_entry_hash {
+    if row.sample_entry_hash != 0
+        && header.sample_entry_hash != 0
+        && header.sample_entry_hash != row.sample_entry_hash
+    {
         return Err(invalid("sidecar sample entry does not match the catalog"));
     }
     if u64::from(header.init_len) > MAX_INIT_BYTES {
@@ -136,7 +279,7 @@ fn validate_index_binding(
     {
         return Err(invalid("sealed catalog extent does not match the sidecar"));
     }
-    Ok(PublishedIndex { records, extent })
+    Ok((records, extent))
 }
 
 /// Parses and checksum-verifies one bounded fragment, then cross-checks every
@@ -194,8 +337,13 @@ pub(crate) async fn load_fragments(
     let mut selected_records = 0usize;
     let mut pending_gap = false;
     for row in rows {
-        let published = match published_index(&row, permit).await {
+        let published = match published_index(state, &row, permit).await {
             Ok(published) => published,
+            // Outside every approved root: already counted.
+            Err(ApiError::NotFound) => {
+                pending_gap |= !out.is_empty();
+                continue;
+            }
             Err(error) => {
                 tracing::warn!(path = %row.path.display(), %error, "unusable sidecar; skipping");
                 pending_gap |= !out.is_empty();
@@ -215,10 +363,12 @@ pub(crate) async fn load_fragments(
             })?;
         let discontinuity_before = row.discontinuity || pending_gap;
         pending_gap = false;
+        // The selection keeps identity, not the descriptor: a long range would
+        // otherwise hold one open file per row until the response ends.
         out.push(SegmentFragments {
             row,
             records: in_range,
-            extent: published.extent,
+            media: published.media,
             discontinuity_before,
         });
     }
@@ -355,7 +505,11 @@ pub(crate) fn vod_playlist(
     let mut target_ticks = 0u64;
     let mut last_hash: Option<u32> = None;
     for seg in segments {
-        if seg.records.iter().any(|record| record.end() > seg.extent) {
+        if seg
+            .records
+            .iter()
+            .any(|record| record.end() > seg.media.extent())
+        {
             return Err(ApiError::Unavailable(
                 "VOD byte range exceeds its published extent".into(),
             ));
@@ -413,12 +567,7 @@ pub(crate) async fn vod(
     Query(params): Query<TimeParams>,
     Extension(auth): Extension<AuthContext>,
 ) -> Result<Response, ApiError> {
-    let permit = media_admission::shared(
-        state
-            .stats
-            .try_media_response()
-            .ok_or_else(|| ApiError::Unavailable("too many concurrent media responses".into()))?,
-    );
+    let permit = state.stats.admit_media(MediaClass::Bounded)?;
     let key = stream_key(&camera, &kind)?;
     let range = resolve_range(&params, WallUs::now())?;
     let capability_lifetime = vod_capability_lifetime(range)?;
@@ -593,11 +742,11 @@ mod tests {
         };
         let lifetime = vod_capability_lifetime(range).unwrap();
         let (row, _, record) = bound_fixture();
-        let extent = record.end();
+        let directory = tempfile::tempdir().expect("temporary directory");
         let segments = [SegmentFragments {
             row,
             records: vec![record],
-            extent,
+            media: ValidatedMedia::for_test(directory.path(), &[], record.end()),
             discontinuity_before: false,
         }];
         let playlist = vod_playlist(
@@ -627,7 +776,7 @@ mod tests {
         assert_eq!(
             validate_index_binding(&row, &header, vec![record], record.end())
                 .unwrap()
-                .extent,
+                .1,
             record.end()
         );
         for bad_header in [
@@ -660,6 +809,145 @@ mod tests {
             ..record
         };
         assert!(validate_index_binding(&row, &header, vec![oversized], u64::MAX).is_err());
+    }
+
+    #[test]
+    fn reopening_requires_the_validated_inode_and_extent() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let media = ValidatedMedia::for_test(directory.path(), &[7; 64], 64);
+        let mut buffer = Vec::new();
+        io::Read::read_to_end(&mut media.reopen().expect("unchanged file"), &mut buffer)
+            .expect("read");
+        assert_eq!(buffer, [7; 64]);
+
+        // A replacement at the same path is a different inode, even with equal bytes.
+        let moved = media.path().with_extension("moved");
+        std::fs::rename(media.path(), &moved).expect("move the validated file away");
+        std::fs::write(media.path(), [7; 64]).expect("replacement");
+        assert_eq!(
+            media.reopen().expect_err("replaced").kind(),
+            io::ErrorKind::InvalidData
+        );
+        std::fs::remove_file(media.path()).expect("remove the replacement");
+        std::fs::rename(&moved, media.path()).expect("restore the validated file");
+        assert!(
+            media.reopen().is_ok(),
+            "the validated inode is accepted again"
+        );
+
+        File::options()
+            .write(true)
+            .open(media.path())
+            .expect("open for truncation")
+            .set_len(63)
+            .expect("truncate");
+        assert_eq!(
+            media.reopen().expect_err("shorter than its extent").kind(),
+            io::ErrorKind::UnexpectedEof
+        );
+
+        std::fs::remove_file(media.path()).expect("remove");
+        std::os::unix::fs::symlink(&moved, media.path()).expect("symlink");
+        assert!(media.reopen().is_err(), "a symlink is never followed");
+    }
+
+    #[test]
+    fn rebuilt_sidecar_headers_with_unknown_run_and_sample_entry_are_accepted() {
+        let (row, header, record) = bound_fixture();
+        assert_ne!(row.run_seq, 0);
+        assert_ne!(row.sample_entry_hash, 0);
+        let rebuilt = IndexHeader {
+            run_id: 0,
+            sample_entry_hash: 0,
+            ..header
+        };
+        let (records, extent) = validate_index_binding(&row, &rebuilt, vec![record], record.end())
+            .expect("zero run and hash mean unknown");
+        assert_eq!(records, vec![record]);
+        assert_eq!(extent, record.end());
+        for partly_known in [
+            IndexHeader {
+                run_id: 0,
+                ..header
+            },
+            IndexHeader {
+                sample_entry_hash: 0,
+                ..header
+            },
+        ] {
+            assert!(
+                validate_index_binding(&row, &partly_known, vec![record], record.end()).is_ok()
+            );
+        }
+    }
+
+    #[test]
+    fn rebuilt_sidecar_headers_still_reject_nonzero_mismatches_and_other_facts() {
+        let (row, header, record) = bound_fixture();
+        for mismatched in [
+            IndexHeader {
+                run_id: row.run_seq + 1,
+                sample_entry_hash: 0,
+                ..header
+            },
+            IndexHeader {
+                run_id: 0,
+                sample_entry_hash: row.sample_entry_hash + 1,
+                ..header
+            },
+            IndexHeader {
+                run_id: 0,
+                sample_entry_hash: 0,
+                init_len: header.init_len - 1,
+                ..header
+            },
+            IndexHeader {
+                run_id: 0,
+                sample_entry_hash: 0,
+                start_wall: WallUs::new(header.start_wall.get() + 1),
+                ..header
+            },
+        ] {
+            assert!(
+                validate_index_binding(&row, &mismatched, vec![record], record.end()).is_err(),
+                "{mismatched:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_owning_root_is_the_longest_component_prefix_and_outside_paths_have_none() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let admit = |relative: &str| {
+            iris_store::admit_recording_root(
+                &directory.path().join(relative),
+                iris_store::RootExpectation::Fresh,
+            )
+            .expect("test root")
+        };
+        let outer = admit("video");
+        let nested = admit("video/nested");
+        let sibling = admit("video-b");
+        let roots = [outer.clone(), nested.clone(), sibling.clone()];
+        let layout = "cam1/main/2023-11-14/000000.000000Z.mp4";
+        assert_eq!(
+            owning_root(&roots, &outer.path().join(layout)),
+            Some(&outer)
+        );
+        assert_eq!(
+            owning_root(&roots, &nested.path().join(layout)),
+            Some(&nested)
+        );
+        assert_eq!(
+            owning_root(&roots, &sibling.path().join(layout)),
+            Some(&sibling),
+            "prefixes compare whole components"
+        );
+        assert_eq!(
+            owning_root(&roots, &directory.path().join("elsewhere").join(layout)),
+            None
+        );
+        assert_eq!(owning_root(&[], &outer.path().join(layout)), None);
     }
 
     #[test]

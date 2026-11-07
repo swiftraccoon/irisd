@@ -68,7 +68,8 @@ pub struct Args {
     #[arg(long)]
     keep: bool,
     /// After 20 s of warm-up, sample the daemon with `perf record` for this
-    /// long into `ROOT/perf.data` (through `sudo -n`, so kernel frames are included).
+    /// long into `ROOT/perf.data` (through `sudo -n`, so kernel frames are
+    /// included). The file holds perf's pipe format: `perf report -i - < ROOT/perf.data`.
     #[arg(long, default_value_t = 0, value_name = "SECONDS", value_parser = clap::value_parser!(u64).range(..=86_400))]
     perf: u64,
 }
@@ -234,6 +235,67 @@ fn measure(
 
 const ROOT_MARKER: &str = "irisd-replay-bench-v1\n";
 
+/// Whether the directory holding the benchmark root keeps other users from
+/// renaming or replacing it: owned by the caller or root, and writable by no
+/// one else unless the sticky bit restricts renames to an entry's owner.
+fn parent_is_private(metadata: &std::fs::Metadata, uid: u32) -> bool {
+    let mode = metadata.mode();
+    let owner_trusted = metadata.uid() == uid || metadata.uid() == 0;
+    let shared_write = mode & 0o022 != 0;
+    let sticky = mode & 0o1000 != 0;
+    metadata.is_dir() && owner_trusted && (!shared_write || sticky)
+}
+
+/// The privileged profiler's command line. `-o -` makes perf write its pipe
+/// format to standard output, which is a file the tool created itself, so the
+/// privileged process never resolves a path inside the caller-writable root.
+fn perf_command_args(pid: u32, seconds: u64) -> Vec<String> {
+    let pid = pid.to_string();
+    let seconds = seconds.to_string();
+    Vec::from(
+        [
+            "sudo", "-n", "perf", "record", "-F", "997", "-g", "-p", &pid, "-o", "-", "--",
+            "sleep", &seconds,
+        ]
+        .map(str::to_owned),
+    )
+}
+
+/// Creates the profile file as the caller: exclusively, as a private (0600)
+/// regular file, never through a symlink.
+fn create_perf_output(path: &Path) -> anyhow::Result<std::fs::File> {
+    let fd = rustix::fs::open(
+        path,
+        rustix::fs::OFlags::WRONLY
+            | rustix::fs::OFlags::CREATE
+            | rustix::fs::OFlags::EXCL
+            | rustix::fs::OFlags::NOFOLLOW
+            | rustix::fs::OFlags::CLOEXEC,
+        rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR,
+    )
+    .with_context(|| format!("creating {}", path.display()))?;
+    Ok(std::fs::File::from(fd))
+}
+
+/// Checks, through the tool's own descriptor, that perf wrote a nonempty
+/// regular file and that `path` still names that file.
+fn verify_perf_output(file: &std::fs::File, path: &Path) -> anyhow::Result<()> {
+    let written = file
+        .metadata()
+        .context("reading the perf output descriptor")?;
+    anyhow::ensure!(
+        written.is_file() && written.len() > 0,
+        "requested perf artifact is empty"
+    );
+    let named = std::fs::symlink_metadata(path).context("requested perf artifact is missing")?;
+    anyhow::ensure!(
+        named.file_type().is_file() && named.dev() == written.dev() && named.ino() == written.ino(),
+        "{} no longer names the perf output",
+        path.display()
+    );
+    Ok(())
+}
+
 fn safe_root_location(root: &Path, cwd: &Path) -> bool {
     root != Path::new("/")
         && root != cwd
@@ -305,6 +367,35 @@ fn validate_args(args: &Args) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Admits a root that is already present only when it is the tool's own: a
+/// caller-owned real directory carrying the marker, with mode 0700.
+fn check_existing_root(root: &Path, uid: u32) -> anyhow::Result<()> {
+    let metadata = std::fs::symlink_metadata(root)?;
+    anyhow::ensure!(
+        metadata.is_dir() && !metadata.file_type().is_symlink() && metadata.uid() == uid,
+        "existing benchmark root must be a caller-owned real directory"
+    );
+    let marker = root.join(".irisd-replay-bench");
+    let marker_metadata = std::fs::symlink_metadata(&marker)
+        .with_context(|| format!("reading benchmark marker in {}", root.display()))?;
+    anyhow::ensure!(
+        marker_metadata.is_file()
+            && !marker_metadata.file_type().is_symlink()
+            && marker_metadata.uid() == uid
+            && marker_metadata.nlink() == 1
+            && std::fs::read_to_string(&marker).is_ok_and(|contents| contents == ROOT_MARKER),
+        "refusing pre-existing unmarked benchmark root {}",
+        root.display()
+    );
+    anyhow::ensure!(
+        metadata.mode() & 0o777 == 0o700,
+        "existing benchmark root {} has mode {:o}; it must be private (chmod 700)",
+        root.display(),
+        metadata.mode() & 0o7777
+    );
+    Ok(())
+}
+
 struct BenchRoot {
     root: PathBuf,
     keep: bool,
@@ -325,27 +416,15 @@ impl BenchRoot {
             safe_root_location(&root, &cwd) && safe_root_location(&resolved_root, &cwd),
             "unsafe benchmark root"
         );
+        let uid = rustix::process::getuid().as_raw();
+        anyhow::ensure!(
+            parent_is_private(&std::fs::metadata(&parent)?, uid),
+            "the directory holding the benchmark root, {}, must be owned by the caller or root \
+             and not writable by others without the sticky bit",
+            parent.display()
+        );
         if root.exists() {
-            let metadata = std::fs::symlink_metadata(&root)?;
-            anyhow::ensure!(
-                metadata.is_dir()
-                    && !metadata.file_type().is_symlink()
-                    && metadata.uid() == rustix::process::getuid().as_raw(),
-                "existing benchmark root must be a caller-owned real directory"
-            );
-            let marker = root.join(".irisd-replay-bench");
-            let marker_metadata = std::fs::symlink_metadata(&marker)
-                .with_context(|| format!("reading benchmark marker in {}", root.display()))?;
-            anyhow::ensure!(
-                marker_metadata.is_file()
-                    && !marker_metadata.file_type().is_symlink()
-                    && marker_metadata.uid() == rustix::process::getuid().as_raw()
-                    && marker_metadata.nlink() == 1
-                    && std::fs::read_to_string(&marker)
-                        .is_ok_and(|contents| contents == ROOT_MARKER),
-                "refusing pre-existing unmarked benchmark root {}",
-                root.display()
-            );
+            check_existing_root(&root, uid)?;
         } else {
             std::fs::DirBuilder::new().mode(0o700).create(&root)?;
             let mut marker = std::fs::OpenOptions::new()
@@ -447,9 +526,9 @@ struct StorageConfig<'a> {
 }
 
 #[derive(Serialize)]
-struct ApiConfig<'a> {
+struct ApiConfig {
     listen: String,
-    tokens: [&'a str; 1],
+    tokens: [String; 1],
 }
 
 #[derive(Serialize)]
@@ -472,9 +551,22 @@ struct CameraConfig {
 #[derive(Serialize)]
 struct BenchConfig<'a> {
     storage: StorageConfig<'a>,
-    api: ApiConfig<'a>,
+    api: ApiConfig,
     ingest: IngestConfig,
     camera: Vec<CameraConfig>,
+}
+
+/// A fresh API bearer token for the daemon under test: 32 hexadecimal
+/// characters from the kernel, the shortest the daemon accepts. The benchmark
+/// never calls the API, so the token only satisfies the configuration check.
+fn bench_api_token() -> anyhow::Result<String> {
+    use std::io::Read as _;
+
+    let mut bytes = [0_u8; 16];
+    std::fs::File::open("/dev/urandom")
+        .and_then(|mut source| source.read_exact(&mut bytes))
+        .context("reading random bytes for the benchmark API token")?;
+    Ok(hex::encode(bytes))
 }
 
 fn write_config(path: &Path, root: &Path, args: &Args) -> anyhow::Result<()> {
@@ -489,7 +581,7 @@ fn write_config(path: &Path, root: &Path, args: &Args) -> anyhow::Result<()> {
         },
         api: ApiConfig {
             listen: format!("127.0.0.1:{}", args.api_port),
-            tokens: ["bench"],
+            tokens: [bench_api_token()?],
         },
         ingest: IngestConfig {
             read_interval_ms: args.read_interval_ms,
@@ -681,7 +773,8 @@ pub fn run(args: &Args) -> anyhow::Result<()> {
         let mut samples = vec![proc_sample(daemon_pid)?];
         let started = Instant::now();
         let mut next_sample = started + Duration::from_secs(5);
-        let mut perf: Option<ManagedChild> = None;
+        let mut perf: Option<(ManagedChild, std::fs::File)> = None;
+        let perf_path = root.join("perf.data");
         let loop_result = (|| -> anyhow::Result<()> {
             while started.elapsed() < Duration::from_secs(args.seconds) {
                 anyhow::ensure!(!cancelled.load(Ordering::SeqCst), "benchmark cancelled");
@@ -696,59 +789,19 @@ pub fn run(args: &Args) -> anyhow::Result<()> {
                     next_sample += Duration::from_secs(5);
                 }
                 if args.perf > 0 && perf.is_none() && started.elapsed() >= Duration::from_secs(20) {
+                    let output = create_perf_output(&perf_path)?;
                     let mut perf_command = Command::new("setsid");
                     perf_command
-                        .args([
-                            "sudo",
-                            "-n",
-                            "perf",
-                            "record",
-                            "-F",
-                            "997",
-                            "-g",
-                            "-p",
-                            &daemon_pid.to_string(),
-                            "-o",
-                            root.join("perf.data")
-                                .to_str()
-                                .context("perf path is not UTF-8")?,
-                            "--",
-                            "sleep",
-                            &args.perf.to_string(),
-                        ])
-                        .stdout(std::fs::File::create(root.join("perf.log"))?)
+                        .args(perf_command_args(daemon_pid, args.perf))
+                        .stdout(output.try_clone()?)
                         .stderr(Stdio::inherit());
-                    perf = Some(ManagedChild::spawn("perf", &mut perf_command)?);
+                    perf = Some((ManagedChild::spawn("perf", &mut perf_command)?, output));
                 }
                 std::thread::sleep(Duration::from_millis(100));
             }
-            if let Some(mut profiler) = perf.take() {
+            if let Some((mut profiler, output)) = perf.take() {
                 profiler.wait_success(Duration::from_secs(args.perf.saturating_add(10)))?;
-                let uid = rustix::process::getuid().as_raw();
-                let gid = rustix::process::getgid().as_raw();
-                let mut chown_command = Command::new("setsid");
-                chown_command
-                    .args([
-                        "sudo",
-                        "-n",
-                        "chown",
-                        &format!("{uid}:{gid}"),
-                        root.join("perf.data")
-                            .to_str()
-                            .context("perf path is not UTF-8")?,
-                    ])
-                    .stdout(Stdio::null())
-                    .stderr(Stdio::inherit());
-                let mut chown = ManagedChild::spawn("perf chown", &mut chown_command)?;
-                chown.wait_success(Duration::from_secs(10))?;
-                let metadata = std::fs::symlink_metadata(root.join("perf.data"))
-                    .context("requested perf artifact is missing")?;
-                anyhow::ensure!(
-                    metadata.is_file() && !metadata.file_type().is_symlink() && metadata.len() > 0,
-                    "requested perf artifact is not a non-empty regular file"
-                );
-                std::fs::File::open(root.join("perf.data"))
-                    .context("requested perf artifact is unreadable")?;
+                verify_perf_output(&output, &perf_path)?;
             }
             Ok(())
         })();
@@ -831,8 +884,8 @@ pub fn run(args: &Args) -> anyhow::Result<()> {
         if args.perf > 0 {
             writeln!(
                 std::io::stderr(),
-                "perf data: {}",
-                root.join("perf.data").display()
+                "perf data (pipe format; perf report -i - < FILE): {}",
+                perf_path.display()
             )?;
         }
         Ok(())
@@ -940,6 +993,17 @@ mod tests {
     }
 
     #[test]
+    fn the_benchmark_api_token_is_a_fresh_thirty_two_character_hex_string() {
+        let first = bench_api_token().unwrap();
+        let second = bench_api_token().unwrap();
+        for token in [&first, &second] {
+            assert_eq!(token.len(), 32);
+            assert!(token.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        }
+        assert_ne!(first, second);
+    }
+
+    #[test]
     fn typed_config_round_trips_path_metacharacters() {
         let parent = tempfile::tempdir().unwrap();
         let root = parent.path().join("quote\" backslash\\ newline\nroot");
@@ -958,6 +1022,97 @@ mod tests {
             parsed["storage"]["state_dir"].as_str(),
             root.join("state").to_str()
         );
+        let token = parsed["api"]["tokens"][0].as_str().unwrap();
+        assert_eq!(
+            token.len(),
+            32,
+            "the daemon requires 32 visible ASCII characters"
+        );
+    }
+
+    #[test]
+    fn perf_writes_its_pipe_format_to_a_descriptor_without_a_privileged_chown() {
+        let args = perf_command_args(4242, 30);
+        assert_eq!(
+            args,
+            [
+                "sudo", "-n", "perf", "record", "-F", "997", "-g", "-p", "4242", "-o", "-", "--",
+                "sleep", "30"
+            ]
+        );
+        assert!(args.windows(2).any(|pair| pair == ["-o", "-"]));
+        assert!(!args.iter().any(|arg| arg.contains("chown")));
+        assert!(!args.iter().any(|arg| arg.contains("perf.data")));
+    }
+
+    #[test]
+    fn the_perf_output_is_a_new_private_caller_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("perf.data");
+        let mut output = create_perf_output(&path).unwrap();
+        let metadata = std::fs::symlink_metadata(&path).unwrap();
+        assert_eq!(metadata.mode() & 0o7777, 0o600);
+        assert_eq!(metadata.uid(), rustix::process::getuid().as_raw());
+        assert!(create_perf_output(&path).is_err(), "never reuses a file");
+
+        assert!(verify_perf_output(&output, &path).is_err(), "empty profile");
+        output.write_all(b"PERFILE2").unwrap();
+        verify_perf_output(&output, &path).unwrap();
+        let replacement = directory.path().join("replacement");
+        std::fs::write(&replacement, b"other").unwrap();
+        std::fs::rename(&replacement, &path).unwrap();
+        assert!(
+            verify_perf_output(&output, &path).is_err(),
+            "a renamed-over path no longer names the profile"
+        );
+
+        let victim = directory.path().join("victim");
+        std::fs::write(&victim, b"unchanged").unwrap();
+        for (name, target) in [
+            ("linked.data", victim.clone()),
+            ("dangling.data", directory.path().join("absent")),
+        ] {
+            let link = directory.path().join(name);
+            std::os::unix::fs::symlink(&target, &link).unwrap();
+            assert!(create_perf_output(&link).is_err(), "{name}");
+        }
+        assert_eq!(std::fs::read(&victim).unwrap(), b"unchanged");
+        assert!(!directory.path().join("absent").exists());
+    }
+
+    #[test]
+    fn existing_roots_must_be_private() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let parent = tempfile::tempdir().unwrap();
+        let root = parent.path().join("bench-root");
+        let executable = std::env::current_exe().unwrap();
+        drop(BenchRoot::prepare(&args(root.clone(), executable.clone())).unwrap());
+        assert_eq!(std::fs::metadata(&root).unwrap().mode() & 0o7777, 0o700);
+        drop(BenchRoot::prepare(&args(root.clone(), executable.clone())).unwrap());
+        for mode in [0o770, 0o707, 0o777, 0o750] {
+            std::fs::set_permissions(&root, std::fs::Permissions::from_mode(mode)).unwrap();
+            let error = BenchRoot::prepare(&args(root.clone(), executable.clone()))
+                .err()
+                .unwrap_or_else(|| panic!("mode {mode:o} must be rejected"));
+            assert!(error.to_string().contains("chmod 700"), "{error:#}");
+        }
+    }
+
+    #[test]
+    fn a_shared_parent_needs_the_sticky_bit() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let parent = tempfile::tempdir().unwrap();
+        let root = parent.path().join("bench-root");
+        let executable = std::env::current_exe().unwrap();
+        std::fs::set_permissions(parent.path(), std::fs::Permissions::from_mode(0o770)).unwrap();
+        assert!(BenchRoot::prepare(&args(root.clone(), executable.clone())).is_err());
+        assert!(!root.exists(), "nothing is created under a shared parent");
+        std::fs::set_permissions(parent.path(), std::fs::Permissions::from_mode(0o1770)).unwrap();
+        drop(BenchRoot::prepare(&args(root.clone(), executable)).unwrap());
+        assert!(root.is_dir());
+        std::fs::set_permissions(parent.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
     }
 
     #[test]

@@ -3,7 +3,8 @@
 # Install at /etc/systemd/system/irisd.service. Adjust ReadWritePaths= to the
 # recording root named in /etc/irisd/irisd.toml (storage.video_roots); the
 # catalog lives under StateDirectory (/var/lib/irisd), which must match
-# storage.state_dir.
+# storage.state_dir. The daemon reaches only the loopback until a drop-in
+# allows the camera subnet (packaging/README.md, step 5).
 
 [Unit]
 Description=irisd network video recorder
@@ -18,11 +19,21 @@ Restart=always
 RestartSec=2s
 WatchdogSec=60
 TimeoutStopSec=30
+# Recording files, camera sockets, and API clients share one descriptor budget.
+# The daemon also raises its soft limit to the hard limit at startup.
+LimitNOFILE=65536
+# Log lines can carry camera-controlled text. With the default, a line holding a
+# raw newline followed by "<0>" would be stored at emergency priority. irisd
+# writes no priority prefixes, so disabling their interpretation loses nothing.
+SyslogLevelPrefix=no
 
 User=irisd
 Group=irisd
 UMask=0077
 StateDirectory=irisd
+# The catalog holds camera metadata, recording paths, and events: owner only.
+# The daemon also repairs the directory and catalog file modes at startup.
+StateDirectoryMode=0700
 ConfigurationDirectory=irisd
 ConfigurationDirectoryMode=0750
 # The recording root (storage.video_roots). Replace with the real path.
@@ -55,10 +66,14 @@ SystemCallArchitectures=native
 SystemCallFilter=@system-service
 SystemCallFilter=~@privileged @resources
 CapabilityBoundingSet=
-# Limit the daemon to the camera network and the loopback. Example for a
-# documentation range; replace with the real subnet.
-#IPAddressDeny=any
-#IPAddressAllow=192.0.2.0/24 localhost
+# Landlock limits TCP ports, not addresses; peers are limited here. Only the
+# loopback is allowed until a drop-in adds the camera subnet, plus the API
+# clients' subnet when api.listen is a LAN address (packaging/README.md, step 5).
+# Allow lists from drop-ins are merged with this one, for example:
+#   [Service]
+#   IPAddressAllow=192.0.2.0/24
+IPAddressDeny=any
+IPAddressAllow=localhost
 
 [Install]
 WantedBy=multi-user.target

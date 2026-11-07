@@ -4,6 +4,8 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
@@ -18,7 +20,9 @@ use iris_store::{
     ApprovedRoot, FreeSpace, free_space, free_space_approved, remove_segment_beneath,
 };
 use tokio::sync::oneshot;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
+
+use crate::adopt::parse_segment_path;
 
 /// Microseconds per day.
 const DAY_US: i64 = 86_400_000_000;
@@ -41,8 +45,62 @@ const MAX_PROTECTIONS_PER_PASS: usize = 2_048;
 const PROTECTION_BUDGET: Duration = Duration::from_millis(100);
 /// A pass that takes longer than this is logged as a warning.
 const SLOW_PASS: Duration = Duration::from_secs(2);
+/// Deletion intents retried per pass.
+const DELETION_RETRY_ROWS: usize = 16;
+/// Elapsed budget for retrying deletion intents in one pass.
+const DELETION_RETRY_BUDGET: Duration = Duration::from_millis(100);
 
 type SegmentCursor = (WallUs, SegmentId);
+
+/// Raw filesystem calls a maintenance owner started on standard-library threads
+/// and that have not returned.
+///
+/// An in-kernel `statvfs`, unlink, or directory sync cannot be cancelled, so a
+/// maintenance job that times out leaves its thread running. The owner waits
+/// for this count to return to zero before it starts another job, which keeps
+/// at most one such call per owner and never races a late removal.
+#[derive(Clone, Debug, Default)]
+pub struct RawCalls(Arc<AtomicUsize>);
+
+impl RawCalls {
+    /// Calls whose threads have not finished.
+    pub fn in_flight(&self) -> usize {
+        self.0.load(Ordering::Acquire)
+    }
+
+    /// Runs `operation` on a named standard-library thread, counted until the
+    /// thread finishes. A thread that cannot be started is not counted.
+    pub fn spawn<T, F>(&self, name: &str, operation: F) -> io::Result<std::thread::JoinHandle<T>>
+    where
+        T: Send + 'static,
+        F: FnOnce() -> T + Send + 'static,
+    {
+        let guard = RawCallGuard::enter(&self.0);
+        std::thread::Builder::new()
+            .name(name.to_owned())
+            .spawn(move || {
+                let _guard = guard;
+                operation()
+            })
+    }
+}
+
+/// Holds one count of [`RawCalls`] until the raw call's thread finishes or
+/// fails to start.
+struct RawCallGuard(Arc<AtomicUsize>);
+
+impl RawCallGuard {
+    fn enter(count: &Arc<AtomicUsize>) -> Self {
+        count.fetch_add(1, Ordering::AcqRel);
+        Self(Arc::clone(count))
+    }
+}
+
+impl Drop for RawCallGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
 
 /// Bounded scan progress retained between periodic retention passes.
 #[derive(Debug, Default)]
@@ -55,6 +113,8 @@ pub struct RetentionState {
     quota_cursor: Option<SegmentCursor>,
     age_cursors: HashMap<StreamKey, AgeScan>,
     next_age_key: usize,
+    deleting_cursor: Option<SegmentCursor>,
+    raw: RawCalls,
 }
 
 #[derive(Debug)]
@@ -64,6 +124,14 @@ struct AgeScan {
 }
 
 impl RetentionState {
+    /// Empty progress whose raw filesystem calls are counted in `raw`.
+    pub fn new(raw: RawCalls) -> Self {
+        Self {
+            raw,
+            ..Self::default()
+        }
+    }
+
     fn reconcile(
         &mut self,
         roots: &[PathBuf],
@@ -158,6 +226,8 @@ pub struct PassReport {
     pub deleted: usize,
     /// Bytes freed.
     pub freed: u64,
+    /// Earlier deletion intents completed by the pass's bounded retry.
+    pub finished_deletions: usize,
     /// Wall-clock duration of the pass.
     pub duration: Duration,
     /// The smallest free-space share across the roots after the pass, in percent.
@@ -347,11 +417,21 @@ async fn pass_inner(
         .maintain_events(now)
         .await
         .context("maintaining the event lifecycle")?;
+    // A tombstone still counts toward the quota; finishing earlier intents first
+    // keeps a phantom row from pushing the quota pass onto newer footage.
+    let finished_deletions = finish_deletion_intents(
+        catalog,
+        approved_roots,
+        &mut state.deleting_cursor,
+        &state.raw,
+    )
+    .await?;
     let retained = load_protections(catalog, now, started).await?;
-    let mut tally = Tally::new(started);
+    let mut tally = Tally::new(started, state.raw.clone());
     let root_start = state.root_start(roots);
     let approved_for_probe = approved_roots.to_vec();
     let allow_unapproved_probe = approved_roots.is_empty();
+    let probe_raw = state.raw.clone();
     let free_pct_min = free_roots(
         FreeRootContext {
             catalog,
@@ -371,10 +451,11 @@ async fn pass_inner(
                 .iter()
                 .find(|approved| approved.path() == root)
                 .cloned();
+            let raw = probe_raw.clone();
             async move {
                 match approved {
-                    Some(approved) => probe_approved_free_space(approved).await,
-                    None if allow_unapproved_probe => probe_free_space(root).await,
+                    Some(approved) => probe_approved_free_space(approved, &raw).await,
+                    None if allow_unapproved_probe => probe_free_space(root, &raw).await,
                     None => Err(io::Error::new(
                         io::ErrorKind::InvalidInput,
                         "retention root was not admitted",
@@ -413,6 +494,7 @@ async fn pass_inner(
     let report = PassReport {
         deleted: tally.deleted,
         freed: tally.freed,
+        finished_deletions,
         duration: started.elapsed(),
         free_pct_min,
         total_bytes,
@@ -429,10 +511,11 @@ struct Tally {
     freed: u64,
     pages: usize,
     rows: usize,
+    raw: RawCalls,
 }
 
 impl Tally {
-    fn new(started: Instant) -> Self {
+    fn new(started: Instant, raw: RawCalls) -> Self {
         Self {
             started,
             attempted: 0,
@@ -440,6 +523,7 @@ impl Tally {
             freed: 0,
             pages: 0,
             rows: 0,
+            raw,
         }
     }
 
@@ -462,7 +546,7 @@ impl Tally {
         approved_roots: &[ApprovedRoot],
     ) -> bool {
         self.attempted += 1;
-        let Some(freed) = delete(catalog, row, approved_roots).await else {
+        let Some(freed) = delete(catalog, row, approved_roots, &self.raw).await else {
             return false;
         };
         self.freed += freed;
@@ -548,29 +632,27 @@ where
     Ok(free_pct_min)
 }
 
-async fn probe_free_space(root: PathBuf) -> io::Result<FreeSpace> {
-    probe_free_space_with(root, |root| free_space(&root)).await
+async fn probe_free_space(root: PathBuf, raw: &RawCalls) -> io::Result<FreeSpace> {
+    probe_free_space_with(root, raw, |root| free_space(&root)).await
 }
 
-async fn probe_approved_free_space(root: ApprovedRoot) -> io::Result<FreeSpace> {
+async fn probe_approved_free_space(root: ApprovedRoot, raw: &RawCalls) -> io::Result<FreeSpace> {
     let path = root.path().to_path_buf();
-    probe_free_space_with(path, move |_| free_space_approved(&root)).await
+    probe_free_space_with(path, raw, move |_| free_space_approved(&root)).await
 }
 
-async fn probe_free_space_with<F>(root: PathBuf, probe: F) -> io::Result<FreeSpace>
+async fn probe_free_space_with<F>(root: PathBuf, raw: &RawCalls, probe: F) -> io::Result<FreeSpace>
 where
     F: FnOnce(PathBuf) -> io::Result<FreeSpace> + Send + 'static,
 {
     let (result_tx, result_rx) = oneshot::channel();
-    // A blocked `statvfs` cannot be cancelled safely. The retention owner is
-    // single-flight and forces bounded process exit instead of launching a
-    // replacement; this standard-library thread cannot hold that exit.
-    let thread = std::thread::Builder::new()
-        .name("irisd-retention-probe".into())
-        .spawn(move || {
-            let result = probe(root);
-            let _ = result_tx.send(result);
-        })?;
+    // A blocked `statvfs` cannot be cancelled safely. If the pass times out the
+    // counted thread outlives it, and the retention owner starts no other pass
+    // until the call returns; the thread cannot hold process exit.
+    let thread = raw.spawn("irisd-retention-probe", move || {
+        let result = probe(root);
+        let _ = result_tx.send(result);
+    })?;
     let result = result_rx
         .await
         .map_err(|err| io::Error::other(format!("free-space probe stopped: {err}")))?;
@@ -710,6 +792,7 @@ fn log_pass(report: &PassReport, quota_bytes: Option<u64>) {
     if report.duration >= SLOW_PASS {
         warn!(
             deleted = report.deleted,
+            finished_deletions = report.finished_deletions,
             freed_mib = report.freed >> 20,
             ms = report.duration.as_millis(),
             free_pct = format_args!("{free_pct:.1}"),
@@ -717,9 +800,10 @@ fn log_pass(report: &PassReport, quota_bytes: Option<u64>) {
             quota_gib = format_args!("{:.2}", gib(quota_bytes)),
             "slow retention pass"
         );
-    } else if report.deleted > 0 {
+    } else if report.deleted > 0 || report.finished_deletions > 0 {
         info!(
             deleted = report.deleted,
+            finished_deletions = report.finished_deletions,
             freed_mib = report.freed >> 20,
             ms = report.duration.as_millis(),
             free_pct = format_args!("{free_pct:.1}"),
@@ -736,17 +820,20 @@ fn gib(bytes: Option<u64>) -> f64 {
 }
 
 /// Commits deletion intent, removes one segment's pair durably, and then
-/// removes its catalog row. `None` leaves a deleting row for startup retry.
+/// removes its catalog row. `None` after the mark leaves a deleting row that
+/// later passes and startup retry; a row whose path is outside its root's
+/// recording layout is never marked.
 async fn delete(
     catalog: &CatalogHandle,
     row: &SegmentRow,
     approved_roots: &[ApprovedRoot],
+    raw: &RawCalls,
 ) -> Option<u64> {
     // The legacy unit-test harness predates persisted root ownership. Keep it
     // isolated from the daemon path, which always supplies admitted roots.
     #[cfg(test)]
     if approved_roots.is_empty() {
-        return delete_unapproved_for_test(catalog, row).await;
+        return delete_unapproved_for_test(catalog, row, raw).await;
     }
 
     let persisted_root = match catalog.segment_root(row.id).await {
@@ -772,6 +859,16 @@ async fn delete(
         );
         return None;
     };
+    // Pair removal and startup only accept layout paths; marking any other row
+    // would leave a tombstone that can never finish.
+    if parse_segment_path(approved.path(), &row.path).as_ref() != Some(&row.key) {
+        warn!(
+            path = %row.path.display(),
+            root = %approved.path().display(),
+            "catalog row is outside its root's recording layout; not deleting it"
+        );
+        return None;
+    }
 
     match catalog
         .mark_deleting_if_unprotected_at_root(
@@ -793,28 +890,37 @@ async fn delete(
             return None;
         }
     }
-    let path = row.path.clone();
+    let freed = remove_pair(approved, &row.path, raw).await?;
+    if let Err(err) = catalog.delete_segment(row.id).await {
+        warn!(path = %row.path.display(), %err, "cannot delete catalog row");
+        return None;
+    }
+    Some(freed)
+}
+
+/// Removes one recording pair beneath its approved root on a counted raw thread
+/// and returns the bytes freed. `None` leaves the deletion intent for a retry.
+async fn remove_pair(approved: ApprovedRoot, path: &Path, raw: &RawCalls) -> Option<u64> {
     let (result_tx, result_rx) = oneshot::channel();
-    let removal_path = path.clone();
+    let removal_path = path.to_path_buf();
     // Unlink and the directory durability barrier can block in the kernel.
-    // Deletion intent remains durable if cancellation detaches this one call,
-    // so startup can finish it idempotently after bounded process exit.
-    let thread = std::thread::Builder::new()
-        .name("irisd-retention-remove".into())
-        .spawn(move || {
-            let _ = result_tx.send(remove_segment_beneath(&approved, &removal_path));
-        });
+    // Deletion intent remains durable if a timeout detaches this one call; the
+    // owner starts no other pass until it returns, and a later pass or startup
+    // finishes the row idempotently.
+    let thread = raw.spawn("irisd-retention-remove", move || {
+        let _ = result_tx.send(remove_segment_beneath(&approved, &removal_path));
+    });
     let thread = match thread {
         Ok(thread) => thread,
         Err(err) => {
-            warn!(path = %row.path.display(), %err, "cannot start segment removal");
+            warn!(path = %path.display(), %err, "cannot start segment removal");
             return None;
         }
     };
     let freed = match result_rx.await {
         Ok(Ok(bytes)) => bytes,
         Ok(Err(err)) => {
-            warn!(path = %row.path.display(), %err, "cannot remove segment files");
+            warn!(path = %path.display(), %err, "cannot remove segment files");
             return None;
         }
         Err(err) => {
@@ -823,25 +929,88 @@ async fn delete(
         }
     };
     if thread.join().is_err() {
-        warn!(path = %row.path.display(), "segment removal thread panicked after returning a result");
-        return None;
-    }
-    if let Err(err) = catalog.delete_segment(row.id).await {
-        warn!(path = %row.path.display(), %err, "cannot delete catalog row");
+        warn!(path = %path.display(), "segment removal thread panicked after returning a result");
         return None;
     }
     Some(freed)
 }
 
+/// The approved root that owns a deletion intent, when the row's persisted root
+/// is approved and its path is in that root's recording layout.
+fn deletion_root<'a>(
+    roots: &'a [ApprovedRoot],
+    persisted_root: Option<&Path>,
+    row: &SegmentRow,
+) -> Option<&'a ApprovedRoot> {
+    let persisted_root = persisted_root?;
+    let root = roots.iter().find(|root| root.path() == persisted_root)?;
+    (parse_segment_path(root.path(), &row.path).as_ref() == Some(&row.key)).then_some(root)
+}
+
+/// Retries one bounded page of durable deletion intents beneath approved roots:
+/// at most [`DELETION_RETRY_ROWS`] rows or [`DELETION_RETRY_BUDGET`], continuing
+/// after `cursor` and wrapping after the last intent. A cleared fault, or a
+/// tombstone whose files are already absent, therefore stops counting toward
+/// the quota without a restart. Rows on unavailable roots or outside the
+/// recording layout remain for startup; failures remain for a later pass.
+async fn finish_deletion_intents(
+    catalog: &CatalogHandle,
+    approved_roots: &[ApprovedRoot],
+    cursor: &mut Option<SegmentCursor>,
+    raw: &RawCalls,
+) -> anyhow::Result<usize> {
+    if approved_roots.is_empty() {
+        return Ok(0);
+    }
+    let started = Instant::now();
+    let rows = catalog
+        .deleting_segments_page(*cursor, DELETION_RETRY_ROWS)
+        .await
+        .context("listing deletion intents")?;
+    let exhausted = rows.len() < DELETION_RETRY_ROWS;
+    let mut complete = true;
+    let mut finished = 0;
+    for (row, persisted_root) in rows {
+        if started.elapsed() >= DELETION_RETRY_BUDGET {
+            complete = false;
+            break;
+        }
+        *cursor = Some(segment_cursor(&row));
+        let Some(root) = deletion_root(approved_roots, persisted_root.as_deref(), &row) else {
+            debug!(path = %row.path.display(), "deletion intent is not beneath an approved root's layout; leaving it for startup");
+            continue;
+        };
+        let Some(freed) = remove_pair(root.clone(), &row.path, raw).await else {
+            continue;
+        };
+        match catalog.delete_segment(row.id).await {
+            Ok(()) => {
+                finished += 1;
+                info!(path = %row.path.display(), freed, "finished interrupted segment deletion");
+            }
+            Err(err) => warn!(path = %row.path.display(), %err, "cannot delete catalog row"),
+        }
+    }
+    if complete && exhausted {
+        *cursor = None;
+    }
+    Ok(finished)
+}
+
 #[cfg(test)]
-async fn delete_unapproved_for_test(catalog: &CatalogHandle, row: &SegmentRow) -> Option<u64> {
-    delete_unapproved_with(catalog, row, |path| remove_segment(&path)).await
+async fn delete_unapproved_for_test(
+    catalog: &CatalogHandle,
+    row: &SegmentRow,
+    raw: &RawCalls,
+) -> Option<u64> {
+    delete_unapproved_with(catalog, row, raw, |path| remove_segment(&path)).await
 }
 
 #[cfg(test)]
 async fn delete_unapproved_with<F>(
     catalog: &CatalogHandle,
     row: &SegmentRow,
+    raw: &RawCalls,
     remove: F,
 ) -> Option<u64>
 where
@@ -869,11 +1038,9 @@ where
     let path = row.path.clone();
     let (result_tx, result_rx) = oneshot::channel();
     let removal_path = path.clone();
-    let thread = match std::thread::Builder::new()
-        .name("irisd-retention-test-remove".into())
-        .spawn(move || {
-            let _ = result_tx.send(remove(removal_path));
-        }) {
+    let thread = match raw.spawn("irisd-retention-test-remove", move || {
+        let _ = result_tx.send(remove(removal_path));
+    }) {
         Ok(thread) => thread,
         Err(err) => {
             warn!(path = %row.path.display(), %err, "cannot start segment removal");
@@ -916,6 +1083,18 @@ mod tests {
         camera: &str,
         bytes: &[u8],
     ) {
+        seed_segment_starting(catalog, path, camera, bytes, 1_000_000).await;
+    }
+
+    /// Writes `bytes` at `path` and adopts it as a one-second sealed recording
+    /// starting at `wall_start`.
+    async fn seed_segment_starting(
+        catalog: &CatalogHandle,
+        path: &Path,
+        camera: &str,
+        bytes: &[u8],
+        wall_start: i64,
+    ) {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(path, bytes).unwrap();
         catalog
@@ -927,8 +1106,8 @@ mod tests {
                 path: path.to_path_buf(),
                 run_seq: 1,
                 discontinuity: false,
-                wall_start: WallUs::new(1_000_000),
-                wall_end: WallUs::new(2_000_000),
+                wall_start: WallUs::new(wall_start),
+                wall_end: WallUs::new(wall_start + 1_000_000),
                 media_start: 0,
                 media_end: 90_000,
                 init_len: 0,
@@ -949,7 +1128,7 @@ mod tests {
         if cursors[key].cursor.is_none() {
             return;
         }
-        let mut tally = Tally::new(Instant::now());
+        let mut tally = Tally::new(Instant::now(), RawCalls::default());
         expire_by_age(
             catalog,
             std::slice::from_ref(key),
@@ -990,8 +1169,10 @@ mod tests {
         let (release_tx, release_rx) = std::sync::mpsc::channel();
         let mut release = ReleaseOnDrop(Some(release_tx));
         let catalog_for_task = catalog.clone();
+        let raw = RawCalls::default();
+        let task_raw = raw.clone();
         let task = tokio::spawn(async move {
-            delete_unapproved_with(&catalog_for_task, &row, move |_| {
+            delete_unapproved_with(&catalog_for_task, &row, &task_raw, move |_| {
                 worker_active.store(true, Ordering::SeqCst);
                 let _ = started_tx.send(());
                 let _ = release_rx.recv();
@@ -1011,9 +1192,10 @@ mod tests {
             active.load(Ordering::SeqCst),
             "the gate must reproduce the uncancellable syscall tail"
         );
+        assert_eq!(raw.in_flight(), 1, "the detached removal stays counted");
         release.0.take().unwrap().send(()).unwrap();
         tokio::time::timeout(Duration::from_secs(1), async {
-            while active.load(Ordering::SeqCst) {
+            while active.load(Ordering::SeqCst) || raw.in_flight() != 0 {
                 tokio::task::yield_now().await;
             }
         })
@@ -1049,8 +1231,10 @@ mod tests {
         let (started_tx, started_rx) = std::sync::mpsc::sync_channel(0);
         let (release_tx, release_rx) = std::sync::mpsc::channel();
         let mut release = ReleaseOnDrop(Some(release_tx));
+        let raw = RawCalls::default();
+        let task_raw = raw.clone();
         let mut task = tokio::spawn(async move {
-            probe_free_space_with(PathBuf::from("synthetic-root"), move |_| {
+            probe_free_space_with(PathBuf::from("synthetic-root"), &task_raw, move |_| {
                 worker_calls.fetch_add(1, Ordering::SeqCst);
                 worker_active.store(true, Ordering::SeqCst);
                 let _ = started_tx.send(());
@@ -1074,9 +1258,10 @@ mod tests {
         assert!(task.await.unwrap_err().is_cancelled());
         assert!(active.load(Ordering::SeqCst));
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(raw.in_flight(), 1, "the detached statvfs stays counted");
         release.0.take().unwrap().send(()).unwrap();
         tokio::time::timeout(Duration::from_secs(1), async {
-            while active.load(Ordering::SeqCst) {
+            while active.load(Ordering::SeqCst) || raw.in_flight() != 0 {
                 tokio::task::yield_now().await;
             }
         })
@@ -1092,7 +1277,9 @@ mod tests {
         let displaced = dir.path().join("displaced-video");
         let approved =
             iris_store::admit_recording_root(&root, iris_store::RootExpectation::Fresh).unwrap();
-        let ordinary_space = probe_approved_free_space(approved.clone()).await.unwrap();
+        let ordinary_space = probe_approved_free_space(approved.clone(), &RawCalls::default())
+            .await
+            .unwrap();
         assert!(ordinary_space.total > 0);
 
         let catalog = CatalogHandle::open(&dir.path().join("catalog.db")).unwrap();
@@ -1292,7 +1479,7 @@ mod tests {
         let mut cursors = HashMap::new();
         for expected in [&first, &second] {
             let mut checks = 0;
-            let mut tally = Tally::new(Instant::now());
+            let mut tally = Tally::new(Instant::now(), RawCalls::default());
             free_roots(
                 FreeRootContext {
                     catalog: &catalog,
@@ -1338,7 +1525,7 @@ mod tests {
         seed_segment(&catalog, &first_file, "cam").await;
         seed_segment(&catalog, &second_file, "cam").await;
 
-        let mut first_tally = Tally::new(Instant::now());
+        let mut first_tally = Tally::new(Instant::now(), RawCalls::default());
         first_tally.attempted = MAX_PER_PASS - 1;
         let mut cursors = HashMap::new();
         free_roots(
@@ -1362,7 +1549,7 @@ mod tests {
         assert!(!first_file.exists());
         assert!(second_file.exists());
 
-        let mut second_tally = Tally::new(Instant::now());
+        let mut second_tally = Tally::new(Instant::now(), RawCalls::default());
         second_tally.attempted = MAX_PER_PASS - 1;
         free_roots(
             FreeRootContext {
@@ -1488,7 +1675,7 @@ mod tests {
         let now = WallUs::new(2 * DAY_US);
 
         for index in 0..2 {
-            let mut tally = Tally::new(Instant::now());
+            let mut tally = Tally::new(Instant::now(), RawCalls::default());
             tally.attempted = MAX_PER_PASS - 1;
             expire_by_age(&catalog, &keys, &mut cursors, &[], now, &mut tally, &[])
                 .await
@@ -1502,7 +1689,7 @@ mod tests {
             assert!(paths[index + 1].exists());
         }
 
-        let mut exhaustion_tally = Tally::new(Instant::now());
+        let mut exhaustion_tally = Tally::new(Instant::now(), RawCalls::default());
         expire_by_age(
             &catalog,
             &keys,
@@ -1521,7 +1708,7 @@ mod tests {
 
         let after_wrap = dir.path().join("after-wrap.mp4");
         seed_segment(&catalog, &after_wrap, "cam").await;
-        let mut wrap_tally = Tally::new(Instant::now());
+        let mut wrap_tally = Tally::new(Instant::now(), RawCalls::default());
         expire_by_age(
             &catalog,
             &keys,
@@ -1633,6 +1820,185 @@ mod tests {
         catalog.shutdown();
     }
 
+    /// A catalog with one admitted, configured recording root.
+    async fn approved_catalog(dir: &Path) -> (CatalogHandle, PathBuf, ApprovedRoot) {
+        let catalog = CatalogHandle::open(&dir.join("catalog.db")).unwrap();
+        let root = dir.join("video");
+        let approved =
+            iris_store::admit_recording_root(&root, iris_store::RootExpectation::Fresh).unwrap();
+        catalog
+            .configure_video_roots(std::slice::from_ref(&root))
+            .await
+            .unwrap();
+        (catalog, root, approved)
+    }
+
+    #[tokio::test]
+    async fn a_cleared_fault_finishes_the_tombstone_without_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let (catalog, root, approved) = approved_catalog(dir.path()).await;
+        let path = root.join("cam/main/1970-01-01/000000Z.mp4");
+        seed_segment(&catalog, &path, "cam").await;
+        // A non-empty directory in place of the sidecar makes pair removal fail.
+        let index = path.with_extension("idx");
+        std::fs::create_dir(&index).unwrap();
+        std::fs::write(index.join("blocker"), b"x").unwrap();
+        let approved = std::slice::from_ref(&approved);
+        let mut state = RetentionState::default();
+
+        let report = pass_approved(&catalog, approved, &mut state, 0, Some(0), &HashMap::new())
+            .await
+            .unwrap();
+        assert_eq!((report.deleted, report.finished_deletions), (0, 0));
+        assert_eq!(catalog.deleting_segments().await.unwrap().len(), 1);
+        assert_eq!(
+            catalog.total_bytes().await.unwrap(),
+            1,
+            "the tombstone still counts"
+        );
+        let catalog_stats = catalog.stats().await.unwrap();
+        assert_eq!(
+            (
+                catalog_stats.deleting_segments,
+                catalog_stats.deleting_bytes
+            ),
+            (1, 1)
+        );
+
+        let report = pass_approved(&catalog, approved, &mut state, 0, Some(0), &HashMap::new())
+            .await
+            .unwrap();
+        assert_eq!(
+            report.finished_deletions, 0,
+            "a persisting fault keeps the tombstone"
+        );
+        assert_eq!(catalog.deleting_segments().await.unwrap().len(), 1);
+
+        std::fs::remove_dir_all(&index).unwrap();
+        let report = pass_approved(&catalog, approved, &mut state, 0, Some(0), &HashMap::new())
+            .await
+            .unwrap();
+        assert_eq!(report.finished_deletions, 1);
+        assert_eq!(catalog.deleting_segments().await.unwrap(), Vec::new());
+        assert_eq!(catalog.total_bytes().await.unwrap(), 0);
+        assert_eq!(report.total_bytes, Some(0));
+        assert!(!path.exists());
+        catalog.shutdown();
+    }
+
+    #[tokio::test]
+    async fn a_phantom_tombstone_is_reclaimed_before_the_quota_deletes_newer_footage() {
+        let dir = tempfile::tempdir().unwrap();
+        let (catalog, root, approved) = approved_catalog(dir.path()).await;
+        let older = root.join("cam/main/1970-01-01/000001Z.mp4");
+        let newest = root.join("cam/main/1970-01-01/000002Z.mp4");
+        seed_segment_starting(&catalog, &older, "cam", &[0; 1_000], 1_000_000).await;
+        seed_segment_starting(&catalog, &newest, "cam", &[0; 1_000], 2_000_000).await;
+        // A deletion whose row removal failed after both unlinks leaves a row
+        // in deletion intent whose files are already gone.
+        let phantom = catalog.segment_by_path(&older).await.unwrap().unwrap();
+        catalog.mark_deleting(phantom.id).await.unwrap();
+        std::fs::remove_file(&older).unwrap();
+        assert_eq!(catalog.total_bytes().await.unwrap(), 2_000);
+
+        let mut state = RetentionState::default();
+        let report = pass_approved(
+            &catalog,
+            std::slice::from_ref(&approved),
+            &mut state,
+            0,
+            Some(1_000),
+            &HashMap::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(report.finished_deletions, 1);
+        assert_eq!(
+            report.deleted, 0,
+            "the quota holds once the phantom is gone"
+        );
+        assert!(newest.exists(), "the newest recording survives");
+        assert_eq!(report.total_bytes, Some(1_000));
+        assert_eq!(catalog.oldest_sealed(4).await.unwrap().len(), 1);
+        catalog.shutdown();
+    }
+
+    #[tokio::test]
+    async fn rows_outside_the_recording_layout_are_never_marked() {
+        let dir = tempfile::tempdir().unwrap();
+        let (catalog, root, approved) = approved_catalog(dir.path()).await;
+        let stray = root.join("stray.mp4");
+        let shallow = root.join("cam/main/000000Z.mp4");
+        let valid = root.join("cam/main/1970-01-01/000000Z.mp4");
+        for path in [&stray, &shallow, &valid] {
+            seed_segment(&catalog, path, "cam").await;
+        }
+
+        let mut state = RetentionState::default();
+        let report = pass_approved(
+            &catalog,
+            std::slice::from_ref(&approved),
+            &mut state,
+            0,
+            Some(0),
+            &HashMap::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(report.deleted, 1, "only the layout row is deleted");
+        assert!(!valid.exists());
+        assert!(stray.exists() && shallow.exists());
+        assert_eq!(catalog.deleting_segments().await.unwrap(), Vec::new());
+        let remaining: Vec<PathBuf> = catalog
+            .oldest_sealed(4)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| row.path)
+            .collect();
+        assert_eq!(remaining.len(), 2);
+        assert!(remaining.contains(&stray) && remaining.contains(&shallow));
+        catalog.shutdown();
+    }
+
+    #[tokio::test]
+    async fn the_deletion_intent_retry_is_bounded_and_wraps() {
+        let dir = tempfile::tempdir().unwrap();
+        let (catalog, root, approved) = approved_catalog(dir.path()).await;
+        let count = DELETION_RETRY_ROWS + 4;
+        for second in 0..count {
+            let path = root.join(format!("cam/main/1970-01-01/{second:06}Z.mp4"));
+            let start = 1_000_000 * i64::try_from(second + 1).unwrap();
+            seed_segment_starting(&catalog, &path, "cam", b"x", start).await;
+            let row = catalog.segment_by_path(&path).await.unwrap().unwrap();
+            catalog.mark_deleting(row.id).await.unwrap();
+        }
+        let raw = RawCalls::default();
+        let mut cursor = None;
+        let approved = std::slice::from_ref(&approved);
+        let first = finish_deletion_intents(&catalog, approved, &mut cursor, &raw)
+            .await
+            .unwrap();
+        assert!(
+            first <= DELETION_RETRY_ROWS,
+            "one page per pass, finished {first}"
+        );
+        let mut finished = first;
+        for _ in 0..count {
+            if finished == count {
+                break;
+            }
+            finished += finish_deletion_intents(&catalog, approved, &mut cursor, &raw)
+                .await
+                .unwrap();
+        }
+        assert_eq!(finished, count);
+        assert_eq!(cursor, None, "the cursor wraps after the last intent");
+        assert_eq!(raw.in_flight(), 0);
+        assert_eq!(catalog.deleting_segments().await.unwrap(), Vec::new());
+        catalog.shutdown();
+    }
+
     #[tokio::test]
     async fn a_deletion_intent_failure_prevents_either_unlink() {
         let dir = tempfile::tempdir().unwrap();
@@ -1644,7 +2010,10 @@ mod tests {
         let row = catalog.oldest_sealed(1).await.unwrap().remove(0);
 
         catalog.shutdown();
-        assert_eq!(delete(&catalog, &row, &[]).await, None);
+        assert_eq!(
+            delete(&catalog, &row, &[], &RawCalls::default()).await,
+            None
+        );
         assert!(path.exists(), "media must remain before durable intent");
         assert!(index.exists(), "index must remain before durable intent");
     }
@@ -1685,7 +2054,10 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(delete(&catalog, &row, &[]).await, None);
+        assert_eq!(
+            delete(&catalog, &row, &[], &RawCalls::default()).await,
+            None
+        );
         assert!(path.exists());
         assert!(catalog.segment(row.id).await.unwrap().is_some());
         assert_eq!(catalog.deleting_segments().await.unwrap(), Vec::new());

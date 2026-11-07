@@ -294,10 +294,11 @@ ffprobe -v error -rtsp_transport tcp -i "rtsp://..." -select_streams v:0 \
 ffmpeg -rtsp_transport tcp -i "rtsp://..." -map 0:v -c copy -t 30 -f hevc raw.hevc \
   -map 0:v -c copy -t 30 -movflags +frag_keyframe+empty_moov+default_base_moof -tag:v hvc1 -f mp4 frag.mp4 \
   -map 0:v -c copy -t 30 -f matroska out.mkv -map 0:v -c copy -t 30 -tag:v hvc1 -f mp4 plain.mp4
-# RTP/RTCP/timing/metadata probe (iris-tools)
-iris-tools rtsp-probe $CAM user 'password' 90 0 /tmp/meta.xml
+# RTP/RTCP/timing/metadata probe (iris-tools); the password comes from the environment
+read -rs CAMERA_PASSWORD && export CAMERA_PASSWORD
+iris-tools rtsp-probe --password-env CAMERA_PASSWORD $CAM user 90 0 probe/meta.xml
 # ONVIF with WS-UsernameToken (clock-offset compensated)
-iris-tools onvif-call user 'password' http://$CAM/onvif/event_service \
+iris-tools onvif-call --password-env CAMERA_PASSWORD user http://$CAM/onvif/event_service \
   '<GetEventProperties xmlns="http://www.onvif.org/ver10/events/wsdl"/>' 60000
 # Dahua event feed
 curl -s -g --digest -u "$CRED" "http://$CAM/cgi-bin/eventManager.cgi?action=attach&codes=[All]&heartbeat=5"

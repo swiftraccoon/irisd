@@ -6,7 +6,7 @@
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
 use std::os::fd::AsRawFd;
-use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _, PermissionsExt as _};
+use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -523,6 +523,9 @@ struct OutputDir {
 }
 
 impl OutputDir {
+    /// Opens, or creates with mode 0700, the sampler's directory. A directory
+    /// already there must be owned by the caller and writable by no one else;
+    /// its mode is otherwise the operator's and is never changed.
     fn open(path: &Path) -> anyhow::Result<Self> {
         if !path.exists() {
             std::fs::DirBuilder::new()
@@ -552,7 +555,14 @@ impl OutputDir {
             opened.is_dir() && opened.uid() == rustix::process::getuid().as_raw(),
             "opened output directory is not a caller-owned directory"
         );
-        fd.set_permissions(std::fs::Permissions::from_mode(0o700))?;
+        anyhow::ensure!(
+            opened.mode() & 0o022 == 0,
+            "output directory {} is writable by its group or others (mode {:o}); remove that \
+             with `chmod go-w {}` or choose a private directory",
+            path.display(),
+            opened.mode() & 0o7777,
+            path.display()
+        );
         let lock = Self::open_regular_fd(&fd, ".lock", false)?;
         rustix::fs::flock(&lock, rustix::fs::FlockOperation::NonBlockingLockExclusive)
             .context("another soak-sample process holds the output lock")?;
@@ -976,7 +986,8 @@ async fn api_check(
     );
     out.insert("health".into(), json!({ "status": status, "body": health }));
     anyhow::ensure!(status == 200, "health endpoint returned HTTP {status}");
-    let (status, body) = api_get(&client, base, "/metrics", None, METRICS_LIMIT).await?;
+    // `/metrics` requires the root bearer unless the daemon exposes it publicly.
+    let (status, body) = api_get(&client, base, "/metrics", token, METRICS_LIMIT).await?;
     anyhow::ensure!(status == 200, "metrics endpoint returned HTTP {status}");
     let metrics = metrics_summary(std::str::from_utf8(&body).context("metrics are not UTF-8")?)?;
     out.insert(
@@ -1187,6 +1198,7 @@ pub fn run(args: &Args) -> anyhow::Result<()> {
 mod tests {
     use super::*;
     use std::fmt::Write as _;
+    use std::os::unix::fs::PermissionsExt as _;
     use std::os::unix::fs::symlink;
 
     #[test]
@@ -1318,6 +1330,34 @@ mod tests {
     }
 
     #[test]
+    fn an_existing_output_directory_keeps_its_mode_unless_others_can_write() {
+        for mode in [0o755, 0o750, 0o700] {
+            let parent = tempfile::tempdir().unwrap();
+            let out_path = parent.path().join("out");
+            std::fs::create_dir(&out_path).unwrap();
+            std::fs::set_permissions(&out_path, std::fs::Permissions::from_mode(mode)).unwrap();
+            drop(OutputDir::open(&out_path).unwrap());
+            assert_eq!(
+                std::fs::metadata(&out_path).unwrap().mode() & 0o777,
+                mode,
+                "mode {mode:o} is left alone"
+            );
+        }
+        for mode in [0o775, 0o777, 0o757] {
+            let parent = tempfile::tempdir().unwrap();
+            let out_path = parent.path().join("out");
+            std::fs::create_dir(&out_path).unwrap();
+            std::fs::set_permissions(&out_path, std::fs::Permissions::from_mode(mode)).unwrap();
+            let error = OutputDir::open(&out_path)
+                .err()
+                .unwrap_or_else(|| panic!("mode {mode:o} must be rejected"));
+            assert!(error.to_string().contains("chmod go-w"), "{error:#}");
+            assert_eq!(std::fs::metadata(&out_path).unwrap().mode() & 0o777, mode);
+            assert!(!out_path.join(".lock").exists(), "nothing is written");
+        }
+    }
+
+    #[test]
     fn fifo_artifacts_are_rejected_without_blocking() {
         let parent = tempfile::tempdir().unwrap();
         let out_path = parent.path().join("out");
@@ -1343,6 +1383,103 @@ mod tests {
             peer_class("ESTAB 0 0 192.0.2.1:5000 192.0.2.9:8554"),
             "other"
         );
+    }
+
+    /// A loopback HTTP fixture for the API check: answers `/api/health`, a
+    /// `/metrics` that requires `Bearer t`, and an empty camera list, one
+    /// connection per request, and records each request's Authorization value.
+    fn api_fixture() -> (
+        String,
+        std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>>,
+    ) {
+        use std::io::BufRead as _;
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let record = std::sync::Arc::clone(&seen);
+        std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while Instant::now() < deadline {
+                let Ok((socket, _)) = listener.accept() else {
+                    std::thread::sleep(Duration::from_millis(5));
+                    continue;
+                };
+                socket.set_nonblocking(false).unwrap();
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                let mut reader = std::io::BufReader::new(&socket);
+                let mut request_line = String::new();
+                if reader.read_line(&mut request_line).is_err() {
+                    continue;
+                }
+                let path = request_line
+                    .split_whitespace()
+                    .nth(1)
+                    .unwrap_or_default()
+                    .to_owned();
+                let mut authorization = String::new();
+                loop {
+                    let mut header = String::new();
+                    if reader.read_line(&mut header).unwrap_or(0) == 0 || header == "\r\n" {
+                        break;
+                    }
+                    if let Some((name, value)) = header.split_once(':')
+                        && name.eq_ignore_ascii_case("authorization")
+                    {
+                        value.trim().clone_into(&mut authorization);
+                    }
+                }
+                record
+                    .lock()
+                    .unwrap()
+                    .push((path.clone(), authorization.clone()));
+                let (status, body) = match path.as_str() {
+                    "/api/health" => (
+                        "200 OK",
+                        r#"{"status":"ok","uptime_s":1,"version":"0.1.0"}"#.to_owned(),
+                    ),
+                    "/metrics" if authorization == "Bearer t" => {
+                        let mut metrics = String::new();
+                        for name in SOAK_METRICS {
+                            writeln!(metrics, "{name} 0").unwrap();
+                        }
+                        ("200 OK", metrics)
+                    }
+                    "/metrics" => ("401 Unauthorized", String::new()),
+                    "/api/cameras" => ("200 OK", "[]".to_owned()),
+                    _ => ("404 Not Found", String::new()),
+                };
+                let mut socket = &socket;
+                let _ = write!(
+                    socket,
+                    "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+            }
+        });
+        (base, seen)
+    }
+
+    #[test]
+    fn the_metrics_scrape_sends_the_configured_bearer() {
+        let (base, seen) = api_fixture();
+        let base = validate_api_base(&base).unwrap();
+        let check = api_check_blocking(&base, Some("t"), &["main".to_owned()], now()).unwrap();
+        assert_eq!(check["metrics"]["status"], 200, "{check}");
+        let seen = seen.lock().unwrap().clone();
+        assert!(
+            seen.contains(&("/metrics".to_owned(), "Bearer t".to_owned())),
+            "{seen:?}"
+        );
+
+        let (unauthenticated, _) = api_fixture();
+        let unauthenticated = validate_api_base(&unauthenticated).unwrap();
+        let error = api_check_blocking(&unauthenticated, None, &["main".to_owned()], now())
+            .expect_err("a protected scrape without a token fails explicitly");
+        assert!(format!("{error:#}").contains("HTTP 401"), "{error:#}");
     }
 
     #[test]

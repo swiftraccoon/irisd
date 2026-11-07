@@ -24,9 +24,9 @@ disk → byte-range serving).
   preserves retained sample bytes and shortens a crossing sample's duration.
 - `reader::parse_fragment` — one fragment held in memory, with its sample tables, for a
   serving path that has read it out of a file (the keyframe resource).
-- `reader::scan`, `reader::scan_from_offset`, `ScanOptions`, `ScanReport`, `FragmentInfo`,
-  and `ScanStop` — a forward walk of a file, or of a tail after validating the
-  initialization, that reports the valid length and why it stopped.
+- `reader::scan`, `reader::scan_with_limit`, `reader::scan_from_offset`, `ScanOptions`,
+  `ScanReport`, `FragmentInfo`, and `ScanStop` — a forward walk of a file, or of a tail after
+  validating the initialization, that reports the valid length and why it stopped.
 - `index::IndexHeader`, `IndexRecord`, `IndexWriter`, `read_index`, and
   `read_index_bounded` — the sidecar `.idx` codec and file; the bounded reader rejects a file whose
   metadata can contain more than the caller's record budget before allocating, and
@@ -65,12 +65,20 @@ API builds playlists from the sidecar records with `hls::media_playlist`.
   `04 §5`. A trailing partial record is ignored on read. Complete records must describe
   contiguous ranges from `init_len`, longer than a trailer and with non-overflowing ends;
   invalid ranges reject the cache so consumers can scan the media.
-- Daemon and offline persisted-cache entrypoints use `read_index_bounded` with the shared
-  `MAX_PERSISTED_INDEX_RECORDS` ceiling of 131,072 records (about 5 MiB). The low-level
-  `read_index` codec requires its caller to impose an equivalent bound. The bounded reader checks
-  metadata, uses fallible reservation, and reads at most the header plus the allowed complete
-  records and one partial-record tail. Oversized caches are rejected before allocation so callers
-  can scan authoritative media instead.
+- Persisted-cache readers apply the shared `MAX_PERSISTED_INDEX_RECORDS` ceiling of 131,072
+  records (about 5 MiB on disk and 5 MiB decoded at 40 bytes per record). Daemon code opens the
+  sidecar itself, without following links or blocking, and reads the descriptor with
+  `read_index_file_bounded` or `read_index_file_bound_to_media`; the path-taking
+  `read_index_bounded` follows symlinks and can block on a FIFO or device, so it serves offline
+  tools and tests. The low-level `read_index` codec requires its caller to impose an equivalent
+  bound. The bounded readers check metadata, use fallible reservation, and read at most the
+  header plus the allowed complete records and one partial-record tail. Oversized caches are
+  rejected before allocation so callers can scan authoritative media instead.
+- Scan budget: `scan` and `scan_from_offset` accept at most `MAX_PERSISTED_INDEX_RECORDS`
+  fragments (about 13 MiB of `FragmentInfo` without sample tables), `scan_with_limit` any other
+  count. A complete fragment beyond the limit stops the scan with `ScanStop::FragmentLimit`; its
+  `valid_len` is then not a truncation point, so recovery refuses such a file and adoption skips
+  it. A damaged region right after the limit reports its own stop reason.
 - Scans expose a nonzero initialization length only after complete `ftyp` and `moov` boxes;
   recovery rejects incomplete initialization without changing media or sidecar bytes.
   `scan_from_offset` still validates that initialization but does not read the trusted prefix
@@ -95,7 +103,7 @@ API builds playlists from the sidecar records with `hls::media_playlist`.
 
 Unit tests per module: box nesting and size patching, large and open-ended headers,
 fragment layout, trailer round trips, scanner behaviour on clean files, truncation,
-zero fill, and corruption, index header and record round trips with a partial tail,
+zero fill, corruption, and the fragment limit, index header and record round trips with a partial tail,
 playlist grouping and continuation trailer exclusion, malformed-cache fallback, completed-init
 recovery guards, fragment order/addressing/optional-field rejection, edit-parent restrictions,
 tail scanning from a validated offset, and a CRC cross-check against the reference crate

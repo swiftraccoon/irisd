@@ -1,11 +1,14 @@
 //! SOAP HTTP transport with the camera's TLS verification policy.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
 use diqwest::{DigestAuthSession, WithDigestAuth as _};
 use futures_util::StreamExt as _;
+use iris_core::id::CameraId;
 use oxvif::transport::{Transport, TransportError};
+use tracing::debug;
 use url::Url;
 
 use crate::endpoint::CameraEndpoint;
@@ -19,6 +22,8 @@ pub(crate) struct SoapTransport {
     client: reqwest::Client,
     digest: DigestAuthSession,
     origin: Url,
+    camera: CameraId,
+    rebase_logged: AtomicBool,
 }
 
 impl SoapTransport {
@@ -33,26 +38,52 @@ impl SoapTransport {
                 .build()?,
             digest: DigestAuthSession::new(&endpoint.username, &endpoint.password),
             origin,
+            camera: endpoint.camera.clone(),
+            rebase_logged: AtomicBool::new(false),
         })
     }
 
-    /// Validates a camera-advertised service URL before WS-Security credentials
-    /// are constructed for it.
-    pub(crate) fn validate_url(&self, candidate: &str) -> Result<Url, TransportError> {
+    /// Rebases a camera-advertised service URL onto the configured origin
+    /// before WS-Security credentials are constructed for it.
+    ///
+    /// Only `http` and `https` URLs without userinfo or a fragment are
+    /// accepted. Their path and query are kept; the scheme, host, and port are
+    /// always the configured ones. Cameras behind NAT or a port forward, or
+    /// configured by host name, advertise addresses the recorder cannot or
+    /// must not reach, and credentials only ever go to the operator's
+    /// authority; an HTTPS configuration is never downgraded. A rebase is
+    /// logged once per transport, at debug level, with the camera only.
+    pub(crate) fn rebase_url(&self, candidate: &str) -> Result<Url, TransportError> {
         let parsed = Url::parse(candidate).map_err(|_| endpoint_policy_error())?;
-        let supported_scheme = matches!(parsed.scheme(), "http" | "https");
-        let same_origin = parsed.scheme() == self.origin.scheme()
-            && parsed.host_str() == self.origin.host_str()
-            && parsed.port_or_known_default() == self.origin.port_or_known_default();
-        if !supported_scheme
-            || !same_origin
+        if !matches!(parsed.scheme(), "http" | "https")
             || !parsed.username().is_empty()
             || parsed.password().is_some()
             || parsed.fragment().is_some()
         {
             return Err(endpoint_policy_error());
         }
-        Ok(parsed)
+        let mut rebased = self.origin.clone();
+        rebased.set_path(parsed.path());
+        rebased.set_query(parsed.query());
+        let advertised_origin = (
+            parsed.scheme(),
+            parsed.host_str(),
+            parsed.port_or_known_default(),
+        );
+        let configured_origin = (
+            rebased.scheme(),
+            rebased.host_str(),
+            rebased.port_or_known_default(),
+        );
+        if advertised_origin != configured_origin
+            && !self.rebase_logged.swap(true, Ordering::Relaxed)
+        {
+            debug!(
+                camera = %self.camera,
+                "camera advertises another service origin; using the configured one"
+            );
+        }
+        Ok(rebased)
     }
 }
 
@@ -64,7 +95,7 @@ impl Transport for SoapTransport {
         action: &str,
         body: String,
     ) -> Result<String, TransportError> {
-        let url = self.validate_url(url)?;
+        let url = self.rebase_url(url)?;
         let response = self
             .client
             .post(url)
@@ -181,24 +212,34 @@ mod tests {
     }
 
     #[test]
-    fn advertised_urls_must_match_the_full_configured_origin() {
+    fn advertised_urls_are_rebased_onto_the_full_configured_origin() {
         let endpoint = endpoint_for("127.0.0.1:8080".parse().unwrap());
         let transport = SoapTransport::new(&endpoint).unwrap();
-        assert!(
-            transport
-                .validate_url("http://127.0.0.1:8080/onvif/events?x=1")
-                .is_ok()
-        );
         for candidate in [
-            "http://127.0.0.2:8080/onvif/events",
-            "http://127.0.0.1:8081/onvif/events",
-            "https://127.0.0.1:8080/onvif/events",
+            "http://127.0.0.1:8080/onvif/events?x=1",
+            "http://127.0.0.2:8080/onvif/events?x=1",
+            "http://127.0.0.1:8081/onvif/events?x=1",
+            "https://127.0.0.1:8080/onvif/events?x=1",
+            "http://camera.example/onvif/events?x=1",
+            "http://[2001:db8::1]:80/onvif/events?x=1",
+        ] {
+            assert_eq!(
+                transport.rebase_url(candidate).unwrap().as_str(),
+                "http://127.0.0.1:8080/onvif/events?x=1",
+                "{candidate}"
+            );
+        }
+        for candidate in [
             "http://user@127.0.0.1:8080/onvif/events",
+            "http://user:secret@192.0.2.10/onvif/events",
             "http://127.0.0.1:8080/onvif/events#fragment",
+            "http://192.0.2.10/onvif/events#",
             "file:///tmp/events",
+            "ftp://127.0.0.1:8080/onvif/events",
+            "not a url",
         ] {
             assert!(
-                transport.validate_url(candidate).is_err(),
+                transport.rebase_url(candidate).is_err(),
                 "accepted {candidate}"
             );
         }
@@ -206,12 +247,32 @@ mod tests {
         let mut https_endpoint = endpoint;
         https_endpoint.https = true;
         let https_transport = SoapTransport::new(&https_endpoint).unwrap();
-        assert!(
+        assert_eq!(
             https_transport
-                .validate_url("http://127.0.0.1:8080/onvif/events")
-                .is_err(),
-            "an authenticated HTTPS endpoint must reject downgrade URLs"
+                .rebase_url("http://127.0.0.1:8080/onvif/events")
+                .unwrap()
+                .as_str(),
+            "https://127.0.0.1:8080/onvif/events",
+            "an authenticated HTTPS endpoint is never downgraded"
         );
+    }
+
+    #[test]
+    fn a_camera_configured_by_host_name_keeps_its_name_for_advertised_addresses() {
+        let mut endpoint = endpoint_for("127.0.0.1:8080".parse().unwrap());
+        endpoint.host = "localhost".to_owned();
+        let transport = SoapTransport::new(&endpoint).unwrap();
+        for candidate in [
+            "http://127.0.0.1:8080/onvif/event_service",
+            "http://localhost/onvif/event_service",
+            "http://localhost:8080/onvif/event_service",
+        ] {
+            assert_eq!(
+                transport.rebase_url(candidate).unwrap().as_str(),
+                "http://localhost:8080/onvif/event_service",
+                "{candidate}"
+            );
+        }
     }
 
     async fn serve_once(status: u16, headers: &str, body: Vec<u8>) -> CameraEndpoint {

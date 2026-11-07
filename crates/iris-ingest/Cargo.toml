@@ -24,4 +24,6 @@ iris-mp4 = { workspace = true }
 workspace = true
 
 [dev-dependencies]
+socket2 = { workspace = true }
+tracing-subscriber = { workspace = true }
 iris-replay = { workspace = true }

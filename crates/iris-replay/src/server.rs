@@ -12,7 +12,7 @@ use iris_h265::LengthPrefixedNals;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{Semaphore, mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
@@ -27,6 +27,11 @@ const SENDER_REPORT_INTERVAL: Duration = Duration::from_secs(5);
 const OUTGOING_QUEUE: usize = 256;
 /// Time allowed for a queued terminal RTSP response to reach the socket.
 const CONTROL_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
+/// Default cap on connections served at once; `replay-bench` drives at most
+/// 256 cameras, one session each.
+pub const DEFAULT_MAX_CONNECTIONS: usize = 256;
+/// Longest accepted request or idle deadline.
+const MAX_DEADLINE: Duration = Duration::from_hours(24);
 
 /// Replay behaviour shared by all sessions.
 #[derive(Clone, Debug)]
@@ -50,6 +55,16 @@ pub struct Options {
     /// Spread a frame's packets over the frame interval instead of sending
     /// them back to back, as a camera on a slow link delivers them.
     pub pace: bool,
+    /// Connections served at once; the listener closes further connections
+    /// as it accepts them.
+    pub max_connections: usize,
+    /// Before `PLAY`, the time a connection has to complete each request.
+    /// Trickled bytes do not extend it.
+    pub request_timeout: Duration,
+    /// After `PLAY`, the longest silence between client requests or
+    /// interleaved frames. It stays above the recorder's keepalive, which
+    /// retina sends every 30 s for the default 60 s session timeout.
+    pub idle_timeout: Duration,
 }
 
 impl Default for Options {
@@ -62,6 +77,9 @@ impl Default for Options {
             stall_for: Duration::from_secs(10),
             burst: false,
             pace: false,
+            max_connections: DEFAULT_MAX_CONNECTIONS,
+            request_timeout: Duration::from_secs(10),
+            idle_timeout: Duration::from_secs(120),
         }
     }
 }
@@ -75,12 +93,24 @@ pub struct Server {
     mounts: Arc<Mounts>,
     options: Arc<Options>,
     counter: Arc<AtomicU64>,
+    connections: Arc<Semaphore>,
 }
 
 impl Server {
-    /// Binds `addr`.
+    /// Binds `addr`. The connection cap must be positive and both deadlines in
+    /// `options` between a millisecond and a day.
     pub async fn bind(addr: SocketAddr, mounts: Mounts, options: Options) -> anyhow::Result<Self> {
         validate_mtu(options.mtu)?;
+        ensure!(
+            (1..=Semaphore::MAX_PERMITS).contains(&options.max_connections),
+            "the replay connection cap must be positive"
+        );
+        let deadline_range = Duration::from_millis(1)..=MAX_DEADLINE;
+        ensure!(
+            deadline_range.contains(&options.request_timeout)
+                && deadline_range.contains(&options.idle_timeout),
+            "replay request and idle deadlines must be positive and at most one day"
+        );
         ensure!(!mounts.is_empty(), "at least one replay mount is required");
         for name in mounts.keys() {
             ensure!(valid_mount_name(name), "invalid replay mount name {name:?}");
@@ -91,6 +121,7 @@ impl Server {
         Ok(Self {
             listener,
             mounts: Arc::new(mounts),
+            connections: Arc::new(Semaphore::new(options.max_connections)),
             options: Arc::new(options),
             counter: Arc::new(AtomicU64::new(seed())),
         })
@@ -101,14 +132,21 @@ impl Server {
         self.listener.local_addr().context("local address")
     }
 
-    /// Accepts connections until the listener fails.
+    /// Accepts connections until the listener fails. A connection beyond
+    /// [`Options::max_connections`] is closed when it is accepted.
     pub async fn run(self) -> anyhow::Result<()> {
         loop {
             let (stream, peer) = self.listener.accept().await.context("accept")?;
+            let Ok(permit) = Arc::clone(&self.connections).try_acquire_owned() else {
+                warn!(%peer, limit = self.options.max_connections, "connection limit reached; closing");
+                drop(stream);
+                continue;
+            };
             let mounts = Arc::clone(&self.mounts);
             let options = Arc::clone(&self.options);
             let counter = Arc::clone(&self.counter);
             tokio::spawn(async move {
+                let _permit = permit;
                 debug!(%peer, "connected");
                 match serve(stream, &mounts, &options, &counter).await {
                     Ok(()) => debug!(%peer, "closed"),
@@ -288,16 +326,29 @@ async fn request_loop(
     options: &Arc<Options>,
 ) -> anyhow::Result<RequestLoopEnd> {
     let mut buf = Vec::with_capacity(4096);
+    let mut deadline = next_request_deadline(connection, options);
     loop {
         match parse(&buf) {
             Parsed::Incomplete => {
-                let n = reader.read_buf(&mut buf).await.context("read")?;
-                if n == 0 {
+                let Ok(read) = tokio::time::timeout_at(deadline, reader.read_buf(&mut buf)).await
+                else {
+                    let (state, limit) = if connection.player.is_some() {
+                        ("after PLAY", options.idle_timeout)
+                    } else {
+                        ("before PLAY", options.request_timeout)
+                    };
+                    anyhow::bail!(
+                        "no complete request within {} s {state}",
+                        limit.as_secs_f64()
+                    );
+                };
+                if read.context("read")? == 0 {
                     return Ok(RequestLoopEnd::InputClosed);
                 }
             }
             Parsed::Interleaved(len) => {
                 buf.drain(..len);
+                deadline = next_request_deadline(connection, options);
             }
             Parsed::Invalid => anyhow::bail!("not an RTSP request"),
             Parsed::Request(request, consumed) => {
@@ -315,9 +366,21 @@ async fn request_loop(
                 if tx.send(Outgoing::Control(reply)).await.is_err() {
                     return Ok(RequestLoopEnd::InputClosed);
                 }
+                deadline = next_request_deadline(connection, options);
             }
         }
     }
+}
+
+/// When the next complete request or interleaved frame must have arrived: the
+/// per-request deadline before `PLAY`, the idle deadline once playing.
+fn next_request_deadline(connection: &Connection, options: &Options) -> tokio::time::Instant {
+    let limit = if connection.player.is_some() {
+        options.idle_timeout
+    } else {
+        options.request_timeout
+    };
+    tokio::time::Instant::now() + limit
 }
 
 fn handle(
@@ -1251,6 +1314,187 @@ mod tests {
             received.ends_with(&expected),
             "terminal response is last on the wire"
         );
+    }
+
+    async fn serve_with(options: Options) -> (SocketAddr, JoinHandle<anyhow::Result<()>>) {
+        let server = Server::bind(
+            "127.0.0.1:0".parse().unwrap(),
+            Mounts::from([("a".to_owned(), test_media(0))]),
+            options,
+        )
+        .await
+        .unwrap();
+        let addr = server.local_addr().unwrap();
+        (addr, tokio::spawn(server.run()))
+    }
+
+    /// Sends OPTIONS and waits for its response; `None` when the server closed.
+    async fn options_round_trip(stream: &mut TcpStream, cseq: u32) -> Option<Vec<u8>> {
+        stream
+            .write_all(format!("OPTIONS rtsp://host/a RTSP/1.0\r\nCSeq: {cseq}\r\n\r\n").as_bytes())
+            .await
+            .ok()?;
+        let mut reply = vec![0; 1024];
+        let read = tokio::time::timeout(Duration::from_secs(2), stream.read(&mut reply))
+            .await
+            .expect("the server answers or closes before the deadline")
+            .ok()?;
+        (read > 0).then(|| reply[..read].to_vec())
+    }
+
+    #[tokio::test]
+    async fn connections_beyond_the_cap_are_closed_at_accept() {
+        let (addr, server) = serve_with(Options {
+            max_connections: 2,
+            ..Options::default()
+        })
+        .await;
+        let mut first = TcpStream::connect(addr).await.unwrap();
+        let mut second = TcpStream::connect(addr).await.unwrap();
+        assert!(options_round_trip(&mut first, 1).await.is_some());
+        assert!(options_round_trip(&mut second, 1).await.is_some());
+        let mut excess = TcpStream::connect(addr).await.unwrap();
+        let mut received = Vec::new();
+        tokio::time::timeout(Duration::from_secs(2), excess.read_to_end(&mut received))
+            .await
+            .expect("the excess connection is closed before the deadline")
+            .unwrap();
+        assert!(received.is_empty(), "the excess connection is never served");
+
+        drop(first);
+        let reused = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let mut retry = TcpStream::connect(addr).await.unwrap();
+                if options_round_trip(&mut retry, 2).await.is_some() {
+                    return retry;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        assert!(reused.is_ok(), "a released slot serves the next connection");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn requests_before_play_must_complete_within_the_deadline() {
+        let (addr, server) = serve_with(Options {
+            request_timeout: Duration::from_millis(200),
+            ..Options::default()
+        })
+        .await;
+        let mut partial = TcpStream::connect(addr).await.unwrap();
+        partial
+            .write_all(b"OPTIONS rtsp://host/a RTSP/1.0\r\nCSeq: 1\r\n")
+            .await
+            .unwrap();
+        let mut received = Vec::new();
+        tokio::time::timeout(Duration::from_secs(3), partial.read_to_end(&mut received))
+            .await
+            .expect("a partial request is closed at the deadline")
+            .unwrap();
+        assert!(received.is_empty(), "a partial request gets no response");
+
+        let mut trickle = TcpStream::connect(addr).await.unwrap();
+        let started = Instant::now();
+        let closed = tokio::time::timeout(Duration::from_secs(3), async {
+            for byte in b"OPTIONS rtsp://host/a RTSP/1.0\r\nCSeq: 2\r\n"
+                .iter()
+                .cycle()
+            {
+                if trickle.write_all(&[*byte]).await.is_err() {
+                    return;
+                }
+                let mut probe = [0u8; 64];
+                if let Ok(Ok(0) | Err(_)) =
+                    tokio::time::timeout(Duration::from_millis(50), trickle.read(&mut probe)).await
+                {
+                    return;
+                }
+            }
+        })
+        .await;
+        assert!(closed.is_ok(), "trickled bytes do not extend the deadline");
+        assert!(started.elapsed() < Duration::from_secs(2));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn a_playing_connection_closes_after_the_idle_deadline() {
+        let (addr, server) = serve_with(Options {
+            idle_timeout: Duration::from_millis(300),
+            ..Options::default()
+        })
+        .await;
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        let session = setup_raw_session(&mut stream).await;
+        let (mut reader, mut writer) = stream.into_split();
+        let received = tokio::spawn(async move {
+            let mut received = Vec::new();
+            tokio::time::timeout(Duration::from_secs(5), reader.read_to_end(&mut received))
+                .await
+                .map(|read| read.map(|_| received))
+        });
+        writer
+            .write_all(
+                format!("PLAY rtsp://host/a RTSP/1.0\r\nCSeq: 2\r\nSession: {session}\r\n\r\n")
+                    .as_bytes(),
+            )
+            .await
+            .unwrap();
+        // Keepalives every 100 ms keep the session for twice the idle deadline.
+        for cseq in 3..9 {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            writer
+                .write_all(
+                    format!(
+                        "GET_PARAMETER rtsp://host/a RTSP/1.0\r\nCSeq: {cseq}\r\nSession: {session}\r\n\r\n"
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+        }
+        let received = received
+            .await
+            .unwrap()
+            .expect("the silent session closes within the deadline")
+            .unwrap();
+        for cseq in 2..9 {
+            assert!(
+                find_bytes(&received, format!("CSeq: {cseq}\r\n").as_bytes()),
+                "response {cseq} arrives while the client keeps the session alive"
+            );
+        }
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn bind_rejects_a_zero_cap_and_zero_deadlines() {
+        for options in [
+            Options {
+                max_connections: 0,
+                ..Options::default()
+            },
+            Options {
+                request_timeout: Duration::ZERO,
+                ..Options::default()
+            },
+            Options {
+                idle_timeout: Duration::ZERO,
+                ..Options::default()
+            },
+        ] {
+            assert!(
+                Server::bind(
+                    "127.0.0.1:0".parse().unwrap(),
+                    Mounts::from([("a".to_owned(), test_media(0))]),
+                    options,
+                )
+                .await
+                .is_err()
+            );
+        }
     }
 
     #[tokio::test]

@@ -534,6 +534,7 @@ impl Playback {
         let playback = match playback {
             Ok(playback) => playback,
             Err(error) => {
+                warn!(camera = %self.camera, error = %format!("{error:#}"), "playback timing unavailable");
                 self.title
                     .set_label(&format!("playback timing unavailable: {error:#}"));
                 return;
@@ -854,6 +855,8 @@ mod tests {
         replacement_views_share_uninterruptible_decoder_permits();
         export_terminal_status_cannot_be_overwritten_by_progress();
         crate::tests::navigation_event_cancels_a_stalled_playback_request();
+        crate::tests::grid_decodes_at_most_max_tiles_feeds();
+        a_window_holding_only_a_stale_open_segment_shows_nothing_recorded();
         playback_error_releases_its_snapshot_listener();
     }
 
@@ -1387,6 +1390,62 @@ mod tests {
             "playback failure must close its snapshot listener"
         );
         assert!(stopped, "playback failure must release its pipeline");
+    }
+
+    fn a_window_holding_only_a_stale_open_segment_shows_nothing_recorded() {
+        gtk::init().unwrap();
+        let runtime = Arc::new(tokio::runtime::Runtime::new().unwrap());
+        let listener = runtime
+            .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let vod_requests = Arc::new(AtomicUsize::new(0));
+        let server = runtime.spawn({
+            let vod_requests = Arc::clone(&vod_requests);
+            async move {
+                let app = axum::Router::new()
+                    .route(
+                        "/api/streams/fixture/main/segments",
+                        axum::routing::get(|| async {
+                            // Opened 3 h before the window's end, last progress 2 h before it.
+                            r#"[{"wall_start_us":-7200000000,"wall_end_us":-3600000000,"sealed":false}]"#
+                        }),
+                    )
+                    .route("/api/events", axum::routing::get(|| async { "[]" }))
+                    .route(
+                        "/api/streams/fixture/main/hls/vod.m3u8",
+                        axum::routing::get(move || {
+                            vod_requests.fetch_add(1, Ordering::SeqCst);
+                            async { axum::http::StatusCode::NOT_FOUND }
+                        }),
+                    );
+                axum::serve(listener, app).await.unwrap();
+            }
+        });
+        let client = Arc::new(Client::new(
+            url::Url::parse(&format!("http://{address}")).unwrap(),
+            None,
+        ));
+        let view = Playback::new("fixture", "main", "sub", &[], thumbnail_decoder_pool());
+        glib::MainContext::default().block_on(async {
+            let opening = view.open(client, Arc::clone(&runtime), 0, 3_600_000_000);
+            let timeout = glib::timeout_future(Duration::from_secs(5));
+            futures::pin_mut!(opening, timeout);
+            assert!(
+                matches!(
+                    futures::future::select(opening, timeout).await,
+                    futures::future::Either::Left(_)
+                ),
+                "the window must load before the deadline"
+            );
+        });
+        assert_eq!(
+            view.title.text(),
+            "fixture: nothing recorded in this window"
+        );
+        assert_eq!(vod_requests.load(Ordering::SeqCst), 0);
+        view.close();
+        server.abort();
     }
 
     #[test]

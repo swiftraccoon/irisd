@@ -5,10 +5,10 @@ Full notes with citations: `appendix/E-language-runtime.md`. Versions checked on
 
 ## 1. Decision
 
-**Rust (stable, edition 2024), no C core.** Runtime: **tokio `current_thread`** (opt-in
-`multi_thread` with 2 workers on ≥ 4-core hosts) owning every socket and timer; **one
-dedicated `std::thread` writer per configured storage root** doing batched `pwritev` + `fdatasync` from
-a bounded channel; **one `std::thread` owning the SQLite connection**; **no io_uring**.
+**Rust (stable, edition 2024), no C core.** Runtime: **one tokio `current_thread` runtime**
+owning every socket and timer; **one dedicated `std::thread` writer per configured storage
+root** doing batched `pwritev` + `fdatasync` from a bounded channel; **one `std::thread` owning
+the SQLite connection**; **no io_uring**.
 
 ## 2. Why Rust and not C, C++, Zig, or Go
 
@@ -105,15 +105,34 @@ Do not use: `tokio-uring`, `glommio`, `monoio` (stale or incompatible), `mp4` 0.
   RestrictRealtime=yes LockPersonality=yes MemoryDenyWriteExecute=yes
   RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX SystemCallArchitectures=native
   SystemCallFilter=@system-service SystemCallFilter=~@privileged @resources
-  CapabilityBoundingSet= UMask=0077 IPAddressDeny=any IPAddressAllow=<LAN> localhost`.
+  CapabilityBoundingSet= UMask=0077 StateDirectoryMode=0700 LimitNOFILE=65536
+  SyslogLevelPrefix=no IPAddressDeny=any IPAddressAllow=localhost`. That address
+  policy denies every address except loopback until the operator adds the camera subnet, and the
+  API clients' subnet when the API listens on the LAN, with a drop-in (`packaging/README.md`);
+  the Landlock network rules below limit TCP ports for any destination address, so this policy
+  is what confines destinations.
   Verify with `systemd-analyze security`. Avoid `DynamicUser=` when recordings live outside
   `StateDirectory` (UID reallocation breaks ownership).
 - Leave `RestrictSUIDSGID` disabled: its systemd syscall filter rejects `openat2`, while
   descriptor-relative no-follow and beneath-root resolution require `openat2` throughout the
   recording lifecycle. `NoNewPrivileges`, an empty capability set, and read-only system paths
   retain the relevant privilege boundary.
-- Landlock in-process after startup: read/write only the video root and state dir; TCP connect
-  only to camera ports; TCP bind only to the API port.
+- Landlock in-process, before the daemon spawns any thread: read the configuration directory,
+  `/etc`, and `/proc`; read/write only the video roots and state dir; TCP connect only to
+  camera ports; TCP bind only to the API port. Filesystem rights (Landlock ABI 1) and TCP
+  bind/connect rights (ABI 4, Linux 6.7) are required: on a kernel without them, or with
+  Landlock disabled at boot, `irisd run` refuses to start unless `--no-sandbox` is given.
+  Rights from later ABIs up to 7 are applied when the kernel has them; a partially enforced
+  ruleset is a warning naming the missing rights, and the `process` statistics line reports
+  `sandbox_enforced`. The network rules limit TCP ports for every destination address; peer
+  addresses are limited by the unit's `IPAddressDeny=` and `IPAddressAllow=`.
+- Startup permission checks: before SQLite opens the catalog, the daemon requires the state
+  directory and `irisd.db`, `-wal`, and `-shm` to belong to the service account (a directory,
+  or a regular file with one link; symbolic links, hard links, and special files fail
+  startup) and removes group and other permissions; SQLite copies the database file's mode
+  to new WAL and shared-memory files. The configuration file draws a warning when users other
+  than the service account and its group can read it. Startup also raises the soft descriptor
+  limit to the hard limit.
 - Linux features that matter: descriptor-relative `openat2`, `fallocate`, `fdatasync`,
   large-folio ext4 sequential-write gains,
   improved HDD readahead. Features that do not matter at this scale: io_uring zero-copy rx,

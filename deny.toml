@@ -10,6 +10,11 @@ yanked = "deny"
 version = 2
 allow = ["GPL-3.0-or-later", "MIT", "Apache-2.0", "Apache-2.0 WITH LLVM-exception", "BSD-2-Clause", "BSD-3-Clause", "ISC", "Zlib", "Unicode-3.0", "CC0-1.0", "MPL-2.0", "OpenSSL", "Unlicense", "CDLA-Permissive-2.0"]
 confidence-threshold = 0.9
+# libfuzzer-sys (fuzz/ only) bundles LLVM's libFuzzer runtime under the University of
+# Illinois/NCSA Open Source License, an OSI-approved permissive license. It links only into the
+# fuzz binaries, never into a shipped artifact; the root workspace check reports the exception as
+# not encountered.
+exceptions = [{ crate = "libfuzzer-sys", allow = ["NCSA"] }]
 
 [bans]
 multiple-versions = "warn"

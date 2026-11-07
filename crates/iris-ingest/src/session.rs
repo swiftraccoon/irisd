@@ -1,5 +1,7 @@
 //! One RTSP session at a time per stream, reconnecting forever.
 
+use std::fmt;
+use std::fmt::Write as _;
 use std::num::NonZeroU32;
 use std::pin::Pin;
 use std::sync::{Arc, OnceLock};
@@ -41,6 +43,10 @@ const HEALTHY_SESSION: Duration = Duration::from_secs(60);
 const GAP_HOLD_TICKS: i64 = 90_000;
 /// A recorder realtime step larger than this ends the run.
 const CLOCK_STEP_US: u64 = 2_000_000;
+/// Longest text, marker included, that one session error puts in a log line.
+const MAX_LOGGED_ERROR_CHARS: usize = 512;
+/// Ends a session error cut at [`MAX_LOGGED_ERROR_CHARS`].
+const TRUNCATED: &str = "...";
 
 /// Why a session ended.
 #[derive(Debug, Error)]
@@ -84,7 +90,8 @@ pub async fn run_stream(
         match outcome {
             Ok(()) => return,
             Err(error) => {
-                warn!(stream = %source.key, %error, "session ended; reconnecting");
+                // Session errors quote camera-supplied text.
+                warn!(stream = %source.key, error = %LogSafe(&error), "session ended; reconnecting");
                 stats.record_reconnect();
             }
         }
@@ -729,6 +736,49 @@ fn signed_micros(at: Instant, anchor: Instant) -> i64 {
     }
 }
 
+/// Displays text a camera can influence, such as a session error, as one
+/// bounded line: printable ASCII passes, `\n`, `\r`, and `\t` become those
+/// escapes, every other character becomes `\u{…}`, and a longer text is cut to
+/// [`MAX_LOGGED_ERROR_CHARS`] characters ending in [`TRUNCATED`]. A camera can
+/// then neither split a journal entry, start a line with a forged priority
+/// prefix, carry terminal controls into the log, nor make the line grow with
+/// what it sends.
+struct LogSafe<'a, T: ?Sized>(&'a T);
+
+impl<T: fmt::Display + ?Sized> fmt::Display for LogSafe<'_, T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut line = EscapedLine(String::with_capacity(MAX_LOGGED_ERROR_CHARS + 16));
+        // The only error is the line filling up, which stops the formatting.
+        if write!(line, "{}", self.0).is_err() {
+            line.0.truncate(MAX_LOGGED_ERROR_CHARS - TRUNCATED.len());
+            line.0.push_str(TRUNCATED);
+        }
+        f.write_str(&line.0)
+    }
+}
+
+/// The escaped text of [`LogSafe`], ASCII only, refusing more once it is
+/// longer than [`MAX_LOGGED_ERROR_CHARS`].
+struct EscapedLine(String);
+
+impl fmt::Write for EscapedLine {
+    fn write_str(&mut self, text: &str) -> fmt::Result {
+        for c in text.chars() {
+            match c {
+                ' '..='~' => self.0.push(c),
+                '\n' => self.0.push_str("\\n"),
+                '\r' => self.0.push_str("\\r"),
+                '\t' => self.0.push_str("\\t"),
+                _ => write!(self.0, "\\u{{{:x}}}", u32::from(c))?,
+            }
+            if self.0.len() > MAX_LOGGED_ERROR_CHARS {
+                return Err(fmt::Error);
+            }
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;
@@ -1079,5 +1129,36 @@ mod tests {
         session.flush(&sink, &source_for_test(), &stats);
         assert_eq!(sink.calls.load(Ordering::Relaxed), 0);
         assert_eq!(stats.fragments(), 0);
+    }
+
+    #[test]
+    fn log_safe_text_escapes_line_breaks_and_controls() {
+        let text = "RTSP framing error: bad\n<0>forged\r\x1b[31m\tend é\u{202e}";
+        assert_eq!(
+            LogSafe(text).to_string(),
+            "RTSP framing error: bad\\n<0>forged\\r\\u{1b}[31m\\tend \\u{e9}\\u{202e}"
+        );
+    }
+
+    #[test]
+    fn log_safe_text_is_cut_to_the_limit() {
+        let exact = "x".repeat(MAX_LOGGED_ERROR_CHARS);
+        assert_eq!(LogSafe(&exact).to_string(), exact);
+
+        let long = format!("{}\n", "y\n".repeat(1 << 20));
+        let line = LogSafe(&long).to_string();
+        assert_eq!(line.len(), MAX_LOGGED_ERROR_CHARS);
+        assert!(line.starts_with("y\\ny\\n"));
+        assert!(line.ends_with(TRUNCATED));
+        assert!(!line.bytes().any(|b| b.is_ascii_control()), "{line:?}");
+    }
+
+    #[test]
+    fn log_safe_session_error_is_one_line() {
+        let error = SessionError::SetupTimeout("DESCRIBE");
+        assert_eq!(
+            LogSafe(&error).to_string(),
+            "DESCRIBE not answered within 15s"
+        );
     }
 }

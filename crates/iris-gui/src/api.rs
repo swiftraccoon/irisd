@@ -37,8 +37,31 @@ const MAX_RETAIN_BODY_BYTES: usize = 64 << 10;
 const MAX_VOD_PLAYLIST_BYTES: usize = 64 << 20;
 /// Matches the API's selected-fragment budget.
 const MAX_PLAYBACK_FRAGMENTS: usize = 100_000;
+/// The tags the daemon's VOD writer emits. Any other `#EXT` tag rejects a
+/// playlist, in particular the URI-bearing ones (`EXT-X-KEY`, `EXT-X-MEDIA`,
+/// `EXT-X-PART`, `EXT-X-STREAM-INF`, ...) that would make the player fetch
+/// from elsewhere. Other comments, such as `#IRIS-FRAGMENT`, pass through.
+const VOD_TAGS: [&str; 12] = [
+    "#EXTM3U",
+    "#EXT-X-VERSION",
+    "#EXT-X-TARGETDURATION",
+    "#EXT-X-PLAYLIST-TYPE",
+    "#EXT-X-MEDIA-SEQUENCE",
+    "#EXT-X-DISCONTINUITY-SEQUENCE",
+    "#EXT-X-INDEPENDENT-SEGMENTS",
+    "#EXT-X-MAP",
+    "#EXTINF",
+    "#EXT-X-BYTERANGE",
+    "#EXT-X-DISCONTINUITY",
+    "#EXT-X-ENDLIST",
+];
 /// Number of exclusive temporary-name attempts before reporting a hostile/full directory.
 const EXPORT_TEMP_ATTEMPTS: usize = 16;
+/// The least free space an export leaves on its filesystem; 2 % of the
+/// filesystem applies when that is larger.
+const EXPORT_RESERVE_MIN_BYTES: u64 = 1 << 30;
+/// Bytes an export writes between free-space checks.
+const EXPORT_SPACE_CHECK_BYTES: u64 = 64 << 20;
 /// Lowercase hexadecimal digits for private temporary names.
 const HEX_DIGITS: &[u8; 16] = b"0123456789abcdef";
 
@@ -51,11 +74,53 @@ pub struct Camera {
     pub name: String,
 }
 
+/// Space on the filesystem an export writes to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct FilesystemSpace {
+    /// Bytes an unprivileged writer may still use.
+    available: u64,
+    /// The filesystem's size in bytes.
+    total: u64,
+}
+
+/// Reads the space of the filesystem holding an open file.
+type SpaceProbe = fn(&tokio::fs::File) -> std::io::Result<FilesystemSpace>;
+
+/// `fstatvfs` on the export's own descriptor, so the figure is for the
+/// filesystem the bytes land on.
+fn filesystem_space(file: &tokio::fs::File) -> std::io::Result<FilesystemSpace> {
+    let stat = rustix::fs::fstatvfs(file)?;
+    Ok(FilesystemSpace {
+        available: stat.f_bavail.saturating_mul(stat.f_frsize),
+        total: stat.f_blocks.saturating_mul(stat.f_frsize),
+    })
+}
+
+/// The free space an export leaves: the larger of 1 GiB and 2 % of the filesystem.
+fn export_reserve(total: u64) -> u64 {
+    EXPORT_RESERVE_MIN_BYTES.max(total / 50)
+}
+
+fn check_export_space(space: FilesystemSpace) -> anyhow::Result<()> {
+    let reserve = export_reserve(space.total);
+    anyhow::ensure!(
+        space.available >= reserve,
+        "export stopped: {} MiB free on the destination filesystem is below its {} MiB reserve",
+        space.available >> 20,
+        reserve >> 20
+    );
+    Ok(())
+}
+
 /// An authenticated API client.
 pub struct Client {
     base: Url,
     token: Option<String>,
     http: reqwest::Client,
+    /// Free-space probe for exports; tests inject a fixed answer.
+    space_probe: SpaceProbe,
+    /// Bytes an export writes between free-space checks.
+    space_check_bytes: u64,
 }
 
 impl Client {
@@ -70,12 +135,21 @@ impl Client {
         connect_timeout: Duration,
         read_timeout: Duration,
     ) -> Self {
+        // The daemon never redirects; following one would let a response name
+        // the origin that playlist references are checked against.
         let http = reqwest::Client::builder()
             .connect_timeout(connect_timeout)
             .read_timeout(read_timeout)
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .expect("static HTTP client options are valid");
-        Self { base, token, http }
+        Self {
+            base,
+            token,
+            http,
+            space_probe: filesystem_space,
+            space_check_bytes: EXPORT_SPACE_CHECK_BYTES,
+        }
     }
 
     /// Lists the cameras.
@@ -186,28 +260,61 @@ pub struct PlaybackFragment {
 pub struct VodPlaylist {
     /// Complete fragments in the order this playlist presents them.
     pub fragments: Vec<PlaybackFragment>,
-    /// The fetched playlist with media and init URIs resolved against its origin.
+    /// The fetched playlist with media and init URIs resolved against its URL,
+    /// every one on the API origin.
     pub body: String,
 }
 
-fn absolute_playlist(text: &str, base: &Url) -> anyhow::Result<String> {
+/// Whether a playlist line is an HLS tag. The comparison ignores case so that
+/// no spelling of a tag escapes [`VOD_TAGS`].
+fn is_tag(line: &str) -> bool {
+    line.as_bytes()
+        .get(..4)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(b"#EXT"))
+}
+
+/// Resolves a playlist reference against `base` and requires the result to be
+/// on `origin` (scheme, host, and effective port) without userinfo. Opaque
+/// origins such as `file:` and `data:` never match.
+fn same_origin(base: &Url, reference: &str, origin: &url::Origin) -> anyhow::Result<Url> {
+    let absolute = base.join(reference)?;
+    anyhow::ensure!(
+        absolute.origin() == *origin
+            && absolute.username().is_empty()
+            && absolute.password().is_none(),
+        "VOD playlist references another origin"
+    );
+    Ok(absolute)
+}
+
+/// Rewrites the daemon's VOD body for the player: init and media references
+/// become absolute URLs on `origin`, and the body may hold only the tags in
+/// [`VOD_TAGS`].
+fn absolute_playlist(text: &str, base: &Url, origin: &url::Origin) -> anyhow::Result<String> {
     let mut body = String::new();
     for line in text.lines() {
-        if line.starts_with("#EXT-X-MAP:") {
-            let (prefix, value) = line
-                .split_once("URI=\"")
-                .context("VOD init map has no URI")?;
+        if is_tag(line) {
+            let name = line.split_once(':').map_or(line, |(name, _)| name);
+            anyhow::ensure!(
+                VOD_TAGS.contains(&name),
+                "VOD playlist has a tag the daemon does not emit"
+            );
+        }
+        if let Some(attributes) = line.strip_prefix("#EXT-X-MAP:") {
+            let value = attributes
+                .strip_prefix("URI=\"")
+                .context("VOD init map must start with its URI")?;
             let (uri, suffix) = value.split_once('"').context("invalid VOD init URI")?;
-            let absolute = base.join(uri).context("invalid VOD init URI")?;
-            body.push_str(prefix);
-            body.push_str("URI=\"");
+            anyhow::ensure!(!suffix.contains("URI="), "VOD init map has a second URI");
+            let absolute = same_origin(base, uri, origin).context("invalid VOD init URI")?;
+            body.push_str("#EXT-X-MAP:URI=\"");
             body.push_str(absolute.as_str());
             body.push('"');
             body.push_str(suffix);
         } else if line.is_empty() || line.starts_with('#') {
             body.push_str(line);
         } else {
-            let absolute = base.join(line).context("invalid VOD media URI")?;
+            let absolute = same_origin(base, line, origin).context("invalid VOD media URI")?;
             body.push_str(absolute.as_str());
         }
         body.push('\n');
@@ -289,6 +396,13 @@ fn validate_range(from: i64, to: i64) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Checks a segment listing against the API's overlap rule. A sealed row must
+/// span a positive interval that overlaps `[from, to)`. The API treats an open
+/// row as extending to the present, and its `wall_end_us` is its last durable
+/// progress, so an open row needs only `wall_start_us <= wall_end_us` and
+/// `wall_start_us < to`: its recorded end can precede `from` (a camera offline
+/// for longer than the window) or equal its start (a file opened after a
+/// rotation or reconnect, before its first sync).
 fn validate_segments(segments: &[Segment], from: i64, to: i64) -> anyhow::Result<()> {
     validate_range(from, to)?;
     anyhow::ensure!(
@@ -296,17 +410,38 @@ fn validate_segments(segments: &[Segment], from: i64, to: i64) -> anyhow::Result
         "too many segments in response"
     );
     for segment in segments {
-        anyhow::ensure!(
-            segment.wall_start_us < segment.wall_end_us,
-            "invalid segment time range in response"
-        );
-        anyhow::ensure!(
-            i128::from(segment.wall_end_us) > i128::from(from)
-                && i128::from(segment.wall_start_us) < i128::from(to),
-            "segment is outside the requested window"
-        );
+        if segment.sealed {
+            anyhow::ensure!(
+                segment.wall_start_us < segment.wall_end_us,
+                "invalid segment time range in response"
+            );
+            anyhow::ensure!(
+                segment.wall_end_us > from && segment.wall_start_us < to,
+                "segment is outside the requested window"
+            );
+        } else {
+            anyhow::ensure!(
+                segment.wall_start_us <= segment.wall_end_us,
+                "invalid open segment time range in response"
+            );
+            anyhow::ensure!(
+                segment.wall_start_us < to,
+                "segment is outside the requested window"
+            );
+        }
     }
     Ok(())
+}
+
+/// Drops open rows that have recorded nothing inside `[from, to)`, so a window
+/// holding only such a row reads as having nothing recorded. Rows that pass
+/// [`validate_segments`] and remain cover part of the window.
+fn recorded_in_window(mut segments: Vec<Segment>, from: i64) -> Vec<Segment> {
+    segments.retain(|segment| {
+        segment.sealed
+            || (segment.wall_end_us > from && segment.wall_start_us < segment.wall_end_us)
+    });
+    segments
 }
 
 /// An event as `/api/events` lists it; only the fields the timeline marks.
@@ -501,7 +636,10 @@ impl Client {
         serde_json::from_slice(&body).with_context(|| format!("decoding {what}"))
     }
 
-    /// Lists the segments of one stream overlapping `[from, to)` (Unix microseconds).
+    /// Lists the segments of one stream that hold recordings inside `[from, to)`
+    /// (Unix microseconds). Open segments that have recorded nothing there, such
+    /// as a stale file of an offline camera or a file before its first sync, are
+    /// omitted.
     pub async fn segments(
         &self,
         camera: &str,
@@ -519,7 +657,7 @@ impl Client {
             .append_pair("to", &to.to_string());
         let segments: Vec<Segment> = self.fetch(url, "segments", MAX_LIST_BODY_BYTES).await?;
         validate_segments(&segments, from, to)?;
-        Ok(segments)
+        Ok(recorded_in_window(segments, from))
     }
 
     /// Lists one camera's events in `[from, to)` (Unix microseconds), newest first
@@ -552,6 +690,10 @@ impl Client {
 
     /// Downloads the MP4 export of `[from, to)` to `path`, calling `progress`
     /// with the bytes written so far after every chunk; returns the total.
+    /// Before the first byte and after every further 64 MiB it checks the
+    /// destination filesystem with `fstatvfs` and stops, removing the partial
+    /// file, when free space would fall below the larger of 1 GiB and 2 % of
+    /// the filesystem.
     pub async fn export(
         &self,
         camera: &str,
@@ -583,6 +725,13 @@ impl Client {
         }
         require_content_type(&response, "video/mp4")?;
         let mut temporary = ExportTemp::create(path).await?;
+        let check_space = |file: &tokio::fs::File| {
+            check_export_space(
+                (self.space_probe)(file).context("reading the export filesystem's free space")?,
+            )
+        };
+        check_space(temporary.file()?)?;
+        let mut next_space_check = self.space_check_bytes;
         let mut stream = response.bytes_stream();
         let mut written = 0u64;
         while let Some(chunk) = stream.next().await {
@@ -595,6 +744,10 @@ impl Client {
             written = written
                 .checked_add(chunk.len() as u64)
                 .context("export byte count overflows")?;
+            if written >= next_space_check {
+                check_space(temporary.file()?)?;
+                next_space_check = written.saturating_add(self.space_check_bytes);
+            }
             progress(written);
         }
         anyhow::ensure!(written > 0, "export response is empty");
@@ -682,8 +835,11 @@ impl Client {
     }
 
     /// Fetches one VOD body for both timing and playback, including boundary GOPs
-    /// and omitting unavailable files. Relative init and media URIs retain their
-    /// original HTTP origin and authentication when the body is served locally.
+    /// and omitting unavailable files. Init and media URIs resolve to absolute
+    /// URLs on the API origin and keep their authentication queries, so they
+    /// still reach the daemon when the body is served locally. A reference to
+    /// another origin or scheme, userinfo, or a tag the daemon does not emit
+    /// rejects the playlist.
     pub async fn vod_playlist(
         &self,
         camera: &str,
@@ -720,9 +876,14 @@ impl Client {
         let text = std::str::from_utf8(&bytes).context("VOD playlist is not UTF-8")?;
         let fragments = playlist_fragments(text)?;
         validate_playback_fragments(&fragments, from, to)?;
+        let origin = self.base.origin();
+        anyhow::ensure!(
+            response.url().origin() == origin,
+            "VOD playlist response came from another origin"
+        );
         Ok(VodPlaylist {
             fragments,
-            body: absolute_playlist(text, response.url())?,
+            body: absolute_playlist(text, response.url(), &origin)?,
         })
     }
 }
@@ -900,6 +1061,102 @@ mod tests {
         assert!(validate_playback_fragments(&ordered, 20_000, 30_000).is_err());
     }
 
+    #[test]
+    fn open_rows_follow_the_api_overlap_rule_and_sealed_rows_stay_strict() {
+        let row = |wall_start_us, wall_end_us, sealed| Segment {
+            wall_start_us,
+            wall_end_us,
+            sealed,
+        };
+        let (from, to) = (100, 200);
+        // An open file of a camera offline since before the window.
+        let stale = row(10, 50, false);
+        // A file opened after a rotation, before its first sync.
+        let fresh = row(150, 150, false);
+        let recording = row(90, 150, false);
+        assert!(validate_segments(&[stale, fresh, recording], from, to).is_ok());
+        for invalid in [
+            row(60, 50, false),
+            row(200, 200, false),
+            row(250, 260, false),
+        ] {
+            assert!(
+                validate_segments(&[invalid], from, to).is_err(),
+                "{invalid:?}"
+            );
+        }
+        for invalid in [row(10, 50, true), row(150, 150, true), row(200, 260, true)] {
+            assert!(
+                validate_segments(&[invalid], from, to).is_err(),
+                "{invalid:?}"
+            );
+        }
+        assert_eq!(
+            recorded_in_window(vec![stale, fresh, recording, row(100, 120, true)], from),
+            [recording, row(100, 120, true)]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_window_with_only_a_stale_open_row_lists_nothing_recorded() {
+        // The API's rows for a one-hour window ending at TO: a file opened 3 h
+        // before TO whose last durable progress was 2 h before it, and a file
+        // opened before its first sync.
+        const FROM: i64 = 1_794_076_005_736_367;
+        const TO: i64 = 1_794_079_605_736_367;
+        const STALE: &str = r#"[{"id":1,"camera":"cam1","kind":"main","run_seq":1,"discontinuity":true,"wall_start_us":1794068805736367,"wall_end_us":1794072405736367,"fragments":10,"bytes":4096,"sealed":false}]"#;
+        const FRESH: &str = r#"[{"id":2,"camera":"cam1","kind":"main","run_seq":1,"discontinuity":true,"wall_start_us":1794079604736367,"wall_end_us":1794079604736367,"fragments":0,"bytes":768,"sealed":false}]"#;
+        for body in [STALE, FRESH] {
+            let (base, server) = serve_fixture(Router::new().route(
+                "/api/streams/{camera}/{kind}/segments",
+                get(move || async move { body }),
+            ))
+            .await;
+            let client = Client::new(base, None);
+            assert_eq!(
+                client.segments("cam1", "main", FROM, TO).await.unwrap(),
+                [],
+                "{body}"
+            );
+            server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn the_viewer_does_not_follow_redirects() {
+        let other_requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (other, other_server) = serve_fixture(Router::new().fallback({
+            let other_requests = Arc::clone(&other_requests);
+            move || async move {
+                other_requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                "#EXTM3U\n"
+            }
+        }))
+        .await;
+        let target = other.join("/vod.m3u8").unwrap().to_string();
+        let (base, server) = serve_fixture(Router::new().route(
+            "/api/streams/{camera}/{kind}/hls/vod.m3u8",
+            get(move || async move {
+                Response::builder()
+                    .status(StatusCode::FOUND)
+                    .header(header::LOCATION, target)
+                    .body(Body::empty())
+                    .unwrap()
+            }),
+        ))
+        .await;
+        let client = Client::new(base, None);
+        let error = client
+            .vod_playlist("cam1", "main", 1, 2)
+            .await
+            .err()
+            .expect("a redirected playlist is refused");
+        assert!(format!("{error:#}").contains("302"), "{error:#}");
+        assert_eq!(other_requests.load(std::sync::atomic::Ordering::SeqCst), 0);
+        server.abort();
+        other_server.abort();
+    }
+
     #[tokio::test]
     async fn counted_reads_and_idle_timeout_bound_responses() {
         let chunked = || async {
@@ -1034,6 +1291,95 @@ mod tests {
         server.abort();
     }
 
+    #[test]
+    fn the_export_reserve_is_the_larger_of_one_gib_and_two_percent() {
+        assert_eq!(export_reserve(10 << 30), 1 << 30);
+        assert_eq!(export_reserve(1 << 40), (1 << 40) / 50);
+        let total = 100 << 30;
+        assert!(
+            check_export_space(FilesystemSpace {
+                available: 2 << 30,
+                total
+            })
+            .is_ok()
+        );
+        assert!(
+            check_export_space(FilesystemSpace {
+                available: (2 << 30) - 1,
+                total
+            })
+            .is_err()
+        );
+        let file = tempfile::tempfile().unwrap();
+        let space = filesystem_space(&tokio::fs::File::from_std(file)).unwrap();
+        assert!(
+            space.total > 0 && space.available <= space.total,
+            "{space:?}"
+        );
+    }
+
+    /// Calls of the plenty-then-low probe in [`exports_stop_before_the_destination_fills`].
+    static SPACE_PROBES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+    /// 512 MiB free of 100 GiB: below the 2 GiB reserve.
+    const LOW_SPACE: FilesystemSpace = FilesystemSpace {
+        available: 512 << 20,
+        total: 100 << 30,
+    };
+
+    /// 50 GiB free of 100 GiB.
+    const PLENTY_OF_SPACE: FilesystemSpace = FilesystemSpace {
+        available: 50 << 30,
+        total: 100 << 30,
+    };
+
+    #[tokio::test]
+    async fn exports_stop_before_the_destination_fills() {
+        let app = Router::new().route(
+            "/api/streams/{camera}/{kind}/export.mp4",
+            get(export_fixture),
+        );
+        let (base, server) = serve_fixture(app).await;
+        let directory = tempfile::tempdir().unwrap();
+        let destination = directory.path().join("recording.mp4");
+        let sentinel = b"pre-existing recording";
+        std::fs::write(&destination, sentinel).unwrap();
+
+        let mut client = Client::new(base.clone(), None);
+        client.space_probe = |_| Ok(LOW_SPACE);
+        let written = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let observed = Arc::clone(&written);
+        let error = client
+            .export("cam1", "main", 10, 11, &destination, move |bytes| {
+                observed.store(bytes, std::sync::atomic::Ordering::SeqCst);
+            })
+            .await
+            .expect_err("too little space refuses the export before writing");
+        assert!(format!("{error:#}").contains("reserve"), "{error:#}");
+        assert_eq!(written.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(std::fs::read(&destination).unwrap(), sentinel);
+        assert_eq!(export_temporaries(directory.path()), Vec::<PathBuf>::new());
+
+        let mut client = Client::new(base, None);
+        client.space_probe = |_| {
+            if SPACE_PROBES.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                Ok(PLENTY_OF_SPACE)
+            } else {
+                Ok(LOW_SPACE)
+            }
+        };
+        client.space_check_bytes = 2048;
+        let error = client
+            .export("cam1", "main", 10, 11, &destination, |_| {})
+            .await
+            .expect_err("space running low stops the export at the next check");
+        assert!(format!("{error:#}").contains("reserve"), "{error:#}");
+        assert_eq!(SPACE_PROBES.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert_eq!(std::fs::read(&destination).unwrap(), sentinel);
+        assert_eq!(export_temporaries(directory.path()), Vec::<PathBuf>::new());
+        server.abort();
+    }
+
     #[tokio::test]
     async fn export_rejects_partial_content_before_creating_a_temporary() {
         let app = Router::new().route(
@@ -1117,26 +1463,110 @@ mod tests {
         }
     }
 
-    #[test]
-    fn snapshot_uris_keep_the_response_origin_queries_and_byte_ranges() {
+    /// The response URL of a fixture VOD request, and the API origin it belongs to.
+    fn vod_base() -> (Url, url::Origin) {
         let base =
             Url::parse("https://192.0.2.10/api/streams/fixture/main/hls/vod.m3u8?token=unused")
                 .unwrap();
+        let origin = Url::parse("https://192.0.2.10:443/").unwrap().origin();
+        (base, origin)
+    }
+
+    #[test]
+    fn snapshot_uris_keep_the_response_origin_queries_and_byte_ranges() {
+        let (base, origin) = vod_base();
         let playlist = concat!(
-            "#EXTM3U\n",
+            "#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-TARGETDURATION:1\n#EXT-X-MEDIA-SEQUENCE:0\n",
+            "#EXT-X-PLAYLIST-TYPE:VOD\n#EXT-X-INDEPENDENT-SEGMENTS\n",
             "#EXT-X-MAP:URI=\"/api/segments/1/file.mp4?token=encoded%26token\",BYTERANGE=\"100@0\"\n",
             "#IRIS-FRAGMENT:WALL-US=10,DURATION-TICKS=90000\n",
             "#EXTINF:1.00000,\n#EXT-X-BYTERANGE:200@100\n",
             "../media/file.mp4?token=encoded%26token\n",
-            "https://192.0.2.20/file.mp4?token=other\n#EXT-X-ENDLIST\n"
+            "#EXT-X-DISCONTINUITY\n#EXTINF:1.00000,\n",
+            "https://192.0.2.10:443/api/segments/2/file.mp4?token=same\n#EXT-X-ENDLIST\n"
         );
-        let body = absolute_playlist(playlist, &base).unwrap();
+        let body = absolute_playlist(playlist, &base, &origin).unwrap();
         assert!(body.contains("#EXT-X-MAP:URI=\"https://192.0.2.10/api/segments/1/file.mp4?token=encoded%26token\",BYTERANGE=\"100@0\"\n"));
         assert!(body.contains("#EXT-X-BYTERANGE:200@100\nhttps://192.0.2.10/api/streams/fixture/main/media/file.mp4?token=encoded%26token\n"));
-        assert!(body.contains("https://192.0.2.20/file.mp4?token=other\n"));
+        assert!(body.contains("\nhttps://192.0.2.10/api/segments/2/file.mp4?token=same\n"));
         assert_eq!(
             playlist_fragments(playlist).unwrap(),
             playlist_fragments(&body).unwrap()
+        );
+    }
+
+    #[test]
+    fn playlist_references_must_stay_on_the_api_origin() {
+        let (base, origin) = vod_base();
+        let with_media = |uri: &str| {
+            format!(
+                "#EXTM3U\n#EXT-X-MAP:URI=\"/api/segments/1/file.mp4\"\n#EXTINF:1.0,\n{uri}\n#EXT-X-ENDLIST\n"
+            )
+        };
+        let with_map = |uri: &str| {
+            format!("#EXTM3U\n#EXT-X-MAP:URI=\"{uri}\"\n#EXTINF:1.0,\n/api/segments/1/file.mp4\n")
+        };
+        for foreign in [
+            "https://192.0.2.20/file.mp4?token=other",
+            "//192.0.2.20/file.mp4",
+            "https://192.0.2.10:8443/file.mp4",
+            "http://192.0.2.10/file.mp4",
+            "file:///etc/hostname",
+            "data:video/mp4;base64,AAAA",
+            "https://user@192.0.2.10/file.mp4",
+            "https://user:secret@192.0.2.10/file.mp4",
+        ] {
+            assert!(
+                absolute_playlist(&with_media(foreign), &base, &origin).is_err(),
+                "media {foreign}"
+            );
+            assert!(
+                absolute_playlist(&with_map(foreign), &base, &origin).is_err(),
+                "map {foreign}"
+            );
+        }
+        assert!(absolute_playlist(&with_media("/api/segments/2/file.mp4"), &base, &origin).is_ok());
+        for map in [
+            "#EXT-X-MAP:BYTERANGE=\"1@0\",URI=\"/api/segments/1/file.mp4\"",
+            "#EXT-X-MAP:URI=\"/api/segments/1/file.mp4\",URI=\"https://192.0.2.20/x\"",
+            "#EXT-X-MAP:URI=/api/segments/1/file.mp4",
+        ] {
+            assert!(
+                absolute_playlist(&format!("#EXTM3U\n{map}\n"), &base, &origin).is_err(),
+                "{map}"
+            );
+        }
+    }
+
+    #[test]
+    fn playlists_carry_only_the_tags_the_daemon_emits() {
+        let (base, origin) = vod_base();
+        for tag in [
+            "#EXT-X-KEY:METHOD=AES-128,URI=\"https://192.0.2.20/key.bin\"",
+            "#EXT-X-KEY:METHOD=NONE",
+            "#EXT-X-SESSION-KEY:METHOD=AES-128,URI=\"/key.bin\"",
+            "#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"a\",NAME=\"a\",URI=\"https://192.0.2.20/a.m3u8\"",
+            "#EXT-X-PART:DURATION=0.5,URI=\"https://192.0.2.20/part.m4s\"",
+            "#EXT-X-PRELOAD-HINT:TYPE=PART,URI=\"https://192.0.2.20/part.m4s\"",
+            "#EXT-X-RENDITION-REPORT:URI=\"https://192.0.2.20/other.m3u8\"",
+            "#EXT-X-I-FRAME-STREAM-INF:BANDWIDTH=1,URI=\"https://192.0.2.20/i.m3u8\"",
+            "#EXT-X-SESSION-DATA:DATA-ID=\"x\",URI=\"https://192.0.2.20/data.json\"",
+            "#EXT-X-STREAM-INF:BANDWIDTH=1",
+            "#EXT-X-PROGRAM-DATE-TIME:2026-11-01T00:00:00Z",
+            "#ext-x-key:METHOD=AES-128,URI=\"https://192.0.2.20/key.bin\"",
+            "#EXTM3U8",
+        ] {
+            let playlist =
+                format!("#EXTM3U\n{tag}\n#EXTINF:1.0,\n/api/segments/1/file.mp4\n#EXT-X-ENDLIST\n");
+            assert!(
+                absolute_playlist(&playlist, &base, &origin).is_err(),
+                "{tag}"
+            );
+        }
+        let commented = "#EXTM3U\n# a comment\n#IRIS-FRAGMENT:WALL-US=1,DURATION-TICKS=9\n";
+        assert_eq!(
+            absolute_playlist(commented, &base, &origin).unwrap(),
+            commented
         );
     }
 

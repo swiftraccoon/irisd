@@ -33,8 +33,9 @@ Where the sources conflict, the order of precedence is:
 | Lints | `cargo clippy --workspace --all-targets -- -D warnings` with `clippy::all` and `clippy::pedantic` enabled in `Cargo.toml` (`[workspace.lints]`) | required |
 | Unsafe code | `#![forbid(unsafe_code)]` workspace-wide (`unsafe_code = "forbid"`) | required |
 | Public docs | `missing_docs` lint; `cargo doc` with `RUSTDOCFLAGS=-D warnings` | required |
-| Tests | `cargo test --workspace` | required |
-| Supply chain | `cargo audit`, `cargo deny check` (`deny.toml`) | required before a release |
+| Tests | `cargo test --workspace` and the vendored crates' suites (`just vendor-test`) | required |
+| Supply chain | `cargo audit` on every lockfile; `cargo deny check` (`deny.toml`) for the root and `fuzz/` graphs (`just audit`) | required before a release |
+| Fuzz build | `just fuzz-build` (the nightly pinned in `fuzz/rust-toolchain.toml`) | CI |
 
 `just check` runs the required set. CI treats warnings as errors.
 

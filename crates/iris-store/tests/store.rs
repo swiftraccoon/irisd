@@ -10,13 +10,13 @@ use bytes::Bytes;
 use iris_core::id::{CameraId, StreamKey, StreamKind};
 use iris_core::time::WallUs;
 use iris_mp4::fragment::{Fragment, Sample};
-use iris_mp4::index::read_index;
+use iris_mp4::index::{MAX_PERSISTED_INDEX_RECORDS, read_index, read_index_file_bound_to_media};
 use iris_mp4::init::SampleEntry;
 use iris_mp4::reader::{ScanOptions, scan};
 use iris_store::recover::recover_segment;
 use iris_store::{
-    QueueFull, SegmentOpened, SegmentProgress, SegmentSealed, StoragePolicy, StoreObserver,
-    WriterHandle, free_space, remove_segment,
+    NoopObserver, QueueFull, RootExpectation, SegmentOpened, SegmentProgress, SegmentSealed,
+    StoragePolicy, StoreObserver, WriterHandle, admit_recording_root, free_space, remove_segment,
 };
 
 fn entry() -> Arc<SampleEntry> {
@@ -599,4 +599,98 @@ fn free_space_reports_the_file_system() {
     let space = free_space(dir.path()).unwrap();
     assert!(space.total > 0);
     assert!(space.available <= space.total);
+}
+
+#[test]
+fn the_writer_rotates_before_the_sidecar_record_limit() {
+    let dir = tempfile::tempdir().unwrap();
+    let total = MAX_PERSISTED_INDEX_RECORDS + 1;
+    let writer = WriterHandle::spawn(
+        dir.path().to_path_buf(),
+        StoragePolicy {
+            sync_interval: Duration::from_secs(3_600),
+            preallocate_bytes: 0,
+            rotate_bytes: u64::MAX,
+            rotate_secs: u64::MAX,
+        },
+        total,
+    )
+    .unwrap();
+    let sample_entry = entry();
+    for index in 0..total {
+        let index = u64::try_from(index).unwrap();
+        let fragment = Fragment {
+            samples: vec![Sample {
+                data: Bytes::from_static(&[0, 0, 0, 4, 0x26, 1, 0xaa, 0xbb]),
+                duration: 3_000,
+                is_sync: true,
+            }],
+            decode_time: index * 3_000,
+            wall: WallUs::new(1_700_000_000_000_000 + i64::try_from(index).unwrap() * 33_333),
+            raw_rtp: 0,
+            new_run: index == 0,
+            sample_entry: Arc::clone(&sample_entry),
+        };
+        writer.try_send(key(), fragment).unwrap();
+    }
+    writer.shutdown().unwrap();
+    assert_eq!(writer.stats().dropped(), 0);
+
+    let files = mp4_files(dir.path());
+    let mut counts = Vec::new();
+    for media in &files {
+        let mut file = File::open(media).unwrap();
+        let media_len = file.metadata().unwrap().len();
+        let report = scan(&mut file, ScanOptions::default()).unwrap();
+        assert_eq!(report.stop, None, "{}", media.display());
+        let index = File::open(media.with_extension("idx")).unwrap();
+        let (_, records) =
+            read_index_file_bound_to_media(index, MAX_PERSISTED_INDEX_RECORDS, &report, media_len)
+                .unwrap()
+                .expect("every sidecar is within the reader limit and bound to its media");
+        counts.push(records.len());
+    }
+    assert_eq!(counts, [MAX_PERSISTED_INDEX_RECORDS - 4_096, 4_097]);
+}
+
+#[test]
+fn recordings_and_their_directories_are_private_whatever_the_umask() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    for approved in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("root");
+        let writer = if approved {
+            let admitted = admit_recording_root(&root, RootExpectation::Fresh).unwrap();
+            WriterHandle::spawn_with_approved_roots(
+                vec![admitted],
+                policy(),
+                8,
+                0,
+                Arc::new(NoopObserver),
+            )
+            .unwrap()
+        } else {
+            WriterHandle::spawn(root.clone(), policy(), 8).unwrap()
+        };
+        writer
+            .try_send(key(), fragment(0, 1_793_460_958, true, &entry(), 64))
+            .unwrap();
+        writer.shutdown().unwrap();
+        let media = mp4_files(&root).remove(0);
+        let date = media.parent().unwrap();
+        let kind = date.parent().unwrap();
+        let camera = kind.parent().unwrap();
+        for path in [
+            media.as_path(),
+            media.with_extension("idx").as_path(),
+            date,
+            kind,
+            camera,
+            root.as_path(),
+        ] {
+            let mode = fs::metadata(path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o077, 0, "{} has mode {mode:o}", path.display());
+        }
+    }
 }

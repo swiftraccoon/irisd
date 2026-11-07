@@ -1,14 +1,14 @@
 //! `daemon-stats`: the summary of one `irisd run` log.
 
 use std::collections::BTreeMap;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufReader, Write};
 use std::path::PathBuf;
 
 use anyhow::Context;
 use clap::Parser;
 
 use crate::logs::{
-    col_max, fmt, kv, mean, median, number, rates, root_identity, split, strip_ansi,
+    LineReader, col_max, fmt, kv, mean, median, number, rates, root_identity, split, strip_ansi,
 };
 use crate::time::parse_seconds;
 
@@ -367,14 +367,33 @@ fn truncate(s: &str, max: usize) -> &str {
 pub fn run(args: &Args) -> anyhow::Result<()> {
     let file = std::fs::File::open(&args.log)
         .with_context(|| format!("opening {}", args.log.display()))?;
-    let lines = BufReader::new(file)
-        .lines()
-        .enumerate()
-        .map(|(line, result)| {
-            result.with_context(|| format!("reading {} line {}", args.log.display(), line + 1))
-        })
-        .collect::<anyhow::Result<Vec<_>>>()?;
-    let parsed = parse(lines.into_iter());
+    // Parse while reading so the log is never held whole; the first read
+    // failure ends the input and fails the run.
+    let mut reader = LineReader::new(BufReader::new(file));
+    let mut failure: Option<anyhow::Error> = None;
+    let lines = std::iter::from_fn(|| match reader.next_line() {
+        Ok(Some(line)) => match std::str::from_utf8(line.bytes) {
+            Ok(text) => Some(text.to_owned()),
+            Err(error) => {
+                failure = Some(anyhow::Error::new(error).context(format!(
+                    "reading {} line {}",
+                    args.log.display(),
+                    line.number
+                )));
+                None
+            }
+        },
+        Ok(None) => None,
+        Err(error) => {
+            failure =
+                Some(anyhow::Error::new(error).context(format!("reading {}", args.log.display())));
+            None
+        }
+    });
+    let parsed = parse(lines);
+    if let Some(error) = failure {
+        return Err(error);
+    }
     let stdout = std::io::stdout();
     let mut out = std::io::BufWriter::new(stdout.lock());
     match render(&parsed, &mut out) {

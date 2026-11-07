@@ -4,9 +4,22 @@ Scope: this crate only. Read the root `AGENTS.md` first.
 
 ## Invariants
 
-- No video parsing in the viewer: the daemon's byte stream goes straight into `appsrc` and
-  `qtdemux`. Changing the live feed format is an API change (`crates/iris-api`,
-  `docs/research/07-architecture.md §5`), not a viewer change.
+- The viewer's Rust code never parses video: the daemon's byte stream goes straight into
+  `appsrc` and `qtdemux`. GStreamer's native elements parse and decode camera-originated
+  media inside the viewer process without a sandbox. Changing the live feed format is an API
+  change (`crates/iris-api`, `docs/research/07-architecture.md §5`), not a viewer change.
+- The live message ceiling is 16 MiB + 1 bytes (`live::LIVE_MESSAGE_BYTES`), shared with the
+  daemon, which closes with 1009 when a sync frame exceeds it. Keep it: raising it multiplies
+  worst-case memory per tile. A 1009 close or an oversized message is the tile's oversized
+  state with a 2 s backoff doubling to 60 s, never a 2 s reconnect loop.
+- `--api` is `http` or `https` without userinfo; plain HTTP to a host other than loopback
+  needs `--allow-insecure-http`. `wss` verifies against the platform's native roots; tests
+  inject a fixture root through `live::session`'s connector.
+- The grid starts at most `--max-tiles` feeds. Exports check `fstatvfs` free space before the
+  first byte and every 64 MiB, and stop when it falls below the larger of 1 GiB and 2 % of
+  the filesystem.
+- A `--token` argument is warned about and moved into `IRISD_TOKEN` by the renderer
+  re-execution; never forward it on a command line.
 - GTK widgets are touched only from the main loop (`glib::spawn_future_local`); GStreamer
   objects may be driven from the runtime threads (`tile::Source` is `Send`, with one producer).
 - `Source::push` rejects a payload before copying if queued plus incoming bytes exceed
@@ -15,7 +28,10 @@ Scope: this crate only. Read the root `AGENTS.md` first.
 - Playback mapping uses the VOD playlist's exact `#IRIS-FRAGMENT` timing, including whole
   boundary GOPs and intra-file gaps. Accumulate 90 kHz ticks before converting to microseconds.
   Fetch the playlist once: the same selection feeds both the mapping and GStreamer.
-  Resolve media and init references against the fetched response URL, preserving queries.
+  Resolve media and init references against the API origin, preserving queries; references
+  to other origins or schemes, userinfo, `#EXT` tags outside `api::VOD_TAGS`, and redirects
+  reject the playlist. Open segment rows follow the API's overlap rule; drop those that
+  recorded nothing inside the window before deciding it is empty.
 - A playback snapshot serves only its immutable playlist on IPv4 loopback behind a
   256-bit OS-random capability path. Its token-bearing body and capability stay out of
   logs and temporary files. Closing, replacing, or failing playback drops the snapshot
@@ -50,6 +66,7 @@ cargo clippy -p iris-gui --all-targets -- -D warnings
 cargo test -p iris-gui
 cargo test -p iris-gui --bin iris-gui -- --ignored --test-threads=1  # run under xvfb-run
 cargo test -p iris-gui --test playback_snapshot -- --ignored  # ffmpeg/libx264 + Xvfb + HLS/H.264 plugins
+cargo test -p iris-gui --test playback_origin -- --ignored  # Xvfb
 RUSTDOCFLAGS="-D warnings" cargo doc -p iris-gui --no-deps
 cargo build --release -p iris-gui
 IRISD_TOKEN=... timeout 45 xvfb-run -a target/release/iris-gui --api http://127.0.0.1:8554   # grid smoke run

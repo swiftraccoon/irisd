@@ -24,10 +24,12 @@ pub const HEADER_LEN: usize = 64;
 pub const RECORD_LEN: usize = 40;
 /// Maximum number of records accepted from any persisted sidecar cache.
 ///
-/// At 40 bytes on disk and 48 bytes in the decoded structure, this limits a
-/// read to about 5 MiB on disk and 6 MiB of record storage, while still allowing
-/// more than three days of one-fragment-per-two-seconds media in one rotated
-/// recording. Callers must fall back to the media file when possible.
+/// A record takes 40 bytes both on disk and in the decoded [`IndexRecord`], so
+/// this limits a read to about 5 MiB on disk and 5 MiB of record storage, while
+/// still allowing more than three days of one-fragment-per-two-seconds media in
+/// one rotated recording. Callers must fall back to the media file when
+/// possible. The writer rotates before a file reaches this many fragments, and
+/// [`crate::reader::scan`] accepts no more fragments than this.
 pub const MAX_PERSISTED_INDEX_RECORDS: usize = 131_072;
 
 /// Record flag: the fragment starts with a sync sample.
@@ -270,8 +272,13 @@ pub fn read_index(path: &Path) -> Result<(IndexHeader, Vec<IndexRecord>), IndexE
 ///
 /// The byte limit includes one possible trailing partial record. File length
 /// is checked before allocation, and the limited reader catches growth after
-/// that check. Serving paths use this instead of allocating from an arbitrary
-/// persisted sidecar length.
+/// that check.
+///
+/// The path is opened with [`File::open`]: every symlink is followed, and a
+/// FIFO or device at `path` can block the calling thread indefinitely. This
+/// suits offline tools and tests. Daemon code opens the sidecar itself,
+/// without following links and without blocking, and passes the descriptor to
+/// [`read_index_file_bounded`] or [`read_index_file_bound_to_media`].
 pub fn read_index_bounded(
     path: &Path,
     max_records: usize,

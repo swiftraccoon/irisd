@@ -13,20 +13,29 @@ env:
 
 jobs:
   check:
-    name: Format, clippy, tests, rustdoc
+    name: Format, clippy, tests, rustdoc, vendored tests
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - name: GTK and GStreamer development libraries (iris-gui)
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends $GTK_PACKAGES
       - name: Install the pinned toolchain
         run: rustup show active-toolchain || rustup toolchain install
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
-      - uses: taiki-e/install-action@1919c4a95903d2c33e4a221102edca87309fc14b # v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: |
+            . -> target
+            third_party/oxvif -> target
+            third_party/retina -> target
+      - uses: taiki-e/install-action@1919c4a95903d2c33e4a221102edca87309fc14b # v2.89.0
         with:
           tool: just
+      - name: Fetch the vendored crates' locked dependencies (just vendor-test runs offline)
+        run: |
+          cargo fetch --locked --manifest-path third_party/oxvif/Cargo.toml
+          cargo fetch --locked --manifest-path third_party/retina/Cargo.toml
       - name: just check
         run: just check
 
@@ -34,14 +43,14 @@ jobs:
     name: Minimum supported Rust version
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - name: GTK and GStreamer development libraries (iris-gui)
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends $GTK_PACKAGES
       - name: Install the minimum supported toolchain
         run: rustup toolchain install 1.92.0 --profile minimal
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - name: Build and test on the MSRV
         run: cargo +1.92.0 test --workspace --locked
 
@@ -49,27 +58,49 @@ jobs:
     name: Advisories and licenses
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - name: Install the pinned toolchain
         run: rustup show active-toolchain || rustup toolchain install
-      - uses: taiki-e/install-action@1919c4a95903d2c33e4a221102edca87309fc14b # v2
+      - uses: taiki-e/install-action@1919c4a95903d2c33e4a221102edca87309fc14b # v2.89.0
         with:
           tool: just,cargo-audit,cargo-deny
       - name: just audit
         run: just audit
 
+  fuzz:
+    name: Fuzz targets build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install the pinned toolchains (the root's, and the nightly that fuzz/ pins)
+        run: |
+          rustup show active-toolchain || rustup toolchain install
+          cd fuzz && (rustup show active-toolchain || rustup toolchain install)
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: fuzz -> target
+      - uses: taiki-e/install-action@1919c4a95903d2c33e4a221102edca87309fc14b # v2.89.0
+        with:
+          tool: just
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --version 0.13.2 --locked
+      - name: just fuzz-build
+        run: just fuzz-build
+
   references:
     name: Reference pack snapshots
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - name: Install the pinned toolchain
         run: rustup show active-toolchain || rustup toolchain install
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           workspaces: .rust-reference/tools/reference-maintenance
       - name: Verify the snapshots against the manifest

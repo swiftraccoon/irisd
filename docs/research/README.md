@@ -11,7 +11,7 @@ open question.
 | Area | Decision | Doc |
 |---|---|---|
 | Language | Rust, no C core; `panic=abort`, fuzzed parsers, `cargo audit/deny` | 03 |
-| Runtime | tokio `current_thread` (opt-in 2 workers); one blocking writer thread per configured root; one SQLite thread; no io_uring | 03, 07 |
+| Runtime | one tokio `current_thread` runtime for every socket and timer, so a blocking call stalls every task and, with `panic = "abort"`, a panic ends the process; one blocking writer thread per configured root; one SQLite thread; no io_uring | 03, 07 |
 | RTSP | retina 0.4.21 with feature `h265`, TCP interleaved, length-prefixed frames, 15 s setup timeout, 30 s inactivity timeout, TEARDOWN on every exit, backoff reconnect | 05 |
 | Socket reads | timer-driven, 20 ms shared tick: drain without arming a wake-up, then sleep; plus `SO_RCVLOWAT` 32 KiB after `PLAY` through a patched retina (`third_party/`); together −53 % CPU against packet-driven reads; `0` restores either default | 05 §1, 12 |
 | Timing | NVR clock is the authority; RTP for relative timing through a CFR regulariser; per-run wall offset via least-delayed frame with ≤ 500 ppm correction; RTCP SR diagnostic only | 04 §7, 01 §5 |

@@ -8,7 +8,7 @@ use tempfile::TempDir;
 
 use iris_catalog::{
     CatalogError, CatalogHandle, Change, EventCursor, EventId, EventProtectionCursor, NewSegment,
-    TimeRange,
+    OPEN_SEGMENT_GRACE, TimeRange,
 };
 use iris_core::event::{Event, EventKind, EventSource, EventState};
 use iris_core::id::{CameraId, StreamKey, StreamKind};
@@ -52,6 +52,27 @@ fn opened(path: &str, wall_start: i64) -> Change {
         init_len: 768,
         sample_entry: entry(),
     }
+}
+
+fn progress(path: &str, fragments: u32, wall_end: WallUs) -> Change {
+    Change::SegmentProgress {
+        path: PathBuf::from(path),
+        durable_len: 4_096,
+        fragments,
+        wall_end,
+        media_end: 90_000,
+    }
+}
+
+async fn listed(
+    catalog: &CatalogHandle,
+    from: WallUs,
+    to: WallUs,
+) -> Vec<iris_catalog::SegmentRow> {
+    catalog
+        .segments(&key(), TimeRange { from, to })
+        .await
+        .expect("segment listing")
 }
 
 fn event(camera: &str, nvr_time: i64, kind: EventKind) -> Event {
@@ -154,7 +175,8 @@ async fn segment_lifecycle_is_observed_in_order() {
     );
     assert_eq!(row.bytes, 5_000_000);
 
-    // Unsealed rows overlap any range that reaches the present.
+    // An unsealed row with durable fragments extends past its last progress by
+    // the listing grace, capped at the present.
     let overlapping = catalog
         .segments(
             &key(),
@@ -227,6 +249,7 @@ async fn segment_limit_is_applied_in_start_order() {
         ("/v/second.mp4", 2_000_000),
     ] {
         catalog.notify(opened(path, start));
+        catalog.notify(progress(path, 1, WallUs::new(start + 500_000)));
     }
 
     let rows = catalog
@@ -1011,5 +1034,180 @@ async fn retained_events_are_marked_listed_and_cleared() {
         catalog.retain_event(EventId(999), None).await,
         Err(CatalogError::UnknownEvent(999))
     ));
+    catalog.shutdown();
+}
+
+#[tokio::test]
+async fn open_rows_without_a_durable_fragment_are_not_listed() {
+    let (_dir, catalog) = open();
+    let now = WallUs::now();
+    catalog.notify(opened("/v/fresh.mp4", now.offset(-1_000_000).get()));
+    let window = (now.offset(-60_000_000), now.offset(60_000_000));
+    assert!(
+        listed(&catalog, window.0, window.1).await.is_empty(),
+        "a freshly opened row has nothing durable to serve"
+    );
+
+    catalog.notify(progress("/v/fresh.mp4", 1, now));
+    let rows = listed(&catalog, window.0, window.1).await;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].fragments, 1);
+    catalog.shutdown();
+}
+
+#[tokio::test]
+async fn an_open_row_without_recent_progress_ends_after_the_grace() {
+    let (_dir, catalog) = open();
+    let now = WallUs::now();
+    let last_progress = now.offset(-540_000_000);
+    catalog.notify(opened("/v/stale.mp4", now.offset(-600_000_000).get()));
+    catalog.notify(progress("/v/stale.mp4", 3, last_progress));
+    let grace = i64::try_from(OPEN_SEGMENT_GRACE.as_micros()).unwrap();
+
+    assert!(
+        listed(&catalog, now.offset(-300_000_000), now)
+            .await
+            .is_empty(),
+        "a row whose writer stopped reporting must not claim a later window"
+    );
+    let covering = listed(&catalog, last_progress.offset(grace - 1_000_000), now).await;
+    assert_eq!(covering.len(), 1);
+    assert_eq!(
+        covering[0].wall_end, last_progress,
+        "the row keeps its recorded end"
+    );
+    assert!(
+        listed(&catalog, last_progress.offset(grace), now)
+            .await
+            .is_empty(),
+        "the grace ends exactly {grace} µs after the last progress"
+    );
+    catalog.shutdown();
+}
+
+#[tokio::test]
+async fn a_progressing_open_row_reaches_the_present() {
+    let (_dir, catalog) = open();
+    let now = WallUs::now();
+    catalog.notify(opened("/v/live.mp4", now.offset(-20_000_000).get()));
+    catalog.notify(progress("/v/live.mp4", 4, now.offset(-2_000_000)));
+    let rows = listed(&catalog, now.offset(-1_000_000), now.offset(1_000_000)).await;
+    assert_eq!(rows.len(), 1, "the live edge lists the growing file");
+    assert!(!rows[0].sealed);
+
+    catalog.notify(Change::SegmentSealed {
+        path: PathBuf::from("/v/live.mp4"),
+        len: 8_192,
+        fragments: 5,
+        wall_end: now.offset(-1_500_000),
+        media_end: 450_000,
+    });
+    assert!(
+        listed(&catalog, now.offset(-1_000_000), now.offset(1_000_000))
+            .await
+            .is_empty(),
+        "a sealed row covers only its recorded interval"
+    );
+    assert_eq!(
+        listed(&catalog, now.offset(-30_000_000), now).await.len(),
+        1
+    );
+    catalog.shutdown();
+}
+
+/// Holds SQLite's write lock from a second connection for `hold`, as an operator
+/// shell, a checkpoint, or a backup tool would, and returns the instant just
+/// before the lock was released.
+fn hold_write_lock(
+    path: &std::path::Path,
+    hold: std::time::Duration,
+) -> std::thread::JoinHandle<std::time::Instant> {
+    let lock = rusqlite::Connection::open(path).expect("second connection");
+    lock.execute_batch("BEGIN IMMEDIATE")
+        .expect("external write lock");
+    std::thread::spawn(move || {
+        std::thread::sleep(hold);
+        let released = std::time::Instant::now();
+        lock.execute_batch("COMMIT")
+            .expect("release the external write lock");
+        released
+    })
+}
+
+/// Runs one catalog write while another connection holds the write lock and
+/// checks that it waited for the lock instead of failing.
+async fn waits_for_the_write_lock<T>(
+    name: &str,
+    path: &std::path::Path,
+    operation: impl Future<Output = Result<T, CatalogError>>,
+) -> T {
+    const HOLD: std::time::Duration = std::time::Duration::from_millis(250);
+    const MIN_WAIT: std::time::Duration = std::time::Duration::from_millis(150);
+
+    let holder = hold_write_lock(path, HOLD);
+    let started = std::time::Instant::now();
+    let value = match operation.await {
+        Ok(value) => value,
+        Err(error) => panic!("{name} failed under an external write lock: {error}"),
+    };
+    let completed = std::time::Instant::now();
+    let released = holder.join().expect("lock holder thread");
+    assert!(
+        completed >= released,
+        "{name} completed while another connection held the write lock"
+    );
+    assert!(
+        completed - started >= MIN_WAIT,
+        "{name} returned after {:?}",
+        completed - started
+    );
+    value
+}
+
+#[tokio::test]
+async fn write_paths_wait_for_an_external_write_lock() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("catalog.db");
+    let catalog = CatalogHandle::open(&path).unwrap();
+    let id = catalog
+        .insert_event(&event("cam1", 1_000, EventKind::Motion))
+        .await
+        .unwrap();
+
+    waits_for_the_write_lock(
+        "insert_event",
+        &path,
+        catalog.insert_event(&event("cam1", 2_000, EventKind::Motion)),
+    )
+    .await;
+    let row = waits_for_the_write_lock(
+        "retain_event",
+        &path,
+        catalog.retain_event(id, Some(WallUs::new(i64::MAX))),
+    )
+    .await;
+    assert_eq!(row.retain_until, Some(WallUs::new(i64::MAX)));
+    waits_for_the_write_lock(
+        "register_recording_root",
+        &path,
+        catalog.register_recording_root(
+            std::path::Path::new("/srv/video"),
+            "0123456789abcdef0123456789abcdef",
+        ),
+    )
+    .await;
+
+    let failures = catalog.metrics().failures();
+    let stats = waits_for_the_write_lock("an event-first batch", &path, async {
+        catalog.notify(Change::Event(event("cam1", 3_000, EventKind::Motion)));
+        catalog.stats().await
+    })
+    .await;
+    assert_eq!(
+        catalog.metrics().failures(),
+        failures,
+        "the batch committed"
+    );
+    assert_eq!(stats.events, 3);
     catalog.shutdown();
 }

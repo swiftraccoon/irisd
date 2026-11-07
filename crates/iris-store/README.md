@@ -24,9 +24,10 @@ observer (the daemon's catalog).
 - `StoreObserver`, `SegmentOpened`, `SegmentProgress`, `SegmentSealed`, `NoopObserver` —
   file lifecycle notifications, delivered on the writer thread after each open, sync, and
   seal.
-- `recover::recover_segment` and `recover::RecoveryReport` — scan a file with CRC
-  verification, truncate it to its valid prefix, and rewrite its index. A valid contiguous
-  index limits the CRC scan to its last indexed fragment and unindexed tail.
+- `recover::recover_segment`, `recover::recover_segment_beneath`, `recover::IndexBinding`, and
+  `recover::RecoveryReport` — scan every complete fragment of a file with CRC verification,
+  truncate it to its valid prefix, and rewrite its index; the daemon variant works through an
+  approved root and takes the catalog row's run and sample-entry hash for the rebuilt header.
 - `layout::segment_path` and `layout::index_path` — the on-disk naming,
   `<root>/<camera>/<kind>/<YYYY-MM-DD>/<HHMMSS.ffffff>Z.mp4` plus `.idx`.
 - `RootIdentity`, `RootExpectation`, `ApprovedRoot`, and `admit_recording_root` — bind a daemon
@@ -39,6 +40,10 @@ observer (the daemon's catalog).
   reopen and verify the root before descriptor-based `fstatvfs`, while approved-root removal
   opens each layout component without following links and unlinks the pair through one pinned
   parent descriptor.
+- `open_segment_beneath`, `open_segment_pair_beneath`, and `open_regular_file` — opens of
+  recordings and sidecars on disk that never follow a final symlink and never block: a FIFO,
+  socket, or device is rejected with `InvalidData` ("not a regular file") before any read, and
+  the returned descriptor performs ordinary blocking I/O.
 
 ## How it is used
 
@@ -65,16 +70,34 @@ the catalog, and wraps the handle in its `FragmentSink` for ingest.
   (`docs/research/04-storage-format.md §8`).
 - **Daemon root admission** requires a catalog expectation and a 128-bit durable marker. A
   previously registered or legacy-owned root is never created or initialized when missing,
-  and a changed marker fails closed across restarts. Admission pins the current physical
+  and a changed marker fails closed across restarts. The marker is a regular file holding 32
+  lowercase hexadecimal characters, optionally followed by one line feed; irisd writes it
+  without the line feed, and any other framing is rejected with the length found. The marker
+  open is nonblocking and no-follow, so a FIFO or symlink marker fails admission and every
+  later probe at once. A missing fresh root, and the root `irisd record` creates, is made
+  through directory descriptors from the deepest ancestor that exists without following
+  any link, and admission continues from the created descriptor. Admission pins the current physical
   device/inode for the daemon run, rejects aliases and later pathname replacement, and does not
   treat that process-local identity as durable state. Each approved segment open pins that verified
   root, then creates layout directories and exclusively claims the pair descriptor-relatively with
   no-follow, beneath, and no-cross-mount resolution. Its free-space probe uses the same verified-root
   admission. Destructive pair removal has the same containment guarantees.
+- **Opens beneath a root** of a media file, sidecar, or marker add no-follow,
+  close-on-exec, no-controlling-terminal, and nonblocking flags, resolve beneath the pinned
+  directory without symlinks, magic links, or mount crossings, and accept only a regular file
+  before restoring blocking I/O. Pair removal never opens a FIFO, socket, device, or symlink in
+  place of a member: it counts zero bytes and unlinks the name without following it. Once the root is reopened and verified, a
+  missing layout directory means both members are absent: removal syncs the deepest
+  ancestor that exists and reports zero bytes, while a missing root remains an error.
+- **Private modes**: media, sidecars, and recovery temporaries are created 0600 and layout and
+  root directories 0700, whatever the process umask.
 - **Root failover** tries roots in configuration order. Each root has a queue bounded by
   the requested capacity; aggregate queue counters cover the entire chain. Workers check
   the free-space floor before every fragment with a one-second cache. Approved roots retain
-  the identity check even when the configured floor is zero. A root below the floor seals its
+  the identity check even when the configured floor is zero. A probe that fails for lack of a
+  process resource (`EMFILE`, `ENFILE`, `ENOMEM`, `EAGAIN`, `EINTR`) keeps the open files, logs a
+  warning, and probes again after the cadence; any other probe failure abandons the root like
+  an I/O error. A root below the floor seals its
   open files and forwards to the next root; a write or sync error abandons its
   files for recovery and forwards subsequent fragments. An incomplete media write is
   retried on the next root. If complete media is followed by a sidecar or preallocation
@@ -98,9 +121,12 @@ the catalog, and wraps the handle in its `FragmentSink` for ingest.
   phase across rotations and across syncs it skips while clean, so fourteen streams do
   not hit the disk together. The observer learns the durable length after each sync.
   A write or sync over one second is counted and logged as slow (`04 §8`, `12 §5`).
-- **Rotation** at `rotate_bytes` (default 1 GiB) or `rotate_secs` (default 1 h),
-  whichever comes first, at the next sync sample; a new run (discontinuity) always opens a
-  new file (`04 §3`).
+- **Rotation** at `rotate_bytes` (default 1 GiB), `rotate_secs` (default 1 h), or 126,976
+  fragments, whichever comes first, at the next sync sample; a new run (discontinuity) or a
+  sample entry whose bytes differ always opens a new file, even when the CRC-32C matches. A
+  file holding `MAX_PERSISTED_INDEX_RECORDS` (131,072) fragments takes no more: dependent
+  fragments are dropped, counted, and logged once until a sync sample opens a new file as a new
+  run, so every sidecar stays within its readers' record ceiling (`04 §3`).
 - **Durability order**: newly created layout directories are synced through their parents;
   approved writers do so beneath the pinned admitted-root descriptor. Media and index paths are
   claimed exclusively, the initialization and index header are written, both files and the
@@ -119,7 +145,13 @@ the catalog, and wraps the handle in its `FragmentSink` for ingest.
   reservation when the logical length is unchanged) and then syncs the media; the already
   published index describes only that CRC-verified prefix, so the catalog seals only after both
   are durable. A file without complete
-  `ftyp` + `moov` initialization is rejected without changing its bytes or sidecar.
+  `ftyp` + `moov` initialization is rejected without changing its bytes or sidecar, and so is a
+  file holding more than 131,072 fragments. The rebuilt header keeps the prior header's nonzero
+  run id and sample-entry hash, else takes the caller's `IndexBinding` (the catalog row's), else
+  zero, so a recovered file stays servable. The sidecar is opened through the pinned directory
+  descriptor without following links or blocking; a missing, symlinked, unreadable, or special
+  sidecar counts as absent and is replaced. `RecoverError::Absent` reports a missing media name
+  or layout directory beneath the verified root.
 - **Paths are UTC**: the file name is the wall time of the first fragment to microsecond
   precision; exclusive numeric suffixes resolve true equal-timestamp collisions.
 
@@ -128,8 +160,14 @@ the catalog, and wraps the handle in its `FragmentSink` for ingest.
 - `tests/store.rs`: round trip of fragments through the writer and the scanner, queue
   depth and latency accounting, a new run opening a second file, recovery of a truncated
   file, full-queue drops, observer notifications in order, `remove_segment`, and
-  `free_space`.
-- Unit tests in `src/layout.rs` (dated paths) and `src/writer.rs`.
+  `free_space`; 131,073 sync fragments rotating into two files that each bind to their sidecar,
+  and private modes from both writers.
+- Unit tests in `src/layout.rs` (dated paths) and `src/writer.rs`; `src/fs.rs` covers marker
+  framing, FIFO members and markers under two-second deadlines, special-file and
+  missing-directory removal, private modes, and symlinked ancestors; `src/recover.rs` covers
+  binding precedence, FIFO and symlinked sidecars, absence, and the fragment limit;
+  `src/stream.rs` covers record-count rotation and forged CRC-32C collisions;
+  `src/writer/worker.rs` covers transient and fatal probe errors.
 - Writer regressions cover ordered failover after write failures and low space, sync
   boundaries across streams and rotation, blocked fallback loss, continuation-only pressure,
   unavailable startup roots, terminal-root recovery, aggregate queue accounting, and

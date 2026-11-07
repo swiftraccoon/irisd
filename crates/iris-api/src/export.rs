@@ -1,6 +1,7 @@
 //! Streamed fMP4 export of a time range.
 
 use std::io::{self, SeekFrom};
+use std::os::unix::fs::FileExt as _;
 use std::sync::Arc;
 use std::task::Poll;
 
@@ -23,19 +24,14 @@ use crate::hls::{
 use crate::media_admission::{self, MediaPermit};
 use crate::query::{TimeParams, resolve_range};
 use crate::segments::stream_key;
-use crate::state::{ApiState, admitted_media_bytes};
+use crate::state::{ApiState, MediaClass, admitted_media_bytes};
 
 pub(crate) async fn export(
     State(state): State<Arc<ApiState>>,
     Path((camera, kind)): Path<(String, String)>,
     Query(params): Query<TimeParams>,
 ) -> Result<Response, ApiError> {
-    let permit = media_admission::shared(
-        state
-            .stats
-            .try_media_response()
-            .ok_or_else(|| ApiError::Unavailable("too many concurrent media responses".into()))?,
-    );
+    let permit = state.stats.admit_media(MediaClass::Streaming)?;
     let key = stream_key(&camera, &kind)?;
     let range = resolve_range(&params, WallUs::now())?;
     let segments = load_fragments(&state, &key, range, &permit).await?;
@@ -82,7 +78,8 @@ pub(crate) async fn export(
 
 /// Checks the actual init bytes because adopted files may lack catalog codec hashes.
 /// This finishes before headers are sent, so incompatible files cannot produce a
-/// partially streamed MP4 under the first file's sample description.
+/// partially streamed MP4 under the first file's sample description. Each file is
+/// reopened beneath its root and must still be the validated inode.
 async fn compatible_init(
     segments: &[SegmentFragments],
     permit: &MediaPermit,
@@ -90,21 +87,21 @@ async fn compatible_init(
     let mut expected: Option<Vec<u8>> = None;
     for segment in segments {
         if u64::from(segment.row.init_len) > MAX_INIT_BYTES
-            || u64::from(segment.row.init_len) > segment.extent
+            || u64::from(segment.row.init_len) > segment.media.extent()
         {
             return Err(ApiError::Unavailable(
                 "export initialization exceeds the serving budget or published extent".into(),
             ));
         }
-        let path = segment.row.path.clone();
+        let media = segment.media.clone();
         let init_len = segment.row.init_len;
-        let init = media_admission::spawn(permit, async move {
-            let mut file = tokio::fs::File::open(path).await?;
+        let init = media_admission::blocking(permit, move || {
+            let file = media.reopen()?;
             let mut init = Vec::new();
             init.try_reserve_exact(init_len as usize)
                 .map_err(|error| io::Error::other(error.to_string()))?;
             init.resize(init_len as usize, 0);
-            file.read_exact(&mut init).await?;
+            file.read_exact_at(&mut init, 0)?;
             Ok::<_, io::Error>(init)
         })
         .await
@@ -149,9 +146,9 @@ async fn stream_segments(
             };
             let file = match &mut file {
                 Some(file) => file,
-                None => file.insert(tokio::fs::File::open(&seg.row.path).await?),
+                None => file.insert(seg.media.open().await?),
             };
-            if u64::from(record.len) > MAX_FRAGMENT_BYTES || record.end() > seg.extent {
+            if u64::from(record.len) > MAX_FRAGMENT_BYTES || record.end() > seg.media.extent() {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "export fragment exceeds serving bounds",
@@ -240,6 +237,7 @@ fn ticks_through(from: WallUs, to: WallUs) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::hls::ValidatedMedia;
     use iris_catalog::{SegmentId, SegmentRow};
     use iris_core::id::{CameraId, StreamKey, StreamKind};
     use iris_mp4::index::IndexRecord;
@@ -251,7 +249,6 @@ mod tests {
         use iris_mp4::reader::parse_fragment;
 
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("recording.mp4");
         let entry = SampleEntry::new(
             Bytes::from_static(b"\0\0\0\x10hvc1\0\0\0\0\0\0\0\0"),
             "hvc1".into(),
@@ -289,9 +286,10 @@ mod tests {
             records.push(record);
             bytes.extend_from_slice(&fragment);
         }
-        std::fs::write(&path, bytes).unwrap();
-        let mut segment = segment(records);
-        segment.row.path = path;
+        let mut segment = segment(dir.path(), records);
+        let extent = segment.media.extent();
+        segment.media = ValidatedMedia::for_test(dir.path(), &bytes, extent);
+        segment.row.path = segment.media.path().to_path_buf();
         let range = TimeRange {
             from: WallUs::new(base + 1_250_000),
             to: WallUs::new(base + 4_750_000),
@@ -331,8 +329,11 @@ mod tests {
         }
     }
 
-    fn segment(records: Vec<IndexRecord>) -> SegmentFragments {
+    /// A segment whose media is an empty validated recording beneath a fresh
+    /// root in `directory`, with the extent its records describe.
+    fn segment(directory: &std::path::Path, records: Vec<IndexRecord>) -> SegmentFragments {
         let extent = records.last().map_or(0, IndexRecord::end);
+        let media = ValidatedMedia::for_test(directory, &[], extent);
         SegmentFragments {
             row: SegmentRow {
                 id: SegmentId(1),
@@ -340,7 +341,7 @@ mod tests {
                     camera: CameraId::try_new("cam1").unwrap(),
                     kind: StreamKind::Main,
                 },
-                path: "/nonexistent".into(),
+                path: media.path().to_path_buf(),
                 run_seq: 1,
                 discontinuity: true,
                 wall_start: records[0].wall,
@@ -358,7 +359,7 @@ mod tests {
                 sample_entry_hash: 0,
             },
             records,
-            extent,
+            media,
             discontinuity_before: true,
         }
     }
@@ -380,8 +381,8 @@ mod tests {
             to: record.wall.offset(1_000_000),
         };
         let directory = tempfile::tempdir().expect("temporary directory");
-        let mut source = segment(vec![record]);
-        source.row.path = directory.path().join("missing.mp4");
+        let source = segment(directory.path(), vec![record]);
+        std::fs::remove_file(source.media.path()).expect("remove the validated recording");
         let (tx, mut rx) = mpsc::channel(1);
         let mut producer =
             tokio::spawn(async move { stream_segments(vec![source], range, &init, &tx).await });
@@ -405,9 +406,10 @@ mod tests {
 
     #[test]
     fn the_edit_list_trims_both_ends_to_the_range() {
+        let directory = tempfile::tempdir().expect("temporary directory");
         let segments = vec![
-            segment(vec![record(0), record(1)]),
-            segment(vec![record(2)]),
+            segment(directory.path(), vec![record(0), record(1)]),
+            segment(directory.path(), vec![record(2)]),
         ];
         let from = record(0).wall.offset(500_000);
         let to = record(2).wall.offset(1_500_000);

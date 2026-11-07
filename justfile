@@ -9,8 +9,8 @@ default:
 fmt:
     cargo fmt --all
 
-# Verify formatting, lints (warnings are errors), docs, and tests.
-check: fmt-check clippy test doc
+# Verify formatting, lints (warnings are errors), docs, tests, and the vendored crates' tests.
+check: fmt-check clippy test doc vendor-test
 
 fmt-check:
     cargo fmt --all -- --check
@@ -24,10 +24,27 @@ test:
 doc:
     RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --locked
 
-# Supply-chain checks (install with `cargo install cargo-audit cargo-deny`).
+# On a machine whose cargo cache lacks these dependencies, run
+# `cargo fetch --locked --manifest-path <manifest>` before this recipe.
+#
+# Test the vendored crates offline through their own manifests and lockfiles.
+vendor-test:
+    cargo test --offline --locked --manifest-path third_party/oxvif/Cargo.toml
+    cargo test --offline --locked --manifest-path third_party/retina/Cargo.toml
+
+# Supply-chain checks of every lockfile (install with `cargo install cargo-audit cargo-deny`).
 audit:
     cargo audit
+    cargo audit --file fuzz/Cargo.lock
+    cargo audit --file third_party/oxvif/Cargo.lock
+    cargo audit --file third_party/retina/Cargo.lock
+    cargo audit --file .rust-reference/tools/reference-maintenance/Cargo.lock
     cargo deny check
+    cargo deny --manifest-path fuzz/Cargo.toml check
+
+# Build every fuzz target with the nightly toolchain pinned in fuzz/rust-toolchain.toml.
+fuzz-build:
+    cd fuzz && cargo fuzz build
 
 # Release build of the daemon.
 build:

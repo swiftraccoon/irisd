@@ -24,10 +24,15 @@ Scope: this crate only. Read the root `AGENTS.md` first.
 - `IndexWriter::from_claimed_file` writes only to a file whose exclusive ownership remains
   with the caller, so store initialization can roll back the exact pair without clobbering it.
 - Timescale 90 kHz, 64-bit `tfdt`, 32-bit per-sample durations (`04 §4`, §7).
-- Daemon and offline persisted-sidecar entrypoints use `read_index_bounded` with the shared
-  131,072-record ceiling. The low-level `read_index` codec remains available only to callers that
-  impose an equivalent bound. The bounded reader checks metadata before allocation, rejects
-  growth beyond the ceiling, and retains the format's trailing-partial-record ignore rule.
+- Persisted-sidecar readers use the shared 131,072-record ceiling. Daemon code passes its own
+  nonblocking, no-follow descriptor to `read_index_file_bounded` or
+  `read_index_file_bound_to_media`; the path-taking `read_index_bounded` follows symlinks and can
+  block on special files, so it is for offline tools and tests. The low-level `read_index` codec
+  remains available only to callers that impose an equivalent bound. The bounded reader checks
+  metadata before allocation, rejects growth beyond the ceiling, and retains the format's
+  trailing-partial-record ignore rule.
+- `scan` accepts at most the same 131,072 fragments; `ScanStop::FragmentLimit` reports a complete
+  fragment beyond the limit and must never be treated as a truncation point.
 
 ## Where things are
 

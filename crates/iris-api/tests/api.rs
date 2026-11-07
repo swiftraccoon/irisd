@@ -12,7 +12,7 @@ use axum::http::{Request, StatusCode, header};
 use bytes::Bytes;
 use futures_util::StreamExt as _;
 use futures_util::future::join_all;
-use iris_api::{ActiveCamera, ApiState, ApiStats, LiveRegistry, router};
+use iris_api::{ActiveCamera, ApiState, ApiStats, LiveRegistry, SnapshotSource, router};
 use iris_catalog::{CatalogHandle, Change};
 use iris_core::event::{Event, EventKind, EventSource, EventState};
 use iris_core::id::{CameraId, StreamKey, StreamKind};
@@ -21,7 +21,7 @@ use iris_ingest::{LiveFrame, LiveRing};
 use iris_mp4::fragment::{Fragment, Sample};
 use iris_mp4::index::read_index;
 use iris_mp4::init::SampleEntry;
-use iris_store::{StoragePolicy, WriterHandle};
+use iris_store::{ApprovedRoot, RootExpectation, StoragePolicy, WriterHandle};
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 use tower::ServiceExt as _;
@@ -100,21 +100,30 @@ fn find_mp4s(root: &Path) -> Vec<PathBuf> {
     found
 }
 
-/// Records synthetic fragments, then registers every sealed file from its sidecar.
+/// The test recording root `dir/video`, given a fresh identity marker on first
+/// use and admitted again by later calls.
+fn recording_root(dir: &Path) -> ApprovedRoot {
+    iris_store::admit_recording_root(&dir.join("video"), RootExpectation::Fresh).unwrap()
+}
+
+/// Records synthetic fragments beneath the recording root of `dir`, then
+/// registers every sealed file from its sidecar.
 async fn record_segments(
-    root: &Path,
+    dir: &Path,
     catalog: &CatalogHandle,
     fragments: Vec<Fragment>,
 ) -> Vec<PathBuf> {
-    record_segments_with_rotation(root, catalog, fragments, 1 << 30).await
+    record_segments_with_rotation(dir, catalog, fragments, 1 << 30).await
 }
 
 async fn record_segments_with_rotation(
-    root: &Path,
+    dir: &Path,
     catalog: &CatalogHandle,
     fragments: Vec<Fragment>,
     rotate_bytes: u64,
 ) -> Vec<PathBuf> {
+    let root = recording_root(dir);
+    let root = root.path();
     let entries: HashMap<u32, Arc<SampleEntry>> = fragments
         .iter()
         .map(|fragment| {
@@ -171,8 +180,11 @@ async fn record_segments_with_rotation(
     files
 }
 
-/// Records three fragments and registers the file with the catalog.
-async fn populate(root: &Path, catalog: &CatalogHandle) -> (PathBuf, u32, u64) {
+/// Records three fragments beneath the recording root of `dir` and registers
+/// the file with the catalog.
+async fn populate(dir: &Path, catalog: &CatalogHandle) -> (PathBuf, u32, u64) {
+    let root = recording_root(dir);
+    let root = root.path();
     let entry = entry();
     let writer = WriterHandle::spawn(
         root.to_path_buf(),
@@ -219,11 +231,13 @@ async fn populate(root: &Path, catalog: &CatalogHandle) -> (PathBuf, u32, u64) {
     (path, header.init_len, len)
 }
 
-fn state(catalog: CatalogHandle, tokens: Vec<String>) -> Arc<ApiState> {
-    state_with_cameras(catalog, tokens, HashMap::new())
+/// API state serving the recording root of `dir`.
+fn state(dir: &Path, catalog: CatalogHandle, tokens: Vec<String>) -> Arc<ApiState> {
+    state_with_cameras(dir, catalog, tokens, HashMap::new())
 }
 
 fn state_with_cameras(
+    dir: &Path,
     catalog: CatalogHandle,
     tokens: Vec<String>,
     active_cameras: HashMap<CameraId, ActiveCamera>,
@@ -234,6 +248,8 @@ fn state_with_cameras(
         live: Arc::new(LiveRegistry::new()),
         events,
         tokens,
+        recording_roots: vec![recording_root(dir)],
+        public_metrics: false,
         snapshot_sources: HashMap::new(),
         active_cameras,
         stats: Arc::new(ApiStats::default()),
@@ -247,7 +263,7 @@ fn state_with_cameras(
 async fn event_websocket_delivers_normally_then_closes_explicitly_on_lag() {
     let dir = tempfile::tempdir().unwrap();
     let catalog = CatalogHandle::open(&dir.path().join("c.db")).unwrap();
-    let state = state(catalog.clone(), Vec::new());
+    let state = state(dir.path(), catalog.clone(), Vec::new());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let server_state = state.clone();
@@ -330,7 +346,7 @@ async fn body_string(response: axum::response::Response) -> String {
 async fn health_reports_ok_without_a_token() {
     let dir = tempfile::tempdir().unwrap();
     let catalog = CatalogHandle::open(&dir.path().join("c.db")).unwrap();
-    let state = state(catalog.clone(), vec!["secret".into()]);
+    let state = state(dir.path(), catalog.clone(), vec!["secret".into()]);
     let app = router(Arc::clone(&state));
     let response = app
         .oneshot(Request::get("/api/health").body(Body::empty()).unwrap())
@@ -348,14 +364,24 @@ async fn health_reports_ok_without_a_token() {
 async fn metrics_expose_catalog_queue_and_event_state() {
     let dir = tempfile::tempdir().unwrap();
     let catalog = CatalogHandle::open(&dir.path().join("c.db")).unwrap();
-    let app = router(state(catalog.clone(), vec!["secret".into()]));
+    let app = router(state(dir.path(), catalog.clone(), vec!["secret".into()]));
     let response = app
-        .oneshot(Request::get("/metrics").body(Body::empty()).unwrap())
+        .oneshot(
+            Request::get("/metrics")
+                .header(header::AUTHORIZATION, "Bearer secret")
+                .body(Body::empty())
+                .unwrap(),
+        )
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     let text = body_string(response).await;
     for name in [
+        "irisd_api_media_rejected_total",
+        "irisd_api_websocket_rejected_total",
+        "irisd_api_snapshot_rejected_total",
+        "irisd_api_unapproved_rows_total",
+        "irisd_live_oversized_closes_total",
         "irisd_catalog_queue_commands",
         "irisd_catalog_queue_bytes",
         "irisd_catalog_commands_rejected_total",
@@ -377,14 +403,19 @@ async fn metrics_expose_catalog_queue_and_event_state() {
 async fn concurrent_metrics_scrapes_share_one_catalog_stats_query() {
     let dir = tempfile::tempdir().unwrap();
     let catalog = CatalogHandle::open(&dir.path().join("c.db")).unwrap();
-    let app = router(state(catalog.clone(), vec!["secret".into()]));
+    let app = router(state(dir.path(), catalog.clone(), vec!["secret".into()]));
     let before = catalog.metrics().query().snapshot().count();
     let responses = join_all((0..64).map(|_| {
         let app = app.clone();
         async move {
-            app.oneshot(Request::get("/metrics").body(Body::empty()).unwrap())
-                .await
-                .unwrap()
+            app.oneshot(
+                Request::get("/metrics")
+                    .header(header::AUTHORIZATION, "Bearer secret")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
         }
     }))
     .await;
@@ -399,10 +430,97 @@ async fn concurrent_metrics_scrapes_share_one_catalog_stats_query() {
 }
 
 #[tokio::test]
+async fn metrics_require_the_root_token_unless_configured_public() {
+    let dir = tempfile::tempdir().unwrap();
+    let catalog = CatalogHandle::open(&dir.path().join("c.db")).unwrap();
+    let private = state(dir.path(), catalog.clone(), vec!["secret".into()]);
+    let app = router(Arc::clone(&private));
+    let anonymous = app
+        .clone()
+        .oneshot(Request::get("/metrics").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(anonymous.status(), StatusCode::UNAUTHORIZED);
+    let wrong = app
+        .clone()
+        .oneshot(
+            Request::get("/metrics")
+                .header(header::AUTHORIZATION, "Bearer nope")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(wrong.status(), StatusCode::UNAUTHORIZED);
+    let root = app
+        .clone()
+        .oneshot(
+            Request::get("/metrics")
+                .header(header::AUTHORIZATION, "Bearer secret")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(root.status(), StatusCode::OK);
+
+    // A media capability minted for a playable path never authorizes metrics.
+    populate(dir.path(), &catalog).await;
+    let playlist = get_with_token(
+        &app,
+        "secret",
+        format!(
+            "/api/streams/cam1/main/hls/vod.m3u8?from={}&to={}",
+            wall(0).get(),
+            wall(3).get()
+        ),
+    )
+    .await;
+    let text = body_string(playlist).await;
+    let capability = text
+        .split("?token=")
+        .nth(1)
+        .and_then(|tail| tail.split(['"', '\n']).next())
+        .expect("playlist capability");
+    let with_capability = app
+        .clone()
+        .oneshot(
+            Request::get(format!("/metrics?token={capability}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(with_capability.status(), StatusCode::UNAUTHORIZED);
+
+    let mut public = state(dir.path(), catalog.clone(), vec!["secret".into()]);
+    Arc::get_mut(&mut public)
+        .expect("sole state owner")
+        .public_metrics = true;
+    let public_app = router(public);
+    let anonymous = public_app
+        .clone()
+        .oneshot(Request::get("/metrics").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(anonymous.status(), StatusCode::OK);
+    assert_eq!(
+        public_app
+            .oneshot(Request::get("/api/cameras").body(Body::empty()).unwrap())
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::UNAUTHORIZED,
+        "public metrics leave every other route protected"
+    );
+    catalog.shutdown();
+}
+
+#[tokio::test]
 async fn metrics_serve_the_last_snapshot_when_refresh_fails() {
     let dir = tempfile::tempdir().unwrap();
     let catalog = CatalogHandle::open(&dir.path().join("c.db")).unwrap();
-    let app = router(state(catalog.clone(), Vec::new()));
+    let app = router(state(dir.path(), catalog.clone(), Vec::new()));
     let first = app
         .clone()
         .oneshot(Request::get("/metrics").body(Body::empty()).unwrap())
@@ -423,7 +541,7 @@ async fn metrics_serve_the_last_snapshot_when_refresh_fails() {
 async fn metrics_cold_failure_is_coalesced_for_the_refresh_cadence() {
     let dir = tempfile::tempdir().unwrap();
     let catalog = CatalogHandle::open(&dir.path().join("c.db")).unwrap();
-    let app = router(state(catalog.clone(), Vec::new()));
+    let app = router(state(dir.path(), catalog.clone(), Vec::new()));
     catalog.shutdown();
     let before = catalog.metrics().query().snapshot().count();
     let responses = join_all((0..64).map(|_| {
@@ -451,7 +569,7 @@ async fn metrics_cold_failure_is_coalesced_for_the_refresh_cadence() {
 async fn health_uptime_ignores_the_wall_clock_start_value() {
     let dir = tempfile::tempdir().unwrap();
     let catalog = CatalogHandle::open(&dir.path().join("c.db")).unwrap();
-    let mut state = state(catalog.clone(), Vec::new());
+    let mut state = state(dir.path(), catalog.clone(), Vec::new());
     let state_mut = Arc::get_mut(&mut state).expect("sole state owner");
     state_mut.started = WallUs::new(i64::MAX);
     state_mut.started_monotonic = Instant::now().checked_sub(Duration::from_secs(2)).unwrap();
@@ -468,7 +586,7 @@ async fn health_uptime_ignores_the_wall_clock_start_value() {
 async fn rejects_missing_or_wrong_tokens_and_accepts_valid_ones() {
     let dir = tempfile::tempdir().unwrap();
     let catalog = CatalogHandle::open(&dir.path().join("c.db")).unwrap();
-    let state = state(catalog.clone(), vec!["secret".into()]);
+    let state = state(dir.path(), catalog.clone(), vec!["secret".into()]);
     let app = router(Arc::clone(&state));
     let missing = app
         .clone()
@@ -523,7 +641,7 @@ async fn blank_configured_tokens_fail_closed_even_when_state_is_constructed_dire
         vec!["   ".to_owned()],
         vec!["valid".to_owned(), String::new()],
     ] {
-        let app = router(state(catalog.clone(), tokens));
+        let app = router(state(dir.path(), catalog.clone(), tokens));
         for authorization in [None, Some("Bearer valid")] {
             let mut request = Request::get("/api/cameras?token=");
             if let Some(authorization) = authorization {
@@ -538,6 +656,18 @@ async fn blank_configured_tokens_fail_closed_even_when_state_is_constructed_dire
         }
     }
     catalog.shutdown();
+}
+
+async fn get_with_token(app: &axum::Router, token: &str, uri: String) -> axum::response::Response {
+    app.clone()
+        .oneshot(
+            Request::get(uri)
+                .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap()
 }
 
 async fn get(app: &axum::Router, uri: String, range: Option<String>) -> axum::response::Response {
@@ -625,7 +755,7 @@ async fn lists_segments_and_builds_a_byte_range_playlist() {
         .await
         .unwrap();
     let (_, init_len, len) = populate(dir.path(), &catalog).await;
-    let app = router(state(catalog.clone(), vec!["t".into()]));
+    let app = router(state(dir.path(), catalog.clone(), vec!["t".into()]));
     let (from, to) = (wall(0).get(), wall(3).get());
 
     let list = get(
@@ -718,7 +848,7 @@ async fn serves_ranges_and_streams_an_export_over_a_real_recording() {
         .expect("registered")
         .id
         .0;
-    let app = router(state(catalog.clone(), vec!["t".into()]));
+    let app = router(state(dir.path(), catalog.clone(), vec!["t".into()]));
     let (from, to) = (wall(0).get(), wall(3).get());
 
     let ranged = get(
@@ -812,7 +942,7 @@ async fn raw_file_responses_stop_at_the_snapshotted_complete_extent() {
         .unwrap();
     media.write_all(b"partial-fragment").unwrap();
     media.flush().unwrap();
-    let app = router(state(catalog.clone(), Vec::new()));
+    let app = router(state(dir.path(), catalog.clone(), Vec::new()));
 
     let full = get(&app, format!("/api/segments/{segment_id}/file.mp4"), None).await;
     assert_eq!(full.status(), StatusCode::OK);
@@ -869,7 +999,7 @@ async fn slow_export_bodies_hold_process_wide_media_admission() {
     let dir = tempfile::tempdir().unwrap();
     let catalog = CatalogHandle::open(&dir.path().join("c.db")).unwrap();
     populate(dir.path(), &catalog).await;
-    let app = router(state(catalog.clone(), Vec::new()));
+    let app = router(state(dir.path(), catalog.clone(), Vec::new()));
     let uri = format!(
         "/api/streams/cam1/main/export.mp4?from={}&to={}",
         wall(0).get(),
@@ -915,7 +1045,7 @@ async fn exports_round_positive_tail_and_presentation_durations_up_to_their_time
         vec![fragment(0, &entry), fragment(1, &entry)],
     )
     .await;
-    let app = router(state(catalog.clone(), Vec::new()));
+    let app = router(state(dir.path(), catalog.clone(), Vec::new()));
     let mut cases: Vec<(i64, i64, Vec<u32>)> = (1..=11).map(|end| (0, end, vec![1])).collect();
     cases.extend([
         (0, 12, vec![2]),
@@ -986,7 +1116,7 @@ async fn exports_round_positive_tail_and_presentation_durations_up_to_their_time
 async fn unknown_segment_and_bad_ranges_are_rejected() {
     let dir = tempfile::tempdir().unwrap();
     let catalog = CatalogHandle::open(&dir.path().join("c.db")).unwrap();
-    let app = router(state(catalog.clone(), Vec::new()));
+    let app = router(state(dir.path(), catalog.clone(), Vec::new()));
     let missing = app
         .clone()
         .oneshot(
@@ -1023,7 +1153,7 @@ async fn unknown_segment_and_bad_ranges_are_rejected() {
 async fn malformed_unicode_timestamps_and_overflowing_ranges_return_bad_request() {
     let dir = tempfile::tempdir().unwrap();
     let catalog = CatalogHandle::open(&dir.path().join("c.db")).unwrap();
-    let app = router(state(catalog.clone(), vec![]));
+    let app = router(state(dir.path(), catalog.clone(), vec![]));
     for query in [
         "from=2026-01-01T00:00:0%C3%A9Z".to_owned(),
         format!("from={}&to={}", i64::MIN, i64::MAX),
@@ -1054,7 +1184,7 @@ async fn clipped_continuations_keep_sync_preroll_in_vod_metadata_and_export() {
     )
     .await;
     let (_, records) = read_index(&iris_store::layout::index_path(&paths[0])).unwrap();
-    let app = router(state(catalog.clone(), vec![]));
+    let app = router(state(dir.path(), catalog.clone(), vec![]));
     let range = format!(
         "from={}&to={}",
         wall(1).offset(100_000).get(),
@@ -1142,7 +1272,7 @@ async fn vod_marks_one_gap_after_a_skipped_middle_sidecar_but_not_a_skipped_firs
     let first_bytes = std::fs::read(&first_index).unwrap();
     let middle_bytes = std::fs::read(&middle_index).unwrap();
     std::fs::write(&middle_index, b"corrupt sidecar").unwrap();
-    let app = router(state(catalog.clone(), Vec::new()));
+    let app = router(state(dir.path(), catalog.clone(), Vec::new()));
     let uri = format!(
         "/api/streams/cam1/main/hls/vod.m3u8?from={}&to={}",
         wall(0).get(),
@@ -1185,7 +1315,7 @@ async fn exports_reject_codec_changes_before_sending_a_body() {
     )
     .await;
     assert_eq!(files.len(), 2);
-    let app = router(state(catalog.clone(), vec![]));
+    let app = router(state(dir.path(), catalog.clone(), vec![]));
     let response = get(
         &app,
         format!(
@@ -1245,7 +1375,7 @@ async fn exports_reject_codec_changes_when_adopted_files_have_unknown_hashes() {
             .await
             .unwrap();
     }
-    let app = router(state(adopted.clone(), vec![]));
+    let app = router(state(dir.path(), adopted.clone(), vec![]));
     let response = get(
         &app,
         format!(
@@ -1265,7 +1395,7 @@ async fn the_keyframe_resource_is_one_sync_sample_behind_the_init_segment() {
     let dir = tempfile::tempdir().unwrap();
     let catalog = CatalogHandle::open(&dir.path().join("c.db")).unwrap();
     let (_, init_len, _) = populate(dir.path(), &catalog).await;
-    let app = router(state(catalog.clone(), vec![]));
+    let app = router(state(dir.path(), catalog.clone(), vec![]));
     // Fragment 1 starts at wall(1); half a second later the newest sync sample is still fragment 1's.
     let t = wall(1).offset(500_000).get();
     let response = get(&app, format!("/api/streams/cam1/main/keyframe?t={t}"), None).await;
@@ -1316,7 +1446,7 @@ async fn implicit_newest_keyframes_are_not_cached() {
     current.wall = WallUs::now();
     let at = current.wall.get();
     record_segments(dir.path(), &catalog, vec![current]).await;
-    let app = router(state(catalog.clone(), Vec::new()));
+    let app = router(state(dir.path(), catalog.clone(), Vec::new()));
     let newest = get(&app, "/api/streams/cam1/main/keyframe".into(), None).await;
     assert_eq!(newest.status(), StatusCode::OK);
     assert_eq!(newest.headers()[header::CACHE_CONTROL], "private, no-store");
@@ -1344,7 +1474,7 @@ async fn keyframe_lookup_enforces_the_two_minute_lower_bound() {
     continuation.samples[0].is_sync = false;
     continuation.wall = first.wall.offset(121_000_000);
     record_segments(dir.path(), &catalog, vec![first.clone(), continuation]).await;
-    let app = router(state(catalog.clone(), Vec::new()));
+    let app = router(state(dir.path(), catalog.clone(), Vec::new()));
 
     let within = get(
         &app,
@@ -1392,7 +1522,11 @@ async fn keyframe_rejects_corrupt_payload_and_false_sidecar_sync() {
     media.seek(SeekFrom::Start(payload)).unwrap();
     media.write_all(&[byte[0] ^ 0x01]).unwrap();
     media.flush().unwrap();
-    let app = router(state(corrupt_catalog.clone(), Vec::new()));
+    let app = router(state(
+        corrupt_dir.path(),
+        corrupt_catalog.clone(),
+        Vec::new(),
+    ));
     let response = get(
         &app,
         format!(
@@ -1403,6 +1537,13 @@ async fn keyframe_rejects_corrupt_payload_and_false_sidecar_sync() {
     )
     .await;
     assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    let body: serde_json::Value = serde_json::from_str(&body_string(response).await).unwrap();
+    assert_eq!(body["error"], "internal error");
+    assert!(body["request_id"].is_u64(), "{body}");
+    assert!(
+        !body.to_string().contains("checksum"),
+        "internal detail stays in the log: {body}"
+    );
     corrupt_catalog.shutdown();
 
     let sync_dir = tempfile::tempdir().unwrap();
@@ -1428,7 +1569,7 @@ async fn keyframe_rejects_corrupt_payload_and_false_sidecar_sync() {
         .write_all(&[iris_mp4::index::FLAG_STARTS_WITH_SYNC])
         .unwrap();
     index.flush().unwrap();
-    let app = router(state(sync_catalog.clone(), Vec::new()));
+    let app = router(state(sync_dir.path(), sync_catalog.clone(), Vec::new()));
     let response = get(
         &app,
         format!(
@@ -1465,7 +1606,7 @@ async fn live_setup() -> (
 ) {
     let dir = tempfile::tempdir().unwrap();
     let catalog = CatalogHandle::open(&dir.path().join("c.db")).unwrap();
-    let state = state(catalog.clone(), vec!["t".into()]);
+    let state = state(dir.path(), catalog.clone(), vec!["t".into()]);
     // Larger than any burst below: a lagging feeder resets to the next sync frame.
     let ring = LiveRing::new(1024);
     state.live.insert(key(), ring.clone());
@@ -1566,6 +1707,173 @@ async fn the_live_playlist_serves_parts_and_segments() {
 }
 
 #[tokio::test]
+async fn streaming_and_bounded_media_classes_are_admitted_independently() {
+    let (app, _ring, _entry, catalog, dir) = live_setup().await;
+    let (path, init_len, _) = populate(dir.path(), &catalog).await;
+    let id = catalog
+        .segment_by_path(&path)
+        .await
+        .unwrap()
+        .expect("registered")
+        .id
+        .0;
+    let file = format!("/api/segments/{id}/file.mp4");
+    let range = format!("from={}&to={}", wall(0).get(), wall(3).get());
+
+    // Eight whole-file bodies that nobody reads fill the streaming class.
+    let mut held = Vec::new();
+    for _ in 0..8 {
+        let response = get(&app, file.clone(), None).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        held.push(response);
+    }
+    for streaming in [
+        get(&app, file.clone(), None).await,
+        get(&app, file.clone(), Some("bytes=0-".into())).await,
+        get(&app, file.clone(), Some("bytes=0-1048576".into())).await,
+        get(
+            &app,
+            format!("/api/streams/cam1/main/export.mp4?{range}"),
+            None,
+        )
+        .await,
+    ] {
+        assert_eq!(streaming.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(streaming.headers()[header::RETRY_AFTER], "1");
+        assert!(
+            body_string(streaming)
+                .await
+                .contains("busy: too many concurrent streaming media responses")
+        );
+    }
+
+    // Bounded resources keep their own class.
+    let init = get(
+        &app,
+        file.clone(),
+        Some(format!("bytes=0-{}", init_len - 1)),
+    )
+    .await;
+    assert_eq!(init.status(), StatusCode::PARTIAL_CONTENT);
+    let vod = get(
+        &app,
+        format!("/api/streams/cam1/main/hls/vod.m3u8?{range}"),
+        None,
+    )
+    .await;
+    assert_eq!(vod.status(), StatusCode::OK);
+    let keyframe = get(
+        &app,
+        format!("/api/streams/cam1/main/keyframe?t={}", wall(1).get()),
+        None,
+    )
+    .await;
+    assert_eq!(keyframe.status(), StatusCode::OK);
+    let live_init = get(&app, "/api/streams/cam1/main/hls/init.mp4".into(), None).await;
+    assert_eq!(live_init.status(), StatusCode::OK);
+    let text = settled_playlist(&app).await;
+    let segment = text
+        .lines()
+        .find(|line| line.starts_with("seg/1/media.m4s?token="))
+        .expect("live segment URI");
+    let live_segment =
+        get_with_capability(&app, format!("/api/streams/cam1/main/hls/{segment}"), None).await;
+    assert_eq!(live_segment.status(), StatusCode::OK);
+
+    drop(held.pop());
+    let admitted = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let response = get(&app, file.clone(), None).await;
+            if response.status() == StatusCode::OK {
+                break response;
+            }
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("a released streaming slot admits the next whole-file request");
+    drop((admitted, held));
+    catalog.shutdown();
+}
+
+#[tokio::test]
+async fn snapshots_are_single_flight_per_camera() {
+    let camera = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = camera.local_addr().unwrap();
+    let (accepted_tx, accepted_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+    let fake_camera = tokio::spawn(async move {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let (mut socket, _) = camera.accept().await.unwrap();
+        let mut request = vec![0_u8; 4096];
+        let _ = socket.read(&mut request).await.unwrap();
+        accepted_tx.send(()).unwrap();
+        release_rx.await.unwrap();
+        let mut jpeg = vec![0_u8; 64];
+        jpeg[..3].copy_from_slice(&[0xff, 0xd8, 0xff]);
+        jpeg[62..].copy_from_slice(&[0xff, 0xd9]);
+        socket
+            .write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: image/jpeg\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    jpeg.len()
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        socket.write_all(&jpeg).await.unwrap();
+    });
+
+    let dir = tempfile::tempdir().unwrap();
+    let catalog = CatalogHandle::open(&dir.path().join("c.db")).unwrap();
+    let mut state = state(dir.path(), catalog.clone(), vec![]);
+    Arc::get_mut(&mut state)
+        .expect("sole state owner")
+        .snapshot_sources = HashMap::from([(
+        key().camera,
+        SnapshotSource {
+            host: address.ip().to_string(),
+            port: address.port(),
+            https: false,
+            tls_verify: true,
+            username: String::new(),
+            password: String::new(),
+        },
+    )]);
+    let counters = Arc::clone(&state.stats);
+    let app = router(state);
+    let first = tokio::spawn({
+        let app = app.clone();
+        async move { get(&app, "/api/cameras/cam1/snapshot.jpg".into(), None).await }
+    });
+    tokio::time::timeout(Duration::from_secs(2), accepted_rx)
+        .await
+        .expect("the camera request is in flight")
+        .unwrap();
+
+    let second = get(&app, "/api/cameras/cam1/snapshot.jpg".into(), None).await;
+    assert_eq!(second.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(second.headers()[header::RETRY_AFTER], "1");
+    assert_eq!(counters.snapshot_rejected(), 1);
+
+    release_tx.send(()).unwrap();
+    let first = tokio::time::timeout(Duration::from_secs(5), first)
+        .await
+        .expect("the first snapshot completes")
+        .unwrap();
+    assert_eq!(first.status(), StatusCode::OK);
+    assert_eq!(
+        to_bytes(first.into_body(), 1 << 20).await.unwrap().len(),
+        64
+    );
+    fake_camera.await.unwrap();
+    catalog.shutdown();
+}
+
+#[tokio::test]
 async fn the_live_playlist_blocks_until_the_requested_part_and_rejects_bad_directives() {
     let (app, ring, entry, catalog, _dir) = live_setup().await;
     let base = "/api/streams/cam1/main/hls";
@@ -1659,6 +1967,7 @@ async fn camera_detail_reports_stream_health() {
         .unwrap();
     let camera_id = CameraId::try_new("cam1").unwrap();
     let state = state_with_cameras(
+        dir.path(),
         catalog.clone(),
         vec![],
         HashMap::from([(
@@ -1703,6 +2012,7 @@ async fn active_camera_surface_excludes_removed_history_without_deleting_recordi
         .unwrap();
     populate(dir.path(), &catalog).await;
     let state = state_with_cameras(
+        dir.path(),
         catalog.clone(),
         Vec::new(),
         HashMap::from([(
@@ -1757,7 +2067,7 @@ async fn retaining_an_event_sets_and_clears_its_time() {
         })
         .await
         .unwrap();
-    let app = router(state(catalog.clone(), vec![]));
+    let app = router(state(dir.path(), catalog.clone(), vec![]));
     let uri = format!("/api/events/{}/retain", id.0);
     let set = app
         .clone()
@@ -1832,7 +2142,7 @@ async fn event_http_cursor_crosses_an_equal_timestamp_page_boundary() {
             .await
             .unwrap();
     }
-    let app = router(state(catalog.clone(), vec![]));
+    let app = router(state(dir.path(), catalog.clone(), vec![]));
     let from = wall(0).get();
     let to = wall(3).get();
     let first = get(

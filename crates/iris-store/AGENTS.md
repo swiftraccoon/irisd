@@ -14,7 +14,18 @@ Scope: this crate only. Read the root `AGENTS.md` first.
   authoritatively CRC-scans every complete media fragment before publication; a bounded sidecar
   may supply only flags and raw-RTP metadata at matching offsets, never prefix validity or catalog
   times. Equal-length truncation and the media sync are required even when the complete file needs
-  no logical shortening, before catalog seal.
+  no logical shortening, before catalog seal. The rebuilt header keeps each nonzero run id and
+  sample-entry hash of the prior header, else the caller's `IndexBinding`, else zero. A file over
+  `MAX_PERSISTED_INDEX_RECORDS` fragments is refused before any byte changes.
+- Every open of a marker, media file, or sidecar beneath a root goes through `fs::open_regular_beneath`:
+  nonblocking, no-follow, beneath, no-cross-mount, regular files only. Removal never opens a
+  special file, and a missing layout directory under a verified root is absence, not an error.
+- The writer never appends a fragment to a file that holds `MAX_PERSISTED_INDEX_RECORDS`
+  fragments, and rotates at the next sync sample once a file holds 4,096 fewer. A sample entry
+  whose bytes differ always rotates; its CRC-32C alone never decides.
+- A free-space probe error for lack of a process resource (`EMFILE`, `ENFILE`, `ENOMEM`,
+  `EAGAIN`, `EINTR`) never abandons files; every other probe error does.
+- Created files are 0600 and created directories 0700, independent of the umask.
 - Initialization claims media and sidecar exclusively, makes their bytes and directory entries
   durable before `SegmentOpened`, and rolls back only the attempt-owned pair on failure. An
   approved writer pins its verified root before layout creation and performs every component and

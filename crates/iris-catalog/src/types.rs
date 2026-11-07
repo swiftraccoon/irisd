@@ -168,6 +168,13 @@ pub struct CatalogStats {
     pub segments: u64,
     /// Bytes of sealed segments.
     pub sealed_bytes: u64,
+    /// Segment rows with durable deletion intent whose pair removal has not
+    /// completed. Retention retries them every pass; a persistent count points at
+    /// a removal fault or an unavailable root.
+    pub deleting_segments: u64,
+    /// Bytes of the rows counted by `deleting_segments`; they still count toward
+    /// the quota total until their rows are removed.
+    pub deleting_bytes: u64,
     /// Event rows.
     pub events: u64,
     /// Logical bytes owned by event strings.

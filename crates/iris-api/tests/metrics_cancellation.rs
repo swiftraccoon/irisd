@@ -23,6 +23,8 @@ fn state(catalog: CatalogHandle) -> Arc<ApiState> {
         live: Arc::new(LiveRegistry::new()),
         events,
         tokens: Vec::new(),
+        recording_roots: Vec::new(),
+        public_metrics: false,
         snapshot_sources: HashMap::new(),
         active_cameras: HashMap::new(),
         stats: Arc::new(ApiStats::default()),
@@ -108,6 +110,8 @@ async fn cancelled_metrics_leader_keeps_one_cache_owned_refresh() {
         .expect("metrics body");
     let text = std::str::from_utf8(&body).expect("UTF-8 metrics");
     assert!(text.contains("irisd_catalog_segments"), "{text}");
+    assert!(text.contains("irisd_catalog_deleting_segments"), "{text}");
+    assert!(text.contains("irisd_catalog_deleting_bytes"), "{text}");
     assert_eq!(
         metrics.query().snapshot().count() - before_queries,
         1,

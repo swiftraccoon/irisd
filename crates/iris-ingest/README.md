@@ -35,12 +35,16 @@ and the timing model, and it is the only place that talks to cameras.
 ```rust
 use std::sync::Arc;
 
+use iris_core::id::{CameraId, StreamKey, StreamKind};
 use iris_ingest::{FragmentSink, IngestOptions, StreamSource, StreamStats, run_stream};
 use tokio_util::sync::CancellationToken;
 
 // `sink` implements FragmentSink (the daemon forwards to the store's writer queue).
 let source = StreamSource {
-    key: "cam1/main".parse().expect("key"),
+    key: StreamKey {
+        camera: CameraId::try_new("cam1").expect("camera id"),
+        kind: StreamKind::Main,
+    },
     url: "rtsp://192.0.2.10:554/cam/realmonitor?channel=1&subtype=0".parse().expect("url"),
     username: "user".into(),
     password: "secret".into(),
@@ -85,7 +89,20 @@ access units exactly once before reconnect or shutdown.
   30 s inactivity timeout; `TEARDOWN` on every exit; RTSP control messages are limited to
   1 MiB for head and body together; timestamp jumps over 10 s end the session; backoff 1 s
   doubling to 30 s with deterministic ±20 % jitter from stream identity and retry attempt,
-  reset after a 60 s healthy session (`05 §1`).
+  reset after a 60 s healthy session (`05 §1`). The patched retina bounds camera-supplied
+  fields (URLs 2,048 bytes, `Session` id 512, `WWW-Authenticate` 4,096, 64 SDP media
+  sections) and fails the session on a longer one.
+- **Teardown.** A `TEARDOWN` on a fresh connection goes to the address the session's
+  connection reached, never to a host the camera advertised, so credentials reach only the
+  configured camera; a background `TEARDOWN` gives up after the session timeout or 60 s,
+  whichever is shorter; at most 64 run in the process, and a session dropped beyond that is
+  not torn down (retina logs a warning) (`05 §1`).
+- **Camera text in logs.** A session error is logged through `LogSafe` (`src/session.rs`):
+  line breaks, other control characters, and non-ASCII are escaped and the text stops at
+  512 characters, so a camera cannot split a journal entry, forge a priority prefix, or
+  flood the log. Retina quotes camera text only as escaped excerpts of at most 512 bytes
+  and logs at most one warning per `DESCRIBE` (`05 §1`). `StreamSource`'s `Debug` output
+  redacts the credentials.
 - **Wall placement and recorder clock.** Receive instants use fresh realtime/monotonic
   correlations. Finalized frame durations feed a per-run least-delay wall-minus-media
   anchor: lower-delay observations take effect immediately, upward movement is limited to
@@ -100,7 +117,9 @@ access units exactly once before reconnect or shutdown.
   reactor once `PLAY` succeeds so arriving segments wake nothing; all streams
   are read in one runtime wake-up; `recv_low_water` sets `SO_RCVLOWAT` after `PLAY` so the
   kernel reports the socket readable once per that many bytes (`05 §1`,
-  `12-ingest-cost.md §3–4`).
+  `12-ingest-cost.md §3–4`). Writes on the detached socket never block the runtime thread:
+  a keepalive the camera does not read stays queued in the session, and the session fails
+  at the next keepalive deadline (`12-ingest-cost.md §6`).
 - **Sinks never block.** The sink is called on the ingest task; a rejected fragment is
   dropped and counted, never awaited. The first rejection in a loss epoch records one gap
   and ends recording continuity. A sync frame already pending is retained; otherwise
@@ -130,7 +149,17 @@ access units exactly once before reconnect or shutdown.
   received frame and clear connection state in both read modes. No hardware is involved.
 - `tests/adversarial_rtsp.rs` uses bounded loopback peers in both read modes to cover
   terminal tail flushes, transport-backlog wall placement, RTSP and H.265 allocation
-  limits, reconnect recovery, and recording continuity after sink rejection.
+  limits, reconnect recovery, and recording continuity after sink rejection. Hostile cameras
+  on OS threads check that a camera which stops reading never stalls the runtime thread
+  (a task beside the session ticks with no gap over 500 ms, through the keepalive and the
+  `TEARDOWN`) and that a `TEARDOWN` never contacts an advertised host (Basic, Digest, and a
+  challenged `TEARDOWN`).
+- `tests/log_bounds.rs` installs the daemon's log subscriber and checks that hostile
+  `DESCRIBE` answers (1 MiB of invalid SDP, 18,000 media sections, unusable sections beside
+  the video) log only escaped lines of at most 1 KiB, one per ended session plus retina's
+  one summary. `tests/teardown_bound.rs` drops 100 sessions against a camera that never
+  answers `TEARDOWN` and checks that 64 background tasks remain. Both bind process-wide
+  state, so each is a test binary of its own.
 - Measurements: `docs/research/11-multi-camera-results.md` (six and seven live cameras) and
   `docs/research/12-ingest-cost.md` (CPU per megabit, the read policy, the low-water mark).
 

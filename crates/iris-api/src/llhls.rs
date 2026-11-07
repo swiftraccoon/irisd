@@ -26,7 +26,7 @@ use bytes::Bytes;
 use iris_core::id::StreamKey;
 use iris_core::time::{TIMESCALE, WallUs};
 use iris_ingest::{LiveError, LiveFrame, LiveRing};
-use iris_mp4::init::build_init_segment;
+use iris_mp4::init::{SampleEntry, build_init_segment};
 use serde::Deserialize;
 use tokio::sync::Notify;
 use tokio::time::Instant;
@@ -34,10 +34,10 @@ use tokio_util::sync::CancellationToken;
 
 use crate::auth::AuthContext;
 use crate::error::ApiError;
-use crate::live::encode_live_fragment;
+use crate::live::{encode_live_fragment, same_sample_entry};
 use crate::media_admission;
 use crate::segments::stream_key;
-use crate::state::{ApiState, admitted_media_bytes};
+use crate::state::{ApiState, MediaClass, admitted_media_bytes};
 
 /// Target length of a partial segment in media ticks (0.5 s).
 pub(crate) const PART_TARGET_TICKS: u64 = 45_000;
@@ -137,7 +137,8 @@ struct Inner {
     next_msn: u64,
     next_seq: u32,
     init: Option<Bytes>,
-    init_hash: Option<u32>,
+    /// The sample entry `init` was built from.
+    init_entry: Option<Arc<SampleEntry>>,
     last_decode_time: Option<u64>,
     discontinuity_sequence: u64,
     last_access: Option<Instant>,
@@ -154,12 +155,12 @@ impl Inner {
     }
 
     fn accept_frame(&mut self, frame: Arc<LiveFrame>, waiting_for_sync: &mut bool) {
-        if self.init_hash != Some(frame.sample_entry.hash) {
-            if self.init_hash.is_some() {
+        if !same_sample_entry(self.init_entry.as_ref(), &frame.sample_entry) {
+            if self.init_entry.is_some() {
                 self.discontinuity_sequence = self.discontinuity_sequence.saturating_add(1);
             }
             self.init = Some(build_init_segment(&frame.sample_entry));
-            self.init_hash = Some(frame.sample_entry.hash);
+            self.init_entry = Some(Arc::clone(&frame.sample_entry));
             self.gops.clear();
             self.last_decode_time = None;
             *waiting_for_sync = true;
@@ -221,7 +222,7 @@ impl Inner {
     fn close(&mut self) {
         self.gops.clear();
         self.init = None;
-        self.init_hash = None;
+        self.init_entry = None;
         self.last_decode_time = None;
         self.closed = true;
     }
@@ -593,12 +594,7 @@ pub(crate) async fn init(
     if !ready {
         return Err(ApiError::Unavailable("no frames yet".into()));
     }
-    let permit = media_admission::shared(
-        state
-            .stats
-            .try_media_response()
-            .ok_or_else(|| ApiError::Unavailable("media serving is busy".into()))?,
-    );
+    let permit = state.stats.admit_media(MediaClass::Bounded)?;
     let init = hls
         .inner
         .lock()
@@ -625,12 +621,7 @@ pub(crate) async fn segment(
     if !ready {
         return Err(ApiError::Unavailable("segment not complete".into()));
     }
-    let permit = media_admission::shared(
-        state
-            .stats
-            .try_media_response()
-            .ok_or_else(|| ApiError::Unavailable("media serving is busy".into()))?,
-    );
+    let permit = state.stats.admit_media(MediaClass::Bounded)?;
     let frames = {
         let inner = hls.inner.lock().map_err(|_| ApiError::NotFound)?;
         let gop = inner
@@ -665,12 +656,7 @@ pub(crate) async fn part(
     if !ready {
         return Err(ApiError::Unavailable("part not complete".into()));
     }
-    let permit = media_admission::shared(
-        state
-            .stats
-            .try_media_response()
-            .ok_or_else(|| ApiError::Unavailable("media serving is busy".into()))?,
-    );
+    let permit = state.stats.admit_media(MediaClass::Bounded)?;
     let frames = {
         let inner = hls.inner.lock().map_err(|_| ApiError::NotFound)?;
         let gop = inner
@@ -962,6 +948,87 @@ mod tests {
             duration,
         )])
         .await;
+    }
+
+    /// CRC-32C (Castagnoli, reflected polynomial 0x82F63B78) lookup table.
+    fn crc32c_table() -> [u32; 256] {
+        let mut table = [0u32; 256];
+        for (index, slot) in table.iter_mut().enumerate() {
+            let mut crc = u32::try_from(index).expect("table index fits u32");
+            for _ in 0..8 {
+                crc = if crc & 1 == 0 {
+                    crc >> 1
+                } else {
+                    (crc >> 1) ^ 0x82f6_3b78
+                };
+            }
+            *slot = crc;
+        }
+        table
+    }
+
+    /// Appends four bytes to `prefix` so that the result's CRC-32C is `target`,
+    /// running the register backwards from the target.
+    fn forge_crc32c(prefix: &[u8], target: u32) -> Vec<u8> {
+        let table = crc32c_table();
+        let mut reverse = [0u32; 256];
+        for (index, value) in table.iter().enumerate() {
+            reverse[(value >> 24) as usize] =
+                (value << 8) ^ u32::try_from(index).expect("table index fits u32");
+        }
+        let mut register = 0xffff_ffffu32;
+        for &byte in prefix {
+            register = (register >> 8) ^ table[((register ^ u32::from(byte)) & 0xff) as usize];
+        }
+        let mut back = target ^ 0xffff_ffff;
+        for _ in 0..4 {
+            back = (back << 8) ^ reverse[(back >> 24) as usize];
+        }
+        let mut forged = prefix.to_vec();
+        forged.extend_from_slice(&(back ^ register).to_le_bytes());
+        forged
+    }
+
+    fn colliding_entries() -> (Arc<SampleEntry>, Arc<SampleEntry>) {
+        let first = b"\0\0\0\x10hvc1\0\0\0\0\0\0\0\0parameter-set-epoch-A".to_vec();
+        let target = iris_mp4::crc::crc32c(&first);
+        let second = forge_crc32c(
+            b"\0\0\0\x10hvc1\0\0\0\0\0\0\0\0parameter-set-epoch-B",
+            target,
+        );
+        let first = SampleEntry::new(Bytes::from(first), "hvc1".into(), 16, 16);
+        let second = SampleEntry::new(Bytes::from(second), "hvc1".into(), 16, 16);
+        assert_ne!(first.bytes, second.bytes);
+        assert_eq!(first.hash, second.hash, "forged CRC-32C collision");
+        (Arc::new(first), Arc::new(second))
+    }
+
+    #[test]
+    fn a_crc_colliding_sample_entry_still_rebuilds_the_init_segment() {
+        let (first, second) = colliding_entries();
+        let with_entry = |decode_time: u64, entry: &Arc<SampleEntry>| {
+            let mut next = (*frame(decode_time, true)).clone();
+            next.sample_entry = Arc::clone(entry);
+            Arc::new(next)
+        };
+        let mut inner = Inner::default();
+        let mut waiting_for_sync = true;
+        inner.accept_frame(with_entry(0, &first), &mut waiting_for_sync);
+        assert_eq!(inner.init, Some(build_init_segment(&first)));
+        assert_eq!(inner.discontinuity_sequence, 0);
+
+        inner.accept_frame(with_entry(3_000, &second), &mut waiting_for_sync);
+        assert_eq!(
+            inner.init,
+            Some(build_init_segment(&second)),
+            "equal hashes must not keep the previous init segment"
+        );
+        assert_eq!(inner.discontinuity_sequence, 1);
+        assert_eq!(inner.gops.len(), 1);
+        assert!(Arc::ptr_eq(
+            &inner.gops[0].frames[0].0.sample_entry,
+            &second
+        ));
     }
 
     #[test]

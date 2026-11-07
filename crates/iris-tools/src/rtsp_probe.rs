@@ -8,6 +8,7 @@ use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::io::{Read as _, Write as _};
 use std::net::{IpAddr, SocketAddr, TcpStream};
+use std::os::unix::fs::MetadataExt as _;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::Context;
@@ -17,6 +18,7 @@ use md5::{Digest, Md5};
 use iris_tools::probe_parser::{rtp_payload_bounds, rtsp_response_bounds};
 
 use crate::logs::terminal_safe;
+use crate::secret::{Password, password_from_env};
 
 const MAX_RTSP_HEADER: usize = 64 * 1024;
 const MAX_RTSP_BODY: usize = 4 * 1024 * 1024;
@@ -45,21 +47,25 @@ fn bounded_float(value: &str, min: f64, max: f64, label: &str) -> Result<f64, St
     }
 }
 
-/// Arguments of `rtsp-probe`.
+/// Arguments of `rtsp-probe`. `Debug` redacts the password.
 #[derive(Debug, Parser)]
 pub struct Args {
+    /// Environment variable holding the RTSP password, which stays out of
+    /// process listings and shell history.
+    #[arg(long = "password-env", value_name = "VAR", value_parser = password_from_env)]
+    password: Password,
     /// Camera host.
     host: String,
     /// RTSP user.
     user: String,
-    /// RTSP password (an argument so nothing secret is stored in a file).
-    password: String,
     /// How long to stream.
     #[arg(value_parser = stream_seconds)]
     seconds: f64,
     /// The `subtype` of the vendor's `realmonitor` path.
     subtype: String,
-    /// Where a sample of the metadata track is written.
+    /// Where a sample of the metadata track is written: an absent path, or a
+    /// caller-owned single-link regular file that is replaced. Symlinks, FIFOs,
+    /// and devices are refused.
     meta_out: std::path::PathBuf,
     /// `GET_PARAMETER` keepalive period in seconds; 0 disables it.
     #[arg(default_value_t = 25.0, value_parser = keepalive_seconds)]
@@ -346,6 +352,35 @@ struct Rtp {
     ext: u64,
 }
 
+/// Writes camera-controlled `bytes` to `path` without following a symlink,
+/// blocking on a FIFO, or writing through another name: the path must be absent,
+/// or name a caller-owned regular file with a single link, which is then truncated.
+fn write_output(path: &std::path::Path, bytes: &[u8]) -> anyhow::Result<()> {
+    let fd = rustix::fs::open(
+        path,
+        rustix::fs::OFlags::WRONLY
+            | rustix::fs::OFlags::CREATE
+            | rustix::fs::OFlags::NOFOLLOW
+            | rustix::fs::OFlags::NONBLOCK
+            | rustix::fs::OFlags::CLOEXEC,
+        rustix::fs::Mode::from_raw_mode(0o644),
+    )
+    .with_context(|| format!("opening {} without following links", path.display()))?;
+    let mut file = std::fs::File::from(fd);
+    let metadata = file.metadata()?;
+    anyhow::ensure!(
+        metadata.is_file()
+            && metadata.nlink() == 1
+            && metadata.uid() == rustix::process::getuid().as_raw(),
+        "{} must be a new file or a caller-owned single-link regular file",
+        path.display()
+    );
+    // Truncate only after the checks, so a hard link to another file survives.
+    file.set_len(0)?;
+    file.write_all(bytes)
+        .with_context(|| format!("writing {}", path.display()))
+}
+
 /// Runs the tool.
 #[allow(clippy::too_many_lines)]
 pub fn run(args: &Args) -> anyhow::Result<()> {
@@ -385,7 +420,7 @@ pub fn run(args: &Args) -> anyhow::Result<()> {
         nonce: None,
         session: None,
         user: args.user.clone(),
-        password: args.password.clone(),
+        password: args.password.expose().to_owned(),
         deadline: Instant::now() + Duration::from_secs(30),
         io_timeout,
     };
@@ -808,7 +843,7 @@ pub fn run(args: &Args) -> anyhow::Result<()> {
         }
         println!("== ONVIF metadata track: pkts={meta_pkts} bytes={meta_bytes}");
         if !meta_sample.is_empty() {
-            std::fs::write(&args.meta_out, &meta_sample)?;
+            write_output(&args.meta_out, &meta_sample)?;
             let text: String = String::from_utf8_lossy(&meta_sample)
                 .split_whitespace()
                 .collect::<Vec<_>>()
@@ -855,6 +890,85 @@ mod tests {
 
         let valid = [0x80, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 42];
         assert_eq!(rtp_payload_bounds(&valid).unwrap(), (12, 13));
+    }
+
+    #[test]
+    fn the_password_comes_from_the_environment_and_stays_out_of_debug() {
+        let expected = std::env::var("PATH").expect("tests run with PATH set");
+        let args = Args::try_parse_from([
+            "rtsp-probe",
+            "--password-env",
+            "PATH",
+            "192.0.2.10",
+            "user",
+            "90",
+            "0",
+            "meta.xml",
+        ])
+        .unwrap();
+        assert_eq!(args.password.expose(), expected);
+        assert_eq!(args.user, "user");
+        assert!(!format!("{args:?}").contains(&expected));
+
+        let error = Args::try_parse_from([
+            "rtsp-probe",
+            "--password-env",
+            "IRIS_TOOLS_TEST_UNSET_PASSWORD_8F3A",
+            "192.0.2.10",
+            "user",
+            "90",
+            "0",
+            "meta.xml",
+        ])
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("IRIS_TOOLS_TEST_UNSET_PASSWORD_8F3A") && error.contains("not set"),
+            "{error}"
+        );
+        assert!(
+            Args::try_parse_from(["rtsp-probe", "192.0.2.10", "user", "90", "0", "meta.xml"])
+                .is_err(),
+            "the password variable is required"
+        );
+    }
+
+    #[test]
+    fn metadata_output_refuses_links_fifos_and_shared_files() {
+        let directory = tempfile::tempdir().unwrap();
+        let victim = directory.path().join("victim.conf");
+        std::fs::write(&victim, b"original contents").unwrap();
+
+        let linked = directory.path().join("linked.xml");
+        std::os::unix::fs::symlink(&victim, &linked).unwrap();
+        assert!(write_output(&linked, b"<camera-controlled/>").is_err());
+
+        let hard = directory.path().join("hard.xml");
+        std::fs::hard_link(&victim, &hard).unwrap();
+        assert!(write_output(&hard, b"<camera-controlled/>").is_err());
+        assert_eq!(std::fs::read(&victim).unwrap(), b"original contents");
+
+        let fifo = directory.path().join("fifo.xml");
+        rustix::fs::mkfifoat(
+            rustix::fs::CWD,
+            &fifo,
+            rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR,
+        )
+        .unwrap();
+        let started = Instant::now();
+        assert!(write_output(&fifo, b"<camera-controlled/>").is_err());
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "a FIFO never blocks"
+        );
+
+        let regular = directory.path().join("meta.xml");
+        std::fs::write(&regular, b"a much longer earlier sample").unwrap();
+        write_output(&regular, b"<new/>").unwrap();
+        assert_eq!(std::fs::read(&regular).unwrap(), b"<new/>");
+        let fresh = directory.path().join("fresh.xml");
+        write_output(&fresh, b"<fresh/>").unwrap();
+        assert_eq!(std::fs::read(&fresh).unwrap(), b"<fresh/>");
     }
 
     #[test]
