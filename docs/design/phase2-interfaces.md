@@ -23,14 +23,22 @@ impl Event { pub fn bounded(self) -> Self; } // bounds kind; validates/quotes/bo
 // iris_core::config additions
 pub struct StorageConfig { pub video_roots: Vec<PathBuf>, pub state_dir: PathBuf,
     pub min_free_percent: u8, /* existing fields unchanged */ }
-pub struct ApiConfig { pub listen: SocketAddr, pub tokens: Vec<String> }   // Config.api
+pub struct ApiConfig { pub listen: SocketAddr, pub tokens: Vec<String>,     // Config.api
+    pub allow_unauthenticated: bool /* false; only with no tokens on a loopback listener */ }
 pub struct CameraConfig { /* existing */ pub http_port: Option<u16> /* 80, or 443 with https */, pub https: bool, pub tls_verify: bool /* true */, pub retention_days: Option<u32>,
     pub events: Vec<EventSource> /* default [] */ }
 impl CameraConfig { pub fn host(&self) -> Option<String> /* host part of rtsp_url */ }
 ```
 
 Configuration loading rejects repeated camera ids, repeated recorded stream kinds or event
-sources within each camera, and `storage.min_free_percent` outside 0..=100; zero disables that floor.
+sources within each camera, storage knobs outside their ranges (`min_free_percent` 0..=50,
+where zero disables that floor; `sync_interval_ms` 100..=60,000; `rotate_secs` 60..=86,400;
+`rotate_bytes` 64 MiB..=64 GiB; `preallocate_bytes` up to the smaller of `rotate_bytes` and
+4 GiB; `quota_gib` at least 1; camera `retention_days` 1..=106,751,991), API tokens shorter
+than 32 visible ASCII characters or equal to the example placeholder, an empty token list
+without `allow_unauthenticated`, and that switch with tokens or on a non-loopback listener.
+Token errors name the entry's position, never its value, and `CameraConfig`'s `Debug` output
+redacts the password.
 Parse failures expose only a generic syntax/schema description and a safe byte span, with
 no input text or value-bearing parser message in display, debug, or error sources.
 `CameraConfig::host` returns a bare host, including IPv6 without brackets. Authorities end
@@ -72,9 +80,11 @@ pub struct EventProtection { pub id: EventId, pub camera: CameraId,
 pub struct RetentionPage { pub rows: Vec<SegmentRow>,
     pub next: Option<(WallUs, SegmentId)>, pub scanned: usize }
 pub struct CameraRow { pub id: CameraId, pub name: String, pub vendor: Option<String> }
-pub struct CatalogStats { pub segments: u64, pub sealed_bytes: u64, pub events: u64,
+pub struct CatalogStats { pub segments: u64, pub sealed_bytes: u64,
+    pub deleting_segments: u64, pub deleting_bytes: u64, pub events: u64,
     pub event_bytes: u64, pub retained_events: u64, pub pruned_events: u64,
     pub db_bytes: u64, pub wal_bytes: u64 }
+pub const OPEN_SEGMENT_GRACE: Duration;   // 30 s: how far an unsealed row extends past its last progress
 pub enum DeleteMarkResult { Marked, Protected, NotFound }
 
 pub enum Change {   // fire-and-forget, applied in order, batched into one transaction per 100 ms
@@ -92,7 +102,7 @@ impl CatalogHandle {
     pub async fn register_recording_root(&self, path: &Path, identity: &str) -> Result<(), CatalogError>;
     pub async fn configure_video_roots(&self, roots: &[PathBuf]) -> Result<(), CatalogError>;
     pub async fn cameras(&self) -> Result<Vec<CameraRow>, CatalogError>;
-    pub async fn segments(&self, key: &StreamKey, range: TimeRange) -> Result<Vec<SegmentRow>, CatalogError>; // overlapping, by wall_start
+    pub async fn segments(&self, key: &StreamKey, range: TimeRange) -> Result<Vec<SegmentRow>, CatalogError>; // overlapping, by wall_start; unsealed rows need a fragment and end at MIN(now, last progress + OPEN_SEGMENT_GRACE)
     pub async fn segment(&self, id: SegmentId) -> Result<Option<SegmentRow>, CatalogError>;
     pub async fn segment_by_path(&self, path: &Path) -> Result<Option<SegmentRow>, CatalogError>;
     pub async fn writing_segments(&self) -> Result<Vec<SegmentRow>, CatalogError>;  // sealed = false
@@ -101,7 +111,7 @@ impl CatalogHandle {
     pub async fn oldest_sealed(&self, limit: usize) -> Result<Vec<SegmentRow>, CatalogError>;
     pub async fn oldest_sealed_after(&self, after: (WallUs, SegmentId), limit: usize) -> Result<Vec<SegmentRow>, CatalogError>;
     pub async fn mark_deleting(&self, id: SegmentId) -> Result<(), CatalogError>;
-    pub async fn mark_empty_writing_deleting(&self, id: SegmentId) -> Result<DeleteMarkResult, CatalogError>;
+    pub async fn mark_empty_writing_deleting(&self, id: SegmentId) -> Result<DeleteMarkResult, CatalogError>; // any open row, whatever its fragment count
     pub async fn mark_deleting_if_unprotected(&self, id: SegmentId, now: WallUs,
         margin: Duration) -> Result<DeleteMarkResult, CatalogError>;
     pub async fn mark_deleting_if_unprotected_at_root(&self, id: SegmentId,
@@ -185,9 +195,12 @@ and expired history before checking overlap.
 `mark_deleting_if_unprotected` repeats the active-protection predicate and records deletion
 intent in one FULL-synchronous transaction. Callers mutate files only after `Marked`.
 Root assignment and startup writing/deleting scans use stable pages of at most 512 rows.
-Existing non-null root assignments are preserved. Empty open rows enter the same FULL-synchronous
-deletion-intent ownership before filesystem removal, and exact path lookups avoid a global
-in-memory deletion set.
+Non-null root assignments are preserved. An open row whose pair is empty or confirmed
+absent enters the same FULL-synchronous deletion-intent ownership before filesystem removal,
+whatever its fragment count, and exact path lookups avoid a global in-memory deletion set.
+Every write transaction begins `IMMEDIATE`, so the busy timeout covers lock acquisition, and
+migration rereads the schema version under the write lock. Open creates missing parents 0700
+and a missing database file 0600.
 
 ## `iris-store` additions
 
@@ -288,38 +301,53 @@ pub struct ApiState {
     pub catalog: CatalogHandle,
     pub live: Arc<LiveRegistry>,                 // LiveRegistry::get(&StreamKey) -> Option<LiveRing>, insert(key, ring)
     pub events: tokio::sync::broadcast::Sender<Arc<Event>>,
-    pub tokens: Vec<String>,                     // bearer tokens; empty = unauthenticated (LAN dev only)
+    pub tokens: Vec<String>,                     // bearer tokens; empty only with api.allow_unauthenticated on a loopback listener
+    pub recording_roots: Vec<ApprovedRoot>,      // media is opened only beneath the root owning a row
+    pub public_metrics: bool,                    // serve /metrics without a token ([api] public_metrics)
     pub snapshot_sources: HashMap<CameraId, SnapshotSource>,   // host, port, https, tls_verify, username, password for snapshot.cgi
     pub active_cameras: HashMap<CameraId, ActiveCamera>,       // current config only; catalog camera rows remain historical
-    pub stats: Arc<ApiStats>,
+    pub stats: Arc<ApiStats>,                    // counters and admission budgets; ApiStats::with_media_limits(streaming, bounded)
     pub started: WallUs,                         // diagnostic wall timestamp
     pub started_monotonic: Instant,              // health/metrics uptime
     pub shutdown: CancellationToken,             // ends long-lived WebSocket sessions
 }
+pub struct ServeLimits {                         // Default: 256 connections, 10 s request head, 30 s write stall
+    pub max_connections: usize,
+    pub header_read_timeout: Duration,
+    pub write_stall_timeout: Duration,
+}
+pub const MAX_LIVE_MESSAGE_BYTES: usize;         // 1 + 16 MiB; also MSG_INIT (0x01), MSG_FRAGMENT (0x02)
 pub fn router(state: Arc<ApiState>) -> axum::Router;
 pub async fn bind(listen: SocketAddr) -> io::Result<tokio::net::TcpListener>;
-pub async fn serve_listener(listener: tokio::net::TcpListener, router: axum::Router, shutdown: CancellationToken) -> io::Result<()>;
-pub async fn serve(listen: SocketAddr, router: axum::Router, shutdown: CancellationToken) -> io::Result<()>;
+pub async fn serve_listener(listener: tokio::net::TcpListener, router: axum::Router, limits: ServeLimits, shutdown: CancellationToken) -> io::Result<()>;
+pub async fn serve(listen: SocketAddr, router: axum::Router, limits: ServeLimits, shutdown: CancellationToken) -> io::Result<()>;
 ```
+
+`serve_listener` speaks HTTP/1.1 only and takes one of `limits.max_connections` slots before
+each `accept`; the slot stays with the connection, including after a WebSocket upgrade. A
+request head must arrive within `header_read_timeout` (idle kept-alive connections close after
+it too), and a response write without progress for `write_stall_timeout` closes the connection.
+Cancelling `shutdown` stops accepting, finishes in-flight responses, and returns when every
+connection has closed.
 
 | Method | Path | Behaviour |
 |---|---|---|
 | GET | `/api/health` | unauthenticated; JSON `{status, uptime_s, version}` |
-| GET | `/metrics` | unauthenticated Prometheus text: `ApiStats`, event-WebSocket lagged-message count, catalog queue count/bytes and peaks, coalescing/rejections/reconciliation, failed change batches, event state, and database/WAL sizes |
+| GET | `/metrics` | Prometheus text, root bearer token required unless `public_metrics`: `ApiStats` (including media, WebSocket, and snapshot admission rejections, rows outside the approved roots, and oversized live closes), event-WebSocket lagged-message count, catalog queue count/bytes and peaks, coalescing/rejections/reconciliation, failed change batches, event state, and database/WAL sizes |
 | GET | `/api/cameras` | JSON list from the running configuration; historical catalog rows are not active cameras |
 | GET | `/api/cameras/{camera}` | configured camera plus health for each recorded stream |
 | GET | `/api/streams/{camera}/{kind}/segments?from=<rfc3339\|unix_us>&to=…` | JSON `SegmentRow`s |
-| GET | `/api/segments/{id}/file.mp4` | the recording file with `Range` support, `video/mp4`; full and range bodies stop at one validated complete sidecar extent; the extension keeps ffmpeg's HLS demuxer (`allowed_segment_extensions`) happy |
+| GET | `/api/segments/{id}/file.mp4` | the recording file with `Range` support, `video/mp4`, served from the descriptor its sidecar was validated against beneath the owning approved root; full and range bodies stop at one validated complete sidecar extent; a row outside every root is 404; the extension keeps ffmpeg's HLS demuxer (`allowed_segment_extensions`) happy |
 | GET | `/api/streams/{camera}/{kind}/hls/vod.m3u8?from&to` | byte-range VOD playlist across segments: one `EXT-X-MAP` per segment (`BYTERANGE="init_len@0"`), three fragments per media segment grouped at sync fragments, `EXT-X-DISCONTINUITY` before a segment with `discontinuity` or a different sample entry hash, fragments read from each segment's sidecar (`iris_mp4::index::read_index`); clipping includes preceding sync preroll; `#IRIS-FRAGMENT` comments describe the served fragments |
 | GET | `/api/streams/{camera}/{kind}/export.mp4?from&to` | streamed fMP4: the first segment's init with a version-1 `elst` trimming presentation to `[from, to)`, then whole fragments including sync preroll, rebased onto a timeline from zero with fresh sequence numbers and trailers; HTTP 400 before streaming if actual initialization bytes differ, including adopted files without catalog codec hashes; `Content-Disposition: attachment` |
 | GET | `/api/streams/{camera}/{kind}/hls/live.m3u8` | LL-HLS from the live ring, with blocking reload and memory-backed parts and segments; non-increasing decode timestamps resume at sync with `EXT-X-DISCONTINUITY`, and `EXT-X-DISCONTINUITY-SEQUENCE` preserves the epoch as entries leave the playlist |
 | GET | `/api/streams/{camera}/{kind}/hls/{init.mp4,seg/{msn}/media.m4s,part/{msn}/{index}/part.m4s}` | memory-backed LL-HLS child resources named by the live playlist |
 | GET | `/api/streams/{camera}/{kind}/keyframe?t=...` | initialization plus one bounded single-sample sync fragment at or before the requested wall time |
-| GET (WebSocket) | `/api/streams/{camera}/{kind}/live` | binary frames: message type byte `0x01` + init segment, then `0x02` + one `prft`-less `moof`+`mdat` per frame built with `iris_mp4::fragment::encode_fragment` on a single sample (sequence counts up, `decode_time` from the frame); on `Lagged`, resend init and resume at the next sync frame |
+| GET (WebSocket) | `/api/streams/{camera}/{kind}/live` | binary frames: message type byte `0x01` + init segment, then `0x02` + one complete `prft` + `moof` + `mdat` + trailer fragment per frame built with `iris_mp4::fragment::encode_fragment` on a single sample (sequence counts up, `decode_time` from the frame); every message is at most `MAX_LIVE_MESSAGE_BYTES` (1 + 16 MiB); on `Lagged` or an oversized dependent frame, resend init and resume at the next sync frame; an oversized sync frame closes with 1009 |
 | GET (WebSocket) | `/api/events` | JSON `Event` per message as published; a receiver that lags the bounded ring is closed with code 1013 and a bounded gap/retry reason, then may list the relevant catalog window |
 | GET | `/api/events?camera&from&to&limit&after_us&after_id` | bounded JSON `EventRow` pages; cursor values appear together and are exclusive |
 | POST | `/api/events/{id}/retain` | set or clear the bounded retention horizon for the event |
-| GET | `/api/cameras/{id}/snapshot.jpg` | redirect-free proxied `GET /cgi-bin/snapshot.cgi?channel=1` with digest auth, 5 s timeout, an 8 MiB streamed ceiling, JPEG marker validation, and fixed `image/jpeg`, `nosniff`, `no-store` response policy |
+| GET | `/api/cameras/{id}/snapshot.jpg` | redirect-free proxied `GET /cgi-bin/snapshot.cgi?channel=1` with digest auth, 5 s timeout, an 8 MiB streamed ceiling, one request per camera in flight (503 with `Retry-After: 1` otherwise), a body starting `FF D8 FF` with an `FF D9` in its last 64 KiB served through that marker, and fixed `image/jpeg`, `nosniff`, `no-store` response policy |
 
 Auth: clients send the root credential only as `Authorization: Bearer <token>`, including for the
 initial WebSocket or playlist request. Authenticated playlists mint bounded tamper-resistant
@@ -337,15 +365,26 @@ table. An unrepresentable span or default start returns HTTP 400. Malformed Unic
 return HTTP 400.
 Event pages use the final row's `nvr_time_us` and positive `id` as the paired continuation,
 so tied timestamps are neither repeated nor omitted. Catalog admission overload and retained
-event capacity exhaustion return HTTP 503.
+event capacity exhaustion return HTTP 503; a full API admission budget returns HTTP 503 with
+`Retry-After: 1` (`ApiError::Busy`). HTTP 500 bodies are `{"error":"internal error",
+"request_id":<n>}`, with the detail logged under the same id.
 Every live or event WebSocket send observes daemon shutdown and has a two-second deadline. Client
 gauges use drop guards, so timeout, cancellation, peer close, and ordinary completion release them.
+At most 64 live sessions (16 per stream) and 32 event sessions are admitted; their slots are taken
+before the upgrade. Inbound messages and frames are limited to 4 KiB, and any data message closes
+the session with 1008.
 
-Disk-backed requests validate bounded sidecars against catalog/header/media identity and capture a
-stable complete extent. Limits are 4,096 rows, 131,072 records per sidecar, 100,000 selected
-records, a 16 MiB playlist, a 4 MiB init, and a 66 MiB stored fragment; eight such responses run
-process-wide, with admission held through detached sidecar/read/encode work and final
-response-buffer/body drop. Raw bodies reserve their capacity-one channel before each bounded read
+Disk-backed requests open media and sidecar beneath the approved root that owns the row, validate
+the sidecar read from its descriptor against catalog/header/media identity (a zero header run or
+sample-entry hash, as recovery rebuilds it, is unknown), and capture a stable complete extent with
+the media's device and inode; exports and keyframes reopen beneath the root and require that inode.
+Limits are 4,096 rows, 131,072 records per sidecar, 100,000 selected
+records, a 16 MiB playlist, a 4 MiB init, and a 66 MiB stored fragment. Media responses are
+admitted in two process-wide classes, streaming (whole or open-ended files, ranges above 1 MiB,
+exports; `[api] max_streaming_media`, default 8) and bounded (VOD, keyframes, LL-HLS resources,
+ranges of at most 1 MiB; `[api] max_bounded_media`, default 32), with admission held through
+detached sidecar/read/encode work and final response-buffer/body drop. Raw bodies reserve their
+capacity-one channel before each bounded read
 and attach admission to every emitted chunk. Export reserves its sole queue slot before
 materializing the next fragment. Fragment transforms verify source CRC and parsed
 timing/sample/sync facts. A VOD omission carries one pending discontinuity to the next usable row.
@@ -365,8 +404,11 @@ map each fragment to its own wall time, preserving gaps and avoiding cumulative 
 ```
 irisd run --config <toml>
 ```
-Startup order: load and fully validate config/derived capacities/timers → arm CPU sampling,
-tickers, SIGTERM, and SIGINT → prepare the state directory → synchronously migrate
+Startup order: load and fully validate config/derived capacities/timers (warning when the file
+is accessible beyond the daemon's account and group) → arm CPU sampling, tickers, SIGTERM, and
+SIGINT → raise the soft descriptor limit to the hard limit → prepare the state directory
+(created 0700; directory and catalog files checked for owner, type, and link count, and group
+or other permissions removed) → synchronously migrate
 `state_dir/irisd.db` and resolve each configured root expectation → admit roots by no-follow
 marker plus physical identity and reject aliases → apply Landlock before any thread → open the
 catalog worker → register those identities → assign only previously unassigned rows in bounded
@@ -378,10 +420,12 @@ a catalog observer → build live rings → spawn ingest tasks (`run_stream`) an
 (`run_dahua_cgi` / `run_onvif_pullpoint` per `camera.events`) → serve the already-bound listener
 → `sd_notify(READY=1)`. Reconciliation extends the startup deadline on elapsed cadence across
 catalog pages, entry enumeration, and media scans, starting before the first file. Landlock permits reading the config, reading/writing video roots and state
-dir, connecting to configured camera ports, and binding the API port. Then every 30 s:
+dir, connecting to configured camera ports, and binding the API port; its ABI 1 filesystem and
+ABI 4 TCP rights are required unless `--no-sandbox`, and later rights are best effort. Then every 30 s:
 `WATCHDOG=1` only if every ingest task
 produced a frame or reconnected in the interval; every 60 s: retention starts with one bounded
-event-maintenance step, then applies free-space, quota, and camera-age policies through indexed
+event-maintenance step and a retry of at most 16 earlier deletion intents (or 100 ms) beneath
+approved roots, then applies free-space, quota, and camera-age policies through indexed
 root-aware pages. A pass stops at 512 deletion attempts, 64 pages, 1,024 candidate rows, or
 one second; candidate rows count raw indexed input before protection filtering. Its minimal
 retained-event projection stops at 2,048 rows or 100 ms and continues by retention deadline.
@@ -392,14 +436,19 @@ progress only after complete returned-candidate consumption. Satisfied root/quot
 reset; age wraps only after indexed exhaustion. Free-space, quota, root, and age policy changes
 prune or reset their bounded state.
 `mark_deleting_if_unprotected` → `Marked` → `remove_segment_beneath` → `delete_segment`; other
-outcomes leave the files untouched. Failed transitions remain for startup and do not count as
+outcomes leave the files untouched, and a row outside its root's layout is never marked. Failed
+transitions remain for the next pass's retry and for startup, and do not count as
 quota/deletion progress. Reporting, retention, and self-check execute as owned single-flight jobs;
-blocking filesystem operations do not run on the monitor thread, and a timed-out uninterruptible
-operation forces bounded process exit rather than relaunch. Shutdown on SIGTERM/SIGINT uses one
+blocking filesystem operations do not run on the monitor thread. A report or retention job past
+its 30 s deadline keeps its state and counts a timeout; its owner starts no further job while a
+raw filesystem call of the dropped job is in flight, and a call still in flight ten minutes later
+stops the daemon. Shutdown on SIGTERM/SIGINT uses one
 25-second absolute budget: emit `STOPPING=1`, cancel once, drain all producers against one shared
 grace, then abort-and-observe any remainder and attempt writer, API, and catalog closure exactly
 once before returning the first saved error.
 
 Packaging: `packaging/systemd/irisd.service` (hardening set from
-`../research/03-language-runtime.md` §5, `Type=notify`, `WatchdogSec=60`), `packaging/sysusers.d/irisd.conf`,
+`../research/03-language-runtime.md` §5, `Type=notify`, `WatchdogSec=60`, `StateDirectoryMode=0700`,
+`LimitNOFILE=65536`, `SyslogLevelPrefix=no`, and `IPAddressDeny=any` with a loopback-only
+`IPAddressAllow=` that a drop-in extends to the camera subnet), `packaging/sysusers.d/irisd.conf`,
 `packaging/README.md`.

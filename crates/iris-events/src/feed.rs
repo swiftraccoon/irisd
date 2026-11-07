@@ -74,18 +74,17 @@ enum SessionError {
 /// Runs the Dahua CGI event feed for one camera until `shutdown` is cancelled.
 ///
 /// Reconnects with exponential backoff on errors, stalls, and end of stream.
-/// Credentials are sent only as HTTP digest responses and never logged.
+/// Credentials are sent only as HTTP digest responses and never logged. A
+/// redirect is never followed: it fails the attachment with its status, so a
+/// camera that redirects HTTP to HTTPS needs `https = true` in its
+/// configuration.
 pub async fn run_dahua_cgi(
     endpoint: CameraEndpoint,
     sink: Arc<dyn EventSink>,
     stats: Arc<EventStats>,
     shutdown: CancellationToken,
 ) {
-    let client = match reqwest::Client::builder()
-        .danger_accept_invalid_certs(!endpoint.tls_verify)
-        .connect_timeout(Duration::from_secs(10))
-        .build()
-    {
+    let client = match cgi_client(&endpoint) {
         Ok(client) => client,
         Err(error) => {
             warn!(camera = %endpoint.camera, %error, "cannot build HTTP client; event feed disabled");
@@ -130,6 +129,16 @@ pub async fn run_dahua_cgi(
         }
     }
     debug!(camera = %endpoint.camera, "event feed stopped");
+}
+
+/// The HTTP client of the CGI feed: the camera's certificate policy, a connect
+/// bound, and no redirects, so a camera cannot steer requests elsewhere.
+fn cgi_client(endpoint: &CameraEndpoint) -> Result<reqwest::Client, reqwest::Error> {
+    reqwest::Client::builder()
+        .danger_accept_invalid_certs(!endpoint.tls_verify)
+        .connect_timeout(Duration::from_secs(10))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
 }
 
 /// Runs one feed session, counting the error that ends it.
@@ -288,6 +297,60 @@ mod tests {
         assert_eq!(parts, [b"Heartbeat".to_vec()]);
         deadline.observe(near_deadline, parts.len());
         assert_eq!(deadline.deadline(), near_deadline + STALL);
+    }
+
+    #[tokio::test]
+    async fn camera_redirects_are_never_followed() {
+        let sink = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let sink_address = sink.local_addr().unwrap();
+        let camera = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let camera_address = camera.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = camera.accept().await.unwrap();
+            let mut request = [0; 1_024];
+            assert!(socket.read(&mut request).await.unwrap() > 0);
+            tokio::io::AsyncWriteExt::write_all(
+                &mut socket,
+                format!(
+                    "HTTP/1.1 302 Found\r\nLocation: http://{sink_address}/internal?x=1\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        });
+        let endpoint = CameraEndpoint {
+            camera: "cam1".parse().unwrap(),
+            host: camera_address.ip().to_string(),
+            http_port: camera_address.port(),
+            https: false,
+            tls_verify: true,
+            username: "user".to_owned(),
+            password: "password".to_owned(),
+        };
+        let url = format!(
+            "{}/cgi-bin/eventManager.cgi?action=attach",
+            endpoint.base_url()
+        );
+        let result = get_with_digest(
+            &cgi_client(&endpoint).unwrap(),
+            &url,
+            "/cgi-bin/eventManager.cgi?action=attach",
+            &mut DigestAuth::new("user", "password"),
+        )
+        .await;
+        assert!(
+            matches!(result, Err(SessionError::Status(StatusCode::FOUND))),
+            "{:?}",
+            result.map(|response| response.status())
+        );
+        assert!(
+            timeout(Duration::from_millis(200), sink.accept())
+                .await
+                .is_err(),
+            "the redirect target received a request"
+        );
+        server.await.unwrap();
     }
 
     #[tokio::test]

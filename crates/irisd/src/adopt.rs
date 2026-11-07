@@ -13,10 +13,11 @@ use iris_core::time::WallUs;
 use iris_mp4::index::{
     IndexHeader, IndexRecord, MAX_PERSISTED_INDEX_RECORDS, read_index_file_bound_to_media,
 };
-use iris_mp4::reader::{ScanOptions, ScanReport, scan};
-use iris_store::recover::{RecoverError, recover_segment_beneath};
+use iris_mp4::reader::{ScanOptions, ScanReport, ScanStop, scan_with_limit};
+use iris_store::recover::{IndexBinding, RecoverError, RecoveryReport, recover_segment_beneath};
 use iris_store::{
-    ApprovedRoot, open_approved_root_directory, open_segment_pair_beneath, remove_segment_beneath,
+    ApprovedRoot, open_approved_root_directory, open_segment_beneath, open_segment_pair_beneath,
+    remove_segment_beneath,
 };
 use tracing::{debug, info, warn};
 
@@ -231,7 +232,7 @@ pub fn summarize_from_index(path: &Path) -> Option<ScanSummary> {
     let mut media = File::open(path).ok()?;
     let index = File::open(path.with_extension("idx")).ok()?;
     let media_len = media.metadata().ok()?.len();
-    let report = scan_authoritative(&mut media).ok()?;
+    let report = scan_authoritative(&mut media, MAX_PERSISTED_INDEX_RECORDS).ok()?;
     let (header, records) =
         read_index_file_bound_to_media(index, MAX_PERSISTED_INDEX_RECORDS, &report, media_len)
             .ok()??;
@@ -274,13 +275,14 @@ fn summarize_validated_index(
     })
 }
 
-fn scan_authoritative(media: &mut File) -> std::io::Result<ScanReport> {
-    scan(
+fn scan_authoritative(media: &mut File, max_fragments: usize) -> std::io::Result<ScanReport> {
+    scan_with_limit(
         std::io::BufReader::new(media),
         ScanOptions {
             verify_crc: false,
             collect_samples: false,
         },
+        max_fragments,
     )
 }
 
@@ -320,7 +322,7 @@ pub fn scan_summary(path: &Path) -> anyhow::Result<Option<ScanSummary>> {
 
 #[cfg(test)]
 fn scan_summary_file(file: File, display_path: &Path) -> anyhow::Result<Option<ScanSummary>> {
-    let report = scan(
+    let report = iris_mp4::reader::scan(
         std::io::BufReader::new(file),
         ScanOptions {
             verify_crc: false,
@@ -363,13 +365,30 @@ fn summarize_report(report: &ScanReport) -> anyhow::Result<Option<ScanSummary>> 
 }
 
 fn summarize_open_pair(
-    mut media: File,
+    media: File,
     index: Option<File>,
     display_path: &Path,
 ) -> anyhow::Result<Option<ScanSummary>> {
+    summarize_open_pair_limited(media, index, display_path, MAX_PERSISTED_INDEX_RECORDS)
+}
+
+/// Summarises a pair whose media may hold at most `max_fragments` fragments.
+/// A file beyond the limit cannot be described by one sidecar, so it is
+/// refused rather than adopted as a shortened prefix.
+fn summarize_open_pair_limited(
+    mut media: File,
+    index: Option<File>,
+    display_path: &Path,
+    max_fragments: usize,
+) -> anyhow::Result<Option<ScanSummary>> {
     let media_len = media.metadata()?.len();
-    let report = scan_authoritative(&mut media)
+    let report = scan_authoritative(&mut media, max_fragments)
         .with_context(|| format!("scanning {}", display_path.display()))?;
+    if let Some(ScanStop::FragmentLimit { limit, .. }) = report.stop {
+        anyhow::bail!(
+            "holds more than {limit} fragments, more than one sidecar index may describe; not adopted"
+        );
+    }
     if let Some(index) = index {
         match read_index_file_bound_to_media(index, MAX_PERSISTED_INDEX_RECORDS, &report, media_len)
         {
@@ -392,11 +411,19 @@ fn summarize_open_pair(
 
 /// Recovers open segments under available recording roots. Rows on unavailable
 /// roots or behind lookup errors remain for a later startup.
+///
+/// Recovery stamps the row's run and sample-entry hash into each rebuilt
+/// sidecar header that lacks them, so a recovered file stays bound to its row.
+/// A row whose media or layout directory is absent beneath its verified root
+/// enters deletion intent whatever its fragment count; its orphan sidecar and
+/// then the row are removed, and the lost fragments are logged.
 pub async fn recover_writing(
     catalog: &CatalogHandle,
     roots: &[ApprovedRoot],
 ) -> anyhow::Result<usize> {
     let mut recovered = 0;
+    let mut dropped = 0usize;
+    let mut fragments_lost = 0u64;
     let mut cursor = None;
     let mut processed = 0usize;
     startup_progress("recovering open segments", processed, recovered);
@@ -404,7 +431,7 @@ pub async fn recover_writing(
         let rows = heartbeat_while(
             "recovering open segments",
             processed,
-            recovered,
+            recovered + dropped,
             catalog.writing_segments_page(cursor, RECONCILE_PAGE),
         )
         .await
@@ -422,12 +449,13 @@ pub async fn recover_writing(
             };
             let report_path = path.clone();
             let recovery_root = root.clone();
+            let expected = IndexBinding::new(row.run_seq, row.sample_entry_hash);
             let report = heartbeat_while(
                 "recovering open segments",
                 processed,
-                recovered,
+                recovered + dropped,
                 tokio::task::spawn_blocking(move || {
-                    recover_segment_beneath(&recovery_root, &report_path)
+                    recover_segment_beneath(&recovery_root, &report_path, expected)
                 }),
             )
             .await
@@ -435,57 +463,102 @@ pub async fn recover_writing(
             match report {
                 Ok(report) => {
                     if report.fragments != 0 {
-                        if let Err(error) =
-                            checked_catalog_media_range(report.media_start, report.media_end)
-                        {
-                            warn!(path = %path.display(), %error, "recovered timeline cannot be represented in the catalog; keeping its writing row");
-                            continue;
+                        if seal_recovered(catalog, &report, expected, processed, recovered).await? {
+                            recovered += 1;
                         }
-                        post_filesystem_catalog_wait(
-                            "sealing a recovered segment",
-                            processed,
-                            recovered,
-                            catalog.mark_sealed(
-                                &path,
-                                report.valid_len,
-                                u32::try_from(report.fragments).unwrap_or(u32::MAX),
-                                report.wall_end,
-                                report.media_end,
-                            ),
-                        )
-                        .await
-                        .context("sealing a recovered segment")?;
-                        info!(
-                            path = %path.display(),
-                            fragments = report.fragments,
-                            truncated = report.truncated,
-                            "recovered open segment"
-                        );
-                        recovered += 1;
                     } else {
                         warn!(path = %path.display(), "recovered segment holds no fragments; scheduling durable cleanup");
                         cleanup_empty_writing(catalog, root, &row).await?;
                     }
                 }
-                Err(RecoverError::Io { source, .. })
-                    if source.kind() == std::io::ErrorKind::NotFound && row.fragments == 0 =>
-                {
-                    warn!(path = %path.display(), "empty open segment pair is incomplete; scheduling durable cleanup");
-                    cleanup_empty_writing(catalog, root, &row).await?;
+                Err(RecoverError::Absent(_)) => {
+                    warn!(
+                        path = %path.display(),
+                        fragments = row.fragments,
+                        "open segment is absent beneath its verified root; dropping its row and recorded fragments"
+                    );
+                    if cleanup_empty_writing(catalog, root, &row).await? {
+                        dropped += 1;
+                        fragments_lost += u64::from(row.fragments);
+                    }
                 }
                 Err(err) => warn!(path = %path.display(), %err, "cannot recover segment"),
             }
         }
-        startup_progress("recovering open segments", processed, recovered);
+        startup_progress("recovering open segments", processed, recovered + dropped);
+    }
+    if dropped != 0 {
+        warn!(
+            recovered,
+            dropped, fragments_lost, "dropped open segments whose files are absent"
+        );
     }
     Ok(recovered)
 }
 
+/// Seals the catalog row of a recovered file that holds fragments. Returns
+/// `false`, keeping the writing row, when the recovered timeline cannot be
+/// stored. A rebuilt sidecar whose binding disagrees with the row is logged,
+/// because the API refuses to serve it.
+async fn seal_recovered(
+    catalog: &CatalogHandle,
+    report: &RecoveryReport,
+    expected: IndexBinding,
+    processed: usize,
+    recovered: usize,
+) -> anyhow::Result<bool> {
+    let path = &report.path;
+    if !binding_matches(report.binding, expected) {
+        warn!(
+            path = %path.display(),
+            sidecar = ?report.binding,
+            catalog = ?expected,
+            "recovered sidecar binding differs from the catalog row; the segment will not be served"
+        );
+    }
+    if let Err(error) = checked_catalog_media_range(report.media_start, report.media_end) {
+        warn!(path = %path.display(), %error, "recovered timeline cannot be represented in the catalog; keeping its writing row");
+        return Ok(false);
+    }
+    post_filesystem_catalog_wait(
+        "sealing a recovered segment",
+        processed,
+        recovered,
+        catalog.mark_sealed(
+            path,
+            report.valid_len,
+            u32::try_from(report.fragments).unwrap_or(u32::MAX),
+            report.wall_end,
+            report.media_end,
+        ),
+    )
+    .await
+    .context("sealing a recovered segment")?;
+    info!(
+        path = %path.display(),
+        fragments = report.fragments,
+        truncated = report.truncated,
+        "recovered open segment"
+    );
+    Ok(true)
+}
+
+/// Whether a recovered header carries every binding field the catalog row
+/// knows; the API refuses a segment whose known fields differ.
+fn binding_matches(found: IndexBinding, expected: IndexBinding) -> bool {
+    (expected.run_id() == 0 || found.run_id() == expected.run_id())
+        && (expected.sample_entry_hash() == 0
+            || found.sample_entry_hash() == expected.sample_entry_hash())
+}
+
+/// Removes an open row whose file holds nothing recoverable. Returns whether
+/// the row is gone; a row that could not enter deletion intent or whose pair
+/// removal failed remains for a later start.
 async fn cleanup_empty_writing(
     catalog: &CatalogHandle,
     root: &ApprovedRoot,
     row: &iris_catalog::SegmentRow,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<bool> {
     cleanup_empty_writing_with(catalog, root, row, |root, path| {
         remove_segment_beneath(&root, &path)
     })
@@ -497,7 +570,7 @@ async fn cleanup_empty_writing_with<F>(
     root: &ApprovedRoot,
     row: &iris_catalog::SegmentRow,
     remove: F,
-) -> anyhow::Result<()>
+) -> anyhow::Result<bool>
 where
     F: FnOnce(ApprovedRoot, PathBuf) -> std::io::Result<u64> + Send + 'static,
 {
@@ -511,7 +584,10 @@ where
     .context("recording durable empty-segment cleanup intent")?
     {
         DeleteMarkResult::Marked => {}
-        DeleteMarkResult::NotFound => return Ok(()),
+        DeleteMarkResult::NotFound => {
+            warn!(path = %row.path.display(), "open segment row cannot enter deletion intent; keeping it for a later start");
+            return Ok(false);
+        }
         DeleteMarkResult::Protected => {
             anyhow::bail!("empty writing segment unexpectedly reported protected")
         }
@@ -527,17 +603,20 @@ where
     .await
     .context("empty-segment cleanup task panicked")?;
     match removed {
-        Ok(_) => post_filesystem_catalog_wait(
-            "deleting a durably removed empty segment row",
-            1,
-            0,
-            catalog.delete_segment(row.id),
-        )
-        .await
-        .context("deleting a durably removed empty segment row"),
+        Ok(_) => {
+            post_filesystem_catalog_wait(
+                "deleting a durably removed empty segment row",
+                1,
+                0,
+                catalog.delete_segment(row.id),
+            )
+            .await
+            .context("deleting a durably removed empty segment row")?;
+            Ok(true)
+        }
         Err(error) => {
             warn!(path = %row.path.display(), %error, "empty segment cleanup remains retryable");
-            Ok(())
+            Ok(false)
         }
     }
 }
@@ -685,10 +764,7 @@ async fn scan_discovered_recording(
         seen,
         adopted,
         tokio::task::spawn_blocking(move || {
-            let (media, index) =
-                open_segment_pair_beneath(&scan_root, &scan_path).with_context(|| {
-                    format!("opening {} beneath approved root", scan_path.display())
-                })?;
+            let (media, index) = open_discovered_pair(&scan_root, &scan_path)?;
             summarize_open_pair(media, index, &scan_path)
         }),
     )
@@ -706,6 +782,21 @@ async fn scan_discovered_recording(
         Err(error) => {
             warn!(%error, "scan task panicked");
             None
+        }
+    }
+}
+
+/// Opens a discovered recording and its sidecar. A sidecar that cannot be
+/// used (a symlink, FIFO, device, directory, or other open failure) is only
+/// a cache, so the media is opened alone and adoption scans it.
+fn open_discovered_pair(root: &ApprovedRoot, path: &Path) -> anyhow::Result<(File, Option<File>)> {
+    match open_segment_pair_beneath(root, path) {
+        Ok(pair) => Ok(pair),
+        Err(pair_error) => {
+            let media = open_segment_beneath(root, path)
+                .with_context(|| format!("opening {} beneath approved root", path.display()))?;
+            warn!(path = %path.display(), %pair_error, "sidecar cannot be opened; scanning the media");
+            Ok((media, None))
         }
     }
 }
@@ -1678,6 +1769,246 @@ mod tests {
         found.sort();
         found.dedup();
         assert_eq!(found.len(), 100);
+    }
+
+    fn mkfifo(path: &Path) {
+        rustix::fs::mkfifoat(
+            rustix::fs::CWD,
+            path,
+            rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR,
+        )
+        .unwrap();
+    }
+
+    /// Awaits `future` for at most two seconds. A blocking task stuck opening
+    /// `fifo` is released before the test fails, so the runtime can shut down
+    /// and the test never hangs.
+    async fn within_deadline<F: Future>(fifo: &Path, future: F) -> F::Output {
+        if let Ok(output) = tokio::time::timeout(Duration::from_secs(2), future).await {
+            return output;
+        }
+        for _ in 0..20 {
+            let _ = rustix::fs::openat(
+                rustix::fs::CWD,
+                fifo,
+                rustix::fs::OFlags::WRONLY | rustix::fs::OFlags::NONBLOCK,
+                rustix::fs::Mode::empty(),
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        panic!(
+            "reconciliation blocked on {} for two seconds",
+            fifo.display()
+        );
+    }
+
+    fn sidecar_binding(index: &Path) -> (u64, u32) {
+        let (header, _) =
+            iris_mp4::index::read_index_bounded(index, MAX_PERSISTED_INDEX_RECORDS).unwrap();
+        (header.run_id, header.sample_entry_hash)
+    }
+
+    #[tokio::test]
+    async fn a_recovered_segment_keeps_the_catalog_binding_in_its_sidecar() {
+        // How the sidecar looks after the unclean stop: intact, rebuilt with
+        // zeros by an earlier recovery, lost, or a planted FIFO.
+        for damage in ["intact", "zeroed", "missing", "fifo"] {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().join("video");
+            let catalog = CatalogHandle::open(&dir.path().join("catalog.db")).unwrap();
+            let approved = approve_root(&catalog, &root).await;
+            let path = sealed_recording(&root);
+            let index = path.with_extension("idx");
+            register_writing(&catalog, path.clone());
+            let row = catalog.segment_by_path(&path).await.unwrap().unwrap();
+            assert_eq!(
+                sidecar_binding(&index),
+                (row.run_seq, row.sample_entry_hash)
+            );
+            assert_ne!(row.sample_entry_hash, 0);
+            match damage {
+                "intact" => {}
+                "zeroed" => {
+                    let (mut header, records) =
+                        iris_mp4::index::read_index_bounded(&index, MAX_PERSISTED_INDEX_RECORDS)
+                            .unwrap();
+                    header.run_id = 0;
+                    header.sample_entry_hash = 0;
+                    let mut bytes = header.encode().to_vec();
+                    for record in records {
+                        bytes.extend(record.encode());
+                    }
+                    std::fs::write(&index, bytes).unwrap();
+                }
+                "missing" => std::fs::remove_file(&index).unwrap(),
+                _ => {
+                    std::fs::remove_file(&index).unwrap();
+                    mkfifo(&index);
+                }
+            }
+
+            let recovered = within_deadline(
+                &index,
+                recover_writing(&catalog, std::slice::from_ref(&approved)),
+            )
+            .await
+            .unwrap();
+            assert_eq!(recovered, 1, "{damage}");
+            let sealed = catalog.segment_by_path(&path).await.unwrap().unwrap();
+            assert!(sealed.sealed, "{damage}");
+            assert!(std::fs::symlink_metadata(&index).unwrap().is_file());
+            assert_eq!(
+                sidecar_binding(&index),
+                (sealed.run_seq, sealed.sample_entry_hash),
+                "{damage}"
+            );
+            catalog.shutdown();
+        }
+    }
+
+    #[tokio::test]
+    async fn adoption_and_deletion_do_not_block_on_a_fifo_sidecar() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("video");
+        let catalog = CatalogHandle::open(&dir.path().join("catalog.db")).unwrap();
+        let approved = approve_root(&catalog, &root).await;
+        let path = sealed_recording(&root);
+        let index = path.with_extension("idx");
+        std::fs::remove_file(&index).unwrap();
+        mkfifo(&index);
+
+        let adopted = within_deadline(
+            &index,
+            adopt_unknown(&catalog, std::slice::from_ref(&approved)),
+        )
+        .await
+        .unwrap();
+        assert_eq!(adopted, 1, "the media is adopted by scanning it");
+        let row = catalog.segment_by_path(&path).await.unwrap().unwrap();
+        assert_eq!(row.fragments, 3);
+
+        catalog.mark_deleting(row.id).await.unwrap();
+        let finished = within_deadline(
+            &index,
+            finish_deleting(&catalog, std::slice::from_ref(&approved)),
+        )
+        .await
+        .unwrap();
+        assert_eq!(finished, 1);
+        assert!(std::fs::symlink_metadata(&path).is_err());
+        assert!(std::fs::symlink_metadata(&index).is_err());
+        assert_eq!(catalog.deleting_segments().await.unwrap(), Vec::new());
+        catalog.shutdown();
+    }
+
+    #[tokio::test]
+    async fn adoption_scans_media_beside_a_symlinked_sidecar() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("video");
+        let catalog = CatalogHandle::open(&dir.path().join("catalog.db")).unwrap();
+        let approved = approve_root(&catalog, &root).await;
+        let path = sealed_recording(&root);
+        let index = path.with_extension("idx");
+        let outside = dir.path().join("outside.idx");
+        std::fs::rename(&index, &outside).unwrap();
+        std::os::unix::fs::symlink(&outside, &index).unwrap();
+
+        assert_eq!(adopt_unknown(&catalog, &[approved]).await.unwrap(), 1);
+        assert_eq!(
+            catalog
+                .segment_by_path(&path)
+                .await
+                .unwrap()
+                .unwrap()
+                .fragments,
+            3
+        );
+        catalog.shutdown();
+    }
+
+    #[test]
+    fn adoption_refuses_a_file_beyond_the_fragment_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = sealed_recording(dir.path());
+        let open = || {
+            (
+                File::open(&path).unwrap(),
+                Some(File::open(path.with_extension("idx")).unwrap()),
+            )
+        };
+        let (media, index) = open();
+        let error = summarize_open_pair_limited(media, index, &path, 2).unwrap_err();
+        assert!(
+            error.to_string().contains("more than 2 fragments"),
+            "{error:#}"
+        );
+        let (media, index) = open();
+        let summary = summarize_open_pair_limited(media, index, &path, 3)
+            .unwrap()
+            .unwrap();
+        assert_eq!(summary.fragments, 3);
+    }
+
+    #[tokio::test]
+    async fn a_missing_layout_directory_completes_empty_cleanup_and_deletion() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("video");
+        let catalog = CatalogHandle::open(&dir.path().join("catalog.db")).unwrap();
+        let approved = approve_root(&catalog, &root).await;
+        let open = root.join("cam1/main/2026-01-01/never-created.mp4");
+        register_writing(&catalog, open.clone());
+        assert_eq!(
+            recover_writing(&catalog, std::slice::from_ref(&approved))
+                .await
+                .unwrap(),
+            0
+        );
+        assert!(catalog.segment_by_path(&open).await.unwrap().is_none());
+        assert_eq!(catalog.writing_segments().await.unwrap(), Vec::new());
+
+        let gone = root.join("cam1/main/2026-01-02/gone.mp4");
+        let id = register_sealed(&catalog, gone).await;
+        catalog.mark_deleting(id).await.unwrap();
+        assert_eq!(finish_deleting(&catalog, &[approved]).await.unwrap(), 1);
+        assert_eq!(catalog.deleting_segments().await.unwrap(), Vec::new());
+        catalog.shutdown();
+    }
+
+    #[tokio::test]
+    async fn missing_open_media_with_fragments_drops_its_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("video");
+        let catalog = CatalogHandle::open(&dir.path().join("catalog.db")).unwrap();
+        let approved = approve_root(&catalog, &root).await;
+        let path = root.join("cam1/main/2026-01-01/lost.mp4");
+        let orphan = path.with_extension("idx");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&orphan, b"orphan sidecar").unwrap();
+        register_writing(&catalog, path.clone());
+        catalog.notify(iris_catalog::Change::SegmentProgress {
+            path: path.clone(),
+            durable_len: 5_000_000,
+            fragments: 3,
+            wall_end: WallUs::new(1_700_000_003_000_000),
+            media_end: 270_000,
+        });
+        assert_eq!(
+            catalog
+                .segment_by_path(&path)
+                .await
+                .unwrap()
+                .unwrap()
+                .fragments,
+            3
+        );
+
+        assert_eq!(recover_writing(&catalog, &[approved]).await.unwrap(), 0);
+        assert!(catalog.segment_by_path(&path).await.unwrap().is_none());
+        assert_eq!(catalog.writing_segments().await.unwrap(), Vec::new());
+        assert_eq!(catalog.deleting_segments().await.unwrap(), Vec::new());
+        assert_eq!(catalog.total_bytes().await.unwrap(), 0);
+        assert!(!orphan.exists());
+        catalog.shutdown();
     }
 
     #[tokio::test]

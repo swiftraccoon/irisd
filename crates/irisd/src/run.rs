@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, bail};
 use clap::Args as ClapArgs;
-use iris_api::{ActiveCamera, ApiState, ApiStats, LiveRegistry, SnapshotSource};
+use iris_api::{ActiveCamera, ApiState, ApiStats, LiveRegistry, ServeLimits, SnapshotSource};
 use iris_catalog::{CatalogHandle, CatalogRootExpectation, CatalogRootRegistry};
 use iris_core::config::{CameraConfig, Config};
 use iris_core::event::{Event, EventSource};
@@ -36,9 +36,10 @@ use tracing::{error, info, warn};
 
 use crate::catalog_observer::{CatalogEventSink, CatalogObserver};
 use crate::proc::{self, CpuMeter, CpuSplit};
-use crate::sandbox::SandboxSpec;
+use crate::retention::RawCalls;
+use crate::sandbox::{SandboxEnforcement, SandboxSpec};
 use crate::selfcheck::SelfCheck;
-use crate::{adopt, retention, sandbox, systemd};
+use crate::{adopt, permissions, retention, sandbox, systemd};
 
 /// Bytes per mebibyte, for human-readable sizes.
 const MIB: f64 = 1_048_576.0;
@@ -68,6 +69,11 @@ const WRITER_DEADLINE: Duration = Duration::from_secs(20);
 const API_DEADLINE: Duration = Duration::from_secs(22);
 /// A statistics or retention job is cancelled after one period of bounded work.
 const MAINTENANCE_TIMEOUT: Duration = Duration::from_secs(30);
+/// A raw filesystem call still in the kernel this long after its job timed out
+/// stops the daemon, so systemd restarts it.
+const RAW_CALL_ESCALATION: Duration = Duration::from_secs(600);
+/// Launches skipped behind an unfinished raw call warn at most this often.
+const SKIPPED_LAUNCH_WARNING_INTERVAL: Duration = Duration::from_secs(60);
 /// Cadence for extending startup while catalog ownership reconciliation runs.
 const STARTUP_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
 
@@ -94,7 +100,8 @@ pub struct Args {
     /// Daemon configuration (TOML).
     #[arg(long, value_name = "PATH")]
     config: PathBuf,
-    /// Skip the Landlock sandbox (for debugging on kernels without Landlock).
+    /// Run without the Landlock sandbox. Without this flag the daemon refuses to
+    /// start on a kernel lacking Landlock ABI 4 (filesystem and TCP rules).
     #[arg(long)]
     no_sandbox: bool,
     /// Log statistics this often.
@@ -146,6 +153,8 @@ struct Daemon {
     /// Largest timer lateness seen on the runtime thread since the last statistics line.
     loop_lag: Arc<Peak>,
     loop_probe: JoinHandle<()>,
+    /// Landlock enforcement, reported in the `process` statistics line.
+    sandbox: SandboxEnforcement,
 }
 
 /// Fallible control-plane state constructed before recording workers or readiness.
@@ -254,6 +263,7 @@ where
 {
     let mut config =
         Config::load(&args.config).with_context(|| format!("loading {}", args.config.display()))?;
+    warn_if_configuration_exposed(&args.config);
     validate(&config)?;
     validate_period("--stats-interval", args.stats_interval)?;
     let source_count = validate_source_urls(&config)?;
@@ -261,10 +271,10 @@ where
     checked_fragment_ticks(config.storage.max_fragment_ms)?;
     let shutdown = CancellationToken::new();
     let mut monitor_state = monitor_initializer(&config, &args, &shutdown)?;
-    std::fs::create_dir_all(&config.storage.state_dir)
-        .with_context(|| format!("creating {}", config.storage.state_dir.display()))?;
+    raise_descriptor_limit();
+    prepare_state_directory(&config.storage.state_dir)?;
     let approved_roots = admit_configured_roots(
-        &config.storage.state_dir.join("irisd.db"),
+        &config.storage.state_dir.join(permissions::CATALOG_FILE),
         &config.storage.video_roots,
     )?;
     if approved_roots.is_empty() {
@@ -275,14 +285,15 @@ where
         .map(|root| root.path().to_path_buf())
         .collect();
 
-    if args.no_sandbox {
+    let sandbox = if args.no_sandbox {
         warn!("sandbox disabled by --no-sandbox");
+        SandboxEnforcement::Disabled
     } else {
         // Before any thread exists: threads inherit the Landlock domain of their creator.
-        sandbox::apply(&sandbox_spec(&config, &args.config))?;
-    }
+        sandbox::apply(&sandbox_spec(&config, &args.config))?
+    };
 
-    let catalog = CatalogHandle::open(&config.storage.state_dir.join("irisd.db"))
+    let catalog = CatalogHandle::open(&config.storage.state_dir.join(permissions::CATALOG_FILE))
         .context("opening the catalog")?;
     for root in &approved_roots {
         catalog
@@ -322,7 +333,15 @@ where
     let (writer, streams, live) = start_recording(&config, &approved_roots, &catalog, &shutdown)?;
     let (events_tx, _) = broadcast::channel::<Arc<Event>>(EVENT_CHANNEL);
     let events = start_events(&config, &catalog, &events_tx, &shutdown);
-    let api = start_api(&config, &catalog, live, events_tx, api_listener, &shutdown);
+    let api = start_api(
+        &config,
+        &approved_roots,
+        &catalog,
+        live,
+        events_tx,
+        api_listener,
+        &shutdown,
+    );
 
     let mut daemon = Daemon {
         config,
@@ -335,6 +354,7 @@ where
         shutdown,
         loop_lag,
         loop_probe,
+        sandbox,
     };
     let mut maintenance = MaintenanceJobs::new(&daemon);
 
@@ -435,10 +455,91 @@ fn validate(config: &Config) -> anyhow::Result<()> {
     if config.storage.video_roots.is_empty() {
         bail!("storage.video_roots is empty");
     }
-    if config.api.tokens.is_empty() {
-        warn!("api.tokens is empty: the API accepts unauthenticated requests");
+    if config.api.allow_unauthenticated {
+        warn!(
+            listen = %config.api.listen,
+            "api.allow_unauthenticated is set: the loopback API accepts unauthenticated requests"
+        );
     }
     Ok(())
+}
+
+/// Warns when users beyond the daemon's account and group can reach the
+/// configuration file, which holds camera passwords and API tokens.
+pub(crate) fn warn_if_configuration_exposed(path: &Path) {
+    if let Some(mode) = permissions::exposed_configuration(path) {
+        warn!(
+            path = %path.display(),
+            mode = format_args!("{mode:04o}"),
+            "the configuration file holds credentials and is accessible to other users; \
+             restrict it to mode 0600, or 0640 with the service account's group"
+        );
+    }
+}
+
+/// Creates the state directory owner-only when it is missing, then checks and
+/// repairs the modes of the directory and the catalog files before SQLite
+/// opens them.
+fn prepare_state_directory(dir: &Path) -> anyhow::Result<()> {
+    use std::os::unix::fs::DirBuilderExt as _;
+
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dir)
+        .with_context(|| format!("creating {}", dir.display()))?;
+    for repair in permissions::secure_state_directory(dir)
+        .with_context(|| format!("checking the state directory {}", dir.display()))?
+    {
+        warn!(
+            path = %repair.path.display(),
+            old_mode = format_args!("{:04o}", repair.old_mode),
+            new_mode = format_args!("{:04o}", repair.new_mode),
+            "restricted state permissions to the service account"
+        );
+    }
+    Ok(())
+}
+
+/// Raises the soft descriptor limit to the hard limit, so recording files, camera
+/// sockets, and API clients share the whole budget the service allows, and logs
+/// both values. A failure keeps the inherited limit.
+fn raise_descriptor_limit() {
+    use rustix::process::Resource;
+
+    let limit = rustix::process::getrlimit(Resource::Nofile);
+    let Some(raised) = raised_descriptor_limit(limit) else {
+        info!(soft = ?limit.current, hard = ?limit.maximum, "descriptor limit");
+        return;
+    };
+    match rustix::process::setrlimit(Resource::Nofile, raised) {
+        Ok(()) => info!(
+            previous_soft = ?limit.current,
+            soft = ?raised.current,
+            hard = ?raised.maximum,
+            "raised the descriptor soft limit to the hard limit"
+        ),
+        Err(error) => warn!(
+            %error,
+            soft = ?limit.current,
+            hard = ?limit.maximum,
+            "cannot raise the descriptor soft limit"
+        ),
+    }
+}
+
+/// The limit with its soft value raised to a finite hard value, or `None` when
+/// the soft value already reaches it or the hard value is unlimited (a soft
+/// limit cannot be set to unlimited for descriptors).
+fn raised_descriptor_limit(limit: rustix::process::Rlimit) -> Option<rustix::process::Rlimit> {
+    let hard = limit.maximum?;
+    limit
+        .current
+        .is_some_and(|soft| soft < hard)
+        .then_some(rustix::process::Rlimit {
+            current: Some(hard),
+            maximum: Some(hard),
+        })
 }
 
 fn validate_period(name: &str, period: Duration) -> anyhow::Result<()> {
@@ -657,6 +758,7 @@ fn start_events(
 
 fn start_api(
     config: &Config,
+    approved_roots: &[ApprovedRoot],
     catalog: &CatalogHandle,
     live: Arc<LiveRegistry>,
     events: broadcast::Sender<Arc<Event>>,
@@ -699,15 +801,29 @@ fn start_api(
         live,
         events,
         tokens: config.api.tokens.clone(),
+        recording_roots: approved_roots.to_vec(),
+        public_metrics: config.api.public_metrics,
         snapshot_sources,
         active_cameras,
-        stats: Arc::new(ApiStats::default()),
+        stats: Arc::new(ApiStats::with_media_limits(
+            config.api.max_streaming_media,
+            config.api.max_bounded_media,
+        )),
         started: WallUs::now(),
         started_monotonic: Instant::now(),
         shutdown: shutdown.clone(),
     });
     let router = iris_api::router(state);
-    tokio::spawn(iris_api::serve_listener(listener, router, shutdown.clone()))
+    let limits = ServeLimits {
+        max_connections: config.api.max_connections,
+        ..ServeLimits::default()
+    };
+    tokio::spawn(iris_api::serve_listener(
+        listener,
+        router,
+        limits,
+        shutdown.clone(),
+    ))
 }
 
 /// Measures how late timers fire on the runtime thread; a blocked thread shows as lag.
@@ -753,6 +869,7 @@ struct ReportState {
     catalog: CatalogHandle,
     roots: Vec<PathBuf>,
     snapshots: Snapshots,
+    raw: RawCalls,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -760,6 +877,94 @@ enum MaintenanceOutcome {
     Complete,
     TimedOut,
     Cancelled,
+}
+
+/// Timeout and raw-call bookkeeping of one single-flight maintenance owner.
+///
+/// A job that exceeds `timeout` is dropped and its state kept. Awaiting the
+/// catalog is cancellable, but a raw filesystem call on a standard-library thread
+/// is not: while one is still in the kernel no further job starts, and if it is
+/// still there `escalation` after the timeout the daemon stops so systemd
+/// restarts it.
+struct MaintenanceGuard {
+    job: &'static str,
+    escalation_reason: &'static str,
+    raw: RawCalls,
+    timeout: Duration,
+    escalation: Duration,
+    timeouts: u64,
+    stuck_since: Option<Instant>,
+    last_skip_warning: Option<Instant>,
+}
+
+impl MaintenanceGuard {
+    fn new(job: &'static str, escalation_reason: &'static str) -> Self {
+        Self {
+            job,
+            escalation_reason,
+            raw: RawCalls::default(),
+            timeout: MAINTENANCE_TIMEOUT,
+            escalation: RAW_CALL_ESCALATION,
+            timeouts: 0,
+            stuck_since: None,
+            last_skip_warning: None,
+        }
+    }
+
+    /// Whether a job may start: `Ok(false)` while a raw call of an earlier job is
+    /// still in the kernel, and the escalation reason once it has been there
+    /// longer than the bound.
+    fn admit(&mut self) -> Result<bool, &'static str> {
+        let in_flight = self.raw.in_flight();
+        if in_flight == 0 {
+            if let Some(since) = self.stuck_since.take() {
+                info!(
+                    job = self.job,
+                    stuck_s = since.elapsed().as_secs(),
+                    "raw filesystem call returned; resuming"
+                );
+            }
+            return Ok(true);
+        }
+        let since = *self.stuck_since.get_or_insert_with(Instant::now);
+        if since.elapsed() >= self.escalation {
+            error!(
+                job = self.job,
+                in_flight,
+                stuck_s = since.elapsed().as_secs(),
+                "a raw filesystem call has not returned; stopping so the service restarts"
+            );
+            return Err(self.escalation_reason);
+        }
+        if self
+            .last_skip_warning
+            .is_none_or(|last| last.elapsed() >= SKIPPED_LAUNCH_WARNING_INTERVAL)
+        {
+            warn!(
+                job = self.job,
+                in_flight,
+                stuck_s = since.elapsed().as_secs(),
+                "skipping: a raw filesystem call of the timed-out job has not returned"
+            );
+            self.last_skip_warning = Some(Instant::now());
+        }
+        Ok(false)
+    }
+
+    /// Records a timeout; the caller keeps the job's state for the next launch.
+    fn timed_out(&mut self) {
+        self.timeouts = self.timeouts.saturating_add(1);
+        let in_flight = self.raw.in_flight();
+        warn!(
+            job = self.job,
+            timeouts = self.timeouts,
+            raw_in_flight = in_flight,
+            "maintenance job exceeded its work deadline; keeping its state"
+        );
+        if in_flight > 0 {
+            self.stuck_since.get_or_insert_with(Instant::now);
+        }
+    }
 }
 
 struct ReportCompletion {
@@ -771,10 +976,15 @@ struct ReportJob {
     idle: Option<ReportState>,
     active: Option<JoinHandle<ReportCompletion>>,
     shutdown: CancellationToken,
+    guard: MaintenanceGuard,
 }
 
 impl ReportJob {
     fn new(daemon: &Daemon) -> Self {
+        let guard = MaintenanceGuard::new(
+            "statistics report",
+            "a statistics report filesystem call did not return",
+        );
         Self {
             idle: Some(ReportState {
                 streams: daemon
@@ -799,29 +1009,40 @@ impl ReportJob {
                 catalog: daemon.catalog.clone(),
                 roots: daemon.config.storage.video_roots.clone(),
                 snapshots: Snapshots::default(),
+                raw: guard.raw.clone(),
             }),
             active: None,
             shutdown: daemon.shutdown.clone(),
+            guard,
         }
     }
 
-    fn launch(&mut self, gauges: Gauges) {
-        let Some(mut state) = self.idle.take() else {
+    /// Starts a report unless one is running or a raw call of a timed-out one is
+    /// still in the kernel. Returns a failure reason once such a call has
+    /// outlived the escalation bound.
+    fn launch(&mut self, gauges: Gauges) -> Option<&'static str> {
+        if self.idle.is_none() {
             if self.active.is_none() {
                 warn!("statistics report owner has no state");
             }
-            return;
-        };
+            return None;
+        }
+        match self.guard.admit() {
+            Ok(true) => {}
+            Ok(false) => return None,
+            Err(reason) => return Some(reason),
+        }
+        let mut state = self.idle.take().expect("report state checked above");
         let shutdown = self.shutdown.clone();
+        let timeout = self.guard.timeout;
         self.active = Some(tokio::spawn(async move {
             let outcome = {
                 let work = report(&mut state, &gauges);
                 tokio::pin!(work);
                 tokio::select! {
                     () = shutdown.cancelled() => MaintenanceOutcome::Cancelled,
-                    result = tokio::time::timeout(MAINTENANCE_TIMEOUT, &mut work) => {
+                    result = tokio::time::timeout(timeout, &mut work) => {
                         if result.is_err() {
-                            warn!("statistics report exceeded its work deadline");
                             MaintenanceOutcome::TimedOut
                         } else {
                             MaintenanceOutcome::Complete
@@ -831,6 +1052,7 @@ impl ReportJob {
             };
             ReportCompletion { state, outcome }
         }));
+        None
     }
 
     fn running(&self) -> bool {
@@ -855,7 +1077,9 @@ impl ReportJob {
                 None
             }
             Ok(completion) if completion.outcome == MaintenanceOutcome::TimedOut => {
-                Some("statistics report exceeded its work deadline")
+                self.idle = Some(completion.state);
+                self.guard.timed_out();
+                None
             }
             Ok(_) => Some("statistics report cancelled unexpectedly"),
             Err(err) => {
@@ -889,10 +1113,15 @@ struct RetentionJob {
     idle: Option<RetentionJobState>,
     active: Option<JoinHandle<RetentionCompletion>>,
     shutdown: CancellationToken,
+    guard: MaintenanceGuard,
 }
 
 impl RetentionJob {
     fn new(daemon: &Daemon, peak: Arc<Peak>) -> Self {
+        let guard = MaintenanceGuard::new(
+            "retention pass",
+            "a retention filesystem call did not return",
+        );
         Self {
             idle: Some(RetentionJobState {
                 catalog: daemon.catalog.clone(),
@@ -900,30 +1129,40 @@ impl RetentionJob {
                 approved_roots: daemon.approved_roots.clone(),
                 age_limits: age_limits(&daemon.config),
                 peak,
-                state: retention::RetentionState::default(),
+                state: retention::RetentionState::new(guard.raw.clone()),
             }),
             active: None,
             shutdown: daemon.shutdown.clone(),
+            guard,
         }
     }
 
-    fn launch(&mut self) {
-        let Some(mut state) = self.idle.take() else {
+    /// Starts a pass unless one is running or a raw call of a timed-out one is
+    /// still in the kernel. Returns a failure reason once such a call has
+    /// outlived the escalation bound.
+    fn launch(&mut self) -> Option<&'static str> {
+        if self.idle.is_none() {
             if self.active.is_none() {
                 warn!("retention owner has no state");
             }
-            return;
-        };
+            return None;
+        }
+        match self.guard.admit() {
+            Ok(true) => {}
+            Ok(false) => return None,
+            Err(reason) => return Some(reason),
+        }
+        let mut state = self.idle.take().expect("retention state checked above");
         let shutdown = self.shutdown.clone();
+        let timeout = self.guard.timeout;
         self.active = Some(tokio::spawn(async move {
             let outcome = {
                 let work = retention_tick(&mut state);
                 tokio::pin!(work);
                 tokio::select! {
                     () = shutdown.cancelled() => MaintenanceOutcome::Cancelled,
-                    result = tokio::time::timeout(MAINTENANCE_TIMEOUT, &mut work) => {
+                    result = tokio::time::timeout(timeout, &mut work) => {
                         if result.is_err() {
-                            warn!("retention pass exceeded its work deadline");
                             MaintenanceOutcome::TimedOut
                         } else {
                             MaintenanceOutcome::Complete
@@ -933,6 +1172,7 @@ impl RetentionJob {
             };
             RetentionCompletion { state, outcome }
         }));
+        None
     }
 
     fn running(&self) -> bool {
@@ -957,7 +1197,9 @@ impl RetentionJob {
                 None
             }
             Ok(completion) if completion.outcome == MaintenanceOutcome::TimedOut => {
-                Some("retention pass exceeded its work deadline")
+                self.idle = Some(completion.state);
+                self.guard.timed_out();
+                None
             }
             Ok(_) => Some("retention task cancelled unexpectedly"),
             Err(err) => {
@@ -1001,6 +1243,9 @@ struct Gauges {
     selfcheck_ok: u64,
     selfcheck_failed: u64,
     selfcheck_skipped: u64,
+    report_timeouts: u64,
+    retention_timeouts: u64,
+    sandbox_enforced: u8,
 }
 
 /// Logs statistics, pings the watchdog, runs retention and the self-check until a signal.
@@ -1027,8 +1272,14 @@ async fn monitor(
                         selfcheck_ok: selfcheck_stats.ok(),
                         selfcheck_failed: selfcheck_stats.failed(),
                         selfcheck_skipped: selfcheck_stats.skipped(),
+                        report_timeouts: maintenance.report.guard.timeouts,
+                        retention_timeouts: maintenance.retention.guard.timeouts,
+                        sandbox_enforced: daemon.sandbox.level(),
                     };
-                    maintenance.report.launch(gauges);
+                    if let Some(reason) = maintenance.report.launch(gauges) {
+                        failure = Some(reason);
+                        break;
+                    }
                 }
             }
             _ = state.watchdog_ticker.tick() => {
@@ -1045,7 +1296,10 @@ async fn monitor(
                 }
             }
             _ = state.retention_ticker.tick() => {
-                maintenance.retention.launch();
+                if let Some(reason) = maintenance.retention.launch() {
+                    failure = Some(reason);
+                    break;
+                }
             }
             _ = state.selfcheck_ticker.tick() => {
                 state.selfcheck.launch_next(&daemon.catalog).await;
@@ -1166,7 +1420,7 @@ async fn report(state: &mut ReportState, gauges: &Gauges) {
     log_events(&mut state.events, now);
     log_writer(&state.writer.stats(), &mut state.snapshots);
     log_catalog(&state.catalog, &mut state.snapshots).await;
-    log_roots(&state.roots).await;
+    log_roots(&state.roots, &state.raw).await;
     log_process(gauges);
     systemd::status(&format!(
         "recording {} streams, {:.2} % CPU, {:.0} MiB, up {} min",
@@ -1281,6 +1535,8 @@ async fn log_catalog(catalog: &CatalogHandle, prev: &mut Snapshots) {
     info!(
         segments = stats.as_ref().map_or(0, |c| c.segments),
         gib = format_args!("{:.2}", stats.as_ref().map_or(0.0, |c| c.sealed_bytes as f64 / GIB)),
+        deleting_segments = stats.as_ref().map_or(0, |c| c.deleting_segments),
+        deleting_mib = format_args!("{:.1}", stats.as_ref().map_or(0.0, |c| c.deleting_bytes as f64 / MIB)),
         events = stats.as_ref().map_or(0, |c| c.events),
         event_mib = format_args!("{:.1}", stats.as_ref().map_or(0.0, |c| c.event_bytes as f64 / MIB)),
         retained_events = stats.as_ref().map_or(0, |c| c.retained_events),
@@ -1314,31 +1570,29 @@ async fn log_catalog(catalog: &CatalogHandle, prev: &mut Snapshots) {
     );
 }
 
-async fn log_roots(roots: &[PathBuf]) {
-    log_roots_with(roots, |root| free_space(&root)).await;
+async fn log_roots(roots: &[PathBuf], raw: &RawCalls) {
+    log_roots_with(roots, raw, |root| free_space(&root)).await;
 }
 
-async fn log_roots_with<F>(roots: &[PathBuf], probe: F)
+async fn log_roots_with<F>(roots: &[PathBuf], raw: &RawCalls, probe: F)
 where
     F: Fn(PathBuf) -> io::Result<iris_store::FreeSpace> + Send + 'static,
 {
     let roots = roots.to_vec();
     let (result_tx, result_rx) = oneshot::channel();
-    // `statvfs` can remain uninterruptible in the kernel. The report owner is
-    // single-flight; if it times out, this one standard-library thread cannot
-    // hold process exit and no replacement report is launched.
-    let thread = std::thread::Builder::new()
-        .name("irisd-root-probe".into())
-        .spawn(move || {
-            let results = roots
-                .into_iter()
-                .map(|root| {
-                    let result = probe(root.clone());
-                    (root, result)
-                })
-                .collect::<Vec<_>>();
-            let _ = result_tx.send(results);
-        });
+    // `statvfs` can remain uninterruptible in the kernel. If the report times
+    // out, this counted standard-library thread outlives it, the report owner
+    // starts no other report until it returns, and it cannot hold process exit.
+    let thread = raw.spawn("irisd-root-probe", move || {
+        let results = roots
+            .into_iter()
+            .map(|root| {
+                let result = probe(root.clone());
+                (root, result)
+            })
+            .collect::<Vec<_>>();
+        let _ = result_tx.send(results);
+    });
     let thread = match thread {
         Ok(thread) => thread,
         Err(err) => {
@@ -1383,6 +1637,9 @@ fn log_process(gauges: &Gauges) {
         selfcheck_ok = gauges.selfcheck_ok,
         selfcheck_failed = gauges.selfcheck_failed,
         selfcheck_skipped = gauges.selfcheck_skipped,
+        report_timeouts = gauges.report_timeouts,
+        retention_timeouts = gauges.retention_timeouts,
+        sandbox_enforced = gauges.sandbox_enforced,
         "process"
     );
 }
@@ -1756,7 +2013,7 @@ mod tests {
         ] {
             let parser_cause = raw.parse::<iris_ingest::Url>().unwrap_err().to_string();
             let config = Config::from_toml_str(&format!(
-                "[[camera]]\nid='cam1'\nname=''\nrtsp_url='{raw}'\nusername=''\npassword=''\nrecord=['main']\n"
+                "[api]\nallow_unauthenticated=true\n[[camera]]\nid='cam1'\nname=''\nrtsp_url='{raw}'\nusername=''\npassword=''\nrecord=['main']\n"
             ))
             .unwrap();
             let error = validate_source_urls(&config).unwrap_err();
@@ -1771,7 +2028,7 @@ mod tests {
     #[tokio::test]
     async fn fallible_monitor_prerequisite_fails_before_worker_state_exists() {
         let config = Config::from_toml_str(
-            "[[camera]]\nid='cam1'\nname=''\nrtsp_url='rtsp://127.0.0.1/main'\nusername=''\npassword=''\nrecord=['main']\n",
+            "[api]\nallow_unauthenticated=true\n[[camera]]\nid='cam1'\nname=''\nrtsp_url='rtsp://127.0.0.1/main'\nusername=''\npassword=''\nrecord=['main']\n",
         )
         .unwrap();
         let args = Args {
@@ -1798,7 +2055,7 @@ mod tests {
         std::fs::write(
             &config_path,
             format!(
-                "[storage]\nvideo_roots=['{}']\nstate_dir='{}'\n\
+                "[storage]\nvideo_roots=['{}']\nstate_dir='{}'\n[api]\nallow_unauthenticated=true\n\
                  [[camera]]\nid='cam1'\nname=''\nrtsp_url='rtsp://127.0.0.1/main'\n\
                  username=''\npassword=''\nrecord=['main']\n",
                 root.display(),
@@ -1852,6 +2109,27 @@ mod tests {
         assignment.await.unwrap();
     }
 
+    fn test_gauges() -> Gauges {
+        Gauges {
+            cpu: CpuSplit::default(),
+            rss: 0,
+            uptime: Duration::ZERO,
+            loop_lag_ms: 0,
+            watchdog_withheld: 0,
+            retention_max_ms: 0,
+            selfcheck_ok: 0,
+            selfcheck_failed: 0,
+            selfcheck_skipped: 0,
+            report_timeouts: 0,
+            retention_timeouts: 0,
+            sandbox_enforced: 0,
+        }
+    }
+
+    fn test_guard() -> MaintenanceGuard {
+        MaintenanceGuard::new("test job", "a test filesystem call did not return")
+    }
+
     #[tokio::test]
     async fn pending_catalog_report_and_long_retention_are_single_flight_and_control_responsive() {
         let report_shutdown = CancellationToken::new();
@@ -1861,19 +2139,10 @@ mod tests {
             idle: None,
             active: Some(report_handle),
             shutdown: report_shutdown,
+            guard: test_guard(),
         };
         for _ in 0..100 {
-            report.launch(Gauges {
-                cpu: CpuSplit::default(),
-                rss: 0,
-                uptime: Duration::ZERO,
-                loop_lag_ms: 0,
-                watchdog_withheld: 0,
-                retention_max_ms: 0,
-                selfcheck_ok: 0,
-                selfcheck_failed: 0,
-                selfcheck_skipped: 0,
-            });
+            assert_eq!(report.launch(test_gauges()), None);
             assert_eq!(report.active.as_ref().unwrap().id(), report_id);
         }
         tokio::select! {
@@ -1886,17 +2155,7 @@ mod tests {
             Err(error) => assert!(error.is_cancelled()),
             Ok(_) => panic!("aborted report task completed normally"),
         }
-        report.launch(Gauges {
-            cpu: CpuSplit::default(),
-            rss: 0,
-            uptime: Duration::ZERO,
-            loop_lag_ms: 0,
-            watchdog_withheld: 0,
-            retention_max_ms: 0,
-            selfcheck_ok: 0,
-            selfcheck_failed: 0,
-            selfcheck_skipped: 0,
-        });
+        assert_eq!(report.launch(test_gauges()), None);
         assert!(
             report.active.is_none(),
             "cancelled report must not relaunch"
@@ -1909,9 +2168,10 @@ mod tests {
             idle: None,
             active: Some(retention_handle),
             shutdown: retention_shutdown,
+            guard: test_guard(),
         };
         for _ in 0..100 {
-            retention.launch();
+            assert_eq!(retention.launch(), None);
             assert_eq!(retention.active.as_ref().unwrap().id(), retention_id);
         }
         tokio::select! {
@@ -1924,11 +2184,226 @@ mod tests {
             Err(error) => assert!(error.is_cancelled()),
             Ok(_) => panic!("aborted retention task completed normally"),
         }
-        retention.launch();
+        assert_eq!(retention.launch(), None);
         assert!(
             retention.active.is_none(),
             "cancelled retention must not relaunch"
         );
+    }
+
+    fn retention_job_for_test(catalog: &CatalogHandle, timeout: Duration) -> RetentionJob {
+        let mut guard = test_guard();
+        guard.timeout = timeout;
+        RetentionJob {
+            idle: Some(RetentionJobState {
+                catalog: catalog.clone(),
+                config: Config::default(),
+                approved_roots: Vec::new(),
+                age_limits: HashMap::new(),
+                peak: Arc::new(Peak::new()),
+                state: retention::RetentionState::new(guard.raw.clone()),
+            }),
+            active: None,
+            shutdown: CancellationToken::new(),
+            guard,
+        }
+    }
+
+    async fn finish_retention_within(
+        job: &mut RetentionJob,
+        limit: Duration,
+    ) -> Option<&'static str> {
+        let result = tokio::time::timeout(limit, job.wait_active())
+            .await
+            .expect("the retention job must finish within its test deadline");
+        job.finish(result)
+    }
+
+    async fn wait_for_raw_calls(raw: &RawCalls, count: usize) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while raw.in_flight() != count {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("raw call count must settle within its test deadline");
+    }
+
+    #[tokio::test]
+    async fn a_timed_out_retention_pass_keeps_its_state_and_relaunches() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("catalog.db");
+        let catalog = CatalogHandle::open(&path).unwrap();
+        let mut retention = retention_job_for_test(&catalog, Duration::from_millis(50));
+        // An operator shell holding the write lock stalls the pass in a
+        // cancellable catalog wait, with no raw filesystem call in flight.
+        let lock = rusqlite::Connection::open(&path).unwrap();
+        lock.execute_batch("BEGIN IMMEDIATE").unwrap();
+        assert_eq!(retention.launch(), None);
+        assert!(retention.running());
+        assert_eq!(
+            finish_retention_within(&mut retention, Duration::from_secs(5)).await,
+            None,
+            "a timeout without a raw call must not stop the daemon"
+        );
+        assert_eq!(retention.guard.timeouts, 1);
+        assert!(
+            retention.idle.is_some(),
+            "the timed-out pass returns its state"
+        );
+        assert_eq!(retention.guard.raw.in_flight(), 0);
+        lock.execute_batch("COMMIT").unwrap();
+
+        retention.guard.timeout = Duration::from_secs(10);
+        assert_eq!(retention.launch(), None);
+        assert!(retention.running(), "the next tick relaunches the pass");
+        assert_eq!(
+            finish_retention_within(&mut retention, Duration::from_secs(10)).await,
+            None
+        );
+        assert!(retention.idle.is_some());
+        assert_eq!(retention.guard.timeouts, 1);
+        catalog.shutdown();
+    }
+
+    #[tokio::test]
+    async fn a_raw_call_in_flight_defers_the_next_job_until_it_returns() {
+        let dir = tempfile::tempdir().unwrap();
+        let catalog = CatalogHandle::open(&dir.path().join("catalog.db")).unwrap();
+        let mut retention = retention_job_for_test(&catalog, MAINTENANCE_TIMEOUT);
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let raw_call = retention
+            .guard
+            .raw
+            .spawn("irisd-test-raw", move || {
+                let _ = release_rx.recv();
+            })
+            .unwrap();
+        // The pass that started the call timed out and returned its state.
+        retention.guard.timed_out();
+        for _ in 0..10 {
+            assert_eq!(retention.launch(), None);
+            assert!(
+                !retention.running(),
+                "no pass may start while the raw call is in the kernel"
+            );
+            assert_eq!(
+                retention.guard.raw.in_flight(),
+                1,
+                "exactly one raw call remains"
+            );
+        }
+        release_tx.send(()).unwrap();
+        wait_for_raw_calls(&retention.guard.raw, 0).await;
+        raw_call.join().unwrap();
+        assert_eq!(retention.launch(), None);
+        assert!(
+            retention.running(),
+            "the job relaunches once the call returns"
+        );
+        assert_eq!(
+            finish_retention_within(&mut retention, Duration::from_secs(10)).await,
+            None
+        );
+        assert_eq!(retention.guard.stuck_since, None);
+        catalog.shutdown();
+    }
+
+    #[tokio::test]
+    async fn a_raw_call_stuck_beyond_the_escalation_bound_stops_the_daemon() {
+        let dir = tempfile::tempdir().unwrap();
+        let catalog = CatalogHandle::open(&dir.path().join("catalog.db")).unwrap();
+        let mut retention = retention_job_for_test(&catalog, MAINTENANCE_TIMEOUT);
+        retention.guard.escalation = Duration::from_millis(500);
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let _raw_call = retention
+            .guard
+            .raw
+            .spawn("irisd-test-raw", move || {
+                let _ = release_rx.recv();
+            })
+            .unwrap();
+        retention.guard.timed_out();
+        assert_eq!(retention.launch(), None, "the call is within the bound");
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        assert_eq!(
+            retention.launch(),
+            Some("a test filesystem call did not return")
+        );
+        assert!(!retention.running());
+        release_tx.send(()).unwrap();
+        wait_for_raw_calls(&retention.guard.raw, 0).await;
+        catalog.shutdown();
+    }
+
+    #[tokio::test]
+    async fn shutdown_completes_within_its_budget_while_a_raw_call_is_stuck() {
+        let dir = tempfile::tempdir().unwrap();
+        let writer = spawn_test_writer(
+            &dir.path().join("video"),
+            Arc::new(CountingObserver::default()),
+        );
+        let mut config = Config::default();
+        config.storage.state_dir = dir.path().join("state");
+        let catalog = CatalogHandle::open(&dir.path().join("catalog.db")).unwrap();
+        let shutdown = CancellationToken::new();
+        let monitor = monitor_for_test(&config, &shutdown);
+        let api = tokio::spawn(async { Ok::<(), io::Error>(()) });
+        let daemon = daemon_for_test(
+            config,
+            catalog,
+            writer,
+            shutdown,
+            Vec::new(),
+            Vec::new(),
+            api,
+            tokio::spawn(async {}),
+        );
+        let mut maintenance = MaintenanceJobs::new(&daemon);
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let raw = maintenance.retention.guard.raw.clone();
+        let _stuck = raw
+            .spawn("irisd-test-stuck", move || {
+                let _ = release_rx.recv();
+            })
+            .unwrap();
+        maintenance.retention.guard.timed_out();
+        let schedule = shutdown_schedule_for_test();
+        let started = Instant::now();
+        let result = stop_with_schedule(daemon, monitor, maintenance, schedule).await;
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < schedule.budget,
+            "shutdown took {elapsed:?} with a raw call stuck"
+        );
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(raw.in_flight(), 1, "the stuck call cannot hold shutdown");
+        release_tx.send(()).unwrap();
+        wait_for_raw_calls(&raw, 0).await;
+    }
+
+    #[test]
+    fn the_descriptor_soft_limit_rises_to_a_finite_hard_limit() {
+        use rustix::process::{Resource, Rlimit};
+
+        let limit = |current, maximum| Rlimit { current, maximum };
+        assert_eq!(
+            raised_descriptor_limit(limit(Some(1_024), Some(524_288))),
+            Some(limit(Some(524_288), Some(524_288)))
+        );
+        assert_eq!(
+            raised_descriptor_limit(limit(Some(65_536), Some(65_536))),
+            None
+        );
+        assert_eq!(raised_descriptor_limit(limit(Some(1_024), None)), None);
+        assert_eq!(raised_descriptor_limit(limit(None, None)), None);
+
+        // Any process may raise its own soft limit up to the hard limit.
+        raise_descriptor_limit();
+        let after = rustix::process::getrlimit(Resource::Nofile);
+        if let Some(hard) = after.maximum {
+            assert_eq!(after.current, Some(hard));
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1942,8 +2417,10 @@ mod tests {
         let (started_tx, started_rx) = std::sync::mpsc::sync_channel(0);
         let (release_tx, release_rx) = std::sync::mpsc::channel();
         let release_rx = Arc::new(std::sync::Mutex::new(release_rx));
+        let raw = RawCalls::default();
+        let task_raw = raw.clone();
         let mut task = tokio::spawn(async move {
-            log_roots_with(&[PathBuf::from("synthetic-root")], move |_| {
+            log_roots_with(&[PathBuf::from("synthetic-root")], &task_raw, move |_| {
                 worker_calls.fetch_add(1, Ordering::SeqCst);
                 worker_active.store(true, Ordering::SeqCst);
                 let _ = started_tx.send(());
@@ -1967,9 +2444,10 @@ mod tests {
         assert!(task.await.unwrap_err().is_cancelled());
         assert!(active.load(Ordering::SeqCst));
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(raw.in_flight(), 1, "the detached statvfs stays counted");
         release_tx.send(()).unwrap();
         tokio::time::timeout(Duration::from_secs(1), async {
-            while active.load(Ordering::SeqCst) {
+            while active.load(Ordering::SeqCst) || raw.in_flight() != 0 {
                 tokio::task::yield_now().await;
             }
         })
@@ -2196,6 +2674,7 @@ mod tests {
             shutdown,
             loop_lag: Arc::new(Peak::new()),
             loop_probe,
+            sandbox: SandboxEnforcement::Disabled,
         }
     }
 
@@ -2610,7 +3089,7 @@ mod tests {
             admit_configured_roots(&catalog_path, &[first.clone(), second.clone()]).unwrap();
         std::fs::set_permissions(&first, std::fs::Permissions::from_mode(0o500)).unwrap();
         let mut config = Config::from_toml_str(
-            "[[camera]]\nid=\"test\"\nname=\"test\"\nrtsp_url=\"rtsp://127.0.0.1:1/main\"\nusername=\"\"\npassword=\"\"\nrecord=[\"main\"]\n",
+            "[api]\nallow_unauthenticated=true\n[[camera]]\nid=\"test\"\nname=\"test\"\nrtsp_url=\"rtsp://127.0.0.1:1/main\"\nusername=\"\"\npassword=\"\"\nrecord=[\"main\"]\n",
         ).unwrap();
         config.storage.video_roots = vec![first.clone(), second.clone()];
         config.storage.min_free_percent = 0;
@@ -2649,7 +3128,7 @@ mod tests {
 
     fn camera(url: &str, port: u16) -> CameraConfig {
         let text = format!(
-            "[[camera]]\nid=\"cam1\"\nname=\"n\"\nrtsp_url=\"{url}\"\nusername=\"u\"\npassword=\"p\"\nhttp_port={port}\n"
+            "[api]\nallow_unauthenticated=true\n[[camera]]\nid=\"cam1\"\nname=\"n\"\nrtsp_url=\"{url}\"\nusername=\"u\"\npassword=\"p\"\nhttp_port={port}\n"
         );
         Config::from_toml_str(&text).unwrap().cameras.remove(0)
     }
@@ -2671,7 +3150,7 @@ mod tests {
     #[test]
     fn sandbox_spec_covers_roots_state_and_ports() {
         let config = Config::from_toml_str(
-            "[storage]\nvideo_roots=[\"/tmp/irisd-test-root\"]\nstate_dir=\"/tmp/irisd-test-state\"\n[api]\nlisten=\"127.0.0.1:9000\"\n[[camera]]\nid=\"a\"\nname=\"\"\nrtsp_url=\"rtsp://192.0.2.1/x\"\nusername=\"\"\npassword=\"\"\nhttp_port=8080\n[[camera]]\nid=\"b\"\nname=\"\"\nrtsp_url=\"rtsp://192.0.2.2:18554/x\"\nsub_url=\"rtsp://192.0.2.2/y\"\nusername=\"\"\npassword=\"\"\n",
+            "[storage]\nvideo_roots=[\"/tmp/irisd-test-root\"]\nstate_dir=\"/tmp/irisd-test-state\"\n[api]\nlisten=\"127.0.0.1:9000\"\nallow_unauthenticated=true\n[[camera]]\nid=\"a\"\nname=\"\"\nrtsp_url=\"rtsp://192.0.2.1/x\"\nusername=\"\"\npassword=\"\"\nhttp_port=8080\n[[camera]]\nid=\"b\"\nname=\"\"\nrtsp_url=\"rtsp://192.0.2.2:18554/x\"\nsub_url=\"rtsp://192.0.2.2/y\"\nusername=\"\"\npassword=\"\"\n",
         )
         .unwrap();
         let spec = sandbox_spec(&config, Path::new("/etc/irisd/irisd.toml"));

@@ -8,13 +8,17 @@ the Linux client described in `docs/research/06-clients.md §3`.
 
 ## What it provides
 
-- The `iris-gui` binary: `--api URL` (or `IRISD_API`), `--token` (or `IRISD_TOKEN`, which
-  keeps it out of process listings), `--kind main|sub` for the grid tiles, positive
-  `--columns N`,
-  `--focus-kind main|sub` for the single-camera and playback views, `--focus CAMERA` to open
-  the single-camera view at start, `--playback` to open playback instead,
-  `--window MINUTES` (default 60) for the playback window, and `--export-to FILE` to export
-  the whole window to a file as soon as playback opens (for scripts and tests).
+- The `iris-gui` binary: `--api URL` (or `IRISD_API`; `http` or `https`),
+  `--allow-insecure-http` to accept a plain-HTTP API on a host other than loopback, the
+  bearer token in `IRISD_TOKEN` (or `--token`, which other local users can read in process
+  listings and the shell keeps in its history: the viewer warns about it and moves it into
+  the environment when it re-executes itself to select the GL renderer), `--kind main|sub`
+  for the grid tiles, positive `--columns N`, positive `--max-tiles N` (default 16) for the
+  live tiles the grid decodes, `--focus-kind main|sub` for the single-camera and playback
+  views, `--focus CAMERA` to open the single-camera view at start, `--playback` to open
+  playback instead, `--window MINUTES` (default 60) for the playback window, and
+  `--export-to FILE` to export the whole window to a file as soon as playback opens (for
+  scripts and tests).
 - Three views in a stack: the grid; the focused live view of one camera with "Back to grid"
   and "Playback" buttons; and the playback view with "Back to grid", "Live", and
   "Play / Pause" buttons, the picture, and the timeline. A click on a tile focuses its
@@ -23,8 +27,11 @@ the Linux client described in `docs/research/06-clients.md §3`.
   and events (`/api/events`) for the timeline, then fetches the HLS VOD playlist
   (`/api/streams/{camera}/{kind}/hls/vod.m3u8`) once for both its fragment timing and
   `playbin3`. A private loopback endpoint serves that frozen body to the player;
-  init and media URIs resolve against the daemon's response URL and retain their queries.
-  A click on the timeline
+  init and media URIs resolve against the daemon's response URL and retain their queries,
+  and every one must stay on the API origin (scheme, host, and port) without userinfo. A
+  reference to another origin or scheme (`file:` and `data:` included), a tag the daemon's
+  VOD writer does not emit (such as `EXT-X-KEY` or `EXT-X-MEDIA`), or a redirect rejects
+  the playlist before GStreamer sees it. A click on the timeline
   seeks; the playhead follows the player four times a second.
 - A strip of thumbnails above the timeline: one keyframe per twelfth of the window where
   something is recorded, from `/api/streams/{camera}/{kind}/keyframe?t=` on the grid's
@@ -40,14 +47,22 @@ the Linux client described in `docs/research/06-clients.md §3`.
   (drawn on the timeline), "Export" asks for a file with the system save dialog and streams
   `/api/streams/{camera}/{kind}/export.mp4` for the range into it, with the bytes written so
   far in the status line. The download uses an exclusive sibling temporary and exposes the
-  final path only through an atomic rename after a complete, nonempty MP4 is synced. Progress
+  final path only through an atomic rename after a complete, nonempty MP4 is synced. Before the
+  first byte and after every further 64 MiB it reads the destination filesystem's free space
+  with `fstatvfs` on the temporary's descriptor and stops, removing the temporary, when less
+  than the larger of 1 GiB and 2 % of the filesystem remains. Progress
   retains one latest value, so completion cannot be overwritten by stale updates. The suggested
   file name is `<camera>-<kind>-<UTC start>.mp4`.
 - `api::Client` — the reads of `/api/cameras`, the segment and event lists, and the VOD
   playlist body and fragment timing, with the root bearer in `Authorization`. The daemon's
   media references carry exact-path capabilities bounded to the selected playback horizon.
   The client applies a five-second connect deadline, a thirty-second body-idle deadline,
-  endpoint byte/count/string limits, and requested-time-domain validation. Progressing exports
+  endpoint byte/count/string limits, and requested-time-domain validation, and follows no
+  redirects. A sealed segment row must span a positive interval that overlaps the window. The
+  API treats an open row as extending to the present, so an open row needs only a start
+  no later than its recorded end and before the window's end; open rows that recorded nothing
+  inside the window (a stale file of an offline camera, or a file before its first sync) are
+  dropped, and a window holding only such rows shows nothing recorded. Progressing exports
   have no short total deadline.
 - `timeline::Timeline` and `timeline::Model` — the timeline widget (coverage bars, event
   marks, ticks, playhead) and the wall-clock to playlist-time mapping from the served
@@ -63,7 +78,9 @@ the Linux client described in `docs/research/06-clients.md §3`.
   checked, and the copied RGB image is at most 64 MiB.
 - `live::Feed` and `live::run` — a reconnecting WebSocket client per tile that pushes the
   daemon's byte stream (one init segment, then one fragment per frame) into the tile's
-  `appsrc`, and asks the tile to restart its pipeline after a reconnection.
+  `appsrc`, and asks the tile to restart its pipeline after a reconnection. An `https` API
+  gives a `wss` feed, verified against the platform's trust store (rustls with the native
+  roots), so the viewer works through a TLS reverse proxy for both API reads and live video.
 - `stage::Stage` — one GStreamer pipeline shared by every live tile, playing for the
   viewer's lifetime; tiles are bins added to and removed from it, so they share one GL
   context and one GL thread. Its bus watch routes errors to the branch they came from;
@@ -74,9 +91,13 @@ the Linux client described in `docs/research/06-clients.md §3`.
   on the input. Readiness is the first buffer at the branch's sink pad.
   Its single producer rejects empty input and checks queued plus incoming bytes against a
   16 MiB limit and queued objects against 512 buffers before copying. WebSocket frames and
-  assembled messages are limited to one type byte plus the 16 MiB payload. Overflow or a
-  fixed-protocol type error fails the feed and reconnects with an init segment and sync frame;
-  the runtime stays unblocked and no arbitrary byte chunks are discarded.
+  assembled messages are limited to one type byte plus the 16 MiB payload: 16 MiB + 1 bytes,
+  the live protocol's message ceiling, which the daemon honours by skipping an oversized
+  non-sync frame and closing with code 1009 (Message Too Big) when a sync frame exceeds it.
+  Queue overflow or a fixed-protocol type error fails the feed and reconnects after 2 s with an
+  init segment and sync frame; the runtime stays unblocked and no arbitrary byte chunks are
+  discarded. A 1009 close or a message above the ceiling puts the tile in a labelled oversized
+  state and retries after 2 s, doubling to 60 s, until the feed delivers video again.
   Playback hands `playbin3` the same `glupload ! glcolorconvert ! gtk4paintablesink` bin
   as its video sink.
 - Playback's widget callbacks hold weak references to the view, so closing and dropping
@@ -88,7 +109,15 @@ the Linux client described in `docs/research/06-clients.md §3`.
 
 ## How it is used
 
-    IRISD_TOKEN=... iris-gui --api http://192.0.2.10:8554 --kind sub --columns 3
+    IRISD_TOKEN=... iris-gui --api https://nvr.example:8443 --kind sub --columns 3
+
+The daemon speaks plain HTTP; for another machine, put a TLS reverse proxy (or a VPN) in
+front of it and point `--api` at the proxy's `https` URL. The viewer checks the proxy's
+certificate against the platform's trust store for API reads and for the `wss` live feeds;
+a proxy with a private CA needs that CA in the system store. On the daemon's own host,
+`--api http://127.0.0.1:8554` (the default) needs nothing more; plain HTTP to any other
+host is refused unless `--allow-insecure-http` accepts sending the token and video
+unencrypted.
 
 The grid fills as `/api/cameras` answers; each tile labels itself with the camera's name and
 id and shows pipeline errors in that label. Logs go to stderr (`RUST_LOG=iris_gui=debug`
@@ -97,10 +126,13 @@ raw client-handshake target even under a broad trace filter because it serialize
 
 ## Invariants and limits
 
-- The viewer never parses video. The daemon's live feed is a fragmented MP4 byte stream
-  (`docs/research/07-architecture.md §5`), and `qtdemux` consumes it as such; the design's
-  `appsrc` of raw access units plus `h265parse` was not needed. `qtdemux` logs an unknown
-  `prft` box per fragment at its warning level and skips it.
+- The viewer's Rust code never parses video. GStreamer's native elements (`qtdemux`, the
+  parsers `decodebin3` inserts, the selected decoder and its driver, and `hlsdemux2` for
+  playback) parse and decode the daemon's stream inside the viewer process without a sandbox,
+  so the viewer is exposed to camera-originated media through them. The daemon's live feed is
+  a fragmented MP4 byte stream (`docs/research/07-architecture.md §5`), and `qtdemux` consumes
+  it as such; the design's `appsrc` of raw access units plus `h265parse` was not needed.
+  `qtdemux` logs an unknown `prft` box per fragment at its warning level and skips it.
 - When the decoder produces GL memory or DMA-BUF, frames stay on the GPU: `glupload` is a no-op,
   `glcolorconvert` converts to RGBA there, and the sink hands GTK a GL texture. Software decode
   and drivers without compatible interop upload system-memory frames. The viewer re-executes itself once
@@ -126,7 +158,11 @@ raw client-handshake target even under a broad trace filter because it serialize
 - The snapshot binds only to IPv4 loopback and requires a 256-bit OS-random capability
   path; the playlist can contain authenticated media URLs. The endpoint and body never
   enter viewer logs or temporary files. It serves the manifest alone; media requests go
-  directly to the daemon.
+  directly to the daemon, and only to the API origin.
+- The grid decodes at most `--max-tiles` live tiles (default 16), in camera order; the
+  tiles after them are labelled as not started and still open their camera's single-camera
+  view when clicked. Each live tile queues at most 16 MiB, so the default bounds the grid's
+  queued live input at 256 MiB.
 - Seeks are key-unit seeks (`KEY_UNIT | FLUSH`): the player lands on the sync sample at or
   before the target, at most one fragment early.
 - The phase-3 exit criterion (`docs/research/08-roadmap.md`) is six tiles plus one main view
@@ -139,6 +175,19 @@ raw client-handshake target even under a broad trace filter because it serialize
 - Unit tests: the live URL derivation (scheme switch, bearer header), the playlist URL, the
   two serialised forms of an event kind, the playlist-time mapping across gaps, the nearest
   event lookup, the export file name, snapshot URI resolution, and private snapshot lifetime.
+  A loopback TLS WebSocket with an `rcgen` certificate shows `live::session` refusing it under
+  the platform's roots (`UnknownIssuer`) and streaming once its root is injected; loopback
+  WebSockets show frames above the ceiling and a 1009 close ending a session as oversized and
+  the feed backing off 2 s then 4 s. Further cases cover playlist references to other
+  origins, schemes, userinfo, and every URI-bearing tag; refused redirects; open segment rows;
+  the API URL and `--token` handling; and exports stopped by an injected low-space probe.
+- `cargo test -p iris-gui --bin iris-gui -- --ignored --test-threads=1` under `xvfb-run`
+  runs the GTK lifecycle checks, including the `--max-tiles` grid cap and a window holding
+  only a stale open segment showing nothing recorded.
+- `cargo test -p iris-gui --test playback_origin -- --ignored` runs the viewer on a virtual
+  display against playlists that name a second loopback origin, `file:` URIs, or an
+  `EXT-X-KEY` tag, and checks that the playlist is refused and the second origin receives no
+  request.
 - `cargo test -p iris-gui --test playback_snapshot -- --ignored` runs a bounded synthetic
   GUI regression with ffmpeg (`libx264`), Xvfb, and GStreamer HLS/H.264 plugins. Its HTTP
   fixture removes the first fragment on a second VOD selection; the player must fetch the
@@ -152,7 +201,11 @@ raw client-handshake target even under a broad trace filter because it serialize
 
 The snapshot uses the workspace's `axum` (MIT) to serve HTTP and `getrandom`
 (MIT OR Apache-2.0) for its private capability. Synthetic tests use `tempfile`
-(MIT OR Apache-2.0) to remove generated media after the run.
+(MIT OR Apache-2.0) to remove generated media after the run. `wss` uses tokio-tungstenite's
+`rustls-tls-native-roots` feature, whose `rustls` and `rustls-native-certs`
+(Apache-2.0 OR ISC OR MIT) the lock already carries for `reqwest`; the export's `fstatvfs`
+comes from the workspace's `rustix` (Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT);
+the TLS fixture uses the workspace's `rcgen` and `tokio-rustls` (MIT OR Apache-2.0).
 
 ## Further reading
 

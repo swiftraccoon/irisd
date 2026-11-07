@@ -46,8 +46,10 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::time::Duration;
 
+    use iris_core::config::DEFAULT_API_STREAMING_MEDIA;
+
     use super::*;
-    use crate::state::{ApiStats, MAX_CONCURRENT_MEDIA_RESPONSES};
+    use crate::state::{ApiStats, MediaClass};
 
     #[tokio::test]
     async fn cancelled_waiters_do_not_release_running_blocking_work() {
@@ -56,8 +58,12 @@ mod tests {
         let release = Arc::new(AtomicBool::new(false));
         let mut waiters = Vec::new();
 
-        for expected in 1..=MAX_CONCURRENT_MEDIA_RESPONSES {
-            let permit = shared(stats.try_media_response().expect("slot within the limit"));
+        for expected in 1..=DEFAULT_API_STREAMING_MEDIA {
+            let permit = shared(
+                stats
+                    .try_media(MediaClass::Streaming)
+                    .expect("slot within the limit"),
+            );
             let running_work = Arc::clone(&running);
             let release_work = Arc::clone(&release);
             waiters.push(tokio::spawn(async move {
@@ -83,14 +89,14 @@ mod tests {
             let _ = waiter.await;
         }
         assert!(
-            stats.try_media_response().is_none(),
+            stats.try_media(MediaClass::Streaming).is_none(),
             "detached blocking work must retain every admission slot"
         );
 
         release.store(true, Ordering::SeqCst);
         tokio::time::timeout(Duration::from_secs(2), async {
             loop {
-                if let Some(permit) = stats.try_media_response() {
+                if let Some(permit) = stats.try_media(MediaClass::Streaming) {
                     drop(permit);
                     break;
                 }
@@ -104,7 +110,7 @@ mod tests {
     #[tokio::test]
     async fn detached_async_work_retains_admission_until_completion() {
         let stats = Arc::new(ApiStats::default());
-        let permit = shared(stats.try_media_response().expect("first slot"));
+        let permit = shared(stats.try_media(MediaClass::Streaming).expect("first slot"));
         let (started_tx, started_rx) = tokio::sync::oneshot::channel();
         let (release_tx, release_rx) = tokio::sync::oneshot::channel();
         let worker = spawn(&permit, async move {
@@ -115,18 +121,22 @@ mod tests {
         drop(worker);
         drop(permit);
 
-        let remaining: Vec<_> = (1..MAX_CONCURRENT_MEDIA_RESPONSES)
-            .map(|_| stats.try_media_response().expect("remaining slot"))
+        let remaining: Vec<_> = (1..DEFAULT_API_STREAMING_MEDIA)
+            .map(|_| {
+                stats
+                    .try_media(MediaClass::Streaming)
+                    .expect("remaining slot")
+            })
             .collect();
         assert!(
-            stats.try_media_response().is_none(),
+            stats.try_media(MediaClass::Streaming).is_none(),
             "detached async work must retain its original slot"
         );
 
         release_tx.send(()).expect("detached work is waiting");
         tokio::time::timeout(Duration::from_secs(2), async {
             loop {
-                if let Some(permit) = stats.try_media_response() {
+                if let Some(permit) = stats.try_media(MediaClass::Streaming) {
                     drop(permit);
                     break;
                 }

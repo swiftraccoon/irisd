@@ -17,9 +17,11 @@ Scope: this crate only. Read the root `AGENTS.md` first.
 - `EventSink::publish` is called from receive loops and must stay non-blocking.
 - CGI attachment has a 10 s header/authentication deadline; do not apply an overall request
   timeout to the indefinite feed body. Its stall clock advances only after a complete part.
-  Both CGI and ONVIF honor `CameraEndpoint::tls_verify`.
-- ONVIF-discovered service and subscription URLs stay on the configured full origin and
-  authenticated SOAP never follows redirects. SOAP has independent byte and XML-structure caps.
+  Both CGI and ONVIF honor `CameraEndpoint::tls_verify`, and neither follows redirects.
+- ONVIF-discovered service and subscription URLs are rebased onto the configured full origin
+  (`SoapTransport::rebase_url`), keeping path and query; userinfo, fragments, and non-HTTP
+  schemes are rejected. Rebase the events URL before creating the subscription and the
+  reference before any later call. SOAP has independent byte and XML-structure caps.
   Clock/authentication classification uses Fault code, subcode, and reason, never free-form
   Detail text.
 - The `EventStats` accessors feed the daemon's `events` statistics line; renaming or

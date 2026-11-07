@@ -13,7 +13,7 @@ const STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
 fn write_config(dir: &Path, listen: SocketAddr, rtsp: SocketAddr) -> PathBuf {
     let config = format!(
         "[storage]\nvideo_roots=[\"{root}\"]\nstate_dir=\"{state}\"\n\
-         [api]\nlisten=\"{listen}\"\ntokens=[\"test\"]\n\
+         [api]\nlisten=\"{listen}\"\ntokens=[\"startup-test-token-0123456789abcdef\"]\n\
          [[camera]]\nid=\"test\"\nname=\"test\"\nrtsp_url=\"rtsp://{rtsp}/main\"\n\
          username=\"\"\npassword=\"\"\nrecord=[\"main\"]\n",
         root = dir.join("video").display(),

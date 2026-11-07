@@ -229,6 +229,14 @@ async fn subscribe(
     subscribe_with_deadline(client, transport, shutdown, CALL_DEADLINE).await
 }
 
+/// Finds the events service and creates a pull-point subscription signed by
+/// `client`, bounding each call by `deadline`.
+///
+/// The advertised events service and subscription reference are rebased onto
+/// the configured origin ([`SoapTransport::rebase_url`]) before use: the events
+/// URL before the subscription exists, so a camera that advertises an
+/// unreachable address still subscribes, and the reference before any later
+/// call, so pulls, renewals, and the unsubscribe reach the configured camera.
 async fn subscribe_with_deadline(
     client: OnvifClient,
     transport: &SoapTransport,
@@ -241,7 +249,7 @@ async fn subscribe_with_deadline(
         .url
         .ok_or(SessionError::NoEventsService)?;
     let events_url = transport
-        .validate_url(&events_url)
+        .rebase_url(&events_url)
         .map_err(oxvif::OnvifError::from)?;
     let mut subscription = bounded_with_deadline(
         shutdown,
@@ -254,7 +262,7 @@ async fn subscribe_with_deadline(
     )
     .await?;
     subscription.reference_url = transport
-        .validate_url(&subscription.reference_url)
+        .rebase_url(&subscription.reference_url)
         .map_err(oxvif::OnvifError::from)?
         .to_string();
     Ok((client, subscription))
@@ -780,6 +788,18 @@ mod tests {
         events_url: String,
         reference_url: String,
         creates: AtomicUsize,
+        create_urls: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl AdvertisedUrlTransport {
+        fn new(events_url: &str, reference_url: &str) -> Self {
+            Self {
+                events_url: events_url.to_owned(),
+                reference_url: reference_url.to_owned(),
+                creates: AtomicUsize::new(0),
+                create_urls: std::sync::Mutex::new(Vec::new()),
+            }
+        }
     }
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -893,7 +913,7 @@ mod tests {
     impl oxvif::transport::Transport for AdvertisedUrlTransport {
         async fn soap_post(
             &self,
-            _url: &str,
+            url: &str,
             action: &str,
             _body: String,
         ) -> Result<String, oxvif::transport::TransportError> {
@@ -905,6 +925,10 @@ mod tests {
             }
             if action.contains("CreatePullPointSubscriptionRequest") {
                 self.creates.fetch_add(1, Ordering::SeqCst);
+                self.create_urls
+                    .lock()
+                    .expect("create URL log")
+                    .push(url.to_owned());
                 return Ok(format!(
                     r#"<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope" xmlns:tev="http://www.onvif.org/ver10/events/wsdl" xmlns:wsa="http://www.w3.org/2005/08/addressing"><s:Body><tev:CreatePullPointSubscriptionResponse><tev:SubscriptionReference><wsa:Address>{}</wsa:Address></tev:SubscriptionReference><tev:CurrentTime>2026-01-01T00:00:00Z</tev:CurrentTime><tev:TerminationTime>2026-01-01T00:10:00Z</tev:TerminationTime></tev:CreatePullPointSubscriptionResponse></s:Body></s:Envelope>"#,
                     self.reference_url
@@ -1280,7 +1304,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn discovered_urls_are_rejected_before_authenticated_followup_calls() {
+    async fn discovered_urls_are_rebased_or_rejected_before_authenticated_followup_calls() {
         let endpoint = CameraEndpoint {
             camera: "cam1".parse().unwrap(),
             host: "127.0.0.1".to_owned(),
@@ -1296,17 +1320,11 @@ mod tests {
         let same_reference = "http://127.0.0.1:8080/onvif/events/subscription";
 
         for rejected in [
-            "http://127.0.0.2:8080/onvif/events",
-            "http://127.0.0.1:8081/onvif/events",
-            "https://127.0.0.1:8080/onvif/events",
             "http://user@127.0.0.1:8080/onvif/events",
             "http://127.0.0.1:8080/onvif/events#fragment",
+            "ftp://127.0.0.1:8080/onvif/events",
         ] {
-            let foreign_events = Arc::new(AdvertisedUrlTransport {
-                events_url: rejected.to_owned(),
-                reference_url: same_reference.to_owned(),
-                creates: AtomicUsize::new(0),
-            });
+            let foreign_events = Arc::new(AdvertisedUrlTransport::new(rejected, same_reference));
             let client =
                 OnvifClient::new(endpoint.base_url()).with_transport(foreign_events.clone());
             assert!(subscribe(client, &policy, &shutdown).await.is_err());
@@ -1316,26 +1334,217 @@ mod tests {
                 "created a subscription at rejected events URL {rejected}"
             );
 
-            let foreign_reference = Arc::new(AdvertisedUrlTransport {
-                events_url: same_events.to_owned(),
-                reference_url: rejected.replace("/onvif/events", "/onvif/events/subscription"),
-                creates: AtomicUsize::new(0),
-            });
+            let reference = rejected.replace("/onvif/events", "/onvif/events/subscription");
+            let foreign_reference = Arc::new(AdvertisedUrlTransport::new(same_events, &reference));
             let client =
                 OnvifClient::new(endpoint.base_url()).with_transport(foreign_reference.clone());
             assert!(subscribe(client, &policy, &shutdown).await.is_err());
             assert_eq!(foreign_reference.creates.load(Ordering::SeqCst), 1);
         }
 
-        let same_origin = Arc::new(AdvertisedUrlTransport {
-            events_url: same_events.to_owned(),
-            reference_url: same_reference.to_owned(),
-            creates: AtomicUsize::new(0),
+        for foreign in [
+            "http://127.0.0.1:8080/onvif/events",
+            "http://192.0.2.10:8080/onvif/events",
+            "http://127.0.0.1:8081/onvif/events",
+            "https://127.0.0.1:8080/onvif/events",
+            "http://camera.example/onvif/events",
+        ] {
+            let reference = foreign.replace("/onvif/events", "/onvif/events/subscription");
+            let advertised = Arc::new(AdvertisedUrlTransport::new(foreign, &reference));
+            let client = OnvifClient::new(endpoint.base_url()).with_transport(advertised.clone());
+            let (_, subscription) = subscribe(client, &policy, &shutdown).await.unwrap();
+            assert_eq!(
+                advertised.create_urls.lock().unwrap().as_slice(),
+                [same_events],
+                "{foreign}"
+            );
+            assert_eq!(subscription.reference_url, same_reference, "{foreign}");
+        }
+    }
+
+    /// The canned reply of a loopback ONVIF camera to one SOAP action, given as
+    /// the request's lowercase `Content-Type` line.
+    fn camera_reply(action: &str, advertised: &str) -> String {
+        if action.contains("getsystemdateandtime") {
+            return r#"<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope" xmlns:tds="http://www.onvif.org/ver10/device/wsdl" xmlns:tt="http://www.onvif.org/ver10/schema"><s:Body><tds:GetSystemDateAndTimeResponse><tds:SystemDateAndTime><tt:UTCDateTime><tt:Time><tt:Hour>0</tt:Hour><tt:Minute>0</tt:Minute><tt:Second>0</tt:Second></tt:Time><tt:Date><tt:Year>2026</tt:Year><tt:Month>1</tt:Month><tt:Day>1</tt:Day></tt:Date></tt:UTCDateTime></tds:SystemDateAndTime></tds:GetSystemDateAndTimeResponse></s:Body></s:Envelope>"#.to_owned();
+        }
+        if action.contains("getcapabilities") {
+            return format!(
+                r#"<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope" xmlns:tds="http://www.onvif.org/ver10/device/wsdl" xmlns:tt="http://www.onvif.org/ver10/schema"><s:Body><tds:GetCapabilitiesResponse><tds:Capabilities><tt:Events><tt:XAddr>{advertised}/onvif/events</tt:XAddr></tt:Events></tds:Capabilities></tds:GetCapabilitiesResponse></s:Body></s:Envelope>"#
+            );
+        }
+        if action.contains("createpullpointsubscriptionrequest") {
+            return format!(
+                r#"<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope" xmlns:tev="http://www.onvif.org/ver10/events/wsdl" xmlns:wsa="http://www.w3.org/2005/08/addressing"><s:Body><tev:CreatePullPointSubscriptionResponse><tev:SubscriptionReference><wsa:Address>{advertised}/onvif/events/subscription</wsa:Address></tev:SubscriptionReference><tev:CurrentTime>2026-01-01T00:00:00Z</tev:CurrentTime><tev:TerminationTime>2026-01-01T00:10:00Z</tev:TerminationTime></tev:CreatePullPointSubscriptionResponse></s:Body></s:Envelope>"#
+            );
+        }
+        if action.contains("pullmessagesrequest") {
+            return r#"<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope"><s:Body><PullMessagesResponse/></s:Body></s:Envelope>"#.to_owned();
+        }
+        if action.contains("unsubscriberequest") {
+            return r#"<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope"><s:Body><UnsubscribeResponse/></s:Body></s:Envelope>"#.to_owned();
+        }
+        panic!("unexpected action {action}");
+    }
+
+    /// Serves one SOAP request per connection; reports `(path, action)` of each.
+    async fn loopback_camera(
+        listener: TcpListener,
+        advertised: String,
+        requests: tokio::sync::mpsc::UnboundedSender<(String, String)>,
+    ) {
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            let mut request = Vec::new();
+            let mut chunk = [0_u8; 4096];
+            let mut complete = None;
+            while complete.is_none() {
+                match socket.read(&mut chunk).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(read) => request.extend_from_slice(&chunk[..read]),
+                }
+                let Some(end) = request.windows(4).position(|window| window == b"\r\n\r\n") else {
+                    continue;
+                };
+                let head = String::from_utf8_lossy(&request[..end + 4]).to_ascii_lowercase();
+                let body_len: usize = head
+                    .lines()
+                    .find_map(|line| line.strip_prefix("content-length:"))
+                    .map_or(0, |value| value.trim().parse().unwrap_or(0));
+                if request.len() >= end + 4 + body_len {
+                    complete = Some(head);
+                }
+            }
+            // A connection that ends before a complete request is not a call.
+            let Some(head) = complete else {
+                continue;
+            };
+            let path = head
+                .split_whitespace()
+                .nth(1)
+                .unwrap_or_default()
+                .to_owned();
+            let action = head
+                .lines()
+                .find(|line| line.starts_with("content-type:"))
+                .unwrap_or_default()
+                .to_owned();
+            let reply = camera_reply(&action, &advertised);
+            let _ = requests.send((path, action));
+            socket
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/soap+xml\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}",
+                        reply.len()
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+        }
+    }
+
+    /// Runs one session against a loopback camera configured as `host` that
+    /// advertises `advertised` for its event services; returns every request
+    /// it served.
+    async fn rebased_session(
+        host: &str,
+        advertised: impl FnOnce(u16) -> String,
+    ) -> Vec<(String, String)> {
+        let camera = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = camera.local_addr().unwrap().port();
+        let (requests_tx, mut requests) = tokio::sync::mpsc::unbounded_channel();
+        let camera_task = tokio::spawn(loopback_camera(camera, advertised(port), requests_tx));
+        let endpoint = CameraEndpoint {
+            camera: "cam1".parse().unwrap(),
+            host: host.to_owned(),
+            http_port: port,
+            https: false,
+            tls_verify: true,
+            username: "marker-user".to_owned(),
+            password: "marker-password".to_owned(),
+        };
+        let shutdown = CancellationToken::new();
+        let session_shutdown = shutdown.clone();
+        let session = tokio::spawn(async move {
+            let mut backoff = Backoff::new("test/onvif");
+            session(
+                &endpoint,
+                &Ignore,
+                &EventStats::new(),
+                &session_shutdown,
+                &mut backoff,
+            )
+            .await
         });
-        let client = OnvifClient::new(endpoint.base_url()).with_transport(same_origin.clone());
-        let (_, subscription) = subscribe(client, &policy, &shutdown).await.unwrap();
-        assert_eq!(subscription.reference_url, same_reference);
-        assert_eq!(same_origin.creates.load(Ordering::SeqCst), 1);
+        let mut served = Vec::new();
+        timeout(Duration::from_secs(10), async {
+            while let Some(request) = requests.recv().await {
+                let pulled = request.1.contains("pullmessagesrequest");
+                let unsubscribed = request.1.contains("unsubscriberequest");
+                served.push(request);
+                if pulled {
+                    shutdown.cancel();
+                }
+                if unsubscribed {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("the session subscribes, pulls, and unsubscribes");
+        timeout(Duration::from_secs(10), session)
+            .await
+            .expect("the session ends after cancellation")
+            .unwrap()
+            .expect("a cancelled session ends cleanly");
+        camera_task.abort();
+        served
+    }
+
+    fn served_paths(served: &[(String, String)]) -> Vec<&str> {
+        served.iter().map(|(path, _)| path.as_str()).collect()
+    }
+
+    #[tokio::test]
+    async fn a_camera_advertising_a_foreign_address_is_served_at_the_configured_one() {
+        let sink = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let sink_address = sink.local_addr().unwrap();
+        let served = rebased_session("127.0.0.1", |_| format!("http://{sink_address}")).await;
+        assert_eq!(
+            served_paths(&served),
+            [
+                "/onvif/device_service",
+                "/onvif/device_service",
+                "/onvif/events",
+                "/onvif/events/subscription",
+                "/onvif/events/subscription",
+            ]
+        );
+        assert!(
+            timeout(Duration::from_millis(200), sink.accept())
+                .await
+                .is_err(),
+            "the advertised address received no request"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_camera_configured_by_host_name_subscribes_through_advertised_addresses() {
+        let served = rebased_session("localhost", |port| format!("http://127.0.0.1:{port}")).await;
+        assert!(
+            served.iter().any(|(path, action)| path == "/onvif/events"
+                && action.contains("createpullpointsubscriptionrequest")),
+            "{served:?}"
+        );
+        assert!(
+            served
+                .iter()
+                .any(|(_, action)| action.contains("unsubscriberequest")),
+            "the subscription is released: {served:?}"
+        );
     }
 
     #[tokio::test]

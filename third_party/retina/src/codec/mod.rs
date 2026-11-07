@@ -893,11 +893,10 @@ impl Depacketizer {
                 onvif::Depacketizer::new(CompressionType::ExiInBand),
             )),
             (_, _) => {
-                log::info!(
-                    "no depacketizer for media/encoding_name {}/{}",
-                    media,
-                    encoding_name
-                );
+                // Server-chosen names: logged and returned as bounded excerpts.
+                let media = crate::mostly_ascii::Excerpt::of(media);
+                let encoding_name = crate::mostly_ascii::Excerpt::of(encoding_name);
+                log::info!("no depacketizer for media/encoding_name {media}/{encoding_name}");
                 return Err(format!(
                     "no depacketizer for media/encoding_name {media}/{encoding_name}"
                 ));

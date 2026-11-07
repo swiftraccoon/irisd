@@ -239,6 +239,122 @@ fn fetch_oid(oid: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The commit fields the publication mutation returns and
+/// [`verify_published_commit`] checks.
+const PUBLISHED_COMMIT_FIELDS: &str = "oid message messageHeadline messageBody \
+    signature { isValid state wasSignedByGitHub } parents(first: 2) { nodes { oid } }";
+
+/// The full message `createCommitOnBranch` builds from a headline and body.
+fn expected_message(headline: &str, body: &str) -> String {
+    if body.is_empty() {
+        headline.to_owned()
+    } else {
+        format!("{headline}\n\n{body}")
+    }
+}
+
+/// Checks the commit the mutation returned before it is adopted: a valid
+/// signature made by GitHub, exactly one parent equal to the remote head the
+/// mutation built on, and the requested message. GitHub shortens a long
+/// `messageHeadline`, so the full `message` is compared as well.
+fn verify_published_commit(
+    commit: &Value,
+    remote_oid: &str,
+    headline: &str,
+    body: &str,
+) -> anyhow::Result<()> {
+    let signature = commit
+        .get("signature")
+        .filter(|signature| !signature.is_null())
+        .context("GitHub returned the commit without a signature")?;
+    anyhow::ensure!(
+        signature.get("isValid") == Some(&Value::Bool(true))
+            && signature.get("state").and_then(Value::as_str) == Some("VALID")
+            && signature.get("wasSignedByGitHub") == Some(&Value::Bool(true)),
+        "GitHub reports the commit signature as not valid or not made by GitHub: {signature}"
+    );
+    let parents = commit
+        .pointer("/parents/nodes")
+        .and_then(Value::as_array)
+        .context("GitHub returned the commit without its parents")?;
+    anyhow::ensure!(
+        parents.len() == 1 && parents[0].get("oid").and_then(Value::as_str) == Some(remote_oid),
+        "the published commit's parents are not exactly the remote head {remote_oid}"
+    );
+    let text = |name: &str| commit.get(name).and_then(Value::as_str);
+    let full_message = text("message")
+        .is_some_and(|message| message.trim_end() == expected_message(headline, body).trim_end());
+    let split_message = text("messageHeadline") == Some(headline)
+        && text("messageBody").is_some_and(|message| message.trim_end() == body.trim_end());
+    anyhow::ensure!(
+        full_message || split_message,
+        "the published commit's message differs from the requested headline and body"
+    );
+    Ok(())
+}
+
+/// Checks a commit from GitHub's REST API (`repos/OWNER/NAME/git/commits/OID`)
+/// before a recovery, or a remote head that already has the local tree, is
+/// adopted: the requested
+/// OID, `verification.verified`, and exactly one parent, which it returns.
+fn verified_rest_parent(commit: &Value, oid: &str) -> anyhow::Result<String> {
+    anyhow::ensure!(
+        commit.get("sha").and_then(Value::as_str) == Some(oid),
+        "GitHub returned a different commit than {oid}"
+    );
+    anyhow::ensure!(
+        commit.pointer("/verification/verified") == Some(&Value::Bool(true)),
+        "GitHub does not verify the signature of {oid}: {}",
+        commit
+            .pointer("/verification/reason")
+            .unwrap_or(&Value::Null)
+    );
+    let parents = commit
+        .get("parents")
+        .and_then(Value::as_array)
+        .context("GitHub returned the commit without its parents")?;
+    anyhow::ensure!(parents.len() == 1, "{oid} does not have exactly one parent");
+    parents[0]
+        .get("sha")
+        .and_then(Value::as_str)
+        .filter(|parent| valid_oid(parent))
+        .map(str::to_owned)
+        .context("GitHub returned an invalid parent OID")
+}
+
+/// Fetches `oid` through the REST API and returns its verified single parent.
+fn remote_verified_parent(target: &Target, oid: &str) -> anyhow::Result<String> {
+    let output = gh(
+        &[
+            "api",
+            "--hostname",
+            &target.hostname,
+            &format!("repos/{}/git/commits/{oid}", target.repo),
+        ],
+        None,
+    )?;
+    anyhow::ensure!(
+        output.status.success(),
+        "reading {oid} from GitHub failed: {}",
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+    let commit: Value =
+        serde_json::from_slice(&output.stdout).context("GitHub returned an invalid commit")?;
+    verified_rest_parent(&commit, oid)
+}
+
+fn is_ancestor(ancestor: &str, descendant: &str) -> anyhow::Result<bool> {
+    let status = Command::new("git")
+        .args(["merge-base", "--is-ancestor", ancestor, descendant])
+        .status()
+        .context("running git merge-base")?;
+    match status.code() {
+        Some(0) => Ok(true),
+        Some(1) => Ok(false),
+        _ => anyhow::bail!("git merge-base --is-ancestor failed with {status}"),
+    }
+}
+
 fn trees_equal(a: &str, b: &str) -> anyhow::Result<bool> {
     Ok(git(&["rev-parse", &format!("{a}^{{tree}}")])?
         == git(&["rev-parse", &format!("{b}^{{tree}}")])?)
@@ -471,11 +587,14 @@ fn recovery_path() -> anyhow::Result<PathBuf> {
     ])?))
 }
 
+/// Records a published OID, with the remote head it must have as its parent,
+/// until local adoption completes.
 fn write_recovery(
     target: &Target,
     branch: &str,
     source: &str,
     oid: &str,
+    base: &str,
 ) -> anyhow::Result<PathBuf> {
     let path = recovery_path()?;
     let tmp = path.with_extension(format!("tmp-{}", std::process::id()));
@@ -485,6 +604,7 @@ fn write_recovery(
         "branch": branch,
         "source": source,
         "published": oid,
+        "base": base,
     }))?;
     let mut file = std::fs::OpenOptions::new()
         .write(true)
@@ -524,6 +644,18 @@ fn recover_pending(target: &Target, branch: &str, source: &str) -> anyhow::Resul
     let prior_source = field("source")?.to_owned();
     let published = field("published")?.to_owned();
     anyhow::ensure!(valid_oid(&published), "recovery state has an invalid OID");
+    let base = field("base").with_context(|| {
+        format!(
+            "recovery state does not record the published commit's parent; reconcile {} manually",
+            path.display()
+        )
+    })?;
+    let parent = remote_verified_parent(target, &published)
+        .with_context(|| format!("published {published} but not adopted"))?;
+    anyhow::ensure!(
+        parent == base,
+        "published {published} but not adopted: its parent is {parent}, not the recorded remote head {base}"
+    );
     if prior_source == source {
         reconcile(branch, source, &published).with_context(|| {
             format!(
@@ -573,6 +705,12 @@ pub fn run(args: &Args) -> anyhow::Result<()> {
     let changes = changed_paths(&remote_oid, &source_oid)?;
     if changes.is_empty() {
         if remote_oid != source_oid && trees_equal(&remote_oid, &source_oid)? {
+            let parent = remote_verified_parent(&target, &remote_oid)
+                .with_context(|| format!("cannot adopt existing remote commit {remote_oid}"))?;
+            anyhow::ensure!(
+                is_ancestor(&parent, &source_oid)?,
+                "cannot adopt existing remote commit {remote_oid}: its parent {parent} is not in the local history"
+            );
             reconcile(&branch, &source_oid, &remote_oid)?;
             delete_temp_refs();
             println!("adopted existing signed commit {remote_oid}");
@@ -611,12 +749,13 @@ pub fn run(args: &Args) -> anyhow::Result<()> {
         git(&["rev-parse", "HEAD"])? == source_oid,
         "HEAD changed while planning"
     );
+    let body = args.body.clone().unwrap_or_default();
     let input = json!({
-        "query": "mutation($input: CreateCommitOnBranchInput!) { createCommitOnBranch(input: $input) { commit { oid } } }",
+        "query": format!("mutation($input: CreateCommitOnBranchInput!) {{ createCommitOnBranch(input: $input) {{ commit {{ {PUBLISHED_COMMIT_FIELDS} }} }} }}"),
         "variables": { "input": {
             "branch": { "repositoryNameWithOwner": target.repo, "branchName": branch },
             "expectedHeadOid": remote_oid,
-            "message": { "headline": args.message, "body": args.body.clone().unwrap_or_default() },
+            "message": { "headline": args.message, "body": body },
             "fileChanges": { "additions": additions, "deletions": deletions },
         }},
     });
@@ -644,34 +783,128 @@ pub fn run(args: &Args) -> anyhow::Result<()> {
         .with_context(|| format!("publication response is ambiguous: {response}"))?
         .to_owned();
     anyhow::ensure!(valid_oid(&oid), "invalid published commit OID");
-    let recovery = write_recovery(&target, &branch, &source_oid, &oid)?;
+    let recovery = write_recovery(&target, &branch, &source_oid, &oid, &remote_oid)?;
+    let commit = response
+        .pointer("/data/createCommitOnBranch/commit")
+        .unwrap_or(&Value::Null);
+    verify_published_commit(commit, &remote_oid, &args.message, &body).with_context(|| {
+        format!(
+            "published {oid} but not adopted; recovery state is {}",
+            recovery.display()
+        )
+    })?;
     reconcile(&branch, &source_oid, &oid)
         .with_context(|| format!("published {oid}; recovery state is {}", recovery.display()))?;
     std::fs::remove_file(&recovery)?;
     delete_temp_refs();
-    let verified = gh(
-        &[
-            "api",
-            "--hostname",
-            &target.hostname,
-            &format!("repos/{}/git/commits/{oid}", target.repo),
-            "--jq",
-            ".verification.verified",
-        ],
-        None,
-    )?;
-    let verified = if verified.status.success() {
-        String::from_utf8_lossy(&verified.stdout).trim().to_owned()
-    } else {
-        "unknown".to_owned()
-    };
-    println!("committed {oid} (verified: {verified}); local {branch} adopted it by CAS");
+    println!("committed {oid} (signed by GitHub); local {branch} adopted it by CAS");
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn published(remote: &str) -> Value {
+        json!({
+            "oid": "b".repeat(40),
+            "message": "fix(store): keep the sync phase\n\nWhy it matters.\n",
+            "messageHeadline": "fix(store): keep the sync phase",
+            "messageBody": "Why it matters.",
+            "signature": { "isValid": true, "state": "VALID", "wasSignedByGitHub": true },
+            "parents": { "nodes": [{ "oid": remote }] },
+        })
+    }
+
+    #[test]
+    fn a_published_commit_is_adopted_only_when_signed_on_the_remote_head_with_its_message() {
+        let remote = "a".repeat(40);
+        let (headline, body) = ("fix(store): keep the sync phase", "Why it matters.");
+        verify_published_commit(&published(&remote), &remote, headline, body).unwrap();
+
+        let mut long = published(&remote);
+        long["messageHeadline"] = json!("fix(store): keep the…");
+        verify_published_commit(&long, &remote, headline, body)
+            .expect("the full message settles a shortened headline");
+
+        let mut unsigned = published(&remote);
+        unsigned["signature"] = Value::Null;
+        let mut missing = published(&remote);
+        missing.as_object_mut().unwrap().remove("signature");
+        let mut invalid = published(&remote);
+        invalid["signature"]["isValid"] = json!(false);
+        let mut unknown = published(&remote);
+        unknown["signature"]["state"] = json!("UNKNOWN_KEY");
+        let mut foreign = published(&remote);
+        foreign["signature"]["wasSignedByGitHub"] = json!(false);
+        let mut wrong_parent = published(&remote);
+        wrong_parent["parents"]["nodes"][0]["oid"] = json!("c".repeat(40));
+        let mut merge = published(&remote);
+        merge["parents"]["nodes"] = json!([{ "oid": remote }, { "oid": "c".repeat(40) }]);
+        let mut orphan = published(&remote);
+        orphan["parents"]["nodes"] = json!([]);
+        let mut message = published(&remote);
+        message["message"] = json!("fix(store): something else");
+        message["messageHeadline"] = json!("fix(store): something else");
+        let mut body_changed = published(&remote);
+        body_changed["message"] = json!("fix(store): keep the sync phase\n\nOther text.");
+        body_changed["messageBody"] = json!("Other text.");
+        for (name, commit) in [
+            ("unsigned", unsigned),
+            ("missing signature", missing),
+            ("invalid signature", invalid),
+            ("unknown signature state", unknown),
+            ("not signed by GitHub", foreign),
+            ("wrong parent", wrong_parent),
+            ("two parents", merge),
+            ("no parent", orphan),
+            ("headline mismatch", message),
+            ("body mismatch", body_changed),
+        ] {
+            assert!(
+                verify_published_commit(&commit, &remote, headline, body).is_err(),
+                "{name}"
+            );
+        }
+        assert!(verify_published_commit(&Value::Null, &remote, headline, body).is_err());
+        assert_eq!(expected_message("h", ""), "h");
+        assert_eq!(expected_message("h", "b"), "h\n\nb");
+    }
+
+    #[test]
+    fn recovered_and_existing_commits_need_rest_verification_and_one_parent() {
+        let oid = "b".repeat(40);
+        let parent = "a".repeat(40);
+        let commit = json!({
+            "sha": oid,
+            "verification": { "verified": true, "reason": "valid" },
+            "parents": [{ "sha": parent }],
+        });
+        assert_eq!(verified_rest_parent(&commit, &oid).unwrap(), parent);
+
+        let mut unverified = commit.clone();
+        unverified["verification"] = json!({ "verified": false, "reason": "unsigned" });
+        let mut other = commit.clone();
+        other["sha"] = json!("c".repeat(40));
+        let mut merge = commit.clone();
+        merge["parents"] = json!([{ "sha": parent }, { "sha": "c".repeat(40) }]);
+        let mut invalid_parent = commit.clone();
+        invalid_parent["parents"] = json!([{ "sha": "not-an-oid" }]);
+        let mut no_verification = commit;
+        no_verification
+            .as_object_mut()
+            .unwrap()
+            .remove("verification");
+        for (name, commit) in [
+            ("unverified", unverified),
+            ("other commit", other),
+            ("two parents", merge),
+            ("invalid parent", invalid_parent),
+            ("no verification", no_verification),
+        ] {
+            assert!(verified_rest_parent(&commit, &oid).is_err(), "{name}");
+        }
+    }
 
     #[test]
     fn rejects_tree_modes_the_commit_api_cannot_preserve() {

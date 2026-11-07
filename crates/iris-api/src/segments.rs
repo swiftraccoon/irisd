@@ -6,7 +6,7 @@ use std::sync::Arc;
 use axum::Json;
 use axum::body::Body;
 use axum::extract::{Path, Query, Request, State};
-use axum::http::{Method, StatusCode, header};
+use axum::http::{HeaderValue, Method, StatusCode, header};
 use axum::response::Response;
 use bytes::Bytes;
 use iris_catalog::{SegmentId, SegmentRow};
@@ -17,12 +17,15 @@ use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncSeekExt as _, SeekFrom};
 use tokio::sync::mpsc;
 
 use crate::error::ApiError;
-use crate::hls::{MAX_SEGMENT_ROWS, published_index};
+use crate::hls::{MAX_SEGMENT_ROWS, PublishedIndex, published_index};
 use crate::media_admission::{self, MediaPermit};
 use crate::query::{TimeParams, resolve_range};
-use crate::state::{ApiState, admitted_media_bytes};
+use crate::state::{ApiState, MediaClass, admitted_media_bytes};
 
 const RAW_BODY_CHUNK_BYTES: u64 = 64 * 1024;
+/// Longest raw range admitted in the bounded media class; whole files,
+/// open-ended ranges, and longer ranges are streaming responses.
+pub(crate) const BOUNDED_RANGE_BYTES: u64 = 1024 * 1024;
 type RawBodyItem = Result<Bytes, io::Error>;
 
 /// A segment as the API presents it (no server paths).
@@ -108,27 +111,50 @@ pub(crate) async fn file(
     Path(id): Path<i64>,
     req: Request,
 ) -> Result<Response, ApiError> {
-    let permit = media_admission::shared(
-        state
-            .stats
-            .try_media_response()
-            .ok_or_else(|| ApiError::Unavailable("too many concurrent media responses".into()))?,
-    );
+    let permit = state
+        .stats
+        .admit_media(raw_admission_class(req.headers().get(header::RANGE)))?;
     let row = state
         .catalog
         .segment(SegmentId(id))
         .await?
         .ok_or(ApiError::NotFound)?;
-    let published = published_index(&row, &permit).await?;
-    serve_extent(&row, published.extent, req, permit).await
+    let published = published_index(&state, &row, &permit).await?;
+    serve_extent(row.id, published, req, permit).await
+}
+
+/// The admission class of a raw request: bounded when its `Range` names at
+/// most [`BOUNDED_RANGE_BYTES`], streaming otherwise. The served length never
+/// exceeds the requested one, so a bounded request cannot stream more.
+fn raw_admission_class(range: Option<&HeaderValue>) -> MediaClass {
+    let requested = range
+        .and_then(|value| value.to_str().ok())
+        .and_then(|raw| raw.strip_prefix("bytes="))
+        .map(str::trim)
+        .filter(|range| !range.contains(','))
+        .and_then(|range| range.split_once('-'))
+        .and_then(|(start, end)| {
+            if start.is_empty() {
+                return end.parse::<u64>().ok();
+            }
+            let start: u64 = start.parse().ok()?;
+            let end: u64 = end.parse().ok()?;
+            end.checked_sub(start)?.checked_add(1)
+        });
+    if requested.is_some_and(|len| len <= BOUNDED_RANGE_BYTES) {
+        MediaClass::Bounded
+    } else {
+        MediaClass::Streaming
+    }
 }
 
 async fn serve_extent(
-    row: &SegmentRow,
-    extent: u64,
+    segment: SegmentId,
+    published: PublishedIndex,
     req: Request,
     permit: MediaPermit,
 ) -> Result<Response, ApiError> {
+    let extent = published.media.extent();
     let Ok(range) = parse_range(req.headers().get(header::RANGE), extent) else {
         return Ok(range_not_satisfiable(extent));
     };
@@ -156,24 +182,26 @@ async fn serve_extent(
             .body(Body::empty())
             .expect("static media response headers are valid"));
     }
-    let path = row.path.clone();
+    // Serve from the descriptor the sidecar was validated against; the
+    // pathname is never reopened, so a later swap cannot change the bytes.
+    let validated = published.file;
     let file = media_admission::spawn(&permit, async move {
-        let mut file = tokio::fs::File::open(path).await?;
+        let mut file = tokio::fs::File::from_std(validated);
         file.seek(SeekFrom::Start(start)).await?;
         Ok::<_, io::Error>(file)
     })
     .await
     .map_err(io::Error::other)??;
     Ok(builder
-        .body(raw_body(file, len, &permit))
+        .body(raw_body(file, len, &permit, segment))
         .expect("static media response headers are valid"))
 }
 
-fn raw_body<R>(reader: R, len: u64, permit: &MediaPermit) -> Body
+fn raw_body<R>(reader: R, len: u64, permit: &MediaPermit, segment: SegmentId) -> Body
 where
     R: AsyncRead + Send + Unpin + 'static,
 {
-    let (mut rx, producer) = spawn_raw_body(reader, len, permit);
+    let (mut rx, producer) = spawn_raw_body(reader, len, permit, segment);
     // The producer deliberately outlives a cancelled response while its current
     // filesystem operation still owns the process-wide admission slot.
     drop(producer);
@@ -185,6 +213,7 @@ fn spawn_raw_body<R>(
     reader: R,
     len: u64,
     permit: &MediaPermit,
+    segment: SegmentId,
 ) -> (mpsc::Receiver<RawBodyItem>, tokio::task::JoinHandle<()>)
 where
     R: AsyncRead + Send + Unpin + 'static,
@@ -207,7 +236,20 @@ where
             }
             buffer.resize(chunk_len, 0);
             match reader.read(&mut buffer).await {
-                Ok(0) => return,
+                Ok(0) => {
+                    // The file shrank under a response whose length was already
+                    // declared: abort the body instead of ending it cleanly.
+                    tracing::warn!(
+                        segment = segment.0,
+                        missing_bytes = remaining,
+                        "recording ended before its validated extent; aborting the response"
+                    );
+                    slot.send(Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "recording ended before its validated extent",
+                    )));
+                    return;
+                }
                 Ok(read) => {
                     buffer.truncate(read);
                     remaining -= u64::try_from(read).expect("read length fits u64");
@@ -226,10 +268,7 @@ where
     (rx, producer)
 }
 
-fn parse_range(
-    value: Option<&axum::http::HeaderValue>,
-    extent: u64,
-) -> Result<Option<(u64, u64)>, ()> {
+fn parse_range(value: Option<&HeaderValue>, extent: u64) -> Result<Option<(u64, u64)>, ()> {
     let Some(value) = value else {
         return Ok(None);
     };
@@ -282,11 +321,12 @@ mod tests {
     use std::task::{Context, Poll};
     use std::time::Duration;
 
+    use iris_core::config::DEFAULT_API_STREAMING_MEDIA;
     use tokio::io::{AsyncWriteExt as _, ReadBuf};
     use tokio::sync::oneshot;
 
     use super::*;
-    use crate::state::{ApiStats, MAX_CONCURRENT_MEDIA_RESPONSES};
+    use crate::state::{ApiStats, MediaClass};
 
     struct StartedReader<R> {
         inner: R,
@@ -306,8 +346,8 @@ mod tests {
         }
     }
 
-    fn header(raw: &'static str) -> axum::http::HeaderValue {
-        axum::http::HeaderValue::from_static(raw)
+    fn header(raw: &'static str) -> HeaderValue {
+        HeaderValue::from_static(raw)
     }
 
     #[test]
@@ -338,16 +378,75 @@ mod tests {
         assert_eq!(parse_range(Some(&header("items=0-1")), 100), Err(()));
     }
 
+    #[test]
+    fn short_ranges_are_bounded_and_everything_else_streams() {
+        for bounded in [
+            "bytes=0-1048575",
+            "bytes=10-20",
+            "bytes=-1048576",
+            "bytes= 5-5 ",
+        ] {
+            assert_eq!(
+                raw_admission_class(Some(&header(bounded))),
+                MediaClass::Bounded,
+                "{bounded}"
+            );
+        }
+        for streaming in [
+            "bytes=0-1048576",
+            "bytes=-1048577",
+            "bytes=0-",
+            "bytes=20-10",
+            "bytes=0-1,4-5",
+            "items=0-1",
+            "bytes=x-y",
+        ] {
+            assert_eq!(
+                raw_admission_class(Some(&header(streaming))),
+                MediaClass::Streaming,
+                "{streaming}"
+            );
+        }
+        assert_eq!(raw_admission_class(None), MediaClass::Streaming);
+    }
+
+    #[tokio::test]
+    async fn an_early_end_of_file_aborts_the_raw_body_with_an_error() {
+        let stats = Arc::new(ApiStats::default());
+        let permit = media_admission::shared(
+            stats
+                .try_media(MediaClass::Streaming)
+                .expect("raw response admission slot"),
+        );
+        let (mut rx, producer) =
+            spawn_raw_body(io::Cursor::new(vec![1, 2, 3]), 10, &permit, SegmentId(1));
+        drop(permit);
+        let first = rx
+            .recv()
+            .await
+            .expect("first chunk")
+            .expect("available bytes are served");
+        assert_eq!(&first[..], &[1, 2, 3]);
+        let error = rx
+            .recv()
+            .await
+            .expect("an error item ends the truncated body")
+            .expect_err("a short file is an error, not a clean end");
+        assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
+        assert!(rx.recv().await.is_none());
+        producer.await.expect("raw producer task");
+    }
+
     #[tokio::test]
     async fn cancelled_raw_bodies_keep_running_reads_within_eight_slots() {
         let stats = Arc::new(ApiStats::default());
         let mut writers = Vec::new();
         let mut producers = Vec::new();
 
-        for _ in 0..MAX_CONCURRENT_MEDIA_RESPONSES {
+        for _ in 0..DEFAULT_API_STREAMING_MEDIA {
             let permit = media_admission::shared(
                 stats
-                    .try_media_response()
+                    .try_media(MediaClass::Streaming)
                     .expect("request within the process-wide limit"),
             );
             let (writer, reader) = tokio::io::duplex(1);
@@ -356,7 +455,7 @@ mod tests {
                 inner: reader,
                 started: Some(started_tx),
             };
-            let (rx, producer) = spawn_raw_body(reader, 1, &permit);
+            let (rx, producer) = spawn_raw_body(reader, 1, &permit, SegmentId(1));
             drop(permit);
             tokio::time::timeout(Duration::from_secs(2), started_rx)
                 .await
@@ -368,7 +467,7 @@ mod tests {
         }
 
         assert!(
-            stats.try_media_response().is_none(),
+            stats.try_media(MediaClass::Streaming).is_none(),
             "a ninth raw read must not start while cancelled bodies have work in flight"
         );
 
@@ -379,7 +478,7 @@ mod tests {
         let mut recovered = vec![
             tokio::time::timeout(Duration::from_secs(2), async {
                 loop {
-                    if let Some(permit) = stats.try_media_response() {
+                    if let Some(permit) = stats.try_media(MediaClass::Streaming) {
                         break permit;
                     }
                     tokio::task::yield_now().await;
@@ -389,7 +488,7 @@ mod tests {
             .expect("one slot returned after its real read ended"),
         ];
         assert!(
-            stats.try_media_response().is_none(),
+            stats.try_media(MediaClass::Streaming).is_none(),
             "the other seven running reads must retain their admission slots"
         );
 
@@ -403,8 +502,8 @@ mod tests {
             producer.await.expect("raw producer task");
         }
         tokio::time::timeout(Duration::from_secs(2), async {
-            while recovered.len() < MAX_CONCURRENT_MEDIA_RESPONSES {
-                if let Some(permit) = stats.try_media_response() {
+            while recovered.len() < DEFAULT_API_STREAMING_MEDIA {
+                if let Some(permit) = stats.try_media(MediaClass::Streaming) {
                     recovered.push(permit);
                 } else {
                     tokio::task::yield_now().await;
@@ -420,17 +519,17 @@ mod tests {
         let stats = Arc::new(ApiStats::default());
         let permit = media_admission::shared(
             stats
-                .try_media_response()
+                .try_media(MediaClass::Streaming)
                 .expect("raw response admission slot"),
         );
-        let held: Vec<_> = (1..MAX_CONCURRENT_MEDIA_RESPONSES)
+        let held: Vec<_> = (1..DEFAULT_API_STREAMING_MEDIA)
             .map(|_| {
                 stats
-                    .try_media_response()
+                    .try_media(MediaClass::Streaming)
                     .expect("remaining admission slot")
             })
             .collect();
-        let (mut rx, producer) = spawn_raw_body(io::Cursor::new(vec![7]), 1, &permit);
+        let (mut rx, producer) = spawn_raw_body(io::Cursor::new(vec![7]), 1, &permit, SegmentId(1));
         drop(permit);
         let chunk = rx
             .recv()
@@ -441,13 +540,13 @@ mod tests {
         assert!(rx.recv().await.is_none(), "raw producer reached its extent");
         producer.await.expect("raw producer task");
         assert!(
-            stats.try_media_response().is_none(),
+            stats.try_media(MediaClass::Streaming).is_none(),
             "transport-held bytes must retain the response admission slot"
         );
 
         drop(chunk);
         let recovered = stats
-            .try_media_response()
+            .try_media(MediaClass::Streaming)
             .expect("the final chunk drop returns admission");
         drop(recovered);
         drop(held);

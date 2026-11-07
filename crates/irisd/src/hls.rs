@@ -2,6 +2,7 @@
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufReader, Write};
+use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -10,8 +11,9 @@ use clap::Args as ClapArgs;
 use iris_core::time::TIMESCALE;
 use iris_mp4::hls::{PlaylistOptions, master_playlist, media_playlist};
 use iris_mp4::index::{IndexRecord, MAX_PERSISTED_INDEX_RECORDS, read_index_file_bound_to_media};
-use iris_mp4::reader::{ScanOptions, scan};
+use iris_mp4::reader::{ScanOptions, ScanStop, scan};
 use iris_store::layout::index_path;
+use iris_store::open_regular_file;
 use tracing::warn;
 
 const MEDIA_PLAYLIST: &str = "index.m3u8";
@@ -125,13 +127,21 @@ fn load_records(file: &Path) -> anyhow::Result<(u32, Vec<IndexRecord>)> {
             collect_samples: false,
         },
     )?;
+    if let Some(ScanStop::FragmentLimit { limit, .. }) = report.stop {
+        bail!(
+            "{} holds more than {limit} fragments, more than one playlist source may describe",
+            file.display()
+        );
+    }
     let records: Vec<_> = report
         .fragments
         .iter()
         .map(IndexRecord::from_scan)
         .collect();
+    // The sidecar is only a cache: it is opened without following a final
+    // symlink or blocking on a FIFO, and any failure falls back to the scan.
     let sidecar = index_path(file);
-    match File::open(&sidecar) {
+    match open_regular_file(&sidecar) {
         Ok(index) => match read_index_file_bound_to_media(
             index,
             MAX_PERSISTED_INDEX_RECORDS,
@@ -263,7 +273,12 @@ fn create_temp(out: &Path, destination: &str, contents: &[u8]) -> anyhow::Result
             ".{destination}.irisd-{}-{sequence}.tmp",
             std::process::id()
         ));
-        match OpenOptions::new().write(true).create_new(true).open(&path) {
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)
+        {
             Ok(mut file) => {
                 if let Err(error) = file.write_all(contents).and_then(|()| file.sync_data()) {
                     remove_claimed_temporary(&path, &file);

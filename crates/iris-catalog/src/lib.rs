@@ -26,6 +26,8 @@
 //!   latency, queue, overload, event-state, database, and WAL measurements.
 //! - [`CatalogError`]: SQLite, I/O, corruption, unsupported schema, overload,
 //!   capacity, not found, and closed errors.
+//! - [`OPEN_SEGMENT_GRACE`]: how far past its last durable progress an
+//!   unsealed segment extends in range listings.
 //!
 //! # Invariants
 //!
@@ -54,6 +56,15 @@
 //!   query state stays in memory so the catalog needs no sandbox-external temp
 //!   directory.
 //! - A failed batch is counted and dropped; the next batch starts clean.
+//!   Write transactions begin `IMMEDIATE`, so another connection briefly
+//!   holding the write lock delays a batch (up to the 5 s busy timeout)
+//!   instead of failing it.
+//! - Range listings list an unsealed segment only once it has a durable
+//!   fragment and end it at the earlier of now and [`OPEN_SEGMENT_GRACE`] past
+//!   its last progress, so an open file whose writer stopped reporting does not
+//!   claim later windows.
+//! - Opening creates missing parent directories 0700 and a missing database
+//!   file 0600; SQLite gives the WAL and shared-memory files the database's mode.
 //!
 //! # Example
 //!
@@ -76,7 +87,7 @@ mod handle;
 mod metrics;
 mod types;
 
-pub use db::{CatalogRootExpectation, CatalogRootRegistry};
+pub use db::{CatalogRootExpectation, CatalogRootRegistry, OPEN_SEGMENT_GRACE};
 pub use handle::CatalogHandle;
 pub use metrics::CatalogMetrics;
 pub use types::{

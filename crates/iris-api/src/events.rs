@@ -12,18 +12,23 @@ use iris_core::event::Event;
 use iris_core::id::CameraId;
 use iris_core::time::WallUs;
 use serde::{Deserialize, Serialize};
+use tokio::sync::OwnedSemaphorePermit;
 use tokio::sync::broadcast::error::RecvError;
 
 use crate::error::ApiError;
 use crate::query::{TimeParams, resolve_range};
 use crate::state::ApiState;
 use crate::state::ApiStats;
+use crate::websocket::{self, Inbound};
 
 /// Default and maximum number of events returned by a listing.
 const DEFAULT_LIMIT: usize = 200;
 const MAX_LIMIT: usize = 10_000;
 /// A stalled peer cannot postpone shutdown past the daemon's outer grace.
 const SEND_DEADLINE: Duration = Duration::from_secs(2);
+/// Largest outbound event message: more than twice the 64 KiB event data
+/// bound plus the 1 KiB kind, after JSON string escaping.
+const MAX_EVENT_MESSAGE_BYTES: usize = 256 * 1024;
 
 #[derive(Debug, Default, Deserialize)]
 pub(crate) struct EventParams {
@@ -107,7 +112,9 @@ pub(crate) async fn list_or_subscribe(
         let upgrade = WebSocketUpgrade::from_request_parts(&mut parts, &())
             .await
             .map_err(|e| ApiError::BadRequest(e.to_string()))?;
-        return Ok(upgrade.on_upgrade(move |socket| push(socket, state)));
+        let admission = state.stats.admit_event_socket()?;
+        return Ok(websocket::limit(upgrade, MAX_EVENT_MESSAGE_BYTES)
+            .on_upgrade(move |socket| push(socket, state, admission)));
     }
     let camera = params
         .camera
@@ -142,15 +149,21 @@ pub(crate) async fn list_or_subscribe(
     Ok(Json(events).into_response())
 }
 
-async fn push(mut socket: WebSocket, state: Arc<ApiState>) {
+/// Pushes published events until the peer closes, lags, or shutdown; holds one
+/// of the process-wide event socket slots throughout.
+async fn push(mut socket: WebSocket, state: Arc<ApiState>, _admission: OwnedSemaphorePermit) {
     let _client = EventClientGauge::new(Arc::clone(&state.stats));
     let mut rx = state.events.subscribe();
     loop {
         tokio::select! {
             () = state.shutdown.cancelled() => break,
-            incoming = socket.recv() => match incoming {
-                None | Some(Err(_) | Ok(Message::Close(_))) => break,
-                Some(Ok(_)) => {}
+            incoming = socket.recv() => match websocket::classify(incoming.as_ref()) {
+                Inbound::Control => {}
+                Inbound::Closed => break,
+                Inbound::Violation => {
+                    let _ = send(&mut socket, websocket::policy_close(), &state.shutdown).await;
+                    break;
+                }
             },
             received = rx.recv() => match received {
                 Ok(event) => {

@@ -9,7 +9,8 @@ use clap::Parser;
 use serde_json::Value;
 
 use crate::logs::{
-    col, col_max, fmt, growth, kv, mean, median, number, rates, root_identity, split, strip_ansi,
+    LineReader, col, col_max, fmt, growth, kv, mean, median, number, rates, root_identity, split,
+    strip_ansi,
 };
 use crate::stats::Row;
 use crate::time::{iso, parse_seconds};
@@ -110,21 +111,36 @@ fn startup_stage(rest: &str) -> Option<Startup> {
     }
 }
 
+/// Appends a statistics row while the journal streams past, keeping only what
+/// the window needs: every row inside `[since, until]`, the last row before
+/// `since` (the baseline [`clip_rows`] keeps), and the first row after `until`,
+/// which keeps the run marked as having statistics for restart detection.
+fn push_row(rows: &mut Vec<Row>, row: Row, since: f64, until: f64) {
+    match rows.last_mut() {
+        Some(last) if row.0 < since && last.0 < since => *last = row,
+        Some(last) if row.0 > until && last.0 > until => {}
+        _ => rows.push(row),
+    }
+}
+
 #[allow(clippy::too_many_lines)]
 fn parse_journal(path: &Path, since: f64, until: f64) -> anyhow::Result<Vec<Run>> {
-    let text =
-        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    let file = std::fs::File::open(path).with_context(|| format!("reading {}", path.display()))?;
+    let mut lines = LineReader::new(std::io::BufReader::new(file));
     let mut runs: Vec<Run> = Vec::new();
-    for (line_no, raw) in text.lines().enumerate() {
+    while let Some(input) = lines
+        .next_line()
+        .with_context(|| format!("reading {}", path.display()))?
+    {
+        let line_no = input.number;
+        let raw = std::str::from_utf8(input.bytes)
+            .with_context(|| format!("{} line {line_no} is not valid UTF-8", path.display()))?;
         let line = strip_ansi(raw);
         let Some(l) = split(&line) else { continue };
         let Some(t) = parse_seconds(l.ts) else {
-            anyhow::bail!(
-                "{} line {} has an invalid timestamp",
-                path.display(),
-                line_no + 1
-            );
+            anyhow::bail!("{} line {line_no} has an invalid timestamp", path.display());
         };
+        let in_window = since <= t && t <= until;
         let kind = l.rest.split(' ').next().unwrap_or("");
         let startup = startup_stage(l.rest);
         let reconciled = l.rest.starts_with("catalog reconciled");
@@ -164,40 +180,46 @@ fn parse_journal(path: &Path, since: f64, until: f64) -> anyhow::Result<Vec<Run>
                 d.insert("root".into(), root);
             }
             match kind {
-                "stream" if d.get("stream").is_some_and(|value| !value.is_empty()) => run
-                    .streams
-                    .entry(d["stream"].clone())
-                    .or_default()
-                    .push((t, d)),
+                "stream" if d.get("stream").is_some_and(|value| !value.is_empty()) => {
+                    let rows = run.streams.entry(d["stream"].clone()).or_default();
+                    push_row(rows, (t, d), since, until);
+                }
                 "events"
                     if d.get("camera").is_some_and(|value| !value.is_empty())
                         && d.get("source").is_some_and(|value| !value.is_empty()) =>
                 {
-                    run.events
+                    let rows = run
+                        .events
                         .entry((d["camera"].clone(), d["source"].clone()))
-                        .or_default()
-                        .push((t, d));
+                        .or_default();
+                    push_row(rows, (t, d), since, until);
                 }
                 "root" if d.get("root").is_some_and(|value| !value.is_empty()) => {
-                    run.roots.entry(d["root"].clone()).or_default().push((t, d));
+                    let rows = run.roots.entry(d["root"].clone()).or_default();
+                    push_row(rows, (t, d), since, until);
                 }
-                "writer" if d.contains_key("fragments") => run.writer.push((t, d)),
+                "writer" if d.contains_key("fragments") => {
+                    push_row(&mut run.writer, (t, d), since, until);
+                }
                 "catalog" if d.contains_key("segments") && d.contains_key("gib") => {
-                    run.catalog.push((t, d));
+                    push_row(&mut run.catalog, (t, d), since, until);
                 }
-                "process" => run.process.push((t, d)),
-                _ => run.problems.push((
+                "process" => push_row(&mut run.process, (t, d), since, until),
+                _ if in_window => run.problems.push((
                     t,
                     "ERROR".to_owned(),
                     format!("malformed {kind} statistics row"),
                 )),
+                _ => {}
             }
         } else if let Some(k) = notable_kind(l.rest) {
-            run.notable
-                .entry(k)
-                .or_default()
-                .push((t, l.level.to_owned(), l.rest.to_owned()));
-        } else if (l.level == "WARN" || l.level == "ERROR") && !l.rest.contains("unknown rtcp ssrc")
+            let rows = run.notable.entry(k).or_default();
+            if in_window {
+                rows.push((t, l.level.to_owned(), l.rest.to_owned()));
+            }
+        } else if in_window
+            && (l.level == "WARN" || l.level == "ERROR")
+            && !l.rest.contains("unknown rtcp ssrc")
         {
             run.problems
                 .push((t, l.level.to_owned(), l.rest.to_owned()));
@@ -319,8 +341,40 @@ fn sum_of_maxes(runs: &[Run], pick: impl Fn(&Run) -> &Vec<Row>, key: &str) -> Op
     })
 }
 
+/// [`counter_growth`] for a cumulative counter the daemon logs with a fraction,
+/// such as the writer's `mib`: the same window and reset rules, over finite
+/// nonnegative values.
+fn float_growth(rows: &[Row], include_initial: bool, key: &str) -> Option<f64> {
+    let values = rows
+        .iter()
+        .map(|(_, fields)| number(fields, key).filter(|value| *value >= 0.0))
+        .collect::<Option<Vec<_>>>()?;
+    let mut total = if include_initial {
+        values.first().copied().unwrap_or(0.0)
+    } else {
+        0.0
+    };
+    for pair in values.windows(2) {
+        if pair[1] >= pair[0] {
+            total += pair[1] - pair[0];
+        }
+    }
+    Some(total)
+}
+
+/// [`sum_of_maxes`] for counters with a fraction.
+fn sum_of_float_maxes(runs: &[Run], pick: impl Fn(&Run) -> &Vec<Row>, key: &str) -> Option<f64> {
+    runs.iter().try_fold(0.0, |total, run| {
+        Some(total + float_growth(pick(run), !run.started_before_window, key)?)
+    })
+}
+
 fn display_counter(value: Option<u64>) -> String {
     value.map_or_else(|| "unknown".to_owned(), |value| value.to_string())
+}
+
+fn display_float_counter(value: Option<f64>, digits: usize) -> String {
+    value.map_or_else(|| "unknown".to_owned(), |value| format!("{value:.digits$}"))
 }
 
 fn true_sample_count(rows: &[Row], key: &str) -> Option<u64> {
@@ -471,6 +525,7 @@ fn report_writer_catalog(runs: &[Run], out: &mut impl Write) -> std::io::Result<
     writeln!(out, "\n== writer")?;
     let rows = all(runs, |r| &r.writer);
     if !rows.is_empty() {
+        // `mib` carries one decimal in the daemon's line; the rest are integers.
         let totals: Vec<String> = [
             "fragments",
             "mib",
@@ -482,10 +537,12 @@ fn report_writer_catalog(runs: &[Run], out: &mut impl Write) -> std::io::Result<
         ]
         .iter()
         .map(|k| {
-            format!(
-                "{k}={}",
+            let total = if *k == "mib" {
+                display_float_counter(sum_of_float_maxes(runs, |r| &r.writer, k), 1)
+            } else {
                 display_counter(sum_of_maxes(runs, |r| &r.writer, k))
-            )
+            };
+            format!("{k}={total}")
         })
         .collect();
         writeln!(out, "totals: {}", totals.join(" "))?;
@@ -760,9 +817,12 @@ struct LoadedSamples {
     completeness: &'static str,
 }
 
+/// Streams a sampler series, keeping the samples inside `[since, until]`. A
+/// final record without its newline (a sample being written) is ignored and
+/// reported rather than decoded.
 fn load_jsonl(path: &Path, since: f64, until: f64) -> anyhow::Result<LoadedSamples> {
-    let bytes = match std::fs::read(path) {
-        Ok(bytes) => bytes,
+    let file = match std::fs::File::open(path) {
+        Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             return Ok(LoadedSamples {
                 rows: Vec::new(),
@@ -771,35 +831,32 @@ fn load_jsonl(path: &Path, since: f64, until: f64) -> anyhow::Result<LoadedSampl
         }
         Err(error) => return Err(error).with_context(|| format!("reading {}", path.display())),
     };
-    let complete = bytes.is_empty() || bytes.ends_with(b"\n");
-    let usable = if complete {
-        bytes.as_slice()
-    } else {
-        let end = bytes
-            .iter()
-            .rposition(|byte| *byte == b'\n')
-            .map_or(0, |i| i + 1);
-        &bytes[..end]
-    };
-    let text = std::str::from_utf8(usable)
-        .with_context(|| format!("{} contains invalid UTF-8", path.display()))?;
+    let mut lines = LineReader::new(std::io::BufReader::new(file));
     let mut rows = Vec::new();
-    for (line_no, line) in text.lines().enumerate() {
+    let mut complete = true;
+    while let Some(input) = lines
+        .next_line()
+        .with_context(|| format!("reading {}", path.display()))?
+    {
+        let line_no = input.number;
+        if !input.terminated {
+            complete = false;
+            break;
+        }
+        let line = std::str::from_utf8(input.bytes)
+            .with_context(|| format!("{} contains invalid UTF-8", path.display()))?;
         anyhow::ensure!(
             !line.trim().is_empty(),
-            "{} line {} is empty",
-            path.display(),
-            line_no + 1
+            "{} line {line_no} is empty",
+            path.display()
         );
         let value: Value = serde_json::from_str(line)
-            .with_context(|| format!("decoding {} line {}", path.display(), line_no + 1))?;
+            .with_context(|| format!("decoding {} line {line_no}", path.display()))?;
         let timestamp = value
             .get("ts")
             .and_then(Value::as_str)
             .and_then(parse_seconds)
-            .with_context(|| {
-                format!("{} line {} has an invalid ts", path.display(), line_no + 1)
-            })?;
+            .with_context(|| format!("{} line {line_no} has an invalid ts", path.display()))?;
         if since <= timestamp && timestamp <= until {
             rows.push((timestamp, value));
         }
@@ -1761,6 +1818,113 @@ mod tests {
             load_jsonl(&directory.path().join("missing.jsonl"), 0.0, f64::INFINITY).unwrap();
         assert_eq!(missing.rows.len(), 0);
         assert_eq!(missing.completeness, "missing");
+    }
+
+    #[test]
+    fn streaming_keeps_the_rows_and_baseline_the_window_needs() {
+        let row = |t: f64, value: u32| -> Row {
+            (
+                t,
+                BTreeMap::from([("frames".to_owned(), value.to_string())]),
+            )
+        };
+        let (since, until) = (100.0, 200.0);
+        // Pre-window rows, a clock step back across `since`, rows after `until`.
+        let arriving = [
+            row(10.0, 1),
+            row(50.0, 2),
+            row(90.0, 3),
+            row(120.0, 4),
+            row(95.0, 5),
+            row(150.0, 6),
+            row(210.0, 7),
+            row(220.0, 8),
+            row(190.0, 9),
+            row(230.0, 10),
+        ];
+        let mut buffered = arriving.to_vec();
+        clip_rows(&mut buffered, since, until);
+        let mut streamed = Vec::new();
+        for row in arriving.clone() {
+            push_row(&mut streamed, row, since, until);
+        }
+        assert!(streamed.len() < arriving.len(), "older rows are not kept");
+        clip_rows(&mut streamed, since, until);
+        assert_eq!(streamed, buffered);
+
+        let text = concat!(
+            "2026-11-01T00:00:00Z INFO writer fragments=10 mib=1.0 syncs=1 files=1 dropped=0 write_errors=0 slow_io=0\n",
+            "2026-11-01T00:01:00Z INFO writer fragments=20 mib=2.0 syncs=2 files=1 dropped=0 write_errors=0 slow_io=0\n",
+            "2026-11-01T00:02:00Z INFO writer fragments=35 mib=3.5 syncs=3 files=1 dropped=0 write_errors=0 slow_io=0\n",
+            "2026-11-01T00:03:00Z INFO writer fragments=50 mib=5.0 syncs=4 files=2 dropped=0 write_errors=0 slow_io=0\n",
+        );
+        let since = parse_seconds("2026-11-01T00:01:30Z").unwrap();
+        let runs = parse_fixture(text, since, f64::INFINITY);
+        assert_eq!(
+            runs[0].writer.len(),
+            3,
+            "baseline plus the two rows in the window"
+        );
+        let mut output = Vec::new();
+        report_writer_catalog(&runs, &mut output).unwrap();
+        let output = String::from_utf8(output).unwrap();
+        assert!(
+            output.contains("totals: fragments=30 mib=3.0 syncs=2 files=1 "),
+            "{output}"
+        );
+    }
+
+    #[test]
+    fn writer_mib_totals_keep_their_decimal_across_runs_and_resets() {
+        let writer = |ts: &str, fragments: u64, mib: &str| {
+            format!(
+                "{ts} INFO writer fragments={fragments} mib={mib} syncs=1 dropped=0 write_errors=0 files=1 queued=0 queue_peak=1 queue_mib_peak=0.1 write_p50_ms=0.1 write_p99_ms=0.2 write_max_ms=0.3 sync_p50_ms=1.0 sync_p99_ms=2.0 sync_max_ms=3.0 slow_io=0\n"
+            )
+        };
+        let text = [
+            writer("2026-11-01T00:00:00Z", 100, "35994.8"),
+            writer("2026-11-01T00:01:00Z", 110, "36000.3"),
+            "2026-11-01T00:02:00Z INFO SIGTERM\n".to_owned(),
+            "2026-11-01T00:02:01Z INFO stopped\n".to_owned(),
+            writer("2026-11-01T01:00:00Z", 5, "10.5"),
+            // A counter reset inside a run adds nothing for its drop.
+            writer("2026-11-01T01:01:00Z", 7, "2.0"),
+            writer("2026-11-01T01:02:00Z", 9, "4.5"),
+        ]
+        .concat();
+        let runs = parse_fixture(&text, 0.0, f64::INFINITY);
+        assert_eq!(runs.len(), 2);
+        let mut output = Vec::new();
+        report_writer_catalog(&runs, &mut output).unwrap();
+        let output = String::from_utf8(output).unwrap();
+        let totals = output
+            .lines()
+            .find(|line| line.starts_with("totals:"))
+            .unwrap();
+        // 36000.3 counted from its start, plus 10.5 and the 2.5 after the reset.
+        assert!(totals.contains(" mib=36013.3 "), "{totals}");
+        assert!(totals.contains("fragments=119 "), "{totals}");
+
+        let windowed = parse_fixture(
+            &text,
+            parse_seconds("2026-11-01T00:00:30Z").unwrap(),
+            f64::INFINITY,
+        );
+        let mut output = Vec::new();
+        report_writer_catalog(&windowed, &mut output).unwrap();
+        let output = String::from_utf8(output).unwrap();
+        // A run already going at the window start counts only its growth (5.5);
+        // the second run starts inside the window and counts in full (13.0).
+        assert!(output.contains(" mib=18.5 "), "{output}");
+
+        let malformed = parse_fixture(
+            &writer("2026-11-01T00:00:00Z", 1, "-1.0"),
+            0.0,
+            f64::INFINITY,
+        );
+        let mut output = Vec::new();
+        report_writer_catalog(&malformed, &mut output).unwrap();
+        assert!(String::from_utf8(output).unwrap().contains(" mib=unknown "));
     }
 
     #[test]

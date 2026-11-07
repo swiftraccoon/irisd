@@ -27,10 +27,10 @@ const DEFAULT_READ_CAPACITY: usize = 64 * 1024;
 enum Io {
     /// A tokio stream: reads and writes wake through `epoll`.
     Reactor(TcpStream),
-    /// A plain non-blocking socket. Reads that would block return `Pending`
-    /// without registering a waker, so the caller must poll again on its own
-    /// timer; writes block briefly (RTSP messages are small). Nothing wakes
-    /// `epoll` for this socket any more.
+    /// A plain non-blocking socket. Reads and writes that would block return
+    /// `Pending` without registering a waker, so the caller must poll again on
+    /// its own timer; a write keeps its unsent remainder for that next poll.
+    /// Nothing wakes `epoll` for this socket any more, and nothing blocks.
     Detached(std::net::TcpStream),
     /// Transient state while detaching; never observed by callers.
     Detaching,
@@ -118,10 +118,10 @@ impl Connection {
         }
     }
 
-    /// Takes the socket out of tokio's reactor. From then on reads that would
-    /// block return `Pending` without a waker and never wake `epoll`; the
-    /// caller polls the connection on its own timer. Writes block briefly.
-    /// Idempotent.
+    /// Takes the socket out of tokio's reactor. From then on reads and writes
+    /// that would block return `Pending` without a waker and never wake
+    /// `epoll`; the caller polls the connection on its own timer, and a flush
+    /// continues from its unsent remainder on each poll. Idempotent.
     pub(crate) fn detach_from_reactor(&mut self) -> std::io::Result<()> {
         if let Io::Reactor(_) = self.stream {
             let Io::Reactor(reactor) = std::mem::replace(&mut self.stream, Io::Detaching) else {
@@ -135,6 +135,24 @@ impl Connection {
                 }
                 Err(e) => return Err(e),
             }
+        }
+        Ok(())
+    }
+
+    /// Undoes the playing-state socket policy for a request whose caller
+    /// awaits it, such as a `TEARDOWN`: resets the receive low-water mark to
+    /// one byte and returns a detached socket to tokio's reactor, so the
+    /// request's writes and its short response wake the calling task. Must
+    /// be called within a tokio runtime. Idempotent.
+    pub(crate) fn return_to_reactor(&mut self) -> std::io::Result<()> {
+        self.set_recv_low_water(1)?;
+        if let Io::Detached(_) = self.stream {
+            let Io::Detached(std_stream) = std::mem::replace(&mut self.stream, Io::Detaching)
+            else {
+                unreachable!("checked above");
+            };
+            self.stream = Io::Reactor(TcpStream::from_std(std_stream)?);
+            self.drained = false;
         }
         Ok(())
     }
@@ -401,9 +419,15 @@ impl Sink<OwnedMessage> for Connection {
 
     fn poll_ready(
         self: std::pin::Pin<&mut Self>,
-        _cx: &mut std::task::Context<'_>,
+        cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Result<(), Self::Error>> {
-        std::task::Poll::Ready(Ok(()))
+        // `start_send` replaces the buffer, so first finish the previous
+        // message: a `TEARDOWN` must not follow half a keepalive.
+        if self.write_buf.is_empty() {
+            std::task::Poll::Ready(Ok(()))
+        } else {
+            self.poll_flush(cx)
+        }
     }
 
     fn start_send(
@@ -425,7 +449,18 @@ impl Sink<OwnedMessage> for Connection {
             let written = match &mut this.stream {
                 Io::Reactor(stream) => std::pin::Pin::new(stream).poll_write(cx, &this.write_buf),
                 Io::Detached(stream) => {
-                    std::task::Poll::Ready(blocking_write(stream, &this.write_buf))
+                    use std::io::Write as _;
+                    // Never block: a peer that stops reading must not stall
+                    // the caller's thread. The unsent remainder stays in
+                    // `write_buf` for the caller's next poll on its timer.
+                    match stream.write(&this.write_buf) {
+                        Ok(0) => std::task::Poll::Ready(Err(std::io::ErrorKind::WriteZero.into())),
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            std::task::Poll::Pending
+                        }
+                        Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                        written => std::task::Poll::Ready(written),
+                    }
                 }
                 Io::Detaching => {
                     std::task::Poll::Ready(Err(std::io::Error::other("connection is detaching")))
@@ -483,16 +518,6 @@ impl Sink<OwnedMessage> for Connection {
             std::task::Poll::Pending => std::task::Poll::Pending,
         }
     }
-}
-
-/// Writes all of `buf` to a detached socket, blocking for the duration: RTSP
-/// messages are a few hundred bytes into an otherwise idle send buffer.
-fn blocking_write(stream: &mut std::net::TcpStream, buf: &[u8]) -> std::io::Result<usize> {
-    use std::io::Write as _;
-    stream.set_nonblocking(false)?;
-    let result = stream.write_all(buf).map(|()| buf.len());
-    stream.set_nonblocking(true)?;
-    result
 }
 
 /// tokio-specific version of [`crate::UdpPair`].
@@ -595,5 +620,150 @@ mod tests {
             connection.parser.stream_pos() as usize,
             crate::rtsp::parse::MAX_CONTROL_MESSAGE_BYTES
         );
+    }
+
+    /// A connection whose peer has a small receive buffer and reads nothing
+    /// until told to; the connection's own send buffer is small too, so a
+    /// large write cannot complete while the peer stalls.
+    async fn stalled_peer() -> (Connection, std::net::TcpStream) {
+        let socket =
+            socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None).unwrap();
+        socket.set_recv_buffer_size(4096).unwrap();
+        let address: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
+        socket.bind(&address.into()).unwrap();
+        socket.listen(1).unwrap();
+        let listener: std::net::TcpListener = socket.into();
+        let stream = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        socket2::SockRef::from(&stream)
+            .set_send_buffer_size(4096)
+            .unwrap();
+        let (peer, _) = listener.accept().unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        (Connection::from_stream(stream).unwrap(), peer)
+    }
+
+    /// Polls once with a waker that does nothing, as a timer-driven caller does.
+    fn poll_once<T>(
+        connection: &mut Connection,
+        poll: impl FnOnce(
+            std::pin::Pin<&mut Connection>,
+            &mut std::task::Context<'_>,
+        ) -> std::task::Poll<T>,
+    ) -> std::task::Poll<T> {
+        let mut cx = std::task::Context::from_waker(futures::task::noop_waker_ref());
+        poll(std::pin::Pin::new(connection), &mut cx)
+    }
+
+    fn pattern(len: usize) -> Vec<u8> {
+        (0..len).map(|i| (i % 251) as u8).collect()
+    }
+
+    #[tokio::test]
+    async fn detached_flush_never_blocks_and_keeps_the_unsent_remainder() {
+        let (mut connection, mut peer) = stalled_peer().await;
+        connection.detach_from_reactor().unwrap();
+        let message = pattern(1 << 20);
+        connection.write_buf = message.clone();
+        // Should a flush block, this starts reading after 10 s, which lets the
+        // blocked write finish, so the test fails instead of hanging.
+        let (done, watchdog) = std::sync::mpsc::channel::<()>();
+        let mut stalled = peer.try_clone().unwrap();
+        std::thread::spawn(move || {
+            use std::io::Read as _;
+            if watchdog.recv_timeout(Duration::from_secs(10)).is_err() {
+                let mut sink = vec![0; 64 * 1024];
+                while matches!(stalled.read(&mut sink), Ok(n) if n > 0) {}
+            }
+        });
+
+        for _ in 0..5 {
+            let started = Instant::now();
+            assert!(poll_once(&mut connection, |c, cx| c.poll_flush(cx)).is_pending());
+            assert!(poll_once(&mut connection, |c, cx| c.poll_ready(cx)).is_pending());
+            assert!(
+                started.elapsed() < Duration::from_millis(100),
+                "a flush to a stalled peer took {:?}",
+                started.elapsed()
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let unsent = connection.write_buf.len();
+        assert!(
+            0 < unsent && unsent < message.len(),
+            "{unsent} bytes unsent"
+        );
+        assert!(
+            connection.write_buf == message[message.len() - unsent..],
+            "the unsent bytes are not the message's tail"
+        );
+        done.send(()).unwrap();
+
+        let reader = std::thread::spawn(move || {
+            use std::io::Read as _;
+            let mut received = Vec::new();
+            peer.read_to_end(&mut received).map(|_| received)
+        });
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while poll_once(&mut connection, |c, cx| c.poll_flush(cx)).is_pending() {
+            assert!(Instant::now() < deadline, "the flush never finished");
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        assert!(connection.write_buf.is_empty());
+        assert!(matches!(
+            poll_once(&mut connection, |c, cx| c.poll_close(cx)),
+            std::task::Poll::Ready(Ok(()))
+        ));
+        let received = reader.join().unwrap().unwrap();
+        assert!(received == message, "the peer received other bytes");
+    }
+
+    #[tokio::test]
+    async fn returning_to_the_reactor_wakes_for_writes_and_a_short_response() {
+        let (mut connection, mut peer) = stalled_peer().await;
+        connection.set_recv_low_water(32 * 1024).unwrap();
+        connection.detach_from_reactor().unwrap();
+        let message = pattern(256 * 1024);
+        connection.write_buf = message.clone();
+        // The peer starts reading when told to, or after 10 s, which also
+        // ends a write that blocks, so the test fails instead of hanging.
+        let (go, gate) = std::sync::mpsc::channel::<()>();
+        let expected = message.len();
+        let peer = std::thread::spawn(move || {
+            use std::io::{Read as _, Write as _};
+            let _ = gate.recv_timeout(Duration::from_secs(10));
+            let mut received = vec![0; expected];
+            peer.read_exact(&mut received)?;
+            peer.write_all(b"RTSP/1.0 200 OK\r\nCSeq: 1\r\n\r\n")?;
+            // Hold the connection open until the client closes it.
+            let mut rest = Vec::new();
+            peer.read_to_end(&mut rest)?;
+            Ok::<_, std::io::Error>(received)
+        });
+        assert!(poll_once(&mut connection, |c, cx| c.poll_flush(cx)).is_pending());
+
+        connection.return_to_reactor().unwrap();
+        let _ = go.send(());
+        // No timer polls here: only the reactor's wake-ups make progress.
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            std::future::poll_fn(|cx| std::pin::Pin::new(&mut connection).poll_ready(cx)),
+        )
+        .await
+        .expect("the reactor woke the flush")
+        .unwrap();
+        let response = tokio::time::timeout(Duration::from_secs(10), connection.next())
+            .await
+            .expect("a short response wakes the reader")
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            response.msg,
+            crate::rtsp::msg::Message::Response(_)
+        ));
+        drop(connection);
+        assert!(peer.join().unwrap().unwrap() == message);
     }
 }

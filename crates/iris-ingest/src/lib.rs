@@ -31,7 +31,10 @@
 //! - With [`IngestOptions::read_interval`] set, sockets are drained on a tick
 //!   shared by every stream instead of on every packet; with
 //!   [`IngestOptions::recv_low_water`] set, the kernel reports a socket
-//!   readable once per that many bytes.
+//!   readable once per that many bytes. A camera that stops reading never
+//!   blocks the runtime thread: the session fails at its next keepalive.
+//! - A session error, which quotes camera-supplied text, is logged as one
+//!   escaped line of at most 512 characters.
 //!
 //! # Example
 //!

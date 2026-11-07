@@ -9,20 +9,21 @@ Full research notes with citations: `appendix/D-camera-integration.md`. Measurem
 |---|---|---|
 | Transport | TCP interleaved | zero loss on a LAN (0 sequence gaps in 90 s on cam1), kernel retransmit, no reorder buffer needed; retina's UDP is experimental with no reorder buffer; Moonfire, go2rtc and Frigate all default to TCP. Head-of-line blocking only adds latency, irrelevant for recording |
 | Frame format | 4-byte length-prefixed NALs, no parameter-set insertion | matches the `hvc1` sample format byte-for-byte; parameter sets come from `Stream::parameters()` and `VideoFrame::has_new_parameters()` |
-| Control messages | 1 MiB maximum for one RTSP head plus body, enforced while parsing and reading | a setup deadline is not an allocation bound; every message is rejected before retained parser state or the connection read buffer crosses the declared limit |
+| Control messages | 1 MiB maximum for one RTSP head plus body, enforced while parsing and reading; camera-supplied fields bounded while parsing: `Content-Base`, `Content-Location`, and joined control URLs 2,048 bytes, `Session` id 512, `WWW-Authenticate` 4,096, 64 SDP media sections; a longer field fails the session with an error naming it | a setup deadline is not an allocation bound; every message is rejected before retained parser state or the connection read buffer crosses the declared limit; keepalives and `TEARDOWN` repeat these fields, so the bounds keep every request small |
 | Keepalive | retina default: `GET_PARAMETER` every `min(timeout, 60)/2` s (cam1 timeout = 60 s) | ONVIF accepts any non-TEARDOWN request as keepalive; `SET_PARAMETER` breaks Tapo cameras |
-| Teardown | `TeardownPolicy::Always` | every setup or playing-session outcome releases camera-side state |
+| Teardown | `TeardownPolicy::Always`; a fresh-connection `TEARDOWN` goes to the address the session reached, the advertised `Content-Base` serving only as its Request-URI; a background `TEARDOWN` retries for the session timeout or 60 s, whichever is shorter; at most 64 run in the process, and a session dropped beyond that is not torn down (a warning) | every setup or playing-session outcome releases camera-side state; a camera cannot direct requests or credentials to another host, keep a task alive for its 136-year maximum timeout, or make dropped sessions accumulate tasks, sockets, and memory |
 | RTCP | `ReceiverReportPolicy::Never`; SRs consumed for diagnostics | TCP needs no RR; SR NTP is recorded per run, never used as the time base |
 | Timestamps | `enforce_timestamps_with_max_jump_secs(10)` | large jumps become run boundaries instead of corrupt timelines |
 | Inactivity | `tokio::time::timeout(30 s, stream.next())`; 15 s on DESCRIBE, SETUP, and PLAY; TEARDOWN on every exit | retina has no data-inactivity timeout of its own; a wedged camera once held DESCRIBE open for 130 s |
 | Recorder clock | fresh realtime/monotonic correlations map packet receive instants; an offset change over 2 s flushes the pending fragment and ends the session | clock steps start a separate run instead of leaving video behind event timestamps |
 | Session exit | cancellation is handled during setup and demuxing; after demux state exists, cancellation, inactivity, EOF, RTSP/demux failure, and frame, RTCP, or clock errors converge on one final flush before connected state is cleared | complete pending access units are delivered exactly once, and the final fragment uses the ordinary timing, gap, size, and sink accounting path |
 | Socket reads | timer-driven: drain the demuxer without arming a wake-up, then sleep until the next tick of a clock shared by every stream (`ingest.read_interval_ms`, default 20) | one read per interval instead of one per packet and one runtime wake-up for all streams; about a quarter less CPU at the same input, 20 ms more live latency (12) |
-| Detached socket | with timer-driven reads the socket leaves tokio's reactor once `PLAY` succeeds (`PlayOptions::detach_from_reactor` in the patched retina): reads that would block return `Pending` without a waker, keepalives and `TEARDOWN` write blocking | `epoll` is edge-triggered and fired once per arriving segment while a socket sat above the low-water mark, 5,400 unused wake-ups a second for fourteen streams; detached, 70 a second, and a third less CPU (12 §6) |
+| Detached socket | with timer-driven reads the socket leaves tokio's reactor once `PLAY` succeeds (`PlayOptions::detach_from_reactor` in the patched retina): reads and writes that would block return `Pending` without a waker; a flush keeps its unsent bytes for the next tick, so a camera that stops reading fails the session at the next keepalive deadline (half its timeout, at most 30 s) instead of stalling the runtime thread; a `TEARDOWN` on that connection first returns the socket to the reactor with the low-water mark back at one byte | `epoll` is edge-triggered and fired once per arriving segment while a socket sat above the low-water mark, 5,400 unused wake-ups a second for fourteen streams; detached, 70 a second, and a third less CPU (12 §6) |
 | Shared ticker | one `ReadTicker` task per runtime wakes every stream waiting for the next tick (`IngestOptions::ticker`) | a timer per stream cost one runtime unpark (an `eventfd` write) per stream per tick (12 §6) |
 | Low-water mark | `SO_RCVLOWAT` 32 KiB on the RTSP socket once `PLAY` succeeds (`ingest.recv_low_water_kib`; `PlayOptions::recv_low_water` in the patched retina under `third_party/`) | the kernel reports the socket readable once per 32 KiB instead of once per packet; with timer reads the cost halves against packet-driven reads; a 1 Mbit/s stream waits up to a quarter second (12 §4) |
 | Reconnect | 1 s → ×2 → 30 s cap, deterministic ±20 % jitter mixed from stream identity and retry attempt; reset after a 60 s healthy session; separate run; resume recording at the next IRAP | decorrelated streams and attempts avoid a synchronized retry burst; Moonfire retries after 1 s; Frigate uses a 10 s socket timeout |
-| Credentials | passed to retina, never in the URL | Moonfire rule; URLs are logged |
+| Credentials | passed to retina, never in the URL; `Debug` output of `StreamSource` and retina `Credentials` redacts them | Moonfire rule; URLs are logged |
+| Diagnostics | camera-supplied text reaches the log only escaped and bounded: retina logs at most one warning per `DESCRIBE` (a count and the first problem) and quotes at most 512-byte escaped excerpts, never the whole SDP; `iris-ingest` logs a session error through an adapter that escapes line breaks and control characters and stops at 512 characters | one hostile `DESCRIBE` once logged its SDP once per media section, gigabytes in a minute on the runtime thread, and a raw line break let a camera start a log line, including a journal priority prefix |
 | URLs | main `subtype=0`, sub `subtype=1`; keep `proto=Onvif` for Dahua compatibility | measured on cam1 |
 
 What retina already handles so irisd does not have to: RFC 7798 single/AP/FU
@@ -34,8 +35,10 @@ ring-buffer reads (0.4.20), and a long list of vendor quirks (Dahua NVR ssrc rad
 `seq=0`, Reolink scaling lists, Tapo keepalive, empty FUs, NAL-type changes within an FU).
 The patched copy under `third_party/` bounds pinned H.265 access-unit payload and projected
 output at 64 MiB while depacketizing, releases partial state on a controlled error, and
-applies the 1 MiB production control-message limit above. The application repeats the
-64 MiB frame bound at fragment assembly as defense in depth.
+applies the 1 MiB production control-message limit, the field bounds, the teardown rules,
+and the diagnostic bounds above. Its writes on a detached socket never block, and it hands
+`sdp-types` no SDP line outside `type=value` form, on which that parser panics. The
+application repeats the 64 MiB frame bound at fragment assembly as defense in depth.
 
 cam1 specifics confirmed in 01: FUs only, AP never, marker on every AU, VPS/SPS/PPS as single
 NAL packets before each IDR, no RTP extensions, no padding, session timeout 60 s, SR every 5 s.
@@ -117,7 +120,9 @@ Implemented sources for Dahua-family cameras:
    `multipart/x-mixed-replace` with the boundary from `Content-Type`; tolerate
    `Content-Length:` without a space and variable blank lines; bound each body to 256 KiB plus
    declared syntax overhead while appending, and retain scan cursors so one-byte fragmentation is
-   linear; stall detection = 2× heartbeat + 5 s; reconnect with backoff. Codes seen in the wild:
+   linear; stall detection = 2× heartbeat + 5 s; reconnect with backoff. Redirects are never
+   followed: a 3xx response fails the session with its status, so a camera that redirects HTTP
+   to HTTPS needs `https = true`. Codes seen in the wild:
    `VideoMotion`, `VideoMotionInfo`,
    `SmartMotionHuman`, `SmartMotionVehicle`, `CrossLineDetection`, `CrossRegionDetection`,
    `LeftDetection`, `TakenAwayDetection`, `FaceDetection`, `AudioMutation`, `AudioAnomaly`,
@@ -146,8 +151,13 @@ Implemented sources for Dahua-family cameras:
    `tns1:RuleEngine/CellMotionDetector/Motion`, `FieldDetector/ObjectsInside`,
    `LineDetector/Crossed`, `TamperDetector/Tamper`, `AudioAnalytics/Audio/DetectedSound`.
    CGI and ONVIF both apply the endpoint's `tls_verify` policy to HTTPS requests. ONVIF service
-   and subscription URLs must match the configured scheme, host, and effective port, with no
-   userinfo or fragment; authenticated SOAP follows no redirects. The SOAP transport retains
+   and subscription URLs are rebased onto the configured scheme, host, and port, keeping their
+   path and query: cameras behind NAT or a port forward, or configured by host name, advertise
+   addresses the recorder cannot or must not reach, and digest and WS-Security material then
+   reach only the configured authority. The events URL is rebased before the subscription is
+   created and the subscription reference before any pull, renewal, or unsubscribe, so the
+   subscription is released at the configured address. URLs with userinfo, a fragment, or a
+   non-HTTP scheme are rejected; authenticated SOAP follows no redirects. The SOAP transport retains
    HTTP digest authentication and its 10 s request bound, caps every response status at 1 MiB,
    and the vendored XML parser independently caps depth, nodes, attributes, and accumulated text.
    Shutdown after a reference exists performs one unsubscribe attempt bounded to 5 s before

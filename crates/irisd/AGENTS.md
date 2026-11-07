@@ -10,7 +10,13 @@ Scope: this crate only. Read the root `AGENTS.md` first.
   `docs/research/07-architecture.md §9`; a change updates all three.
 - The sandbox spec (`sandbox_spec` in `run.rs`) is derived from the configuration and applied
   before any thread is spawned; its paths and ports are the ones in
-  `docs/research/07-architecture.md §6` and `packaging/README.md`.
+  `docs/research/07-architecture.md §6` and `packaging/README.md`. Landlock ABI 1 filesystem
+  and ABI 4 TCP rights are hard requirements (startup fails without them unless
+  `--no-sandbox`); later rights are best effort. Keep the kernel-facing build in
+  `sandbox::restrict` and the decision in the pure `sandbox::decide`, which the tests drive.
+- Before the catalog opens, `permissions::secure_state_directory` checks and repairs the state
+  directory and catalog files; it must run before any SQLite connection, because SQLite copies
+  the database file's mode to new WAL and shared-memory files.
 - The watchdog ping is gated on every stream having made progress since the last check
   (`all_streams_progressed`); never ping unconditionally.
 - Retention order and bounds (event maintenance, free-space floor, quota, age; oldest sealed
@@ -30,13 +36,22 @@ Scope: this crate only. Read the root `AGENTS.md` first.
   marker/physical aliases, and only visits `ApprovedRoot`s. Catalog rows are paged; root walks
   are streaming and no-follow; one elapsed heartbeat covers every reconciliation phase. A writing
   row on an unavailable root or behind a filesystem lookup error is preserved; only confirmed
-  absence under its exact admitted persisted root permits cleanup.
+  absence under its exact admitted persisted root permits cleanup. Confirmed absence
+  (`RecoverError::Absent`: a missing media name or layout directory beneath the verified root)
+  applies whatever the row's fragment count; a missing root is never absence.
+- Recovery passes the row's `run_seq` and sample-entry hash as the `IndexBinding`, so a rebuilt
+  sidecar stays bound to its row. Reconciliation opens never block or follow a final symlink:
+  adoption scans the media when its sidecar cannot be opened, and skips a file beyond the
+  131,072-fragment limit.
 - Startup registers configured roots and completes durable deletion intents on available roots
   before writing recovery and adoption. Retention unlinks only after
   `mark_deleting_if_unprotected` returns `Marked`; `Protected` and `NotFound` do not mutate the
   filesystem. It removes the row only after the directory barrier; failed transitions count
-  neither deletion nor quota progress.
-- Empty writing rows enter durable deletion intent before descriptor-relative pair removal.
+  neither deletion nor quota progress. It never marks a row whose path is outside its root's
+  layout (`adopt::parse_segment_path`), and each pass retries one bounded page of deletion
+  intents (16 rows or 100 ms, cursor in `RetentionState`) before its quota arithmetic.
+- Empty and absent writing rows enter durable deletion intent before descriptor-relative pair
+  removal.
   Every destructive startup/retention operation uses its exact approved root and keeps a row or
   tombstone until both names are absent and the directory barrier succeeds.
 - Shutdown has one absolute budget: cancel once, await all producers against one shared grace,
@@ -64,7 +79,9 @@ Scope: this crate only. Read the root `AGENTS.md` first.
 - `catalog_observer.rs` — store notifications and camera events into the catalog.
 - `retention.rs` — the retention pass and its report.
 - `selfcheck.rs` — the rotating CRC check of sealed files.
-- `sandbox.rs` — the Landlock ruleset.
+- `sandbox.rs` — the Landlock ruleset and the enforcement decision.
+- `permissions.rs` — startup checks of the configuration file, the state directory, and the
+  catalog files.
 - `systemd.rs` — readiness, watchdog, and stopping notifications.
 - `proc.rs` — CPU, RSS, thread, and descriptor sampling from `/proc/self`.
 
@@ -92,9 +109,11 @@ A change to the statistics lines is checked by feeding a log to
 
 - Anything awaited inside the monitor loop delays signals and watchdog ticks. Reporting,
   retention, and self-check work stays single-flight, separately owned, cancellable, and bounded;
-  blocking filesystem calls run off the current-thread runtime. An uninterruptible raw filesystem
-  call may detach only while its single-flight owner forces bounded process exit; never relaunch
-  that owner, and preserve deletion intent so late completion is retry-safe.
+  blocking filesystem calls run off the current-thread runtime. Start every raw filesystem call
+  of a report or retention job through its owner's `RawCalls::spawn`, so a call that outlives a
+  timed-out job stays counted; `MaintenanceGuard::admit` refuses to relaunch the owner while the
+  count is nonzero and escalates to exit after ten minutes. Preserve deletion intent so a late
+  removal is retry-safe.
 - The select arms in `monitor` borrow disjoint fields of `Daemon`; a helper that takes the
   whole struct will not compile.
 - `start_recording` opens two RTSP sessions per camera; the limit is three per camera, and

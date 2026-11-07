@@ -17,6 +17,9 @@ use crate::state::{ApiState, SnapshotSource};
 
 /// Largest snapshot accepted from a camera.
 const MAX_SNAPSHOT_LEN: usize = 8 << 20;
+/// How far before the end of a camera body the final end-of-image marker is
+/// sought; cameras may pad or append trailers after it.
+const JPEG_EOI_WINDOW: usize = 64 * 1024;
 const SNAPSHOT_PATH: &str = "/cgi-bin/snapshot.cgi?channel=1";
 const SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -28,6 +31,9 @@ pub(crate) async fn snapshot(
 ) -> Result<Response, ApiError> {
     let id = CameraId::try_new(&camera).map_err(|e| ApiError::BadRequest(e.to_string()))?;
     let source = state.snapshot_sources.get(&id).ok_or(ApiError::NotFound)?;
+    // One camera request at a time per camera; the guard also releases the
+    // slot when the client goes away mid-request.
+    let _in_flight = state.stats.admit_snapshot(&id)?;
     let body = fetch_snapshot(source).await?;
     Ok(snapshot_response(body))
 }
@@ -90,10 +96,10 @@ async fn fetch_snapshot_with_timeout(
         return Err(ApiError::Upstream("snapshot too large".into()));
     }
     let body = collect_snapshot(response).await?;
-    if !is_jpeg(&body) {
+    let Some(end) = jpeg_extent(&body) else {
         return Err(ApiError::Upstream("camera returned an invalid JPEG".into()));
-    }
-    Ok(body)
+    };
+    Ok(body.slice(..end))
 }
 
 fn snapshot_response(body: Bytes) -> Response {
@@ -133,8 +139,20 @@ async fn collect_snapshot(response: reqwest::Response) -> Result<Bytes, ApiError
     Ok(Bytes::from(body))
 }
 
-fn is_jpeg(body: &[u8]) -> bool {
-    body.len() >= 4 && body.starts_with(&[0xff, 0xd8]) && body.ends_with(&[0xff, 0xd9])
+/// The length of the JPEG at the start of `body`: through its final
+/// end-of-image marker (`FF D9`) within the last [`JPEG_EOI_WINDOW`] bytes.
+/// `None` without a start-of-image marker and first segment marker
+/// (`FF D8 FF`) or without that end marker. Bytes after the marker are
+/// padding or vendor trailers and are not served.
+fn jpeg_extent(body: &[u8]) -> Option<usize> {
+    if !body.starts_with(&[0xff, 0xd8, 0xff]) {
+        return None;
+    }
+    let window_start = body.len().saturating_sub(JPEG_EOI_WINDOW).max(3);
+    body.get(window_start..)?
+        .windows(2)
+        .rposition(|pair| pair == [0xff, 0xd9])
+        .map(|position| window_start + position + 2)
 }
 
 fn redacted_upstream_error(error: &reqwest::Error) -> ApiError {
@@ -239,11 +257,83 @@ mod tests {
     }
 
     fn jpeg_with_len(len: usize) -> Vec<u8> {
-        assert!(len >= 4);
+        assert!(len >= 5);
         let mut body = vec![0_u8; len];
-        body[..2].copy_from_slice(&[0xff, 0xd8]);
+        body[..3].copy_from_slice(&[0xff, 0xd8, 0xff]);
         body[len - 2..].copy_from_slice(&[0xff, 0xd9]);
         body
+    }
+
+    #[test]
+    fn the_jpeg_extent_ends_at_the_final_end_marker_in_the_tail_window() {
+        let jpeg = jpeg_with_len(64);
+        assert_eq!(jpeg_extent(&jpeg), Some(64));
+        for tail in [
+            &b"\r\n"[..],
+            &[0_u8][..],
+            &[0_u8; 3][..],
+            &[0x5a_u8; 1024][..],
+        ] {
+            let mut padded = jpeg.clone();
+            padded.extend_from_slice(tail);
+            assert_eq!(
+                jpeg_extent(&padded),
+                Some(64),
+                "{} trailing bytes",
+                tail.len()
+            );
+        }
+        // An embedded thumbnail's end marker precedes the image's own.
+        let mut nested = jpeg_with_len(32);
+        nested.extend_from_slice(&jpeg_with_len(32));
+        nested.extend_from_slice(b"\0\0");
+        assert_eq!(jpeg_extent(&nested), Some(64));
+    }
+
+    #[test]
+    fn bodies_without_both_jpeg_markers_in_bounds_are_rejected() {
+        assert_eq!(jpeg_extent(b"<html>not a jpeg</html>"), None);
+        assert_eq!(jpeg_extent(&[]), None);
+        assert_eq!(jpeg_extent(&[0xff, 0xd8]), None);
+        assert_eq!(
+            jpeg_extent(&[0xff, 0xd8, 0xff, 0xd9]),
+            None,
+            "the end marker cannot overlap the start marker"
+        );
+        let mut missing_start = jpeg_with_len(64);
+        missing_start[2] = 0x00;
+        assert_eq!(
+            jpeg_extent(&missing_start),
+            None,
+            "missing first segment marker"
+        );
+        let mut missing_end = jpeg_with_len(64);
+        missing_end[62] = 0x00;
+        assert_eq!(jpeg_extent(&missing_end), None);
+        // The marker and everything after it fill exactly the tail window.
+        let mut distant = jpeg_with_len(64);
+        distant.extend(std::iter::repeat_n(0_u8, JPEG_EOI_WINDOW - 2));
+        assert_eq!(
+            jpeg_extent(&distant),
+            Some(64),
+            "an end marker just inside the window is found"
+        );
+        distant.push(0);
+        assert_eq!(
+            jpeg_extent(&distant),
+            None,
+            "an end marker more than 64 KiB before the end is rejected"
+        );
+    }
+
+    #[tokio::test]
+    async fn padded_snapshots_are_served_through_their_end_marker() {
+        let mut body = jpeg_with_len(64);
+        body.extend_from_slice(b"\r\n\0\0");
+        let source = serve_body(body, "image/jpeg").await;
+        let served = fetch_snapshot(&source).await.expect("padding is accepted");
+        assert_eq!(served.len(), 64);
+        assert!(served.ends_with(&[0xff, 0xd9]));
     }
 
     fn upstream_text(error: ApiError) -> String {

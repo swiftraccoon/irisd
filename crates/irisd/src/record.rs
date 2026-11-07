@@ -113,6 +113,7 @@ impl MonitorState {
 pub async fn run(args: Args) -> anyhow::Result<()> {
     let config =
         Config::load(&args.config).with_context(|| format!("loading {}", args.config.display()))?;
+    crate::run::warn_if_configuration_exposed(&args.config);
     let sources = select_sources(&config, &args)?;
     let queue_capacity =
         crate::run::checked_queue_capacity(config.storage.max_queued_fragments, sources.len())?;
@@ -273,6 +274,8 @@ async fn shutdown_recording(
     failure
 }
 
+/// Creates the standalone root descriptor-relatively: a symlink in any
+/// component of `root` fails instead of creating directories elsewhere.
 fn prepare_recording_root(root: &Path) -> anyhow::Result<()> {
     create_recording_root(root).with_context(|| format!("creating {}", root.display()))
 }
@@ -508,7 +511,7 @@ mod tests {
         ] {
             let parser_cause = raw.parse::<iris_ingest::Url>().unwrap_err().to_string();
             let config = Config::from_toml_str(&format!(
-                "[[camera]]\nid='cam1'\nname=''\nrtsp_url='{raw}'\nusername=''\npassword=''\nrecord=['main']\n"
+                "[api]\nallow_unauthenticated=true\n[[camera]]\nid='cam1'\nname=''\nrtsp_url='{raw}'\nusername=''\npassword=''\nrecord=['main']\n"
             ))
             .unwrap();
             let error = select_sources(&config, &args(vec![StreamKind::Main])).unwrap_err();
@@ -636,5 +639,21 @@ mod tests {
             summary_dropped(writer_stats.dropped(), stream_stats.dropped_sink()),
             1
         );
+    }
+
+    #[test]
+    fn a_root_behind_a_symlinked_ancestor_is_refused_without_creating_anything() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = dir.path().join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        let linked = dir.path().join("linked");
+        std::os::unix::fs::symlink(&outside, &linked).unwrap();
+
+        assert!(prepare_recording_root(&linked.join("video/root")).is_err());
+        assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 0);
+
+        let root = dir.path().join("video/root");
+        prepare_recording_root(&root).unwrap();
+        assert!(root.is_dir());
     }
 }

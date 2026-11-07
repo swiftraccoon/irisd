@@ -1,5 +1,6 @@
 //! What to ingest and how.
 
+use std::fmt;
 use std::time::Duration;
 
 use iris_core::config::TimestampMode;
@@ -11,7 +12,10 @@ use crate::live::LiveRing;
 use crate::session::ReadTicker;
 
 /// One RTSP stream to record.
-#[derive(Clone, Debug)]
+///
+/// The `Debug` output redacts the credentials, and the whole URL if it
+/// carries user information anyway.
+#[derive(Clone)]
 pub struct StreamSource {
     /// Owning camera and stream kind.
     pub key: StreamKey,
@@ -21,6 +25,23 @@ pub struct StreamSource {
     pub username: String,
     /// RTSP password.
     pub password: String,
+}
+
+impl fmt::Debug for StreamSource {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let url: &dyn fmt::Debug =
+            if self.url.username().is_empty() && self.url.password().is_none() {
+                &self.url
+            } else {
+                &"<redacted>"
+            };
+        f.debug_struct("StreamSource")
+            .field("key", &self.key)
+            .field("url", url)
+            .field("username", &"<redacted>")
+            .field("password", &"<redacted>")
+            .finish()
+    }
 }
 
 /// Ingest policy.
@@ -65,6 +86,40 @@ impl Default for IngestOptions {
             read_interval: None,
             ticker: None,
             recv_low_water: None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn debug_redacts_credentials() {
+        let source = StreamSource {
+            key: StreamKey {
+                camera: "cam1".parse().expect("camera id"),
+                kind: iris_core::id::StreamKind::Main,
+            },
+            url: "rtsp://192.0.2.10/cam".parse().expect("URL"),
+            username: "distinctive-user".to_owned(),
+            password: "distinctive-password".to_owned(),
+        };
+        let embedded = StreamSource {
+            url: "rtsp://distinctive-user:distinctive-password@192.0.2.10/cam"
+                .parse()
+                .expect("URL"),
+            ..source.clone()
+        };
+        for (source, shows_url) in [(source, true), (embedded, false)] {
+            for rendered in [format!("{source:?}"), format!("{source:#?}")] {
+                assert!(rendered.contains("<redacted>"), "{rendered}");
+                assert!(rendered.contains("cam1"), "{rendered}");
+                assert_eq!(rendered.contains("192.0.2.10"), shows_url, "{rendered}");
+                for marker in ["distinctive-user", "distinctive-password"] {
+                    assert!(!rendered.contains(marker), "debug leaked {marker}");
+                }
+            }
         }
     }
 }

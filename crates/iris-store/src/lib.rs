@@ -23,6 +23,9 @@
 //! - [`create_recording_root`], [`free_space`], [`free_space_approved`], and
 //!   [`remove_segment`]: durable root preparation and the file-system
 //!   operations retention needs.
+//! - [`open_segment_beneath`], [`open_segment_pair_beneath`], and
+//!   [`open_regular_file`]: opens that never follow a final symlink and never
+//!   block on a FIFO or device, accepting only regular files.
 //!
 //! # Invariants
 //!
@@ -67,8 +70,8 @@ mod writer;
 pub use fs::{
     ApprovedRoot, FreeSpace, ROOT_IDENTITY_MARKER, RootExpectation, RootIdentity,
     admit_recording_root, create_recording_root, free_space, free_space_approved,
-    open_approved_root_directory, open_segment_beneath, open_segment_pair_beneath, remove_segment,
-    remove_segment_beneath, verify_approved_root,
+    open_approved_root_directory, open_regular_file, open_segment_beneath,
+    open_segment_pair_beneath, remove_segment, remove_segment_beneath, verify_approved_root,
 };
 pub use iris_mp4::fragment::Fragment;
 pub use observer::{NoopObserver, SegmentOpened, SegmentProgress, SegmentSealed, StoreObserver};

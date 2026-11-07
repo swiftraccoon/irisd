@@ -75,12 +75,19 @@ tile.**
   between files, and omits files whose sidecars cannot be served. Cumulative ticks convert
   to microseconds at each playlist boundary, avoiding per-fragment rounding drift.
   The viewer fetches one VOD body for both timing and playback. It resolves init and media
-  references against the fetched response URL, preserving authentication queries, and
-  serves that frozen playlist to GStreamer through a loopback endpoint behind a 256-bit
-  OS-random capability path. Repeated player requests receive the same selection, even if
-  appends or retention change a later daemon playlist. The endpoint serves only the
-  manifest; media still comes directly from the daemon, and removal of a selected file
-  can fail playback. Opening and automatic export run outside the serial UI event receiver.
+  references against the fetched response URL, preserving authentication queries, requires
+  every one to stay on the API origin (scheme, host, port) without userinfo, and refuses a
+  body carrying any tag the daemon's VOD writer does not emit, so a hostile API or an on-path
+  attacker cannot steer GStreamer to other hosts, `file:` URIs, or key and rendition fetches;
+  the client follows no redirects. It serves that frozen playlist to GStreamer through a
+  loopback endpoint behind a 256-bit OS-random capability path. Repeated player requests
+  receive the same selection, even if appends or retention change a later daemon playlist.
+  The endpoint serves only the manifest; media still comes directly from the daemon's
+  origin, and removal of a selected file can fail playback. A segment listing follows the
+  API's overlap rule: an open row counts as extending to the present, and open rows that
+  recorded nothing inside the window are dropped, so a camera offline for longer than the
+  window, or a file before its first sync, reads as nothing recorded rather than an error.
+  Opening and automatic export run outside the serial UI event receiver.
   Closing or replacing playback cancels pending playlist, thumbnail, and export work, drops
   its listener without waiting on the GTK main loop, and generation-fences a running thumbnail
   decode that cannot be interrupted. Across all playback views and replacements, two thumbnail
@@ -89,16 +96,29 @@ tile.**
   pipeline and listener after the bus callback returns. Tokens and capability paths stay out of
   viewer logs and temporary files; the log output layer rejects tungstenite's raw client-handshake
   target even when a broad trace filter is selected.
-  Live WebSocket frames/messages are limited to the 16 MiB payload plus one type byte.
-  `appsrc` input has 16 MiB and 512-buffer queue limits enforced before copying each nonempty
-  payload; overflow or an unknown fixed-protocol type reconnects from init and sync without
-  blocking the runtime. Playback widget callbacks hold weak references so dropping the view
-  releases its resources. API reads apply connect/read-idle deadlines and endpoint-specific
-  byte, row, string, and time-domain limits.
+  Live WebSocket frames/messages are limited to the 16 MiB payload plus one type byte, the live
+  protocol's 16 MiB + 1 ceiling: the daemon skips an oversized non-sync frame and closes with
+  1009 when a sync frame exceeds it, and the viewer shows that, or a message above its own
+  limit, as an oversized tile state, retrying after 2 s and doubling to 60 s until video
+  flows again. `appsrc` input has 16 MiB and 512-buffer queue limits enforced before copying
+  each nonempty payload; overflow or an unknown fixed-protocol type reconnects from init and
+  sync after 2 s without blocking the runtime. The grid decodes at most `--max-tiles` live
+  tiles (default 16, so at most 256 MiB of queued live input); the rest are labelled and open
+  their single-camera view on a click. Playback widget callbacks hold weak references so
+  dropping the view releases its resources. API reads apply connect/read-idle deadlines and
+  endpoint-specific byte, row, string, and time-domain limits.
+  Remote viewing goes through a TLS reverse proxy: an `https` API gives `wss` live feeds, and
+  both verify the proxy against the platform's trust store. Plain HTTP to a host other than
+  loopback is refused unless `--allow-insecure-http` accepts an unencrypted bearer and video.
+  The bearer belongs in `IRISD_TOKEN`; a `--token` argument draws a warning and moves into the
+  environment when the viewer re-executes itself for the GL renderer.
   Export marks a range on that timeline and streams the daemon's MP4 export into an exclusively
-  created sibling temporary chosen with the system save dialog. A complete nonempty MP4 is synced
-  and atomically renamed over the final path; progress keeps one latest value. The dated
-  measurements below cover software decode, NVDEC, renderers, and the shared stage.
+  created sibling temporary chosen with the system save dialog. Before the first byte and after
+  every further 64 MiB it checks the destination's free space with `fstatvfs` and stops,
+  removing the temporary, below the larger of 1 GiB and 2 % of the filesystem. A complete
+  nonempty MP4 is synced and atomically renamed over the final path; progress keeps one latest
+  value. The dated measurements below cover software decode, NVDEC, renderers, and the shared
+  stage.
 - Fallback widget: `libmpv2` 7.0.0 (one `mpv_render_context` per core, `hwdec=nvdec|vaapi`),
   if a driver/GL combination misbehaves with the GStreamer path.
 - Rejected: egui/iced/Slint (no maintained zero-copy video path; frame uploads through the

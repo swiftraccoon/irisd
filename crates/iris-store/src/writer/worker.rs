@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 
 use iris_core::id::StreamKey;
 use iris_mp4::fragment::Fragment;
+use rustix::io::Errno;
 use tracing::{error, warn};
 
 use super::{Command, SLOW_IO, WriterStats, sync_phase};
@@ -142,11 +143,25 @@ impl RootWorker {
         {
             return Ok(true);
         }
-        let space = self.approved_root.as_ref().map_or_else(
+        let probe = self.approved_root.as_ref().map_or_else(
             || (self.space_probe)(&self.root),
             crate::fs::free_space_approved,
-        )?;
+        );
         self.space_checked = Some(Instant::now());
+        let space = match probe {
+            Ok(space) => space,
+            Err(error) if is_transient_probe_error(&error) => {
+                // The process, not the root, ran out of a resource. Open files
+                // stay in use; the probe runs again after the cadence.
+                warn!(root = %self.root.display(), %error,
+                    "free-space probe failed transiently; keeping open files and retrying in one second");
+                return Ok(true);
+            }
+            Err(error) => {
+                self.space_checked = None;
+                return Err(error);
+            }
+        };
         Ok(self.min_free_percent == 0
             || (space.total > 0
                 && u128::from(space.available) * 100
@@ -269,6 +284,22 @@ impl RootWorker {
     }
 }
 
+/// Whether a free-space probe failed because the process lacked a resource
+/// rather than because the root is unavailable: descriptors (`EMFILE`,
+/// `ENFILE`), memory (`ENOMEM`), or a retryable call (`EAGAIN`, which is
+/// also `EWOULDBLOCK`, and `EINTR`). Every other error, including `ENOENT`,
+/// `EIO`, `ESTALE`, `ENOTDIR`, and an identity mismatch, means the root
+/// itself failed.
+fn is_transient_probe_error(error: &io::Error) -> bool {
+    matches!(
+        Errno::from_io_error(error),
+        Some(Errno::MFILE | Errno::NFILE | Errno::NOMEM | Errno::AGAIN | Errno::INTR)
+    ) || matches!(
+        error.kind(),
+        io::ErrorKind::OutOfMemory | io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -307,6 +338,127 @@ mod tests {
                 16,
             )),
         }
+    }
+
+    static TRANSIENT_PROBES: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
+
+    fn exhausted_descriptors(_: &Path) -> io::Result<FreeSpace> {
+        TRANSIENT_PROBES.fetch_add(1, Ordering::SeqCst);
+        Err(io::Error::from_raw_os_error(Errno::MFILE.raw_os_error()))
+    }
+
+    fn missing_root(_: &Path) -> io::Result<FreeSpace> {
+        Err(io::Error::from_raw_os_error(Errno::NOENT.raw_os_error()))
+    }
+
+    #[test]
+    fn transient_probe_errors_are_resource_errors_only() {
+        for errno in [
+            Errno::MFILE,
+            Errno::NFILE,
+            Errno::NOMEM,
+            Errno::AGAIN,
+            Errno::WOULDBLOCK,
+            Errno::INTR,
+        ] {
+            assert!(is_transient_probe_error(&errno.into()), "{errno:?}");
+        }
+        for errno in [
+            Errno::NOENT,
+            Errno::IO,
+            Errno::STALE,
+            Errno::NOTDIR,
+            Errno::LOOP,
+            Errno::ACCESS,
+        ] {
+            assert!(!is_transient_probe_error(&errno.into()), "{errno:?}");
+        }
+        assert!(!is_transient_probe_error(&io::Error::new(
+            io::ErrorKind::InvalidData,
+            "recording-root marker changed after admission"
+        )));
+    }
+
+    #[test]
+    fn a_transient_probe_failure_keeps_writing_and_probes_again_after_the_cadence() {
+        let dir = tempfile::tempdir().unwrap();
+        let stats = Arc::new(WriterStats::default());
+        let mut worker = RootWorker::new(
+            dir.path().to_path_buf(),
+            StoragePolicy::default(),
+            Arc::clone(&stats),
+            Arc::new(NoopObserver),
+            None,
+            1,
+            exhausted_descriptors,
+            None,
+        );
+        worker.write(key(), fragment(0, true));
+        worker.write(key(), fragment(1, false));
+        assert!(worker.available, "the root stays in use");
+        assert_eq!(
+            TRANSIENT_PROBES.load(Ordering::SeqCst),
+            1,
+            "cached for one second"
+        );
+
+        let checked = worker
+            .space_checked
+            .expect("a failed probe still starts the cadence");
+        worker.space_checked = Some(checked.checked_sub(Duration::from_secs(2)).unwrap());
+        worker.write(key(), fragment(2, false));
+        assert_eq!(
+            TRANSIENT_PROBES.load(Ordering::SeqCst),
+            2,
+            "probed again after the cadence"
+        );
+        assert!(worker.available);
+        assert_eq!(stats.fragments(), 3);
+        assert_eq!(stats.dropped(), 0);
+        assert_eq!(stats.write_errors(), 0);
+        worker.close().unwrap();
+
+        let mut media = Vec::new();
+        let mut directories = vec![dir.path().to_path_buf()];
+        while let Some(directory) = directories.pop() {
+            for entry in fs::read_dir(directory).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    directories.push(path);
+                } else if path.extension().is_some_and(|extension| extension == "mp4") {
+                    media.push(path);
+                }
+            }
+        }
+        assert_eq!(media.len(), 1, "the open file was never abandoned");
+        let report = iris_mp4::reader::scan(
+            fs::File::open(&media[0]).unwrap(),
+            iris_mp4::reader::ScanOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(report.fragments.len(), 3);
+    }
+
+    #[test]
+    fn an_unavailable_root_probe_failure_still_abandons() {
+        let dir = tempfile::tempdir().unwrap();
+        let stats = Arc::new(WriterStats::default());
+        let mut worker = RootWorker::new(
+            dir.path().to_path_buf(),
+            StoragePolicy::default(),
+            Arc::clone(&stats),
+            Arc::new(NoopObserver),
+            None,
+            1,
+            missing_root,
+            None,
+        );
+        worker.write(key(), fragment(0, true));
+        assert!(!worker.available);
+        assert_eq!(stats.write_errors(), 1);
+        assert_eq!(stats.dropped(), 1);
+        assert_eq!(stats.fragments(), 0);
     }
 
     #[test]

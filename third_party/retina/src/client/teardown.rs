@@ -1,24 +1,78 @@
 // Copyright (C) The Retina Authors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+use std::net::SocketAddr;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
 use bytes::Bytes;
 use url::Url;
 
 use crate::rtsp::msg::{self, OwnedMessage, StatusCode};
 
-use super::{ResponseMode, RtspConnection, SessionOptions, Tool};
+use super::{MAX_BACKGROUND_TEARDOWNS, ResponseMode, RtspConnection, SessionOptions, Tool};
 use crate::{Error, error::ErrorInt};
 
 const EXISTING_CONN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 const FRESH_CONN_INITIAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
 const FRESH_CONN_MAX_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(16);
 
+/// Longest a background `TEARDOWN` keeps trying, whatever session timeout the
+/// server announced.
+pub(super) const MAX_LIFETIME: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Background `TEARDOWN` tasks running in this process.
+static RUNNING: AtomicUsize = AtomicUsize::new(0);
+
+/// One of the [`MAX_BACKGROUND_TEARDOWNS`] places for a background
+/// `TEARDOWN` task, released when dropped.
+pub(super) struct Slot(&'static AtomicUsize);
+
+impl Slot {
+    /// Takes a place, or returns `None` when all are taken.
+    pub(super) fn acquire() -> Option<Self> {
+        Self::acquire_from(&RUNNING, MAX_BACKGROUND_TEARDOWNS)
+    }
+
+    fn acquire_from(counter: &'static AtomicUsize, max: usize) -> Option<Self> {
+        let mut taken = counter.load(Ordering::Acquire);
+        loop {
+            if taken >= max {
+                return None;
+            }
+            match counter.compare_exchange_weak(
+                taken,
+                taken + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return Some(Self(counter)),
+                Err(actual) => taken = actual,
+            }
+        }
+    }
+
+    /// Returns how many places are taken.
+    pub(super) fn in_use() -> usize {
+        RUNNING.load(Ordering::Acquire)
+    }
+}
+
+impl Drop for Slot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 /// Handles `TEARDOWN` loop in the background, removing the stale session entry on success or
 /// session expiry.
+///
+/// `base_url` is only the Request-URI: fresh connections go to `peer`, the
+/// address the session's own connection reached.
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn background_teardown(
     seqnum: Option<u64>,
     base_url: Url,
+    peer: SocketAddr,
     tool: Option<Tool>,
     session_id: Box<str>,
     just_try_once: bool,
@@ -37,6 +91,7 @@ pub(super) async fn background_teardown(
         expires,
         teardown_loop_forever(
             base_url,
+            peer,
             tool,
             &session_id,
             just_try_once,
@@ -76,6 +131,7 @@ pub(super) async fn background_teardown(
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn teardown_loop_forever(
     url: Url,
+    peer: SocketAddr,
     tool: Option<Tool>,
     session_id: &str,
     just_try_once: bool,
@@ -96,6 +152,17 @@ pub(super) async fn teardown_loop_forever(
         },
         body: Bytes::new(),
     };
+
+    // A session read on its owner's timer left its socket outside the reactor
+    // with a raised low-water mark, so neither the request's writes nor the
+    // response would wake this task. Undo both so the attempt below makes
+    // progress as I/O allows and `attempt_deadline` bounds it.
+    if let Some(c) = conn.as_mut()
+        && let Err(e) = c.inner.return_to_reactor()
+    {
+        log::debug!("TEARDOWN {session_id} skips the session's own connection: {e}");
+        conn = None;
+    }
 
     let attempt_deadline = tokio::time::sleep(EXISTING_CONN_TIMEOUT);
     tokio::pin!(attempt_deadline);
@@ -157,7 +224,10 @@ pub(super) async fn teardown_loop_forever(
             .as_mut()
             .reset(tokio::time::Instant::now() + timeout);
         let attempt = async {
-            let conn = RtspConnection::connect(&url).await?;
+            // The session's own peer, never the host in `url`: a server may
+            // advertise any `Content-Base`, and this request carries
+            // credentials.
+            let conn = RtspConnection::connect_peer(peer).await?;
             attempt(&mut req, tool.as_ref(), options, &mut requested_auth, conn).await
         };
         tokio::select! {
@@ -227,5 +297,25 @@ async fn attempt(
             Ok(status)
         }
         _ => Err(e),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn slots_are_bounded_and_released_on_drop() {
+        static COUNTER: AtomicUsize = AtomicUsize::new(0);
+        let held: Vec<Slot> = (0..3)
+            .map(|_| Slot::acquire_from(&COUNTER, 3).expect("a free slot"))
+            .collect();
+        assert!(Slot::acquire_from(&COUNTER, 3).is_none());
+        assert_eq!(COUNTER.load(Ordering::Acquire), 3);
+        drop(held);
+        assert_eq!(COUNTER.load(Ordering::Acquire), 0);
+        let again = Slot::acquire_from(&COUNTER, 3);
+        assert!(again.is_some());
+        assert_eq!(COUNTER.load(Ordering::Acquire), 1);
     }
 }

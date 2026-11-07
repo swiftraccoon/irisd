@@ -20,10 +20,22 @@ Scope: this crate only. Read the root `AGENTS.md` first.
 - Pragmas (WAL, `synchronous = NORMAL`, foreign keys, busy timeout, in-memory temporary
   query state) implement `04 §6` without requiring a sandbox-external temp directory;
   deletion intent alone commits under scoped `synchronous = FULL` before filesystem mutation.
+  Every write transaction goes through `write_transaction` (`BEGIN IMMEDIATE`), so the busy
+  timeout covers lock acquisition; migration rereads the schema version under that lock.
+- `Db::open` creates missing parents 0700 and a missing database file 0600 before SQLite
+  opens it; SQLite copies the database file's mode to the WAL and shared-memory files.
 - Retention atomically rechecks active same-camera event protection and commits `deleting`
   under FULL synchronization. Filesystem mutation follows only `DeleteMarkResult::Marked`.
   Deleting rows are absent from serving and candidate queries, remain visible to
-  `deleting_segments`, and contribute to byte totals until durable pair deletion removes them.
+  `deleting_segments`, and contribute to byte totals until durable pair deletion removes them;
+  `CatalogStats::deleting_segments` and `deleting_bytes` count them. The daemon retries them
+  in every retention pass and at startup.
+- `mark_empty_writing_deleting` marks any open, non-deleting row whatever its fragment count
+  (startup calls it for a pair that is empty or confirmed absent); keep its name and
+  signature, which startup reconciliation depends on.
+- Range listings (`segments`, `segments_limited`) list an unsealed row only with
+  `fragments > 0` and extend it to `MIN(now, wall_end_us + OPEN_SEGMENT_GRACE)`; sealed rows
+  cover their recorded interval. The rows keep their recorded `wall_end`.
 - Event listing has both row and aggregate-owned-byte limits and pages by the exclusive
   `(nvr_time_us, id)` cursor. Retention projections omit vendor payload and page active marks
   by `(retain_until_us, id)` while projecting receipt time for overlap. Event maintenance
@@ -70,6 +82,10 @@ Tests use `tempfile` directories only. A query change should come with a test in
 
 ## Pitfalls
 
+- Never open a write transaction with `Connection::transaction()` (DEFERRED). A deferred
+  transaction that reads before it writes gets `SQLITE_BUSY` at once when another connection
+  holds the write lock, because SQLite skips the busy handler for a reader upgrading to a
+  writer; the failed batch is dropped. Use `write_transaction`.
 - `Change::SegmentProgress` and `SegmentSealed` find their row by path; the writer and the
   catalog must agree on the exact `PathBuf` (no normalisation on either side).
 - `SegmentOpened` interns the sample entry by hash; a hash collision between different

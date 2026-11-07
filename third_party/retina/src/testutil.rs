@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 #[cfg(test)]
-use std::sync::Once;
+use std::cell::RefCell;
 use std::sync::OnceLock;
 
 #[cfg(test)]
@@ -10,8 +10,6 @@ use bytes::Bytes;
 use derive_more::Debug;
 use pretty_hex::{HexConfig, PrettyHex as _};
 
-#[cfg(test)]
-static INIT_LOGGING: Once = Once::new();
 static FINDER: OnceLock<memchr::memmem::Finder> = OnceLock::new();
 
 pub const NONASCII_HEX_CONFIG: HexConfig = HexConfig {
@@ -137,7 +135,7 @@ impl std::fmt::Debug for HexDebug {
 #[cfg(test)]
 macro_rules! assert_eq_hex {
     ($left:expr, $right:expr) => {{
-        pretty_assertions::assert_eq!(
+        assert_eq!(
             $crate::testutil::HexDebug(Vec::from(AsRef::<[u8]>::as_ref(&$left))),
             $crate::testutil::HexDebug(Vec::from(AsRef::<[u8]>::as_ref(&$right))),
         );
@@ -155,29 +153,65 @@ macro_rules! assert_eq_hexes {
             .iter()
             .map(|x| $crate::testutil::HexDebug(Vec::from(AsRef::<[u8]>::as_ref(x))))
             .collect::<Vec<_>>();
-        pretty_assertions::assert_eq!(left, right);
+        assert_eq!(left, right);
     }};
 }
 
 #[cfg(test)]
 pub(crate) use {assert_eq_hex, assert_eq_hexes};
 
+/// Installs the tests' logger, which keeps records only for [`capture_logs`].
 #[cfg(test)]
 pub(crate) fn init_logging() {
-    use std::str::FromStr as _;
-    INIT_LOGGING.call_once(|| {
-        let h = mylog::Builder::new()
-            .is_test(true)
-            .format(
-                ::std::env::var("RUST_FORMAT")
-                    .map_err(|_| ())
-                    .and_then(|s| mylog::Format::from_str(&s))
-                    .unwrap_or(mylog::Format::Google),
-            )
-            .spec(::std::env::var("RUST_LOG").as_deref().unwrap_or("info"))
-            .build();
-        h.install().unwrap();
-    })
+    static INIT: std::sync::Once = std::sync::Once::new();
+    INIT.call_once(|| {
+        log::set_logger(&ThreadCapture).expect("no other logger in tests");
+        log::set_max_level(log::LevelFilter::Trace);
+    });
+}
+
+#[cfg(test)]
+thread_local! {
+    static CAPTURED: RefCell<Option<Vec<(log::Level, String)>>> = const { RefCell::new(None) };
+}
+
+/// Keeps the records of threads inside [`capture_logs`] and drops the rest.
+#[cfg(test)]
+struct ThreadCapture;
+
+#[cfg(test)]
+impl log::Log for ThreadCapture {
+    fn enabled(&self, _metadata: &log::Metadata<'_>) -> bool {
+        true
+    }
+
+    fn log(&self, record: &log::Record<'_>) {
+        if CAPTURED.with_borrow(Option::is_none) {
+            return;
+        }
+        // Formatted before the borrow, in case formatting itself logs.
+        let message = record.args().to_string();
+        CAPTURED.with_borrow_mut(|captured| {
+            if let Some(records) = captured {
+                records.push((record.level(), message));
+            }
+        });
+    }
+
+    fn flush(&self) {}
+}
+
+/// Runs `f`, returning its result and the log records it emitted on this
+/// thread (level and message).
+#[cfg(test)]
+pub(crate) fn capture_logs<R>(f: impl FnOnce() -> R) -> (R, Vec<(log::Level, String)>) {
+    init_logging();
+    CAPTURED.with_borrow_mut(|captured| *captured = Some(Vec::new()));
+    let result = f();
+    let records = CAPTURED
+        .with_borrow_mut(Option::take)
+        .expect("capture started above");
+    (result, records)
 }
 
 #[cfg(test)]
@@ -189,4 +223,29 @@ pub(crate) fn response(mut raw: &'static [u8]) -> (crate::rtsp::msg::Response, B
         crate::rtsp::msg::Message::Response(r) => (r, Bytes::from_static(body_slice)),
         _ => panic!("unexpected message type"),
     }
+}
+
+/// Interprets `raw` as a complete response to a `DESCRIBE` of `request_url`,
+/// as a session does: returns the number of streams, or the error a session
+/// would report. Warnings go to the `log` crate. For fuzz tests.
+///
+/// # Panics
+///
+/// If `request_url` is not a URL.
+pub fn parse_describe_response(request_url: &str, mut raw: &[u8]) -> Result<usize, String> {
+    let request_url = url::Url::parse(request_url).expect("a valid request URL");
+    let mut parser = crate::rtsp::parse::Parser::builder()
+        .max_message_size(crate::rtsp::parse::MAX_CONTROL_MESSAGE_BYTES)
+        .build();
+    let (message, body) = match parser.feed(&mut raw) {
+        Ok(Some(parsed)) => parsed,
+        Ok(None) => return Err("no message".to_owned()),
+        Err(e) => return Err(format!("not one RTSP message: {e}")),
+    };
+    let crate::rtsp::msg::Message::Response(response) = message else {
+        return Err("not a response".to_owned());
+    };
+    let body = bytes::Bytes::copy_from_slice(body);
+    crate::client::parse::parse_describe(request_url, &response, &body)
+        .map(|presentation| presentation.streams.len())
 }

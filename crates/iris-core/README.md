@@ -33,6 +33,9 @@ use iris_core::config::Config;
 use iris_core::time::{MediaTicks, WallUs};
 
 let config = Config::from_toml_str(r#"
+[api]
+allow_unauthenticated = true
+
 [[camera]]
 id = "cam1"
 name = "Example"
@@ -48,13 +51,19 @@ let later = WallUs::now().offset(gop.as_micros());
 ```
 
 `Config::load` reads a file. Core rejects unknown fields, duplicate camera ids, repeated
-recorded kinds or event sources within a camera, `storage.min_free_percent` outside 0..=100,
-`storage.max_fragment_ms` outside 1..=60,000, writer queues above 4,096 fragments per stream,
-audio in the recorded-stream list, non-subscribable `onvif_metadata` and `manual` event sources,
-and camera retention above 106,751,991 days. Zero disables
+recorded kinds or event sources within a camera, `storage.min_free_percent` above 50,
+`storage.sync_interval_ms` outside 100..=60,000, `storage.rotate_secs` outside 60..=86,400,
+`storage.rotate_bytes` outside 64 MiB..=64 GiB, `storage.preallocate_bytes` above the smaller
+of `rotate_bytes` and 4 GiB, a `storage.quota_gib` of zero, `storage.max_fragment_ms` outside
+1..=60,000, writer queues above 4,096 fragments per stream, audio in the recorded-stream list,
+non-subscribable `onvif_metadata` and `manual` event sources, and camera retention outside
+1..=106,751,991 days. The API needs at least one bearer token of 32 or more visible ASCII
+characters (0x21 to 0x7e) that is not the example placeholder, or
+`api.allow_unauthenticated = true` with no token on a loopback listener; token errors name the
+entry's position, never its value. Zero disables
 the free-space floor; a zero writer queue retains one slot. Parse errors retain a safe byte span
 and generic syntax/schema description, without source excerpts or parser messages that can
-disclose credentials.
+disclose credentials. `CameraConfig`'s `Debug` output shows the password as `<redacted>`.
 
 ## Invariants and limits
 
@@ -85,7 +94,8 @@ disclose credentials.
 
 Unit tests live beside each module: id validation and round trips, RFC 3339 and NTP64
 conversions including a microsecond sweep, tick arithmetic, configuration defaults,
-derived URLs and ports, configuration validation and error redaction, histogram buckets,
+derived URLs and ports, configuration validation (storage range boundaries, API token rules,
+the example configuration with a generated token) and error and `Debug` redaction, histogram buckets,
 deltas, concurrent publication and maximum resets. The doctests
 in `config` and `time` are part of the suite. The read interval and low-water defaults
 come from `docs/research/12-ingest-cost.md`.

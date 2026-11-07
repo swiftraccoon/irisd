@@ -23,7 +23,10 @@ use crate::types::xml_escape;
 // ── WsSecurityToken ───────────────────────────────────────────────────────────
 
 /// A WS-Security `UsernameToken` ready to be serialised into a SOAP header.
-#[derive(Debug, Clone)]
+///
+/// The `Debug` output redacts the username, digest, and nonce, which together
+/// with `created` would let a reader replay the token.
+#[derive(Clone)]
 pub struct WsSecurityToken {
     pub username: String,
     /// `Base64( SHA-1( nonce_raw ‖ created ‖ password ) )`
@@ -104,6 +107,17 @@ impl WsSecurityToken {
             created  = self.created,
         )
         .unwrap();
+    }
+}
+
+impl std::fmt::Debug for WsSecurityToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WsSecurityToken")
+            .field("username", &"<redacted>")
+            .field("password_digest", &"<redacted>")
+            .field("nonce_b64", &"<redacted>")
+            .field("created", &self.created)
+            .finish()
     }
 }
 
@@ -292,5 +306,26 @@ mod tests {
         assert_eq!(token.created.len(), 20);
         assert!(token.created.ends_with('Z'));
         assert_eq!(token.created.chars().nth(10), Some('T'));
+    }
+
+    #[test]
+    fn test_debug_redacts_verifier_material() {
+        let token = WsSecurityToken::from_parts(
+            "distinctive-user",
+            "distinctive-digest",
+            "distinctive-nonce",
+            "2024-01-01T00:00:00Z",
+        );
+        for rendered in [format!("{token:?}"), format!("{token:#?}")] {
+            assert!(rendered.contains("<redacted>"));
+            assert!(rendered.contains("2024-01-01T00:00:00Z"));
+            for marker in [
+                "distinctive-user",
+                "distinctive-digest",
+                "distinctive-nonce",
+            ] {
+                assert!(!rendered.contains(marker), "debug leaked {marker}");
+            }
+        }
     }
 }

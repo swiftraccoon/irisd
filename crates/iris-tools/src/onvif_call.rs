@@ -9,6 +9,7 @@ use sha1::{Digest, Sha1};
 pub use iris_tools::probe_parser::camera_utc;
 
 use crate::logs::terminal_safe;
+use crate::secret::{Password, password_from_env};
 use crate::time::{iso, now};
 
 const MAX_RESPONSE: usize = 4 * 1024 * 1024;
@@ -31,13 +32,15 @@ fn bounded_limit(value: &str) -> Result<usize, String> {
     }
 }
 
-/// Arguments of `onvif-call`.
+/// Arguments of `onvif-call`. `Debug` redacts the password.
 #[derive(Debug, Parser)]
 pub struct Args {
+    /// Environment variable holding the ONVIF password, which stays out of
+    /// process listings and shell history.
+    #[arg(long = "password-env", value_name = "VAR", value_parser = password_from_env)]
+    password: Password,
     /// The ONVIF user.
     user: String,
-    /// The password (an argument so nothing secret is stored in a file).
-    password: String,
     /// The service URL, for example `http://192.0.2.10/onvif/event_service`.
     service_url: String,
     /// The SOAP body's inner XML.
@@ -161,7 +164,7 @@ async fn call(args: &Args) -> anyhow::Result<()> {
     let mut nonce = [0u8; 16];
     getrandom(&mut nonce)?;
     let created = iso(now() + offset).replace('Z', ".000Z");
-    let header = security_header(&args.user, &args.password, &nonce, &created)?;
+    let header = security_header(&args.user, args.password.expose(), &nonce, &created)?;
     let envelope = format!(
         "<s:Envelope xmlns:s=\"http://www.w3.org/2003/05/soap-envelope\">{header}<s:Body>{}</s:Body></s:Envelope>",
         args.body_xml
@@ -201,6 +204,40 @@ pub fn run(args: &Args) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_password_comes_from_the_environment_and_stays_out_of_debug() {
+        let expected = std::env::var("PATH").expect("tests run with PATH set");
+        let args = Args::try_parse_from([
+            "onvif-call",
+            "user",
+            "--password-env",
+            "PATH",
+            "http://192.0.2.10/onvif/event_service",
+            "<GetEventProperties/>",
+            "1000",
+        ])
+        .unwrap();
+        assert_eq!(args.password.expose(), expected);
+        assert_eq!(args.user, "user");
+        assert!(!format!("{args:?}").contains(&expected));
+
+        let error = Args::try_parse_from([
+            "onvif-call",
+            "--password-env",
+            "IRIS_TOOLS_TEST_UNSET_PASSWORD_8F3A",
+            "user",
+            "http://192.0.2.10/onvif/event_service",
+            "<GetEventProperties/>",
+            "1000",
+        ])
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("IRIS_TOOLS_TEST_UNSET_PASSWORD_8F3A") && error.contains("not set"),
+            "{error}"
+        );
+    }
 
     #[test]
     fn reads_the_camera_time_and_builds_the_digest() {

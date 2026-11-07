@@ -62,6 +62,8 @@ Addresses in examples use the RFC 5737 range, for example `host: "192.0.2.10".in
   after an authentication failure so a wrong password cannot lock the account out, parts bounded
   at 256 KiB. A 10 s deadline covers attachment and digest authentication through receipt of
   response headers; the streaming body uses an absolute deadline since the last completed part.
+  Redirects are never followed: a 3xx fails the session with its status and is retried with
+  backoff, so a camera that redirects HTTP to HTTPS needs `https = true`.
   Multipart scanning is linear across transport fragmentation and bounds body plus syntax before
   appending.
 - ONVIF: requests a 10 min subscription and renews at 80 % of the lifetime granted by the
@@ -77,8 +79,11 @@ Addresses in examples use the RFC 5737 range, for example `host: "192.0.2.10".in
 - Both sources apply `CameraEndpoint::tls_verify` to HTTPS calls. ONVIF uses a configurable
   SOAP transport with the same 10 s HTTP request bound and digest authentication as the
   upstream transport; normal certificate verification remains enabled unless the endpoint
-  explicitly disables it. Camera-advertised URLs must match the configured scheme, host, and
-  effective port, may not carry userinfo or fragments, and authenticated SOAP follows no
+  explicitly disables it. Camera-advertised service and subscription URLs are rebased onto the
+  configured scheme, host, and port, keeping their path and query, so cameras behind NAT or a
+  port forward, or configured by host name, still subscribe, and credentials only reach the
+  configured authority; an HTTPS configuration is never downgraded. URLs with userinfo, a
+  fragment, or a scheme other than HTTP(S) are rejected, and authenticated SOAP follows no
   redirects. Every SOAP response is capped at 1 MiB; XML depth, nodes, attributes, and retained
   text are independently capped at 64, 16,384, 32,768, and 1 MiB in the vendored `oxvif`
   parser.
@@ -97,7 +102,7 @@ Addresses in examples use the RFC 5737 range, for example `host: "192.0.2.10".in
 
 Unit tests cover CGI part parsing and valid JSON normalisation (`dahua`), multipart exact limits
 and linear work across fragmentation (`multipart`), digest responses and debug redaction
-(`digest`), ONVIF origin policy, cancellation cleanup, granted leases, topic/property semantics,
+(`digest`), ONVIF URL rebasing, cancellation cleanup, granted leases, topic/property semantics,
 structured items, and strict ISO 8601 parsing (`onvif`), backoff pacing (`backoff`), and the
 counters (`stats`). Hardware validation of
 both sources, including the clock-offset fallback and the 5 s pull timeout, is recorded in
@@ -105,7 +110,10 @@ both sources, including the clock-offset fallback and the 5 s pull timeout, is r
 described in `docs/research/07-architecture.md §9`.
 
 Loopback HTTP tests cover a connected server withholding attachment headers, HTTP digest
-authentication, bounded SOAP bodies on every status, redirect refusal, and SOAP fault forwarding.
+authentication, bounded SOAP bodies on every status, CGI and SOAP redirect refusal (the redirect
+target receives nothing), and SOAP fault forwarding. A loopback ONVIF camera that advertises a
+foreign address, or an IP address while configured by host name, is subscribed, pulled, and
+unsubscribed at its configured address while a listener at the advertised one receives nothing.
 A TLS fixture generates a temporary self-signed certificate and checks both certificate policies
 through the ONVIF session.
 

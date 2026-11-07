@@ -5,8 +5,9 @@
 //! and a playback view of one camera's recordings over a window, played from
 //! the daemon's HLS VOD playlist with a timeline for seeking. Each tile owns a GStreamer pipeline fed from the daemon's live
 //! WebSocket endpoint: an init segment followed by one fragment per frame,
-//! which `qtdemux` consumes as a fragmented MP4 byte stream, so the viewer
-//! never parses video itself. Decoding goes through `decodebin3`, which picks
+//! which `qtdemux` consumes as a fragmented MP4 byte stream, so the viewer's
+//! Rust code never parses video; GStreamer's native elements parse and decode
+//! it in this process, without a sandbox. Decoding goes through `decodebin3`, which picks
 //! the highest-ranked H.265 decoder present (hardware where the drivers
 //! provide one, software otherwise), and the frames land in
 //! `gtk4paintablesink`. Live tiles are branches of one shared pipeline, the
@@ -23,6 +24,7 @@ mod tile;
 mod timeline;
 
 use std::cell::RefCell;
+use std::ffi::OsString;
 use std::num::NonZeroU32;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -30,7 +32,7 @@ use std::sync::Arc;
 use clap::Parser;
 use gtk::prelude::*;
 use gtk::{gio, glib};
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::Layer as _;
 use tracing_subscriber::filter;
@@ -49,10 +51,15 @@ use crate::tile::Tile;
 #[derive(Clone, Debug, Parser)]
 #[command(version)]
 struct Args {
-    /// Base URL of the irisd API.
+    /// Base URL of the irisd API: `https` (through a TLS proxy) or `http`.
     #[arg(long, env = "IRISD_API", default_value = "http://127.0.0.1:8554")]
     api: Url,
-    /// Bearer token for the API.
+    /// Accept a plain-HTTP API URL on a non-loopback host. The bearer token and
+    /// the video then cross the network unencrypted.
+    #[arg(long)]
+    allow_insecure_http: bool,
+    /// Bearer token for the API. Prefer `IRISD_TOKEN`: a value given here is
+    /// visible to other local users and kept in shell history.
     #[arg(long, env = "IRISD_TOKEN", hide_env_values = true)]
     token: Option<String>,
     /// Stream kind shown in the grid tiles.
@@ -64,6 +71,10 @@ struct Args {
     /// Tiles per row.
     #[arg(long, default_value = "3")]
     columns: NonZeroU32,
+    /// Live tiles the grid decodes at once; the tiles after them stay idle and
+    /// still open their camera's single-camera view when clicked.
+    #[arg(long, default_value = "16", value_name = "N")]
+    max_tiles: NonZeroU32,
     /// Open this camera's single-camera view at start.
     #[arg(long, value_name = "CAMERA")]
     focus: Option<String>,
@@ -121,9 +132,79 @@ fn safe_log_metadata(metadata: &tracing::Metadata<'_>) -> bool {
     metadata.target() != SENSITIVE_LOG_TARGET
 }
 
+/// Why a token given as `--token` is moved or flagged.
+const TOKEN_ARGUMENT_WARNING: &str = "--token on the command line is visible to other local \
+    users and kept in shell history; set IRISD_TOKEN instead";
+
+/// Splits one `--token VALUE` or `--token=VALUE` out of the arguments after the
+/// program name, returning the remaining arguments and the value. A repeated or
+/// valueless option, or one after `--`, returns `None` so clap reports it.
+fn take_token_argument(args: &[OsString]) -> Option<(Vec<OsString>, OsString)> {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let mut found: Option<(usize, usize, OsString)> = None;
+    let mut index = 0;
+    while index < args.len() {
+        let arg = args[index].as_bytes();
+        if arg == b"--" {
+            break;
+        }
+        let (taken, value) = if arg == b"--token" {
+            let value = args.get(index + 1)?;
+            if value.as_bytes().starts_with(b"-") {
+                return None;
+            }
+            (2, value.clone())
+        } else if let Some(value) = arg.strip_prefix(b"--token=") {
+            (1, OsString::from(std::ffi::OsStr::from_bytes(value)))
+        } else {
+            index += 1;
+            continue;
+        };
+        if found.is_some() {
+            return None;
+        }
+        found = Some((index, taken, value));
+        index += taken;
+    }
+    let (start, taken, value) = found?;
+    let mut rest = args[..start].to_vec();
+    rest.extend_from_slice(&args[start + taken..]);
+    Some((rest, value))
+}
+
+/// Refuses API URLs the viewer must not use: schemes other than `http` and
+/// `https`, userinfo, and plain HTTP to a host other than loopback unless
+/// `allow_insecure_http` accepts it.
+fn check_api_url(api: &Url, allow_insecure_http: bool) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        matches!(api.scheme(), "http" | "https"),
+        "the API URL must use http or https"
+    );
+    anyhow::ensure!(
+        api.username().is_empty() && api.password().is_none(),
+        "the API URL cannot carry userinfo; pass the bearer token in IRISD_TOKEN"
+    );
+    let loopback = match api.host() {
+        Some(url::Host::Ipv4(address)) => address.is_loopback(),
+        Some(url::Host::Ipv6(address)) => address.is_loopback(),
+        Some(url::Host::Domain(name)) => name.eq_ignore_ascii_case("localhost"),
+        None => anyhow::bail!("the API URL has no host"),
+    };
+    anyhow::ensure!(
+        api.scheme() == "https" || loopback || allow_insecure_http,
+        "refusing plain HTTP to {}: the bearer token and video would cross the network \
+         unencrypted; use an https URL through a TLS proxy, or pass --allow-insecure-http",
+        api.host_str().unwrap_or_default()
+    );
+    Ok(())
+}
+
 /// Re-executes the viewer with `GSK_RENDERER` set when nothing set it. GTK reads
 /// the variable before any API runs, and setting it in-process is unsafe, so
-/// the process replaces itself once; on failure the viewer runs as it is.
+/// the process replaces itself once; on failure the viewer runs as it is. A
+/// `--token` argument moves into the replacement's `IRISD_TOKEN`, out of its
+/// command line.
 fn select_renderer() {
     use std::os::unix::process::CommandExt as _;
     if std::env::var_os("GSK_RENDERER").is_some() {
@@ -132,10 +213,14 @@ fn select_renderer() {
     let Ok(exe) = std::env::current_exe() else {
         return;
     };
-    let error = std::process::Command::new(exe)
-        .args(std::env::args_os().skip(1))
-        .env("GSK_RENDERER", RENDERER)
-        .exec();
+    let mut args: Vec<OsString> = std::env::args_os().skip(1).collect();
+    let mut command = std::process::Command::new(exe);
+    if let Some((rest, token)) = take_token_argument(&args) {
+        eprintln!("warning: {TOKEN_ARGUMENT_WARNING}");
+        command.env("IRISD_TOKEN", token);
+        args = rest;
+    }
+    let error = command.args(args).env("GSK_RENDERER", RENDERER).exec();
     eprintln!("cannot re-execute with GSK_RENDERER={RENDERER}: {error}");
 }
 
@@ -147,6 +232,13 @@ fn main() -> glib::ExitCode {
         .with(filter)
         .with(tracing_subscriber::fmt::layer().with_filter(filter::filter_fn(safe_log_metadata)))
         .init();
+    if take_token_argument(&std::env::args_os().skip(1).collect::<Vec<_>>()).is_some() {
+        warn!("{TOKEN_ARGUMENT_WARNING}");
+    }
+    if let Err(error) = check_api_url(&args.api, args.allow_insecure_http) {
+        error!("{error}");
+        return glib::ExitCode::FAILURE;
+    }
     if let Err(error) = gst::init() {
         error!(%error, "GStreamer failed to initialise");
         return glib::ExitCode::FAILURE;
@@ -443,16 +535,28 @@ fn populate_grid(views: &mut Views, cameras: &[Camera], args: &Args) {
     }
 }
 
-/// Shows the grid and starts every tile's feed.
+/// Shows the grid and starts the feeds of the first `--max-tiles` tiles; the
+/// others say why they are idle and still focus their camera when clicked.
 fn show_grid(views: &mut Views, args: &Args) {
     leave_views(views);
-    for tile in &views.tiles {
-        if let Err(error) = tile.start(feed(args, tile.camera(), &args.kind)) {
-            error!(camera = tile.camera(), %error, "cannot start a tile");
+    let limit = usize::try_from(args.max_tiles.get()).unwrap_or(usize::MAX);
+    for (index, tile) in views.tiles.iter().enumerate() {
+        if index < limit {
+            if let Err(error) = tile.start(feed(args, tile.camera(), &args.kind)) {
+                error!(camera = tile.camera(), %error, "cannot start a tile");
+            }
+        } else {
+            tile.idle(&format!(
+                "not started: the grid decodes at most {limit} live tiles (--max-tiles)"
+            ));
         }
     }
     views.stack.set_visible_child_name("grid");
-    info!(tiles = views.tiles.len(), "grid shown");
+    info!(
+        tiles = views.tiles.len(),
+        live = views.tiles.len().min(limit),
+        "grid shown"
+    );
 }
 
 /// Shows `camera`'s main stream alone and stops the grid's decoders.
@@ -619,6 +723,133 @@ mod tests {
     }
 
     #[test]
+    fn plain_http_to_a_remote_api_needs_an_explicit_opt_in() {
+        let check = |url: &str, allow| check_api_url(&Url::parse(url).unwrap(), allow);
+        for loopback in [
+            "http://127.0.0.1:8554",
+            "http://127.3.4.5:8554",
+            "http://[::1]:8554",
+            "http://localhost:8554",
+        ] {
+            assert!(check(loopback, false).is_ok(), "{loopback}");
+        }
+        assert!(check("https://192.0.2.10:8443", false).is_ok());
+        let refused = check("http://192.0.2.10:8554", false).unwrap_err();
+        assert!(refused.to_string().contains("--allow-insecure-http"));
+        assert!(check("http://192.0.2.10:8554", true).is_ok());
+        for invalid in [
+            "ftp://127.0.0.1/",
+            "file:///example",
+            "http://user:secret@127.0.0.1:8554",
+            "https://user@192.0.2.10/",
+        ] {
+            assert!(check(invalid, true).is_err(), "{invalid}");
+        }
+
+        let args = Args::try_parse_from([
+            "iris-gui",
+            "--api",
+            "http://192.0.2.10:8554",
+            "--allow-insecure-http",
+        ])
+        .unwrap();
+        assert!(args.allow_insecure_http);
+        assert!(
+            !Args::try_parse_from(["iris-gui"])
+                .unwrap()
+                .allow_insecure_http
+        );
+    }
+
+    #[test]
+    fn a_command_line_token_moves_out_of_the_reexecuted_arguments() {
+        let args = |items: &[&str]| items.iter().map(OsString::from).collect::<Vec<_>>();
+        assert_eq!(
+            take_token_argument(&args(&["--token", "secret", "--kind", "main"])),
+            Some((args(&["--kind", "main"]), OsString::from("secret")))
+        );
+        assert_eq!(
+            take_token_argument(&args(&["--columns", "2", "--token=se=cret"])),
+            Some((args(&["--columns", "2"]), OsString::from("se=cret")))
+        );
+        for unchanged in [
+            &["--kind", "main"][..],
+            &["--token"][..],
+            &["--token", "--kind"][..],
+            &["--token", "a", "--token", "b"][..],
+            &["--token=a", "--token=b"][..],
+            &["--", "--token", "a"][..],
+        ] {
+            assert_eq!(take_token_argument(&args(unchanged)), None, "{unchanged:?}");
+        }
+    }
+
+    #[test]
+    fn the_grid_decodes_sixteen_tiles_unless_told_otherwise() {
+        assert_eq!(
+            Args::try_parse_from(["iris-gui"]).unwrap().max_tiles.get(),
+            16
+        );
+        assert_eq!(
+            Args::try_parse_from(["iris-gui", "--max-tiles", "4"])
+                .unwrap()
+                .max_tiles
+                .get(),
+            4
+        );
+        let error = Args::try_parse_from(["iris-gui", "--max-tiles", "0"])
+            .expect_err("zero live tiles must be rejected");
+        assert_eq!(error.kind(), ErrorKind::ValueValidation);
+    }
+
+    /// Under a display: the grid starts feeds for the first `--max-tiles`
+    /// tiles only and labels the rest.
+    pub(super) fn grid_decodes_at_most_max_tiles_feeds() {
+        gtk::init().unwrap();
+        gst::init().unwrap();
+        // Registration may already have happened in this process.
+        let _ = gstgtk4::plugin_register_static();
+        let runtime = Arc::new(tokio::runtime::Runtime::new().unwrap());
+        // Nothing listens on the discard port, so the feeds only retry.
+        let api = Url::parse("http://127.0.0.1:9").unwrap();
+        let (tx, _rx) = async_channel::unbounded();
+        let (_, stack, grid, focus_box, focus_title, status) = build_widgets(&tx);
+        let mut views = Views {
+            stack,
+            grid,
+            focus_box,
+            focus_title,
+            status,
+            tiles: Vec::new(),
+            focused: None,
+            playback: None,
+            playback_task: None,
+            thumbnail_decoders: thumbnail_decoder_pool(),
+            runtime: Arc::clone(&runtime),
+            client: Arc::new(Client::new(api.clone(), None)),
+            tx,
+            stage: Stage::new().unwrap(),
+        };
+        let mut args = Args::try_parse_from(["iris-gui", "--max-tiles", "2"]).unwrap();
+        args.api = api;
+        let cameras = ["cam1", "cam2", "cam3"].map(|id| Camera {
+            id: id.to_owned(),
+            name: format!("Camera {id}"),
+        });
+        populate_grid(&mut views, &cameras, &args);
+        show_grid(&mut views, &args);
+        assert!(views.tiles[0].is_running() && views.tiles[1].is_running());
+        assert!(!views.tiles[2].is_running());
+        assert!(
+            views.tiles[2].label_text().contains("--max-tiles"),
+            "{}",
+            views.tiles[2].label_text()
+        );
+        leave_views(&mut views);
+        assert!(views.tiles.iter().all(|tile| !tile.is_running()));
+    }
+
+    #[test]
     fn columns_rejects_zero_and_accepts_one() {
         let error = Args::try_parse_from(["iris-gui", "--columns", "0"])
             .expect_err("zero columns must be rejected");
@@ -682,10 +913,12 @@ mod tests {
         }));
         let args = Args {
             api: Url::parse(&format!("http://{address}")).unwrap(),
+            allow_insecure_http: false,
             token: None,
             kind: "sub".to_owned(),
             focus_kind: "main".to_owned(),
             columns: NonZeroU32::new(1).unwrap(),
+            max_tiles: NonZeroU32::new(16).unwrap(),
             focus: Some("fixture".to_owned()),
             playback: true,
             window: 1,

@@ -34,15 +34,18 @@ config/              cameras.example.toml (committed), cameras.local.toml (gitig
 docs/research/       research and design, including every dated measurement
 .rust-reference/     the Rust project reference pack (policies, vendored guides, its own Rust CLI)
 docs/standards/ietf/ the RTSP, RTP, HEVC payload, HLS, and codecs documents, as published
-third_party/         vendored dependencies with local patches (retina + SO_RCVLOWAT); see its README
-.github/workflows/   CI: check (format, clippy, tests, rustdoc, audit) and docs (rustdoc to GitHub Pages)
+third_party/         vendored dependencies with local patches (retina, oxvif); see its README
+.github/workflows/   CI: check (format, clippy, tests, rustdoc, vendored tests), MSRV, audit, fuzz build,
+                     references; docs (rustdoc to GitHub Pages); dependabot.yml (weekly action updates)
 ```
 
 ## Commands
 
-- `just check` — format check, clippy with warnings as errors, tests, docs. Run before
-  finishing any change.
-- `just fmt`, `just test`, `just clippy`, `just doc`, `just audit`.
+- `just check` — format check, clippy with warnings as errors, tests, docs, and the vendored
+  crates' tests. Run before finishing any change.
+- `just fmt`, `just test`, `just clippy`, `just doc`, `just vendor-test` (the vendored crates'
+  own test suites, offline), `just audit` (cargo-audit over every lockfile and cargo-deny),
+  `just fuzz-build` (every fuzz target on the pinned nightly).
 - `just record 2m` — record the configured cameras for two minutes into the default root.
 - `cargo run -p irisd -- inspect <file.mp4>` — list fragments and timing of a recording.
 

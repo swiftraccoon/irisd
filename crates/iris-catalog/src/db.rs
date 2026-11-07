@@ -3,10 +3,13 @@
 
 use std::collections::HashMap;
 use std::mem::size_of;
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use rusqlite::{Connection, OptionalExtension, Row, named_params, params};
+use rusqlite::{
+    Connection, OptionalExtension, Row, Transaction, TransactionBehavior, named_params, params,
+};
 use tracing::warn;
 
 use crate::types::{
@@ -43,6 +46,19 @@ const EVENT_RECORDING_MARGIN_US: i64 = 30 * 1_000_000;
 const EVENT_PRUNE_BATCH: usize = 1_000;
 /// Maximum segment rows held by one startup-reconciliation page.
 const RECONCILE_PAGE_ROWS: usize = 512;
+
+/// How long after its last durable progress an unsealed segment still extends
+/// toward the present in range listings ([`crate::CatalogHandle::segments_limited`]).
+///
+/// The writer reports progress after each sync (every five seconds by default)
+/// and a fragment spans at most two seconds by default, so thirty seconds covers
+/// two sync intervals, one fragment, and catalog batching with margin. An open
+/// row whose progress stops for longer (a camera outage, a file the writer
+/// abandoned, or a row startup recovery could not reach) ends this long after
+/// its last progress, so it drops out of later windows instead of claiming to
+/// cover them. Catalog overload that starves progress for longer than the grace
+/// also hides a growing row until its next progress.
+pub const OPEN_SEGMENT_GRACE: Duration = Duration::from_secs(30);
 
 const SCHEMA_V1: &str = "
 CREATE TABLE schema_version (version INTEGER NOT NULL);
@@ -424,12 +440,21 @@ pub struct Db {
 
 impl Db {
     /// Opens (creating if needed) and migrates the database at `path`.
+    ///
+    /// Missing parent directories are created with mode 0700 and a missing
+    /// database file with mode 0600, whatever the process umask. SQLite gives
+    /// the write-ahead log and shared-memory files the database file's mode, so
+    /// a fresh catalog stays readable by its owner only.
     pub fn open(path: &Path) -> Result<Self, CatalogError> {
         if let Some(parent) = path.parent()
             && !parent.as_os_str().is_empty()
         {
-            std::fs::create_dir_all(parent)?;
+            std::fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(parent)?;
         }
+        create_private_database(path)?;
         let conn = Connection::open(path)?;
         // The daemon's filesystem sandbox intentionally admits only configured
         // state and recording roots. Keep SQLite's transient sorter and
@@ -461,9 +486,23 @@ impl Db {
         Ok(db)
     }
 
-    fn migrate(&mut self, version: i64) -> Result<(), CatalogError> {
+    /// Brings the schema to [`SCHEMA_VERSION`]. `observed` is the version read
+    /// before persistent pragmas; the authoritative version is read again under
+    /// the write lock, so a concurrent opener that migrated first is not
+    /// migrated twice.
+    fn migrate(&mut self, observed: i64) -> Result<(), CatalogError> {
+        if observed >= SCHEMA_VERSION {
+            return Ok(());
+        }
+        let tx = write_transaction(&mut self.conn)?;
+        let version = stored_schema_version(&tx)?;
+        if version > SCHEMA_VERSION {
+            return Err(CatalogError::UnsupportedSchema {
+                found: version,
+                supported: SCHEMA_VERSION,
+            });
+        }
         if version < SCHEMA_VERSION {
-            let tx = self.conn.transaction()?;
             if version < 1 {
                 tx.execute_batch(SCHEMA_V1)?;
             }
@@ -501,8 +540,8 @@ impl Db {
                 "INSERT INTO schema_version (version) VALUES (?1)",
                 params![SCHEMA_VERSION],
             )?;
-            tx.commit()?;
         }
+        tx.commit()?;
         Ok(())
     }
 
@@ -523,7 +562,7 @@ impl Db {
         }
         let path = path_text(path);
         self.with_full_synchronous(|connection| {
-            let transaction = connection.transaction()?;
+            let transaction = write_transaction(connection)?;
             let existing = transaction
                 .query_row(
                     "SELECT identity FROM recording_root WHERE path = ?1",
@@ -598,7 +637,7 @@ impl Db {
             }
             cursor = assignments.last().map(|(id, _)| *id);
             let count = assignments.len();
-            let tx = self.conn.transaction()?;
+            let tx = write_transaction(&mut self.conn)?;
             for (id, root) in assignments {
                 tx.execute(
                     "UPDATE segment SET root = ?1 WHERE id = ?2 AND root IS NULL",
@@ -702,7 +741,7 @@ impl Db {
     /// Applies a batch of changes in one transaction.
     pub fn apply(&mut self, changes: &[Change]) -> Result<ApplyOutcome, CatalogError> {
         let roots = self.roots.clone();
-        let tx = self.conn.transaction()?;
+        let tx = write_transaction(&mut self.conn)?;
         let now = WallUs::now();
         let mut event_work = EVENT_PRUNE_BATCH;
         let mut rejected_events = 0usize;
@@ -818,7 +857,8 @@ impl Db {
     }
 
     /// Segments of a stream overlapping `range`, by start time. An unsealed
-    /// segment is treated as extending to `now`.
+    /// segment is listed only once it has a durable fragment, and it extends to
+    /// the earlier of now and [`OPEN_SEGMENT_GRACE`] past its last progress.
     pub fn segments(
         &mut self,
         key: &StreamKey,
@@ -827,7 +867,8 @@ impl Db {
         self.segments_limited(key, range, usize::MAX)
     }
 
-    /// Segments of a stream overlapping `range`, capped before rows are materialized.
+    /// Segments of a stream overlapping `range`, capped before rows are
+    /// materialized. Unsealed rows follow the rule of [`Db::segments`].
     pub fn segments_limited(
         &mut self,
         key: &StreamKey,
@@ -835,15 +876,20 @@ impl Db {
         limit: usize,
     ) -> Result<Vec<SegmentRow>, CatalogError> {
         let now = WallUs::now();
+        // An open row without a durable fragment has nothing to serve, and one
+        // whose progress stopped must not claim later windows.
         let sql = format!(
             "SELECT {SEGMENT_COLUMNS} FROM segment s JOIN sample_entry e ON e.id = s.sample_entry_id \
              WHERE s.deleting = 0 AND s.camera_id = :camera AND s.kind = :kind \
              AND s.wall_start_us < :to \
-             AND (CASE WHEN s.sealed = 0 THEN :now ELSE s.wall_end_us END) > :from \
+             AND (s.sealed = 1 OR s.fragments > 0) \
+             AND (CASE WHEN s.sealed = 0 THEN MIN(:now, s.wall_end_us + :grace) \
+                  ELSE s.wall_end_us END) > :from \
              ORDER BY s.wall_start_us LIMIT :limit"
         );
         let mut stmt = self.conn.prepare_cached(&sql)?;
         let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let grace = i64::try_from(OPEN_SEGMENT_GRACE.as_micros()).unwrap_or(i64::MAX);
         let rows = stmt
             .query_map(
                 named_params! {
@@ -852,6 +898,7 @@ impl Db {
                     ":to": range.to.get(),
                     ":from": range.from.get(),
                     ":now": now.get(),
+                    ":grace": grace,
                     ":limit": limit,
                 },
                 segment_row,
@@ -1031,7 +1078,7 @@ impl Db {
     /// removed.
     pub fn mark_deleting(&mut self, id: SegmentId) -> Result<(), CatalogError> {
         self.with_full_synchronous(|conn| {
-            let tx = conn.transaction()?;
+            let tx = write_transaction(conn)?;
             tx.execute(
                 "UPDATE segment SET deleting = 1 WHERE id = ?1 AND sealed = 1",
                 params![id.0],
@@ -1041,16 +1088,18 @@ impl Db {
         })
     }
 
-    /// Durably transitions an empty open segment into startup deletion intent.
+    /// Durably transitions an open segment into startup deletion intent,
+    /// whatever its fragment count. Startup calls it for an open row whose
+    /// recording pair is empty or confirmed absent beneath an approved root.
     pub fn mark_empty_writing_deleting(
         &mut self,
         id: SegmentId,
     ) -> Result<DeleteMarkResult, CatalogError> {
         self.with_full_synchronous(|connection| {
-            let transaction = connection.transaction()?;
+            let transaction = write_transaction(connection)?;
             let changed = transaction.execute(
                 "UPDATE segment SET deleting = 1 \
-                 WHERE id = ?1 AND sealed = 0 AND deleting = 0 AND fragments = 0",
+                 WHERE id = ?1 AND sealed = 0 AND deleting = 0",
                 params![id.0],
             )?;
             let result = if changed == 1 {
@@ -1072,7 +1121,7 @@ impl Db {
         margin_us: i64,
     ) -> Result<DeleteMarkResult, CatalogError> {
         self.with_full_synchronous(|conn| {
-            let tx = conn.transaction()?;
+            let tx = write_transaction(conn)?;
             let changed = tx.execute(
                 "UPDATE segment AS candidate SET deleting = 1 \
                  WHERE candidate.id = :id AND candidate.sealed = 1 \
@@ -1120,7 +1169,7 @@ impl Db {
     ) -> Result<DeleteMarkResult, CatalogError> {
         let expected_root = path_text(expected_root);
         self.with_full_synchronous(|conn| {
-            let tx = conn.transaction()?;
+            let tx = write_transaction(conn)?;
             let changed = tx.execute(
                 "UPDATE segment AS candidate SET deleting = 1 \
                  WHERE candidate.id = :id AND candidate.sealed = 1 \
@@ -1247,7 +1296,7 @@ impl Db {
 
     /// Inserts a sealed segment found on disk.
     pub fn adopt_segment(&mut self, row: &NewSegment) -> Result<SegmentId, CatalogError> {
-        let tx = self.conn.transaction()?;
+        let tx = write_transaction(&mut self.conn)?;
         let entry_id = upsert_sample_entry(&tx, row.sample_entry.as_deref())?;
         tx.execute(
             "INSERT INTO segment (camera_id, kind, path, root, run_seq, discontinuity, wall_start_us, \
@@ -1379,7 +1428,7 @@ impl Db {
         id: EventId,
         until: Option<WallUs>,
     ) -> Result<EventRow, CatalogError> {
-        let tx = self.conn.transaction()?;
+        let tx = write_transaction(&mut self.conn)?;
         let stored: Option<(i64, Option<i64>)> = tx
             .query_row(
                 "SELECT storage_bytes, retain_until_us FROM event WHERE id = ?1",
@@ -1556,7 +1605,7 @@ impl Db {
 
     /// Inserts an event and returns its id.
     pub fn insert_event(&mut self, event: &Event) -> Result<EventId, CatalogError> {
-        let tx = self.conn.transaction()?;
+        let tx = write_transaction(&mut self.conn)?;
         let mut remaining = EVENT_PRUNE_BATCH;
         let id = try_insert_event(&tx, event, WallUs::now(), EVENT_LIMITS, &mut remaining)?;
         tx.commit()?;
@@ -1566,7 +1615,7 @@ impl Db {
     /// Runs one bounded event-lifecycle maintenance step, including the
     /// recording-horizon rule.
     pub fn maintain_events(&mut self, now: WallUs) -> Result<(), CatalogError> {
-        let tx = self.conn.transaction()?;
+        let tx = write_transaction(&mut self.conn)?;
         let next = maintain_events_tx(&tx, now, true, EVENT_LIMITS, self.event_maintenance_cursor)?;
         tx.commit()?;
         self.event_maintenance_cursor = next;
@@ -1575,16 +1624,32 @@ impl Db {
 
     /// Aggregate counts.
     pub fn stats(&mut self) -> Result<CatalogStats, CatalogError> {
-        let (segments, sealed_bytes, invalid_segments): (i64, i64, i64) = self
+        let (segments, sealed_bytes, deleting_segments, deleting_bytes, invalid_segments): (
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+        ) = self
             .conn
             .query_row(
                 "SELECT COUNT(*), \
                  COALESCE(SUM(CASE WHEN sealed = 1 THEN bytes ELSE 0 END), 0), \
+                 COALESCE(SUM(CASE WHEN deleting != 0 THEN 1 ELSE 0 END), 0), \
+                 COALESCE(SUM(CASE WHEN deleting != 0 THEN bytes ELSE 0 END), 0), \
                  COALESCE(SUM(CASE WHEN typeof(sealed) = 'integer' AND sealed IN (0, 1) \
                                         AND typeof(bytes) = 'integer' AND bytes >= 0 \
                                    THEN 0 ELSE 1 END), 0) FROM segment",
                 [],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
             )
             .map_err(row_error)?;
         if invalid_segments != 0 {
@@ -1612,6 +1677,8 @@ impl Db {
         Ok(CatalogStats {
             segments: checked_u64(segments, "segment count")?,
             sealed_bytes: checked_u64(sealed_bytes, "sealed byte total")?,
+            deleting_segments: checked_u64(deleting_segments, "deleting segment count")?,
+            deleting_bytes: checked_u64(deleting_bytes, "deleting byte total")?,
             events: checked_u64(events, "event count")?,
             event_bytes: checked_u64(event_bytes, "event logical byte total")?,
             retained_events: checked_u64(retained_events, "active retained-event count")?,
@@ -1623,7 +1690,7 @@ impl Db {
 }
 
 fn apply_segment_opened(
-    tx: &rusqlite::Transaction<'_>,
+    tx: &Transaction<'_>,
     roots: &[PathBuf],
     change: &Change,
 ) -> Result<(), CatalogError> {
@@ -1671,7 +1738,7 @@ fn apply_segment_opened(
 }
 
 fn upsert_sample_entry(
-    tx: &rusqlite::Transaction<'_>,
+    tx: &Transaction<'_>,
     entry: Option<&SampleEntry>,
 ) -> Result<i64, CatalogError> {
     let (hash, codecs, width, height, config): (i64, &str, i64, i64, &[u8]) = match entry {
@@ -1697,10 +1764,7 @@ fn upsert_sample_entry(
     Ok(id)
 }
 
-fn insert_event_row(
-    tx: &rusqlite::Transaction<'_>,
-    event: &Event,
-) -> Result<EventId, CatalogError> {
+fn insert_event_row(tx: &Transaction<'_>, event: &Event) -> Result<EventId, CatalogError> {
     let bounded = event.clone().bounded();
     let (kind, kind_other) = kind_storage(&bounded.kind);
     let storage_bytes = i64::try_from(event_storage_bytes(&bounded))
@@ -1725,7 +1789,7 @@ fn insert_event_row(
 }
 
 fn try_insert_event(
-    tx: &rusqlite::Transaction<'_>,
+    tx: &Transaction<'_>,
     event: &Event,
     now: WallUs,
     limits: EventLimits,
@@ -1751,7 +1815,7 @@ fn try_insert_event(
 }
 
 fn event_fits(
-    tx: &rusqlite::Transaction<'_>,
+    tx: &Transaction<'_>,
     incoming_bytes: u64,
     limits: EventLimits,
 ) -> Result<bool, CatalogError> {
@@ -1759,7 +1823,7 @@ fn event_fits(
     Ok(rows < limits.rows && incoming_bytes <= limits.bytes.saturating_sub(bytes))
 }
 
-fn event_state(tx: &rusqlite::Transaction<'_>) -> Result<(u64, u64), CatalogError> {
+fn event_state(tx: &Transaction<'_>) -> Result<(u64, u64), CatalogError> {
     let mut stmt = tx.prepare_cached(EVENT_STATE_SQL)?;
     let (rows, bytes): (i64, i64) = stmt
         .query_row([], |row| Ok((row.get(0)?, row.get(1)?)))
@@ -1771,7 +1835,7 @@ fn event_state(tx: &rusqlite::Transaction<'_>) -> Result<(u64, u64), CatalogErro
 }
 
 fn clear_expired_marks(
-    tx: &rusqlite::Transaction<'_>,
+    tx: &Transaction<'_>,
     now: WallUs,
     remaining: &mut usize,
 ) -> Result<(), CatalogError> {
@@ -1788,7 +1852,7 @@ fn clear_expired_marks(
 }
 
 fn prune_for_event(
-    tx: &rusqlite::Transaction<'_>,
+    tx: &Transaction<'_>,
     incoming_bytes: u64,
     limits: EventLimits,
     remaining: &mut usize,
@@ -1834,7 +1898,7 @@ fn prune_for_event(
 }
 
 fn prune_event_horizon(
-    tx: &rusqlite::Transaction<'_>,
+    tx: &Transaction<'_>,
     now: WallUs,
     after: Option<EventCursor>,
     limit: usize,
@@ -1896,7 +1960,7 @@ fn prune_event_horizon(
 }
 
 fn maintain_events_tx(
-    tx: &rusqlite::Transaction<'_>,
+    tx: &Transaction<'_>,
     now: WallUs,
     recording_horizon: bool,
     limits: EventLimits,
@@ -2244,6 +2308,34 @@ fn row_error(error: rusqlite::Error) -> CatalogError {
         }
         other => CatalogError::Sqlite(other),
     }
+}
+
+/// Creates an empty owner-only database file when none exists; SQLite opens an
+/// empty file as a new database. An existing entry is left for SQLite to open.
+fn create_private_database(path: &Path) -> std::io::Result<()> {
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+    {
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+/// Begins a write transaction that takes SQLite's write lock before its first
+/// statement.
+///
+/// A deferred transaction that reads first already holds a read snapshot when
+/// it upgrades to a writer; SQLite then returns `SQLITE_BUSY` at once instead of
+/// invoking the busy handler, because waiting could deadlock against another
+/// writer. `BEGIN IMMEDIATE` acquires the lock up front, so the connection's
+/// busy timeout covers lock acquisition on every write path, including an
+/// operator shell, a checkpoint, or a backup holding the lock briefly.
+fn write_transaction(conn: &mut Connection) -> rusqlite::Result<Transaction<'_>> {
+    conn.transaction_with_behavior(TransactionBehavior::Immediate)
 }
 
 /// Reads an existing schema version without changing persistent SQLite pragmas.
@@ -3916,5 +4008,175 @@ mod tests {
         });
         assert!(result.is_err());
         assert_eq!(synchronous(&db.conn), 1, "failure must restore NORMAL");
+    }
+
+    #[test]
+    fn migration_rereads_the_schema_version_under_the_write_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = Db::open(&dir.path().join("catalog.db")).unwrap();
+        // A second opener that read version zero before another process's
+        // migration committed must not replay the schema over migrated tables.
+        db.migrate(0).unwrap();
+        assert_eq!(stored_schema_version(&db.conn).unwrap(), SCHEMA_VERSION);
+        let state_rows: i64 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM recording_root_state", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(state_rows, 1);
+
+        db.conn
+            .execute(
+                "UPDATE schema_version SET version = ?1",
+                params![SCHEMA_VERSION + 1],
+            )
+            .unwrap();
+        assert!(matches!(
+            db.migrate(0),
+            Err(CatalogError::UnsupportedSchema { found, supported })
+                if found == SCHEMA_VERSION + 1 && supported == SCHEMA_VERSION
+        ));
+    }
+
+    #[test]
+    fn open_creates_owner_only_state_whatever_the_umask() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("state");
+        let path = state.join("nested").join("catalog.db");
+        let mut db = Db::open(&path).unwrap();
+        db.ensure_camera(&CameraId::try_new("cam1").unwrap(), "front", None)
+            .unwrap();
+        let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o7777;
+        for directory in [state.clone(), state.join("nested")] {
+            assert_eq!(
+                mode(&directory) & 0o077,
+                0,
+                "{} has mode {:o}",
+                directory.display(),
+                mode(&directory)
+            );
+        }
+        let shm = PathBuf::from(format!("{}-shm", path.display()));
+        for file in [path.clone(), wal_path(&path), shm] {
+            assert_eq!(
+                mode(&file) & 0o077,
+                0,
+                "{} has mode {:o}",
+                file.display(),
+                mode(&file)
+            );
+        }
+    }
+
+    fn open_row(db: &mut Db, path: &Path, fragments: u32) -> SegmentId {
+        db.apply(&[
+            Change::SegmentOpened {
+                key: segment(path.to_path_buf()).key,
+                path: path.to_path_buf(),
+                run_seq: 1,
+                discontinuity: false,
+                wall_start: WallUs::new(1_000_000),
+                media_start: 0,
+                init_len: 700,
+                sample_entry: std::sync::Arc::new(SampleEntry::new(
+                    bytes::Bytes::from_static(b"\0\0\0\x10hvc1\0\0\0\0\0\0\0\0"),
+                    "hvc1".into(),
+                    16,
+                    16,
+                )),
+            },
+            Change::SegmentProgress {
+                path: path.to_path_buf(),
+                durable_len: 5_000,
+                fragments,
+                wall_end: WallUs::new(2_000_000),
+                media_end: 90_000,
+            },
+        ])
+        .unwrap();
+        db.segment_by_path(path).unwrap().unwrap().id
+    }
+
+    #[test]
+    fn open_rows_enter_deletion_intent_whatever_their_fragment_count() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = Db::open(&dir.path().join("catalog.db")).unwrap();
+        let empty = open_row(&mut db, &dir.path().join("empty.mp4"), 0);
+        let recorded = open_row(&mut db, &dir.path().join("recorded.mp4"), 3);
+        let sealed = db
+            .adopt_segment(&segment(dir.path().join("sealed.mp4")))
+            .unwrap();
+        for id in [empty, recorded] {
+            assert_eq!(
+                db.mark_empty_writing_deleting(id).unwrap(),
+                DeleteMarkResult::Marked
+            );
+            assert_eq!(
+                db.mark_empty_writing_deleting(id).unwrap(),
+                DeleteMarkResult::NotFound,
+                "a tombstone is not marked twice"
+            );
+        }
+        assert_eq!(
+            db.mark_empty_writing_deleting(sealed).unwrap(),
+            DeleteMarkResult::NotFound
+        );
+        assert_eq!(
+            db.mark_empty_writing_deleting(SegmentId(i64::MAX)).unwrap(),
+            DeleteMarkResult::NotFound
+        );
+        let mut deleting: Vec<SegmentId> = db
+            .deleting_segments()
+            .unwrap()
+            .into_iter()
+            .map(|row| row.id)
+            .collect();
+        deleting.sort();
+        assert_eq!(deleting, vec![empty, recorded]);
+        assert!(db.segment(sealed).unwrap().is_some());
+        assert_eq!(db.writing_segments().unwrap(), Vec::<SegmentRow>::new());
+    }
+
+    #[test]
+    fn stats_count_deletion_intents_and_their_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = Db::open(&dir.path().join("catalog.db")).unwrap();
+        db.adopt_segment(&segment(dir.path().join("kept.mp4")))
+            .unwrap();
+        let removed = db
+            .adopt_segment(&segment(dir.path().join("removed.mp4")))
+            .unwrap();
+        let stats = db.stats().unwrap();
+        assert_eq!((stats.deleting_segments, stats.deleting_bytes), (0, 0));
+
+        db.mark_deleting(removed).unwrap();
+        let stats = db.stats().unwrap();
+        assert_eq!(
+            (
+                stats.segments,
+                stats.deleting_segments,
+                stats.deleting_bytes
+            ),
+            (2, 1, 12_345)
+        );
+        assert_eq!(
+            db.total_bytes().unwrap(),
+            2 * 12_345,
+            "a tombstone counts toward the quota total until its row is removed"
+        );
+
+        db.delete_segment(removed).unwrap();
+        let stats = db.stats().unwrap();
+        assert_eq!(
+            (
+                stats.segments,
+                stats.deleting_segments,
+                stats.deleting_bytes
+            ),
+            (1, 0, 0)
+        );
     }
 }

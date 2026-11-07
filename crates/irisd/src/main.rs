@@ -17,9 +17,12 @@
 //! - `record`, `inspect`, `recover`, `hls`, `serve` — the offline subcommands.
 //! - `adopt` — start-up reconciliation of the catalog with the files on disk.
 //! - `catalog_observer` — store notifications and camera events into the catalog.
-//! - `retention` — the retention pass: free-space floor, size quota, age limits.
+//! - `retention` — the retention pass: free-space floor, size quota, age limits,
+//!   and a bounded retry of earlier deletion intents.
 //! - `selfcheck` — a rotating CRC check of each stream's newest sealed file.
 //! - `sandbox` — the Landlock ruleset, applied before any thread exists.
+//! - `permissions` — startup checks of the configuration file, the state
+//!   directory, and the catalog files.
 //! - `systemd` — readiness, watchdog, and stopping notifications.
 //! - `proc` — CPU, RSS, thread, and descriptor sampling from `/proc/self`.
 //!
@@ -35,6 +38,7 @@ mod adopt;
 mod catalog_observer;
 mod hls;
 mod inspect;
+mod permissions;
 mod proc;
 mod record;
 mod recover;

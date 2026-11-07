@@ -22,6 +22,8 @@ async fn keyframe_status_at(t: i64) -> StatusCode {
         live: Arc::new(LiveRegistry::new()),
         events,
         tokens: vec![],
+        recording_roots: Vec::new(),
+        public_metrics: false,
         snapshot_sources: HashMap::new(),
         active_cameras: HashMap::new(),
         stats: Arc::new(ApiStats::default()),

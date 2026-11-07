@@ -19,15 +19,17 @@ serving) this crate is the index that turns a wall-clock range into byte ranges 
   `stats`) and mutations (`ensure_camera`, `mark_sealed`, `adopt_segment`,
   `mark_deleting_if_unprotected`, `delete_segment`, `insert_event`, `retain_event`,
   `maintain_events`), plus durable root registration, bounded root assignment, and the
-  empty-writing deletion-intent transition for startup reconciliation; `metrics`; `shutdown`.
+  open-row deletion-intent transition for startup reconciliation; `metrics`; `shutdown`.
+- `OPEN_SEGMENT_GRACE` — how long past its last durable progress an unsealed row still
+  extends toward the present in range listings (30 s).
 - `Change` — `SegmentOpened`, `SegmentProgress`, `SegmentSealed`, `Event`: what the store's
   observer and the event feeds report, batched into one transaction per 100 ms.
 - `SegmentRow`, `EventRow`, `EventProtection`, `RetentionPage`, `CameraRow`, `NewSegment`,
   `SegmentId`, `EventId`, `EventCursor`, `EventProtectionCursor`, `DeleteMarkResult`, and
   `TimeRange` (half-open `[from, to)` in wall microseconds) — rows, stable cursors, scan
   progress, and mutation outcomes.
-- `CatalogStats` — segment and sealed-byte totals; event row, logical-byte, active-mark, and
-  prune totals; database and WAL sizes.
+- `CatalogStats` — segment and sealed-byte totals; rows and bytes in deletion intent; event
+  row, logical-byte, active-mark, and prune totals; database and WAL sizes.
 - `CatalogMetrics` — transaction, query, queue-wait, and event receipt-to-commit latency
   histograms; batch counters; queue count/owned-byte gauges and peaks; coalescing, rejection,
   and rejection counters plus the reconciliation-required flag, shared by every clone of the
@@ -77,9 +79,15 @@ catalog.shutdown();
   dropped, never retried (`docs/research/04-storage-format.md §6`).
 - **Connection settings.** WAL mode, `synchronous = NORMAL` for ordinary work, foreign keys
   on, a 5 s busy timeout, and `temp_store = MEMORY` so bounded sorters and materialized queries
-  never need an ambient temporary directory outside the filesystem sandbox. Deletion intent
+  never need an ambient temporary directory outside the filesystem sandbox. Every write
+  transaction begins `IMMEDIATE`, so the busy timeout also covers taking the write lock: a
+  second writer (an operator shell, a checkpoint, a backup) delays a batch by up to 5 s instead
+  of failing it at once. Migration rereads the schema version under that lock. Deletion intent
   commits under scoped `synchronous = FULL` before filesystem mutation and restores `NORMAL`;
   the database belongs on an SSD (`04 §6`).
+- **File modes.** Open creates missing parent directories with mode 0700 and a missing
+  database file with mode 0600, whatever the umask; SQLite gives the WAL and shared-memory
+  files the database file's mode.
 - **Schema.** Version 9 contains `camera`, `sample_entry`, `segment`, `event`,
   `catalog_state`, `recording_root`, `recording_root_state`, and `schema_version`. Migrations add event retention (v2), deletion intent
   (v3), injective vendor-kind storage (v4), root/global time indexes (v5), and transactional
@@ -97,16 +105,23 @@ catalog.shutdown();
   sync), the final length and fragment count at seal, the sealed flag, and durable deletion
   intent. Deleting rows are hidden from serving and candidate queries but retain their bytes
   until pair removal and row deletion complete, so a failed attempt cannot claim quota
-  progress. `bytes` of an open file is its written length, so `total_bytes` is what a quota
-  compares against.
+  progress; `stats` reports their count and bytes, and the daemon retries them in every
+  retention pass as well as at startup. `bytes` of an open file is its written length, so
+  `total_bytes` is what a quota compares against.
 - **Startup reconciliation.** Root assignment, open rows, and deletion intents are paged by
   stable ids with at most 512 rows per page. Existing non-null root ownership is never rewritten.
-  Empty open rows enter FULL-synchronous deletion intent before pair removal, and exact-path
-  probes replace a cardinality-wide in-memory deletion set.
+  An open row whose pair is empty or confirmed absent enters FULL-synchronous deletion intent
+  before pair removal, whatever its fragment count, and exact-path probes replace a
+  cardinality-wide in-memory deletion set.
 - **Bounded serving query.** `segments_limited` applies its row limit in SQLite before rows and
   their owned strings are materialized. Media-serving callers use it to reject ranges above their
   documented row budget; `segments` is the unbounded internal query for callers that enforce
-  their own limits.
+  their own limits. A sealed row covers its recorded interval. An unsealed row is listed only
+  once it has a durable fragment and extends to the earlier of now and `OPEN_SEGMENT_GRACE`
+  (30 s) past its last progress, so an open file whose writer stopped reporting (a camera
+  outage, an abandoned file, a row recovery could not reach) drops out of later windows; rows
+  keep their recorded `wall_end`. Catalog overload that starves progress longer than the grace
+  hides a growing file until its next progress.
 - **Retention.** Candidate SQL is indexed, root-aware, and paged by `(wall_start, segment id)`.
   Each call caps raw indexed input before active-protection filtering and returns the last
   scanned cursor/count even when no row passes. Age pages bound raw rows by start before
@@ -130,12 +145,14 @@ catalog.shutdown();
 
 ## Tests and measurements
 
-- `tests/catalog.rs`: ordered segment lifecycle; retention ordering, root isolation, atomic
-  protection, and deletion; event filters, tied-time cursors, aggregate read budgets, bounded
-  strings, and lifecycle plateau; bounded ingress overload; idempotent shutdown; metrics;
-  database and WAL sizes. Database unit tests cover migrations through version 9, unsupported
-  schema rejection before side effects, checked corruption errors, injective vendor kinds,
-  query plans, and durable deletion intent.
+- `tests/catalog.rs`: ordered segment lifecycle; open-row listing grace and zero-fragment
+  exclusion; retention ordering, root isolation, atomic protection, and deletion; event filters,
+  tied-time cursors, aggregate read budgets, bounded strings, and lifecycle plateau; bounded
+  ingress overload; write paths waiting for an external write lock; idempotent shutdown;
+  metrics; database and WAL sizes. Database unit tests cover migrations through version 9,
+  the version reread under the write lock, unsupported schema rejection before side effects,
+  owner-only file creation, checked corruption errors, injective vendor kinds, query plans,
+  durable deletion intent for sealed and open rows, and deletion-intent statistics.
 - Measurements: `docs/research/12-ingest-cost.md` (transaction p99 under load) and the soak
   figures in `docs/research/11-multi-camera-results.md`.
 

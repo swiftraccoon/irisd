@@ -12,7 +12,11 @@ Scope: this crate only. Read the root `AGENTS.md` first.
   the last packet of an access unit). MTU admission is `256..=65535`; packetization and
   interleaving are fallible and packetization stays streaming.
 - The server is a test instrument, not a product: no authentication, TCP only, bounded to
-  what the recorder's client needs.
+  what the recorder's client needs. It listens outside loopback only with `--allow-remote`,
+  serves at most `Options::max_connections` connections (closing the rest at accept), and
+  closes a connection whose request is incomplete after `request_timeout` before `PLAY` or
+  that stays silent for `idle_timeout` after it. Keep `idle_timeout` well above the
+  recorder's 30-s keepalive, or long benchmarks lose their sessions.
 - Synthetic recordings are real irisd files (scanner and CRC clean); `synth` must track the
   format in `iris-mp4`. Its public builders are fallible and enforce their documented GOP,
   frame, payload, NAL, duration, and clock bounds before allocating the recording.

@@ -18,6 +18,7 @@ mod onvif_call;
 mod report;
 mod rtsp_probe;
 mod sample;
+mod secret;
 mod stats;
 mod time;
 

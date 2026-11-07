@@ -163,9 +163,14 @@ The two changes, in `iris-ingest` and the vendored retina:
 - **Sockets leave the reactor once `PLAY` succeeds** (`PlayOptions::detach_from_reactor`
   in the patched retina, `third_party/`): the tokio stream turns back into a plain
   non-blocking socket, so reads that would block return `Pending` without a waker and
-  nothing wakes `epoll` for the socket; the loop polls on the tick as before. Keepalives
-  and `TEARDOWN` write blocking, a few hundred bytes into an idle send buffer. Only the
-  timer-driven mode detaches; packet-driven reads keep the reactor.
+  nothing wakes `epoll` for the socket; the loop polls on the tick as before. Writes never
+  block: a keepalive that does not fit the send buffer returns `Pending`, keeps its unsent
+  bytes, and continues on later ticks, and a camera that stops reading fails the session at
+  the next keepalive deadline instead of stalling the runtime thread (a blocking write would
+  hold the thread for as long as the camera kept the connection open). A `TEARDOWN` on the
+  connection first returns the socket to the reactor. The read path, and so the measurements
+  below, are the same either way: the session writes only its keepalive, every 30 s on cam1.
+  Only the timer-driven mode detaches; packet-driven reads keep the reactor.
 - **One read per tick**: a detached read shorter than the space offered means the socket's
   queue is empty, so the connection answers the rest of that tick's polls with `Pending`
   instead of a read that would return `EAGAIN`; the flag clears with that `Pending`, and

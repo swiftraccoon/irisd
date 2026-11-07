@@ -3,6 +3,7 @@
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, File, OpenOptions};
 use std::io;
+use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -14,6 +15,10 @@ use rustix::fs::{AtFlags, Mode, OFlags};
 
 use crate::layout;
 use crate::observer::{SegmentProgress, SegmentSealed};
+
+/// Recordings and sidecars are readable and writable by their owner only,
+/// whatever the process umask.
+const PRIVATE_FILE_MODE: u32 = 0o600;
 
 /// An open `.mp4` with its `.idx`, written strictly sequentially.
 #[derive(Debug)]
@@ -307,6 +312,11 @@ impl SegmentFile {
         self.end
     }
 
+    /// Fragments appended so far; each has one sidecar record.
+    pub(crate) fn fragments(&self) -> u32 {
+        self.fragments
+    }
+
     /// When the file was created.
     pub(crate) fn opened_at(&self) -> Instant {
         self.opened_at
@@ -375,6 +385,7 @@ fn claim_unique_pair(
         let file = match OpenOptions::new()
             .write(true)
             .create_new(true)
+            .mode(PRIVATE_FILE_MODE)
             .open(&candidate)
         {
             Ok(file) => file,
@@ -390,6 +401,7 @@ fn claim_unique_pair(
         match OpenOptions::new()
             .write(true)
             .create_new(true)
+            .mode(PRIVATE_FILE_MODE)
             .open(&index_path)
         {
             Ok(index_file) => {
@@ -428,7 +440,7 @@ fn claim_unique_pair_beneath(
     let mut candidate = path.to_path_buf();
     let mut candidate_name = name;
     let create_flags = OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL;
-    let create_mode = Mode::RUSR | Mode::WUSR | Mode::RGRP | Mode::WGRP | Mode::ROTH | Mode::WOTH;
+    let create_mode = Mode::RUSR | Mode::WUSR;
     for n in 0..100u32 {
         if n > 0 {
             let stem = path

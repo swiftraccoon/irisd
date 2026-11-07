@@ -17,11 +17,13 @@ use serde::Deserialize;
 use tokio::io::{AsyncReadExt as _, AsyncSeekExt as _};
 
 use crate::error::ApiError;
-use crate::hls::{MAX_FRAGMENT_BYTES, MAX_INIT_BYTES, load_fragments, validate_fragment_record};
+use crate::hls::{
+    MAX_FRAGMENT_BYTES, MAX_INIT_BYTES, ValidatedMedia, load_fragments, validate_fragment_record,
+};
 use crate::media_admission;
 use crate::query::parse_time;
 use crate::segments::stream_key;
-use crate::state::{ApiState, admitted_media_bytes};
+use crate::state::{ApiState, MediaClass, admitted_media_bytes};
 
 /// How far back from `t` the sync sample may lie: longer than any fragment
 /// the store writes, so a sync sample inside a recording is always found.
@@ -41,12 +43,7 @@ pub(crate) async fn keyframe(
     Path((camera, kind)): Path<(String, String)>,
     Query(params): Query<KeyframeParams>,
 ) -> Result<Response, ApiError> {
-    let permit = media_admission::shared(
-        state
-            .stats
-            .try_media_response()
-            .ok_or_else(|| ApiError::Unavailable("too many concurrent media responses".into()))?,
-    );
+    let permit = state.stats.admit_media(MediaClass::Bounded)?;
     let key = stream_key(&camera, &kind)?;
     let implicit_newest = params.t.is_none();
     let t = match &params.t {
@@ -65,12 +62,12 @@ pub(crate) async fn keyframe(
         to: WallUs::new(to),
     };
     let segments = load_fragments(&state, &key, range, &permit).await?;
-    let Some((path, init_len, record)) = segments
+    let Some((media, init_len, record)) = segments
         .iter()
         .flat_map(|seg| {
             seg.records
                 .iter()
-                .map(move |r| (seg.row.path.clone(), seg.row.init_len, r))
+                .map(move |r| (&seg.media, seg.row.init_len, r))
         })
         .filter(|(_, _, r)| {
             r.flags & FLAG_STARTS_WITH_SYNC != 0 && r.wall >= range.from && r.wall <= t
@@ -79,10 +76,11 @@ pub(crate) async fn keyframe(
     else {
         return Err(ApiError::NotFound);
     };
+    let media = media.clone();
     let record = *record;
     let body = media_admission::spawn(
         &permit,
-        async move { build(&path, init_len, &record).await },
+        async move { build(&media, init_len, &record).await },
     )
     .await
     .map_err(io::Error::other)??;
@@ -106,10 +104,10 @@ pub(crate) async fn keyframe(
         .into_response())
 }
 
-/// Reads the init section and the fragment, and re-encodes the fragment's
-/// first sample alone.
+/// Reads the init section and the fragment from the validated recording,
+/// reopened beneath its root, and re-encodes the fragment's first sample alone.
 async fn build(
-    path: &std::path::Path,
+    media: &ValidatedMedia,
     init_len: u32,
     record: &IndexRecord,
 ) -> Result<Bytes, ApiError> {
@@ -118,7 +116,7 @@ async fn build(
             "keyframe source exceeds the serving budget".into(),
         ));
     }
-    let mut file = tokio::fs::File::open(path).await?;
+    let mut file = media.open().await?;
     let mut init = Vec::new();
     init.try_reserve_exact(init_len as usize).map_err(|error| {
         ApiError::Unavailable(format!("cannot reserve keyframe initialization: {error}"))

@@ -10,7 +10,7 @@ use anyhow::{Context, bail};
 use clap::Parser;
 use iris_replay::media::Media;
 use iris_replay::rtsp::valid_mount_name;
-use iris_replay::server::{Mounts, Options, Server};
+use iris_replay::server::{DEFAULT_MAX_CONNECTIONS, Mounts, Options, Server};
 use iris_replay::synth::{self, Plan};
 use tracing::info;
 use tracing_subscriber::EnvFilter;
@@ -19,9 +19,17 @@ use tracing_subscriber::EnvFilter;
 #[derive(Debug, Parser)]
 #[command(version)]
 struct Args {
-    /// Address to listen on.
+    /// Address to listen on; anything but loopback also needs `--allow-remote`.
     #[arg(long, default_value = "127.0.0.1:8554")]
     listen: SocketAddr,
+    /// Accept a non-loopback `--listen`. The server has no authentication, so
+    /// every mounted recording is then open to the network.
+    #[arg(long)]
+    allow_remote: bool,
+    /// Connections served at once; further connections are closed on accept.
+    #[arg(long, default_value_t = DEFAULT_MAX_CONNECTIONS as u32, value_name = "N",
+          value_parser = clap::value_parser!(u32).range(1..=65_536))]
+    max_connections: u32,
     /// A mount: NAME=PATH of an irisd recording, served as `rtsp://<listen>/NAME`.
     #[arg(long = "mount", value_name = "NAME=PATH")]
     mounts: Vec<String>,
@@ -51,9 +59,21 @@ struct Args {
     pace: bool,
 }
 
+/// Refuses a listener outside loopback unless `allow_remote` opts in.
+fn check_listen(listen: SocketAddr, allow_remote: bool) -> anyhow::Result<()> {
+    if !listen.ip().is_loopback() && !allow_remote {
+        bail!(
+            "refusing to listen on {listen}: replay has no authentication and serves every \
+             mount to whoever connects; pass --allow-remote to accept that"
+        );
+    }
+    Ok(())
+}
+
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
+    check_listen(args.listen, args.allow_remote)?;
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
     tracing_subscriber::fmt().with_env_filter(filter).init();
     let mut mounts = Mounts::new();
@@ -101,6 +121,8 @@ async fn main() -> anyhow::Result<()> {
         stall_for: args.stall_for,
         burst: args.burst,
         pace: args.pace,
+        max_connections: usize::try_from(args.max_connections)?,
+        ..Options::default()
     };
     let server = Server::bind(args.listen, mounts, options).await?;
     info!(listen = %server.local_addr()?, "serving");
@@ -126,6 +148,41 @@ fn claim_mount_name(claimed: &mut HashSet<String>, name: &str) -> anyhow::Result
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_remote_listener_needs_an_explicit_opt_in() {
+        for local in ["127.0.0.1:8554", "127.0.0.2:1", "[::1]:8554"] {
+            assert!(
+                check_listen(local.parse().unwrap(), false).is_ok(),
+                "{local}"
+            );
+        }
+        for remote in ["0.0.0.0:8554", "192.0.2.10:8554", "[::]:8554"] {
+            let error = check_listen(remote.parse().unwrap(), false).unwrap_err();
+            assert!(error.to_string().contains("--allow-remote"), "{remote}");
+            assert!(
+                check_listen(remote.parse().unwrap(), true).is_ok(),
+                "{remote}"
+            );
+        }
+        let args =
+            Args::try_parse_from(["iris-replay", "--listen", "0.0.0.0:8554", "--synth", "a"])
+                .unwrap();
+        assert!(!args.allow_remote);
+        assert_eq!(args.max_connections, 256);
+        let args = Args::try_parse_from([
+            "iris-replay",
+            "--allow-remote",
+            "--max-connections",
+            "8",
+            "--synth",
+            "a",
+        ])
+        .unwrap();
+        assert!(args.allow_remote);
+        assert_eq!(args.max_connections, 8);
+        assert!(Args::try_parse_from(["iris-replay", "--max-connections", "0"]).is_err());
+    }
 
     #[test]
     fn mount_names_are_reachable_and_unique_across_sources() {

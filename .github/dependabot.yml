@@ -1,0 +1,15 @@
+# Version updates for the SHA-pinned GitHub Actions in .github/workflows, grouped into one weekly
+# pull request. Cargo dependencies are updated by hand against the committed lockfiles, and the
+# reference pack's npm manifests are upstream snapshots that this file does not cover.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      github-actions:
+        patterns:
+          - "*"
+    commit-message:
+      prefix: ci

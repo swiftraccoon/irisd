@@ -195,7 +195,11 @@ impl Depacketizer {
             Some(fp) => match InternalParameters::parse_format_specific_params(fp) {
                 Ok(p) => Some(p),
                 Err(e) => {
-                    log::warn!("Ignoring bad H.265 format-specific-params {:?}: {}", fp, e);
+                    log::warn!(
+                        "Ignoring bad H.265 format-specific-params \"{}\": {}",
+                        crate::mostly_ascii::Excerpt::of(fp),
+                        crate::mostly_ascii::Excerpt::of(&e)
+                    );
                     None
                 }
             },

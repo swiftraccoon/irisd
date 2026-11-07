@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use iris_api::{ActiveCamera, ApiState, ApiStats, LiveRegistry, router};
+use iris_api::{ActiveCamera, ApiState, ApiStats, LiveRegistry, ServeLimits, router};
 use iris_catalog::CatalogHandle;
 use iris_core::id::{CameraId, StreamKey, StreamKind};
 use iris_core::time::WallUs;
@@ -28,6 +28,8 @@ fn state(catalog: CatalogHandle, live: Arc<LiveRegistry>) -> Arc<ApiState> {
         live,
         events,
         tokens: Vec::new(),
+        recording_roots: Vec::new(),
+        public_metrics: false,
         snapshot_sources: HashMap::new(),
         active_cameras: HashMap::from([(
             key().camera,
@@ -50,12 +52,21 @@ async fn start_server(state: Arc<ApiState>) -> (std::net::SocketAddr, tokio::tas
         .expect("bind loopback API");
     let address = listener.local_addr().expect("loopback address");
     let server = tokio::spawn(async move {
-        axum::serve(listener, router(state))
-            .await
-            .expect("serve loopback API");
+        iris_api::serve_listener(
+            listener,
+            router(state),
+            ServeLimits::default(),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("serve loopback API");
     });
     (address, server)
 }
+
+/// A sync frame below the live message limit that still outgrows the loopback
+/// socket buffers, so a peer that stops reading blocks the send.
+const BLOCKING_FRAME_BYTES: usize = 15 << 20;
 
 async fn wait_until(timeout: Duration, mut predicate: impl FnMut() -> bool) {
     tokio::time::timeout(timeout, async {
@@ -149,8 +160,13 @@ async fn live_non_reader_is_released_by_the_send_deadline() {
             .await
             .expect("connect live WebSocket");
     wait_until(Duration::from_secs(1), || state.stats.live_clients() == 1).await;
-    ring.publish(large_frame(16 << 20));
+    ring.publish(large_frame(BLOCKING_FRAME_BYTES));
     wait_until(Duration::from_secs(4), || state.stats.live_clients() == 0).await;
+    assert_eq!(
+        state.stats.live_oversized_closes(),
+        0,
+        "the send deadline, not the message limit, ends this session"
+    );
 
     server.abort();
     catalog.shutdown();
@@ -171,10 +187,11 @@ async fn shutdown_interrupts_a_blocked_live_send() {
             .await
             .expect("connect live WebSocket");
     wait_until(Duration::from_secs(1), || state.stats.live_clients() == 1).await;
-    ring.publish(large_frame(16 << 20));
+    ring.publish(large_frame(BLOCKING_FRAME_BYTES));
     tokio::time::sleep(Duration::from_millis(50)).await;
     state.shutdown.cancel();
     wait_until(Duration::from_secs(1), || state.stats.live_clients() == 0).await;
+    assert_eq!(state.stats.live_oversized_closes(), 0);
 
     server.abort();
     catalog.shutdown();

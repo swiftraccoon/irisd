@@ -8,9 +8,10 @@ use std::path::PathBuf;
 use anyhow::{Context, bail};
 use clap::Args as ClapArgs;
 use iris_core::time::TIMESCALE;
-use iris_mp4::index::{MAX_PERSISTED_INDEX_RECORDS, read_index_bounded};
+use iris_mp4::index::{MAX_PERSISTED_INDEX_RECORDS, read_index_file_bounded};
 use iris_mp4::reader::{FragmentInfo, ScanOptions, scan};
 use iris_store::layout::index_path;
+use iris_store::open_regular_file;
 
 /// Arguments for `inspect`.
 #[derive(Debug, ClapArgs)]
@@ -180,13 +181,23 @@ fn checked_ticks_to_micros(ticks: i64) -> Option<i64> {
     i64::try_from(i128::from(ticks).checked_mul(100)?.div_euclid(9)).ok()
 }
 
+/// Reports the sidecar beside the recording. It is opened without following
+/// a final symlink or blocking on a FIFO, and read within the shared record
+/// limit.
 fn report_sidecar(args: &Args, fragments: &[FragmentInfo]) {
     let path = index_path(&args.file);
-    if !path.exists() {
-        println!("sidecar index:      none at {}", path.display());
-        return;
-    }
-    match read_index_bounded(&path, MAX_PERSISTED_INDEX_RECORDS) {
+    let index = match open_regular_file(&path) {
+        Ok(index) => index,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            println!("sidecar index:      none at {}", path.display());
+            return;
+        }
+        Err(error) => {
+            println!("sidecar index:      unusable: {error}");
+            return;
+        }
+    };
+    match read_index_file_bounded(index, MAX_PERSISTED_INDEX_RECORDS) {
         Ok((header, records)) => {
             let offsets_agree = records.len() == fragments.len()
                 && records.iter().zip(fragments).all(|(r, f)| {

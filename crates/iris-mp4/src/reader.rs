@@ -4,12 +4,19 @@
 //! sample accounting, and trailers. It stops at the first inconsistency and
 //! reports how many bytes are valid, which is exactly what crash recovery
 //! needs to truncate a file that was open when power failed.
+//!
+//! A scan accepts at most a fixed number of fragments, by default
+//! [`MAX_PERSISTED_INDEX_RECORDS`], the same ceiling every sidecar reader
+//! applies, so the memory a scan holds is bounded whatever the file contains.
+//! A complete fragment beyond that limit ends the scan with
+//! [`ScanStop::FragmentLimit`].
 
 use std::io::{self, Read, Seek, SeekFrom};
 
 use crate::boxes::{BoxHeader, be_u32, be_u64};
 use crate::crc::Crc32c;
 use crate::fragment::{MAX_MOOF_LEN, MAX_PAYLOAD_LEN, TRAILER_LEN, decode_trailer};
+use crate::index::MAX_PERSISTED_INDEX_RECORDS;
 use iris_core::time::WallUs;
 
 /// Facts about one fragment, as read from its boxes.
@@ -76,11 +83,22 @@ pub enum ScanStop {
         /// Offset of the fragment.
         offset: u64,
     },
+    /// A complete, valid fragment follows the last fragment the scan may
+    /// accept. The file is not damaged at `offset`; it holds more fragments
+    /// than one sidecar index can describe, so `valid_len` is not a
+    /// truncation point.
+    FragmentLimit {
+        /// Offset of the first fragment beyond the limit.
+        offset: u64,
+        /// The number of fragments the scan accepted.
+        limit: usize,
+    },
 }
 
 /// What a scan found: the init segment length, every valid fragment, how many
 /// bytes from the start are valid, and why the scan stopped if it did not reach
-/// a clean end of file. `valid_len` is what crash recovery truncates to.
+/// a clean end of file. Unless the scan stopped at
+/// [`ScanStop::FragmentLimit`], `valid_len` is what crash recovery truncates to.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ScanReport {
     /// Length of completely accepted `ftyp` + `moov`, or zero for a rejected init.
@@ -103,8 +121,34 @@ pub struct ScanOptions {
     pub collect_samples: bool,
 }
 
-/// Scans a recording.
-pub fn scan<R: Read + Seek>(mut reader: R, options: ScanOptions) -> io::Result<ScanReport> {
+/// Scans a recording, accepting at most [`MAX_PERSISTED_INDEX_RECORDS`]
+/// fragments.
+///
+/// # Errors
+///
+/// Propagates reader failures; malformed content ends the scan with a
+/// [`ScanStop`] instead.
+pub fn scan<R: Read + Seek>(reader: R, options: ScanOptions) -> io::Result<ScanReport> {
+    scan_with_limit(reader, options, MAX_PERSISTED_INDEX_RECORDS)
+}
+
+/// Scans a recording, accepting at most `max_fragments` fragments.
+///
+/// When another complete, valid fragment follows the last accepted one, the
+/// report stops with [`ScanStop::FragmentLimit`] at that fragment's offset. A
+/// damaged region right after the limit reports its own stop reason instead,
+/// so a file holding exactly `max_fragments` fragments and a torn tail is
+/// reported like any other torn file.
+///
+/// # Errors
+///
+/// Propagates reader failures; malformed content ends the scan with a
+/// [`ScanStop`] instead.
+pub fn scan_with_limit<R: Read + Seek>(
+    mut reader: R,
+    options: ScanOptions,
+    max_fragments: usize,
+) -> io::Result<ScanReport> {
     let file_len = reader.seek(SeekFrom::End(0))?;
     reader.seek(SeekFrom::Start(0))?;
 
@@ -125,6 +169,7 @@ pub fn scan<R: Read + Seek>(mut reader: R, options: ScanOptions) -> io::Result<S
         init_len,
         u64::from(init_len),
         options,
+        max_fragments,
     )
 }
 
@@ -133,6 +178,8 @@ pub fn scan<R: Read + Seek>(mut reader: R, options: ScanOptions) -> io::Result<S
 /// Bytes between the initialization and `start` are not read. The caller must
 /// establish that `start` is a trusted fragment boundary, for example from a
 /// contiguous sidecar index whose last record is then validated by this scan.
+/// Like [`scan`], it accepts at most [`MAX_PERSISTED_INDEX_RECORDS`]
+/// fragments, counted from `start`.
 ///
 /// # Errors
 ///
@@ -162,7 +209,14 @@ pub fn scan_from_offset<R: Read + Seek>(
             "scan offset is outside the fragment region",
         ));
     }
-    scan_fragments(&mut reader, file_len, init_len, start, options)
+    scan_fragments(
+        &mut reader,
+        file_len,
+        init_len,
+        start,
+        options,
+        MAX_PERSISTED_INDEX_RECORDS,
+    )
 }
 
 /// Reads and validates exactly one fragment at `start` without following it
@@ -217,6 +271,7 @@ fn scan_fragments<R: Read + Seek>(
     init_len: u32,
     mut offset: u64,
     options: ScanOptions,
+    max_fragments: usize,
 ) -> io::Result<ScanReport> {
     let mut report = ScanReport {
         init_len,
@@ -226,6 +281,13 @@ fn scan_fragments<R: Read + Seek>(
     };
     loop {
         match scan_fragment(reader, offset, file_len, options)? {
+            Ok(_) if report.fragments.len() >= max_fragments => {
+                report.stop = Some(ScanStop::FragmentLimit {
+                    offset,
+                    limit: max_fragments,
+                });
+                return Ok(report);
+            }
             Ok(info) => {
                 offset += u64::from(info.len);
                 report.valid_len = offset;
@@ -959,6 +1021,57 @@ mod tests {
         assert_eq!(f.wall, Some(WallUs::new(1_000_000)));
         assert_eq!(f.sample_durations, vec![3000, 2990]);
         assert_eq!(f.sample_sizes, vec![6, 7]);
+    }
+
+    #[test]
+    fn stops_before_a_complete_fragment_beyond_the_limit() {
+        let file = file_with(3);
+        let options = ScanOptions {
+            verify_crc: true,
+            collect_samples: false,
+        };
+        let full = scan(Cursor::new(&file), options).unwrap();
+        assert_eq!(full.stop, None);
+
+        let limited = scan_with_limit(Cursor::new(&file), options, 2).unwrap();
+        assert_eq!(limited.fragments, full.fragments[..2]);
+        assert_eq!(limited.valid_len, full.fragments[2].offset);
+        assert_eq!(
+            limited.stop,
+            Some(ScanStop::FragmentLimit {
+                offset: full.fragments[2].offset,
+                limit: 2,
+            })
+        );
+        assert_eq!(
+            scan_with_limit(Cursor::new(&file), options, 3).unwrap(),
+            full
+        );
+        let none = scan_with_limit(Cursor::new(&file), options, 0).unwrap();
+        assert_eq!(none.fragments, Vec::<FragmentInfo>::new());
+        assert_eq!(
+            none.stop,
+            Some(ScanStop::FragmentLimit {
+                offset: u64::from(full.init_len),
+                limit: 0,
+            })
+        );
+    }
+
+    #[test]
+    fn a_damaged_fragment_after_the_limit_reports_its_own_stop() {
+        let file = file_with(3);
+        let full = scan(Cursor::new(&file), ScanOptions::default()).unwrap();
+        let torn_at = full.fragments[2].offset + 10;
+        let torn = &file[..usize::try_from(torn_at).unwrap()];
+        let report = scan_with_limit(Cursor::new(torn), ScanOptions::default(), 2).unwrap();
+        assert_eq!(report.fragments, full.fragments[..2]);
+        assert_eq!(
+            report.stop,
+            Some(ScanStop::Truncated {
+                offset: full.fragments[2].offset,
+            })
+        );
     }
 
     #[test]

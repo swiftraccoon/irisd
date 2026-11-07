@@ -27,13 +27,14 @@ use url::Url;
 
 use crate::client::parse::SessionHeader;
 use crate::codec::CodecItem;
+use crate::mostly_ascii::Excerpt;
 use crate::{
     Error, ErrorInt, RtspMessageContext, StreamContext, StreamContextInner, TcpStreamContext,
     UdpStreamContext,
 };
 
 mod channel_mapping;
-mod parse;
+pub(crate) mod parse;
 
 /// Internal API, public for a benchmark only.
 #[doc(hidden)]
@@ -810,9 +811,10 @@ impl Tool {
     }
 }
 
+/// Writes the server-supplied value quoted, escaped, and cut at 512 bytes.
 impl std::fmt::Debug for Tool {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        std::fmt::Debug::fmt(&*self.0, f)
+        write!(f, "\"{}\"", Excerpt::of(&self.0))
     }
 }
 
@@ -1024,10 +1026,21 @@ struct StreamStateInit {
 }
 
 /// Username and password authentication credentials.
-#[derive(Clone, Debug, Eq, PartialEq)]
+///
+/// The `Debug` output redacts both fields.
+#[derive(Clone, Eq, PartialEq)]
 pub struct Credentials {
     pub username: String,
     pub password: String,
+}
+
+impl Debug for Credentials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Credentials")
+            .field("username", &"<redacted>")
+            .field("password", &"<redacted>")
+            .finish()
+    }
 }
 
 /// Marker trait for the state of a [Session].
@@ -1135,6 +1148,11 @@ struct SessionInner {
     /// exception is during drop.
     conn: Option<RtspConnection>,
 
+    /// The address the session's connection reached. A `TEARDOWN` on a fresh
+    /// connection goes here, never to a host the server advertised, so
+    /// credentials are only ever sent to the server the caller chose.
+    peer_addr: SocketAddr,
+
     options: SessionOptions,
     requested_auth: Option<http_auth::PasswordClient>,
     presentation: Presentation,
@@ -1187,6 +1205,10 @@ enum SessionFlag {
     /// Set if an `OPTIONS` request has completed and advertised supported for
     /// `GET_PARAMETER`.
     GetParameterSupported = 0x10,
+
+    /// Set once a request received in state `Playing` has been logged; later
+    /// ones are logged at trace level only.
+    PlayingRequestLogged = 0x20,
 }
 
 impl RtspConnection {
@@ -1197,12 +1219,26 @@ impl RtspConnection {
         let inner = crate::tokio::Connection::connect(host, port)
             .await
             .map_err(|e| wrap!(ErrorInt::ConnectError(e)))?;
-        Ok(Self {
+        Ok(Self::new(inner))
+    }
+
+    /// Connects to `peer` itself, with no name lookup.
+    async fn connect_peer(peer: SocketAddr) -> Result<Self, Error> {
+        let stream = tokio::net::TcpStream::connect(peer)
+            .await
+            .map_err(|e| wrap!(ErrorInt::ConnectError(e)))?;
+        let inner = crate::tokio::Connection::from_stream(stream)
+            .map_err(|e| wrap!(ErrorInt::ConnectError(e)))?;
+        Ok(Self::new(inner))
+    }
+
+    fn new(inner: crate::tokio::Connection) -> Self {
+        Self {
             inner,
             channels: ChannelMappings::default(),
             next_cseq: 1,
             seen_unassigned: false,
-        })
+        }
     }
 
     fn validate_url(url: &Url) -> Result<url::Host<&str>, String> {
@@ -1328,6 +1364,20 @@ impl RtspConnection {
                     })
                 }
                 let www_authenticate: &str = www_authenticate;
+                if www_authenticate.len() > parse::MAX_WWW_AUTHENTICATE_BYTES {
+                    bail!(ErrorInt::RtspResponseError {
+                        conn_ctx: *self.inner.ctx(),
+                        msg_ctx,
+                        method: req.method().clone(),
+                        cseq,
+                        status: resp.status_code,
+                        description: format!(
+                            "WWW-Authenticate of {} bytes exceeds the {}-byte limit",
+                            www_authenticate.len(),
+                            parse::MAX_WWW_AUTHENTICATE_BYTES
+                        ),
+                    })
+                }
                 *requested_auth = match http_auth::PasswordClient::try_from(www_authenticate) {
                     Ok(c) => Some(c),
                     Err(e) => bail!(ErrorInt::RtspResponseError {
@@ -1529,9 +1579,11 @@ impl Session<Described> {
             })?;
         let describe_status = response.status_code;
         let sdp = resp_body;
+        let peer_addr = conn.inner.ctx().peer_addr;
         Ok(Session(
             Box::pin(SessionInner {
                 conn: Some(conn),
+                peer_addr,
                 options,
                 requested_auth,
                 presentation,
@@ -2642,10 +2694,23 @@ impl Session<Playing> {
                         continue;
                     }
                     msg::Message::Request(request) => {
-                        warn!(
-                            "Received RTSP request in Playing state. Responding unimplemented.\n{:#?}",
-                            request
-                        );
+                        // Server-chosen text, logged once per session and bounded.
+                        let method = Excerpt::of(&request.method);
+                        if self.0.flags & (SessionFlag::PlayingRequestLogged as u8) == 0 {
+                            self.0.flags |= SessionFlag::PlayingRequestLogged as u8;
+                            warn!(
+                                "Ignoring a {method} request received in Playing state \
+                                 ({} headers, {}-byte body); later requests on this session \
+                                 are logged at trace level",
+                                request.headers.iter().count(),
+                                msg.body_len,
+                            );
+                        } else {
+                            trace!("Ignoring a {method} request received in Playing state");
+                        }
+                        // As after any other message: what follows may
+                        // already be buffered, with no wake-up to come.
+                        continue;
                     }
                 },
                 Poll::Ready(Some(Err(e))) => {
@@ -2722,9 +2787,19 @@ impl PinnedDrop for SessionInner {
             None => return,
         };
 
-        // For now, assume the whole timeout is left.
+        let Some(slot) = teardown::Slot::acquire() else {
+            warn!(
+                "Not tearing down a dropped session: {MAX_BACKGROUND_TEARDOWNS} background \
+                 TEARDOWNs are already running"
+            );
+            return;
+        };
+
+        // Assume the whole timeout is left. The server chooses the timeout, up
+        // to about 136 years, so retries end at `MAX_LIFETIME`.
         let expires = tokio::time::Instant::now()
-            + std::time::Duration::from_secs(session.timeout_sec.into());
+            + std::time::Duration::from_secs(session.timeout_sec.into())
+                .min(teardown::MAX_LIFETIME);
 
         // Track the session, if there is a group.
         let (teardown_tx, teardown_rx) = tokio::sync::watch::channel(None);
@@ -2750,9 +2825,10 @@ impl PinnedDrop for SessionInner {
             None
         };
 
-        tokio::spawn(teardown::background_teardown(
+        let teardown = teardown::background_teardown(
             seqnum,
             this.presentation.base_url.clone(),
+            *this.peer_addr,
             this.presentation.tool.take(),
             session.id,
             just_try_once,
@@ -2761,8 +2837,29 @@ impl PinnedDrop for SessionInner {
             this.conn.take(),
             teardown_tx,
             expires,
-        ));
+        );
+        tokio::spawn(async move {
+            // Held until the task ends or is dropped with its runtime.
+            let _slot = slot;
+            teardown.await;
+        });
     }
+}
+
+/// The most background `TEARDOWN` tasks that run at once in a process.
+///
+/// A dropped [`Session`] whose [`TeardownPolicy`] asks for a `TEARDOWN` gets
+/// a background task, which lives until the `TEARDOWN` succeeds or the
+/// session expires (at most a minute). Beyond this many tasks, a dropped
+/// session is not torn down and a warning is logged instead, so a server
+/// that never answers cannot make sessions accumulate tasks, sockets, and
+/// memory without bound.
+pub const MAX_BACKGROUND_TEARDOWNS: usize = 64;
+
+/// Returns how many background `TEARDOWN` tasks are running in this process,
+/// at most [`MAX_BACKGROUND_TEARDOWNS`].
+pub fn background_teardowns() -> usize {
+    teardown::Slot::in_use()
 }
 
 impl futures::Stream for Session<Playing> {
@@ -3700,5 +3797,241 @@ mod tests {
             pkt_ref.as_typed().unwrap(),
             Some(crate::rtcp::TypedPacketRef::ReceiverReport(_))
         ));
+    }
+
+    #[test]
+    fn credentials_debug_redacts_both_fields() {
+        let creds = Credentials {
+            username: "distinctive-user".to_owned(),
+            password: "distinctive-password".to_owned(),
+        };
+        for rendered in [format!("{creds:?}"), format!("{creds:#?}")] {
+            assert!(rendered.contains("<redacted>"), "{rendered}");
+            assert!(!rendered.contains("distinctive-user"), "{rendered}");
+            assert!(!rendered.contains("distinctive-password"), "{rendered}");
+        }
+    }
+
+    #[test]
+    fn tool_debug_is_a_bounded_excerpt() {
+        let tool = Tool::new(&format!("LIVE555\n{}", "v".repeat(4096)));
+        let rendered = format!("{tool:?}");
+        assert!(rendered.starts_with("\"LIVE555\\nvvv"), "{rendered:.40}");
+        assert!(rendered.len() < 600, "{} bytes", rendered.len());
+    }
+
+    /// A server may announce any session timeout; the background `TEARDOWN`
+    /// gives up after a minute all the same.
+    #[tokio::test(start_paused = true)]
+    async fn teardown_lifetime_is_at_most_a_minute() {
+        let (conn, mut server) = connect_to_mock().await;
+        let url = Url::parse("rtsp://127.0.0.1:554/cam").unwrap();
+        let group = Arc::new(SessionGroup::default());
+        let (session, _) = tokio::join!(
+            Session::describe_with_conn(
+                conn,
+                SessionOptions::default()
+                    .session_group(group.clone())
+                    .teardown(TeardownPolicy::Always),
+                url
+            ),
+            req_response(
+                &mut server,
+                msg::Method::DESCRIBE,
+                response(include_bytes!("testdata/reolink_describe.txt"))
+            ),
+        );
+        let mut session = session.unwrap();
+        tokio::join!(
+            async {
+                session.setup(0, SetupOptions::default()).await.unwrap();
+            },
+            req_response(
+                &mut server,
+                msg::Method::SETUP,
+                response(
+                    b"RTSP/1.0 200 OK\r\nCSeq: 2\r\nSession: clamp;timeout=4294967295\r\n\
+                      Transport: RTP/AVP/TCP;unicast;interleaved=0-1\r\n\r\n"
+                )
+            ),
+        );
+        let (session, _) = tokio::join!(
+            session.play(PlayOptions::default()),
+            req_response(
+                &mut server,
+                msg::Method::PLAY,
+                response(include_bytes!("testdata/reolink_play.txt"))
+            ),
+        );
+        let session = session.unwrap();
+        let dropped = tokio::time::Instant::now();
+        drop(session);
+        server.close().await.unwrap();
+
+        let stale = group.stale_sessions();
+        assert_eq!(stale.num_sessions, 1);
+        assert_eq!(
+            stale.max_expires,
+            Some(dropped + std::time::Duration::from_secs(60))
+        );
+        tokio::time::timeout(
+            std::time::Duration::from_secs(120),
+            group.await_stale_sessions(&stale),
+        )
+        .await
+        .expect("the TEARDOWN gives up at its one-minute limit");
+        assert_eq!(group.stale_sessions().num_sessions, 0);
+    }
+
+    /// A server's requests in state `Playing` are ignored; the first is logged
+    /// once, without its content, and the stream goes on.
+    #[test]
+    fn requests_in_playing_state_are_logged_once() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let ((), records) = crate::testutil::capture_logs(|| {
+            runtime.block_on(async {
+                let (conn, mut server) = connect_to_mock().await;
+                let url = Url::parse("rtsp://127.0.0.1:554/cam").unwrap();
+                let (session, _) = tokio::join!(
+                    Session::describe_with_conn(
+                        conn,
+                        SessionOptions::default().teardown(TeardownPolicy::Never),
+                        url
+                    ),
+                    req_response(
+                        &mut server,
+                        msg::Method::DESCRIBE,
+                        response(include_bytes!("testdata/reolink_describe.txt"))
+                    ),
+                );
+                let mut session = session.unwrap();
+                tokio::join!(
+                    async {
+                        session.setup(0, SetupOptions::default()).await.unwrap();
+                    },
+                    req_response(
+                        &mut server,
+                        msg::Method::SETUP,
+                        response(include_bytes!("testdata/reolink_setup.txt"))
+                    ),
+                );
+                let (session, _) = tokio::join!(
+                    session.play(PlayOptions::default()),
+                    req_response(
+                        &mut server,
+                        msg::Method::PLAY,
+                        response(include_bytes!("testdata/reolink_play.txt"))
+                    ),
+                );
+                let session = session.unwrap();
+                tokio::pin!(session);
+                session.0.keepalive_timer = None;
+                tokio::join!(
+                    async {
+                        let item = tokio::time::timeout(
+                            std::time::Duration::from_secs(10),
+                            session.next(),
+                        )
+                        .await
+                        .expect("the packet after the requests");
+                        match item {
+                            Some(Ok(PacketItem::Rtp(p))) => assert_eq!(p.payload(), b"hello world"),
+                            o => panic!("unexpected item: {o:#?}"),
+                        }
+                    },
+                    async {
+                        for _ in 0..3 {
+                            server
+                                .send(OwnedMessage::Request {
+                                    head: msg::Request {
+                                        method: msg::Method::SET_PARAMETER,
+                                        request_uri: None,
+                                        headers: [(
+                                            msg::HeaderName::try_from("X-Marker").unwrap(),
+                                            msg::HeaderValue::try_from("distinctive-marker")
+                                                .unwrap(),
+                                        )]
+                                        .into(),
+                                    },
+                                    body: Bytes::new(),
+                                })
+                                .await
+                                .unwrap();
+                        }
+                        let pkt = b"\x80\x60\x41\xd4\x00\x00\x00\x00\xdc\xc4\xa0\xd8hello world";
+                        server
+                            .send(OwnedMessage::Data {
+                                channel_id: 0,
+                                body: Bytes::from_static(pkt),
+                            })
+                            .await
+                            .unwrap();
+                    },
+                );
+            })
+        });
+        let playing: Vec<_> = records
+            .iter()
+            .filter(|(_, message)| message.contains("in Playing state"))
+            .collect();
+        assert_eq!(playing.len(), 3, "{records:?}");
+        let warned = playing
+            .iter()
+            .filter(|(level, _)| *level == log::Level::Warn)
+            .count();
+        assert_eq!(warned, 1, "{playing:?}");
+        for (_, message) in playing {
+            assert!(!message.contains("distinctive-marker"), "{message}");
+            assert!(!message.contains('\n'), "{message}");
+        }
+    }
+
+    #[tokio::test]
+    async fn oversized_www_authenticate_fails_the_request() {
+        let (conn, mut server) = connect_to_mock().await;
+        let url = Url::parse("rtsp://127.0.0.1:554/cam").unwrap();
+        let realm = "r".repeat(parse::MAX_WWW_AUTHENTICATE_BYTES);
+        let creds = Credentials {
+            username: "user".to_owned(),
+            password: "secret".to_owned(),
+        };
+        let (session, _) = tokio::join!(
+            Session::describe_with_conn(conn, SessionOptions::default().creds(Some(creds)), url),
+            async {
+                let msg = server.next().await.unwrap().unwrap();
+                let msg::Message::Request(request) = msg.msg else {
+                    panic!("expected DESCRIBE");
+                };
+                let cseq = request.headers.get("CSeq").unwrap().to_string();
+                let challenge = format!("Digest realm=\"{realm}\", nonce=\"n\"");
+                server
+                    .send(OwnedMessage::Response {
+                        head: msg::Response {
+                            status_code: StatusCode::UNAUTHORIZED,
+                            reason_phrase: "Unauthorized".to_owned(),
+                            headers: [
+                                (
+                                    msg::HeaderName::CSEQ,
+                                    msg::HeaderValue::try_from(cseq).unwrap(),
+                                ),
+                                (
+                                    msg::HeaderName::WWW_AUTHENTICATE,
+                                    msg::HeaderValue::try_from(challenge).unwrap(),
+                                ),
+                            ]
+                            .into(),
+                        },
+                        body: Bytes::new(),
+                    })
+                    .await
+                    .unwrap();
+            },
+        );
+        let error = session.err().expect("an oversized challenge").to_string();
+        assert!(error.contains("WWW-Authenticate of "), "{error}");
+        assert!(error.contains("exceeds the 4096-byte limit"), "{error}");
     }
 }

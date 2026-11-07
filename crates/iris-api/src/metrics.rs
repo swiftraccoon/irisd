@@ -135,6 +135,16 @@ fn catalog_stats(out: &mut String, stats: CatalogStats) {
             "Bytes in the catalog write-ahead log file.",
             stats.wal_bytes,
         ),
+        (
+            "irisd_catalog_deleting_segments",
+            "Segments with durable deletion intent awaiting pair removal.",
+            stats.deleting_segments,
+        ),
+        (
+            "irisd_catalog_deleting_bytes",
+            "Bytes of segments in deletion intent; they still count toward the quota.",
+            stats.deleting_bytes,
+        ),
     ] {
         gauge(out, name, help, value);
     }
@@ -174,6 +184,35 @@ pub(crate) async fn metrics(State(state): State<Arc<ApiState>>) -> Response {
         "Event messages skipped by lagging WebSocket receivers.",
         state.stats.event_messages_lagged(),
     );
+    for (name, help, value) in [
+        (
+            "irisd_api_media_rejected_total",
+            "Media requests answered 503 because their admission class was full.",
+            state.stats.media_rejected(),
+        ),
+        (
+            "irisd_api_websocket_rejected_total",
+            "Live and event WebSocket upgrades answered 503 by the socket caps.",
+            state.stats.websocket_rejected(),
+        ),
+        (
+            "irisd_api_snapshot_rejected_total",
+            "Snapshot requests answered 503 while the camera's previous request was in flight.",
+            state.stats.snapshot_rejected(),
+        ),
+        (
+            "irisd_api_unapproved_rows_total",
+            "Recording rows refused because their path is outside every approved root.",
+            state.stats.unapproved_rows(),
+        ),
+        (
+            "irisd_live_oversized_closes_total",
+            "Live WebSockets closed with 1009 because a sync frame exceeded the message limit.",
+            state.stats.live_oversized_closes(),
+        ),
+    ] {
+        counter(&mut out, name, help, value);
+    }
     gauge(
         &mut out,
         "irisd_uptime_seconds",
