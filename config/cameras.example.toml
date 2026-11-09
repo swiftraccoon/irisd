@@ -2,15 +2,18 @@
 # /etc/irisd/irisd.toml (service) or config/cameras.local.toml (development;
 # gitignored). It holds camera credentials and API tokens, so keep it mode 0600,
 # or 0640 with the service account's group; the daemon warns when other users can
-# read it. Values outside the stated ranges are rejected at load.
+# read it. Values outside the stated ranges are rejected at load. Values shown are the
+# defaults unless a comment says otherwise.
 #
 # Addresses below use the RFC 5737 documentation range.
 
 [storage]
 # Directories that receive recordings; the first eligible root is used, with later roots as
-# ordered failover targets.
+# ordered failover targets. A root path must hold no symbolic link in any component: configure
+# the resolved physical path. Default: ["data/recordings"], relative to the working directory.
 video_roots = ["/srv/irisd/video"]
-# Catalog database and other small state (an SSD is ideal).
+# Catalog database and other small state (an SSD is ideal). Default: "data/state", relative
+# to the working directory.
 state_dir = "/var/lib/irisd"
 # Retention deletes the oldest sealed recordings while a root has less free space than this.
 # Range: 0..=50; zero disables the free-space floor.
@@ -21,8 +24,8 @@ min_free_percent = 5
 # quota_gib = 2000
 # Power-loss window: open files are flushed this often (milliseconds). Range: 100..=60000.
 sync_interval_ms = 5000
-# Longest fragment; a GOP longer than this (plus a quarter of slack) is split.
-# Range: 1..=60000.
+# Fragment duration cap: a GOP is split once it spans this plus a quarter, so a fragment lasts
+# at most 1.25 times this. Range: 1..=60000.
 max_fragment_ms = 2000
 # Space reserved ahead of each file's written length (bytes). Range: 0 up to the smaller
 # of rotate_bytes and 4294967296 (4 GiB); zero disables preallocation.
@@ -39,12 +42,13 @@ max_queued_fragments = 32
 [ingest]
 # How often camera sockets are read, in milliseconds. Packets accumulate between reads so one
 # system call covers many of them and every stream is read in the same wake-up; the live view
-# lags by this much more. 0 reads on every packet (about a quarter more CPU).
+# lags by this much more. 0 reads on every packet (about a third more CPU;
+# docs/research/12-ingest-cost.md §3). Range: 0..=1000.
 read_interval_ms = 20
 # Receive low-water mark per camera socket in KiB: the kernel reports a socket readable only
 # once this much is queued, so a steady stream wakes the daemon once per that many bytes
 # instead of once per packet. A slow stream waits this many bytes before its frames are read
-# (a quarter second at 1 Mbit/s). 0 leaves the kernel default of one byte.
+# (a quarter second at 1 Mbit/s). 0 leaves the kernel default of one byte. Range: 0..=1024.
 recv_low_water_kib = 32
 
 [api]
@@ -68,25 +72,39 @@ max_bounded_media = 32
 # Serve /metrics without a token. False requires the root bearer token for scrapes.
 public_metrics = false
 
-# One [[camera]] table per camera. Field names follow the original test
-# configuration. `rtsp_url` is the main stream; `sub_url` defaults to the same
-# URL with subtype=1 for Dahua-style URLs. For cameras whose sub stream stops
-# when a second RTSP session opens (docs/research/01-camera-probe.md §5b), set
-# it to the subtype=2 (third stream) URL instead. Credentials are never embedded in
-# URLs; irisd passes them to RTSP digest auth, the vendor CGI API, and ONVIF
-# separately.
+[provisioning]
+# Accept cameras added and removed through the API (POST and DELETE on /api/cameras, root
+# token required). Added cameras are kept in <state_dir>/cameras.toml and restart with the
+# daemon; the [[camera]] entries below stay authoritative and cannot be removed through the API.
+enabled = false
+# Most cameras the API may add beyond the configured ones. Range: 1..=64.
+max_cameras = 16
+# TCP ports an added camera may use for RTSP and HTTP(S). The sandbox allows them at start,
+# so a camera on another port needs a [[camera]] entry below and a restart. Port 0 is
+# rejected, and at least one port is required while provisioning is enabled.
+connect_ports = [554, 80, 443]
+
+# One [[camera]] table per camera; the table has no defaults for id, name, rtsp_url,
+# username, and password. `rtsp_url` is the main stream, an rtsp:// URL with a host;
+# `sub_url` defaults to the same URL with subtype=1 for Dahua-style URLs. For cameras whose
+# sub stream stops when a second RTSP session opens (docs/research/01-camera-probe.md §5b),
+# set it to the subtype=2 (third stream) URL instead. A URL that embeds credentials is
+# rejected; irisd passes `username` and `password` to RTSP digest auth, the vendor CGI API,
+# and ONVIF separately.
 [[camera]]
-id = "cam1"
+id = "cam1"                 # 1 to 32 characters of [a-z0-9_-]; used in paths and URLs
 name = "Example"
 rtsp_url = "rtsp://192.0.2.10:554/cam/realmonitor?channel=1&subtype=0&unicast=true&proto=Onvif"
 sub_url  = "rtsp://192.0.2.10:554/cam/realmonitor?channel=1&subtype=1&unicast=true&proto=Onvif"
 username = "user"
 password = "secret"
 vendor = "dahua"            # optional vendor label returned by the API and stored in the catalog
-http_port = 80              # vendor CGI and ONVIF port
+http_port = 80              # vendor CGI and ONVIF port; default 80, or 443 with https
 https = false               # use HTTPS for CGI and ONVIF
 tls_verify = true           # verify camera TLS certificates; false permits self-signed devices
-record = ["main", "sub"]    # supported video kinds; each may appear only once per camera
+record = ["main", "sub"]    # supported video kinds, each at most once; this is the default
 timestamp_mode = "regularize" # regularize camera jitter, or "passthrough" for diagnostics
-retention_days = 21         # range 1..=106751991; delete after this many days
-events = ["dahua_cgi"]      # distinct event sources: dahua_cgi, onvif_pull_point
+retention_days = 21         # range 1..=106751991; default unset: no age limit
+events = ["dahua_cgi"]      # distinct event sources: dahua_cgi, onvif_pull_point; default []
+snapshot = "auto"           # auto (ONVIF when events are pull-point only, else Dahua CGI),
+                            # dahua_cgi, onvif, or none

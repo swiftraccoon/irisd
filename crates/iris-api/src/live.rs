@@ -82,12 +82,13 @@ fn init_message(init: &[u8]) -> Message {
     Message::Binary(Bytes::from(out))
 }
 
-/// Encodes one frame as a complete fragment (`prft`, `moof`, `mdat`,
-/// trailer) holding one sample.
-pub(crate) fn encode_live_fragment(
+/// Appends one frame to `out` as a complete fragment (`prft`, `moof`,
+/// `mdat`, trailer) holding one sample; returns the fragment's length.
+pub(crate) fn encode_live_fragment_into(
+    out: &mut Vec<u8>,
     frame: &LiveFrame,
     sequence: u32,
-) -> Result<Vec<u8>, FragmentError> {
+) -> Result<usize, FragmentError> {
     let sample = Sample {
         data: frame.data.clone(),
         duration: frame.duration.max(1),
@@ -101,30 +102,28 @@ pub(crate) fn encode_live_fragment(
         },
         std::slice::from_ref(&sample),
     )?;
-    let mut out = Vec::with_capacity(usize::try_from(encoded.total_len()).expect("fits usize"));
+    let total = usize::try_from(encoded.total_len()).expect("a fragment fits in memory");
+    out.reserve(total);
     out.extend_from_slice(&encoded.prefix);
     out.extend_from_slice(&sample.data);
     out.extend_from_slice(&encoded.trailer);
-    Ok(out)
+    Ok(total)
 }
 
 /// Builds a `0x02` message: one fragment holding one sample, or `None` when
-/// the message would exceed [`MAX_LIVE_MESSAGE_BYTES`].
-pub(crate) fn fragment_message(
-    frame: &LiveFrame,
-    sequence: u32,
-) -> Result<Option<Message>, FragmentError> {
+/// the message would exceed [`MAX_LIVE_MESSAGE_BYTES`]. The fragment is
+/// encoded in place behind the type byte, so the frame is copied once.
+fn fragment_message(frame: &LiveFrame, sequence: u32) -> Result<Option<Message>, FragmentError> {
     // The payload alone may already exceed the limit; skip encoding it.
     if 1 + frame.data.len() > MAX_LIVE_MESSAGE_BYTES {
         return Ok(None);
     }
-    let fragment = encode_live_fragment(frame, sequence)?;
-    if 1 + fragment.len() > MAX_LIVE_MESSAGE_BYTES {
+    let mut out = Vec::with_capacity(1 + frame.data.len() + 512);
+    out.push(MSG_FRAGMENT);
+    encode_live_fragment_into(&mut out, frame, sequence)?;
+    if out.len() > MAX_LIVE_MESSAGE_BYTES {
         return Ok(None);
     }
-    let mut out = Vec::with_capacity(1 + fragment.len());
-    out.push(MSG_FRAGMENT);
-    out.extend_from_slice(&fragment);
     Ok(Some(Message::Binary(Bytes::from(out))))
 }
 

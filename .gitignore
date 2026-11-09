@@ -1,11 +1,9 @@
 # Rust
-/target
 **/target/
 **/*.rs.bk
 Cargo.lock.orig
 
 # Local, secret, or large
-config/*.local.toml
 *.local.toml
 /data
 /scratch
@@ -24,7 +22,8 @@ AGENTS.override.md
 
 # Local-only documentation (identifying details about hosts, networks, cameras)
 /docs/local/
-__pycache__/
+
+# cargo-fuzz output
 fuzz/corpus/
 fuzz/artifacts/
 fuzz/coverage/

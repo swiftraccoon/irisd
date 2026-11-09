@@ -55,7 +55,9 @@ impl StoreObserver for CatalogObserver {
     }
 }
 
-/// Records events in the catalog and fans them out to API subscribers.
+/// Records events in the catalog and fans them out to API subscribers. The
+/// live fan-out is independent of persistence: an event the catalog rejects
+/// under overload still reaches the subscribers.
 pub struct CatalogEventSink {
     catalog: CatalogHandle,
     events: broadcast::Sender<Arc<Event>>,

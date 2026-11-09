@@ -7,7 +7,8 @@
    sudo install -Dm755 target/release/irisd /usr/local/bin/irisd
    ```
 
-2. Create the service account and state directory:
+2. Create the service account (the unit's `StateDirectory=` creates `/var/lib/irisd`, mode
+   0700, at first start):
 
    ```sh
    sudo install -Dm644 packaging/sysusers.d/irisd.conf /usr/lib/sysusers.d/irisd.conf
@@ -46,10 +47,10 @@
    configured root. Add one entry for each configured root rather than granting a parent
    directory.
 
-   Catalog schema 9 upgrades require an operator-installed `.irisd-root-id` for every
-   pre-identity recording root. Verify the intended storage is mounted and follow the durable
-   marker procedure in [`04-storage-format.md` §3](../docs/research/04-storage-format.md#3-file-layout)
-   before starting the upgraded daemon.
+   A root the daemon cannot identify stays unavailable: one without a `.irisd-root-id` marker
+   that holds files or catalog rows, and every unregistered root of a catalog created before
+   schema 9. Verify the intended storage is mounted, then install a marker by the durable
+   procedure in [`04-storage-format.md` §3](../docs/research/04-storage-format.md#3-file-layout).
 
 5. Allow the camera network. The unit permits only the loopback
    (`IPAddressDeny=any`, `IPAddressAllow=localhost`), so the daemon reaches no camera
@@ -63,7 +64,10 @@
      sudo tee /etc/systemd/system/irisd.service.d/network.conf
    ```
 
-   Allow lists from drop-ins are merged with the unit's own.
+   Allow lists from drop-ins are merged with the unit's own. With `[provisioning] enabled`,
+   add `multicast` to the list (`IPAddressAllow=192.0.2.0/24 multicast`) so the viewer's camera
+   discovery can send its WS-Discovery probe; without it the probe is dropped and discovery
+   lists nothing.
 
 6. Install and start the unit:
 
@@ -77,37 +81,37 @@
 `systemd-analyze security irisd` reports the hardening score. The daemon pings the
 watchdog only while every camera stream makes progress, so a wedged daemon is restarted
 within `WatchdogSec`. Logs go to the journal: `journalctl -u irisd -f`.
-`SyslogLevelPrefix=no` stores every line at the priority the daemon logged it with, so
-camera-controlled text cannot raise a line's journal priority; irisd writes no priority
-prefixes of its own.
+`SyslogLevelPrefix=no` stores every line at the unit's `SyslogLevel=` (info by default), so
+camera-controlled text cannot raise a line's journal priority. irisd writes no priority
+prefixes: its level appears only as text in each line, so filter by that text
+(`journalctl -u irisd --grep WARN`), not with `-p`.
 
 The unit deliberately leaves `RestrictSUIDSGID` disabled. That systemd filter rejects
-`openat2`, which the daemon requires for no-follow, beneath-root path resolution.
-`NoNewPrivileges`, the empty capability set, `ProtectSystem=strict`, and Landlock retain the
-service's privilege and filesystem boundaries.
+`openat2`, which the daemon requires for no-follow, beneath-root path resolution. Without it,
+the daemon could mark a file it owns set-user-ID. Its writable paths are the state directory
+(0700), the recording roots (0750, group `irisd`), and a private `/tmp` and `/var/tmp`, so
+keep login users out of the `irisd` group and mount recording filesystems `nosuid` where
+possible.
 
 The daemon also applies a Landlock sandbox on top of the unit's restrictions: it can read
-its configuration directory, `/etc`, and `/proc`, read and write the recording roots and the
-state directory, connect to the TCP ports the camera URLs name (554 when unspecified) and
-each camera's `http_port`, and bind the API port. Landlock ABI 4 (Linux 6.7) or later is
-required; on an older kernel, or one with Landlock disabled, the daemon refuses to start
-unless `irisd run` is given `--no-sandbox`, which runs it unsandboxed with a warning.
-Landlock filters ports for any destination address; the unit's `IPAddressAllow=` list
-restricts the peers.
+its configuration directory, `/etc`, and `/proc`; read and write the recording roots and the
+state directory; connect to the TCP ports the camera URLs name (554 when unspecified), each
+camera's `http_port`, and, with provisioning enabled, the `provisioning.connect_ports`; and
+bind the API port. Landlock ABI 4 (Linux 6.7) or later is required; on an older kernel, or
+one with Landlock disabled, the daemon refuses to start unless `irisd run` is given
+`--no-sandbox`, which runs it unsandboxed with a warning. Landlock filters ports for any
+destination address; the unit's `IPAddressAllow=` list restricts the peers.
 
-`StateDirectoryMode=0700` keeps the catalog directory private to the service account.
-Before it opens the catalog, the daemon also requires the state directory and the
-`irisd.db`, `irisd.db-wal`, and `irisd.db-shm` files to belong to the service account,
-refuses symbolic or hard links and special files in their place, and removes group and
-other permissions with a warning. An installation whose catalog was readable by other
-users is therefore repaired at its next start; reading the catalog afterwards requires the
-service account.
+`StateDirectoryMode=0700` keeps the catalog directory private to the service account. Before it
+opens the catalog, the daemon also requires the state directory and the `irisd.db`, `irisd.db-wal`,
+`irisd.db-shm`, `capability.key`, and `cameras.toml` files to belong to the service account, refuses
+symbolic or hard links and special files in their place, and removes group and other permissions
+with a warning. An installation whose catalog was readable by other users is therefore repaired at
+its next start; reading the catalog afterwards requires the service account.
 
 `LimitNOFILE=65536` gives recording files, camera sockets, and API clients one descriptor
 budget; the daemon raises its soft limit to the hard limit at startup and logs both.
 
 Upgrades follow the alpha policy in `STANDARDS.md` §9: configuration has no compatibility
-promise before 1.0. A configuration with a token shorter than 32 characters, the example
-placeholder, or an empty token list without `api.allow_unauthenticated` no longer loads;
-generate a token before restarting the upgraded daemon. Storage settings outside the
-documented ranges (`config/cameras.example.toml`) are rejected the same way.
+promise before 1.0, and the daemon refuses to start on a configuration that breaks the token
+rules of step 3 or the ranges in `config/cameras.example.toml`.

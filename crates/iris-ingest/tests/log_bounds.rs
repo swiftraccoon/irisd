@@ -1,8 +1,9 @@
 //! Camera-supplied text reaches the log only as short, single, escaped lines.
 //!
-//! A test binary of its own: it installs the process's log subscriber, set up
-//! as the daemon sets it up (`info`, no target), with retina's `log` records
-//! bridged into it.
+//! A test binary of its own: it installs the process's log subscriber,
+//! configured like the daemon's (`info`, no target) with retina's `log`
+//! records bridged into it, but with ANSI colours off, so the byte checks see
+//! only what a camera contributed and not the formatter's escape sequences.
 
 use std::io::{self, Read as _, Write as _};
 use std::net::SocketAddr;
@@ -66,8 +67,8 @@ enum Body {
     /// 1 MiB that is no SDP: a version line carrying terminal controls, then
     /// line breaks and forged journal priority prefixes.
     Invalid,
-    /// 256 KiB of 18,000 unusable media sections after the video, which once
-    /// logged the whole SDP once per section (68 s of logging).
+    /// 256 KiB of 18,000 unusable media sections after the video: a warning
+    /// per section would log the whole SDP 18,000 times.
     ManySections,
     /// The video, then the most unusable sections accepted, one with controls.
     UnusableSections,
@@ -161,7 +162,7 @@ fn spawn_camera(body: Body, stop: &Arc<AtomicBool>) -> (SocketAddr, Arc<AtomicUs
                 cseq,
                 200,
                 "OK",
-                &[("Content-Type", "application/sdp".to_owned())],
+                &[("Content-Type", "application/sdp")],
                 &body,
             );
             if stream.write_all(&reply).is_ok() {

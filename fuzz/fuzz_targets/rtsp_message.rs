@@ -45,7 +45,8 @@ fuzz_target!(|data: &[u8]| {
     for limit in [PRODUCTION_LIMIT, fuzzed_limit] {
         let contiguous = parse_contiguous(stream, limit);
         let chunked = parse_in_chunks(stream, limit, control);
-        check_agreement(&contiguous, &chunked, limit <= stream.len(), limit);
+        let limit_reachable = limit <= stream.len();
+        check_agreement(&contiguous, &chunked, limit_reachable, limit);
     }
 });
 

@@ -17,18 +17,33 @@ one `moof` + `mdat` each.
   readiness gate. `ServeLimits` sets the connection cap, the request-head deadline, and the
   write-stall deadline.
 - `ApiState` — the catalog handle, the live-ring registry, the event broadcast channel, the
-  accepted tokens, the approved recording roots, the public-metrics switch, active configured
-  cameras, snapshot sources, request counters, monotonic start instant, and the shutdown token.
+  accepted tokens, the capability secret, the approved recording roots, the public-metrics
+  switch, the running cameras (configured or added through the API), snapshot sources, the
+  optional camera control, request counters, the wall and monotonic start instants, and the
+  shutdown token. The daemon assembles it once; its fields are that assembly record.
+- `CapabilitySecret` and `CAPABILITY_SECRET_BYTES` — the 32 random bytes that sign media
+  capabilities, kept by the daemon in its state directory; `Debug` redacts them.
+- `ActiveCamera` — one running camera as the camera routes present it: id, name, vendor, and
+  whether the API added it.
+- `CameraControl`, `ControlRequest`, and `ProvisionError` — the daemon's control contract for
+  provisioning and the ONVIF lookups: the routes send requests through the control and the
+  daemon answers each with a result or a `ProvisionError`, whose variants map to the statuses
+  in the route table. `ControlRequest` stays exhaustive on purpose, so the daemon's match is
+  compile-checked.
 - `LiveRegistry` — live rings by stream, filled by the daemon as streams start.
-- `SnapshotSource` — a camera's `snapshot.cgi` endpoint with digest credentials. Its host
-  is a bare name or IP address; the snapshot URL builder brackets IPv6 authorities.
+- `SnapshotSource` — where a camera's snapshots come from, with digest credentials: the Dahua
+  CGI endpoint or the URL its ONVIF Media service names, resolved on first use and shared by the
+  source's clones. Built with `SnapshotSource::new`; its host is a bare name or IP address, and
+  the snapshot URL builder brackets IPv6 authorities. `Debug` redacts both credentials.
 - `ApiStats` — request, client, event WebSocket lag, and admission-rejection counters exposed
-  on `/metrics`, plus the shared admission budgets; `ApiStats::with_media_limits` sizes the
+  on `/metrics`, plus the shared admission budgets; `ApiStats::new_with_media_limits` sizes the
   two media classes.
-- `ApiError` — handler failures rendered as a JSON `{ "error": … }` body with the matching
-  status. HTTP 500 bodies are `{"error":"internal error","request_id":<n>}`; the detail is
-  logged at warn level with the same id. A full admission budget is `ApiError::Busy`: HTTP 503
-  with `Retry-After: 1`.
+- Handler failures are rendered as a JSON `{ "error": … }` body with the matching status.
+  HTTP 500 bodies are `{"error":"internal error","request_id":<n>}`; the detail is logged at
+  warn level with the same id. A full admission budget is HTTP 503 with `Retry-After: 1`. A
+  JSON body an extractor refuses (missing or mistyped field, wrong `Content-Type`) is HTTP 400
+  with the same body shape; one over the 64 KiB limit is HTTP 413. Store and lifecycle
+  failures of provisioning answer a fixed 503 body, with their detail in the log.
 - `MSG_INIT`, `MSG_FRAGMENT`, and `MAX_LIVE_MESSAGE_BYTES` — the live WebSocket message type
   bytes and the largest message, one type byte plus a 16 MiB payload.
 
@@ -36,18 +51,22 @@ one `moof` + `mdat` each.
 |---|---|
 | `GET /api/health` | liveness: status, uptime, version |
 | `GET /metrics` | Prometheus text: requests, clients, event WebSocket lag, API admission rejections (media classes, WebSocket caps, snapshots), rows outside the approved roots, oversized live closes, uptime, catalog queue/state totals, rows and bytes in deletion intent, failed batches, catalog admission rejections, pruning, and database/WAL sizes; root bearer token required unless `public_metrics` is set |
-| `GET /api/cameras` | the configured cameras |
+| `GET /api/cameras` | the running cameras, configured or added through the API; `provisioned` marks the added ones, which `DELETE` applies to |
+| `POST /api/cameras` | adds a camera described like a `[[camera]]` table (JSON) and answers 201 with it as the list shows it; needs `[provisioning] enabled` on the daemon (403 otherwise) and the root token; 400 for an invalid camera, a port outside `provisioning.connect_ports`, or the `max_cameras` limit, 409 for an id in use, 503 when the daemon cannot write its store or start the camera |
+| `DELETE /api/cameras/{camera}` | stops and forgets a camera the API added (204); 409 for a configured camera, 404 for an unknown one; recordings and catalog rows stay |
+| `GET /api/onvif/devices?wait_ms` | the cameras a WS-Discovery probe finds within `wait_ms` (default 3000, 500 to 10000): device service host and port, and the name, hardware, and location scopes, bounded and sanitised; needs `[provisioning] enabled` (403 otherwise) and the root token; 503 when the probe cannot be sent or four lookups run already |
+| `POST /api/onvif/streams` | body `{"host", "http_port"?, "https"?, "tls_verify"?, "username", "password"}`: the RTSP URLs of the camera's ONVIF media profiles (token, name, URL), each moved onto `host`; gated like discovery; 400 for a host that is not a bare name or address or a port outside `connect_ports`, 502 when the camera gives no usable answer |
 | `GET /api/cameras/{camera}` | the camera with the health of each recorded stream: connected, frames, fragments, bytes, reconnects, loss events, gaps, last frame time, codec, nominal frame duration, camera clock offset, live viewers |
-| `GET /api/cameras/{camera}/snapshot.jpg` | a size-capped JPEG fetched without redirects from the camera with digest authentication, one request per camera at a time, served through its final end-of-image marker |
+| `GET /api/cameras/{camera}/snapshot.jpg` | a size-capped JPEG fetched without redirects or a proxy from the camera with digest authentication, from the Dahua CGI endpoint or, for a camera whose `snapshot` is `onvif` (the default when its events come from ONVIF pull-point alone), from the URL its ONVIF Media service names for its first profile, resolved on first use, kept for an hour, forgotten after a failed fetch, and rebased onto the configured camera; one request per camera at a time, served through its final end-of-image marker |
 | `GET /api/streams/{camera}/{kind}/segments?from&to` | catalog rows in a time range |
 | `GET /api/streams/{camera}/{kind}/hls/vod.m3u8?from&to` | a byte-range VOD playlist over the range |
 | `GET /api/streams/{camera}/{kind}/export.mp4?from&to` | a stand-alone recording of the range, streamed: the init segment with an edit list for start preroll, then fragments rebased from zero with fresh sequence numbers and trailers; tail samples at or after `to` are omitted and a crossing sample's duration is shortened (`docs/research/04-storage-format.md §10`) |
 | `GET /api/streams/{camera}/{kind}/live` | WebSocket: an init segment, then one fragment per frame, each message at most 16 MiB + 1 byte |
-| `GET /api/streams/{camera}/{kind}/hls/live.m3u8[?_HLS_msn&_HLS_part]` | the low-latency live playlist from the live ring: 0.5 s parts, blocking reload (waits up to 6 s, then 503), preload hints; relative URIs `init.mp4`, `seg/{msn}/media.m4s`, `part/{msn}/{index}/part.m4s` beside it, served from memory (`docs/research/04-storage-format.md §10`) |
+| `GET /api/streams/{camera}/{kind}/hls/live.m3u8[?_HLS_msn&_HLS_part]` | the low-latency live playlist from the live ring: parts of as many whole frames as fit 0.5 s, blocking reload (waits up to three target durations, 12 s before the first segment completes, then 503; a directive more than two segments or three seconds of parts ahead is 400), preload hints; relative URIs `init.mp4`, `seg/{msn}/media.m4s`, `part/{msn}/{index}/part.m4s` beside it, served from memory (`docs/research/04-storage-format.md §10`) |
 | `GET /api/streams/{camera}/{kind}/keyframe?t=` | a playable MP4 of one frame: the init segment and a single-sample fragment holding the sync sample at or before `t` (default: the newest), looked up within the two minutes before `t`; `x-iris-wall-us` carries the sample's time |
-| `GET /api/segments/{id}/file.mp4` | one recording file, with HTTP range support |
-| `POST /api/events/{id}/retain` | body `{"until": TIME}` keeps the footage around the event (30 s each side) from retention until then; `{"until": null}` or no body clears it; returns the event with `retain_until_us` |
-| `GET /api/events?camera&from&to&limit&after_us&after_id` | bounded events in a range after an optional exclusive `(time,id)` cursor, or a WebSocket push when upgraded |
+| `GET /api/segments/{id}/file.mp4` | one recording file, with HTTP range support: one `bytes` range, clamped to the validated extent; a range unit other than `bytes` is ignored and the whole file served; several ranges or an unsatisfiable one answer 416 |
+| `POST /api/events/{id}/retain` | body `{"until": TIME}` keeps the footage around the event (30 s each side) from retention until then; `{"until": null}` or an empty body clears it; the body is read as JSON whatever its `Content-Type`, and an unknown field or an unparseable time is 400; returns the event with `retain_until_us` |
+| `GET /api/events?camera&from&to&limit&after_us&after_id` | bounded events in a range after an optional exclusive `(time,id)` cursor, or a WebSocket push when upgraded; `limit` defaults to 200 and is clamped to 1–10,000, so a full page may continue from its last `(nvr_time, id)` |
 
 `from` and `to` accept Unix microseconds or RFC 3339; `from` defaults to an hour before
 `to`, `to` to the present, and a range may span at most seven days. Malformed Unicode
@@ -61,25 +80,30 @@ materialized-owned-row budget; JSON encoding can require more response bytes.
 
 ## How it is used
 
-A client presents the root token as `Authorization: Bearer <token>`; playlists mint bounded
-`token` query capabilities scoped to each exact media path so a player can follow them without
-receiving the root token. Rolling live-HLS capabilities last 15 minutes. An immutable VOD
-playlist's children last for its selected span plus a 15-minute playback margin, capped at seven
-days; inherited capabilities cannot extend their expiry. The live
-WebSocket sends binary messages whose first byte is the type: `0x01` an initialization
-segment, `0x02` a media fragment holding one frame. A message never exceeds
-`MAX_LIVE_MESSAGE_BYTES`, the type byte plus a 16 MiB payload, which is what the viewer
-accepts. A dependent frame that would not fit is skipped, and the stream resumes at the next
-sync frame with a fresh initialization segment, as after lag; a sync frame that would not fit
-closes the socket with code 1009 (message too big), counted as
-`irisd_live_oversized_closes_total`. Event push sends one JSON event per
-text message. If an event receiver falls behind the bounded broadcast ring, the server closes
-it with code 1013 and a bounded gap/retry reason; the client reconnects and lists the relevant
-catalog window, which may omit events rejected by catalog admission. Every WebSocket write has a
-two-second deadline and observes daemon shutdown, so a peer that stops reading cannot retain its
-client slot through the daemon's shutdown grace. Clients send no data messages: a text or
-binary message, or anything beyond the 4 KiB inbound message and frame limit, ends the
-session with close code 1008 (policy violation); pings and closes are answered as usual.
+A client presents the root token as `Authorization: Bearer <token>`; playlists mint bounded `token`
+query capabilities scoped to each exact media path so a player can follow them without receiving the
+root token. A capability is an HMAC-SHA256 tag under `ApiState::capability_secret`, the 32-byte
+secret the daemon keeps in its state directory; root tokens take no part in it, so a captured URL
+reveals nothing about a token. Only the paths playlists issue capabilities for accept one: a VOD
+playlist's recording files and the live playlist's init, segment, and part resources; playlists
+themselves, the live WebSocket, and every other route take the root token. Rolling live-HLS
+capabilities last 15 minutes, their expiry rounded down to the minute so every playlist reload
+within it mints identical child URIs. An immutable VOD playlist's children last for its selected
+span plus a 15-minute playback margin, capped at seven days; inherited capabilities cannot extend
+their expiry. The live WebSocket sends binary messages
+whose first byte is the type: `0x01` an initialization segment, `0x02` a media fragment holding one
+frame. A message never exceeds `MAX_LIVE_MESSAGE_BYTES`, the type byte plus a 16 MiB payload, which
+is what the viewer accepts. A dependent frame that would not fit is skipped, and the stream resumes
+at the next sync frame with a fresh initialization segment, as after lag; a sync frame that would
+not fit closes the socket with code 1009 (message too big), counted as
+`irisd_live_oversized_closes_total`. Event push sends one JSON event per text message. If an event
+receiver falls behind the bounded broadcast ring, the server closes it with code 1013 and a bounded
+gap/retry reason; the client reconnects and lists the relevant catalog window, which may omit events
+rejected by catalog admission. Every WebSocket write has a two-second deadline and observes daemon
+shutdown, so a peer that stops reading cannot retain its client slot through the daemon's shutdown
+grace. Clients send no data messages: a text or binary message, or anything beyond the 4 KiB inbound
+message and frame limit, ends the session with close code 1008 (policy violation); pings and closes
+are answered as usual.
 
 ```sh
 curl -H 'Authorization: Bearer TOKEN' 'http://127.0.0.1:8554/api/cameras'
@@ -104,9 +128,11 @@ spawns `serve_listener` before reporting readiness.
   connection and drops the body, releasing its media admission; any accepted byte restarts
   that deadline, so slow readers are kept. Shutdown stops accepting and lets each connection
   finish its in-flight response.
-- Playlists are byte ranges into the recording files, grouped three fragments per media
-  segment with `EXT-X-INDEPENDENT-SEGMENTS`, an `EXT-X-MAP` per file, and a discontinuity at
-  run boundaries (`docs/research/04-storage-format.md §10`).
+- Playlists are byte ranges into the recording files. A media segment starts at a sync
+  fragment and runs until the first sync fragment after its third fragment, continuation
+  fragments always joining it, with `EXT-X-INDEPENDENT-SEGMENTS`, an `EXT-X-MAP` per file, and
+  a discontinuity at run boundaries, after a skipped row, and where the sample entry changes
+  (`docs/research/04-storage-format.md §10`).
 - Clipping a continuation fragment includes the preceding sync fragment and every fragment
   between them. VOD presents this preroll; exports use `elst` to hide start preroll while
   retaining the samples needed to decode it. Tail samples starting at or after the requested
@@ -121,9 +147,23 @@ spawns `serve_listener` before reporting readiness.
 - Export compares the selected files' initialization bytes before sending headers and returns
   HTTP 400 when they differ, including adopted files without catalog codec hashes. A client
   must request one codec configuration at a time.
-- LL-HLS marks a non-increasing decode timestamp with `EXT-X-DISCONTINUITY` and resumes at
-  the next sync frame. `EXT-X-DISCONTINUITY-SEQUENCE` preserves the epoch as segments leave
-  the window; lag and codec changes also advance the epoch.
+- LL-HLS follows the vendored HLS draft: `EXT-X-TARGETDURATION` is pinned per feeder when
+  the first GOP completes (its length rounded up to whole seconds plus one second, at most the
+  10 s GOP budget) and never changes; `PART-TARGET` is pinned from the first frame's duration
+  (the whole frames that fit 0.5 s, at least one, so every non-final part lasts exactly the
+  target); complete segments stay listed until the complete segments after them cover three
+  target durations, at most 12; `EXT-X-VERSION` is 6; each segment after a discontinuity
+  carries `EXT-X-PROGRAM-DATE-TIME`; and a blocking reload waits three target durations. A
+  GOP that would outlast the pinned target, or exceed 16 MiB or 600 frames, is cut where it is
+  with `EXT-X-DISCONTINUITY`, as is the open segment on ring lag or a non-increasing decode
+  timestamp, and dependent frames are dropped until the next sync frame. A new sample entry
+  starts the window over with a new init segment. `EXT-X-DISCONTINUITY-SEQUENCE` preserves
+  the epoch as segments leave the window. Cameras whose GOP length varies beyond one second
+  therefore get cut segments; a fixed I-frame interval suits LL-HLS.
+- Each watched stream keeps at most 12 complete GOPs of up to 16 MiB, 600 frames, and the
+  pinned target each (about five GOPs, 15 to 30 MiB, at a 2 s 4K GOP), beyond the live ring's
+  own windows; each bounded-class segment response encodes a copy of up to one GOP, so the
+  default 32 bounded slots can hold about 0.5 GiB of response buffers.
 - Segment DTOs never expose server paths.
 - Media is read only through descriptors opened beneath the approved recording root that owns
   a row's path (`ApiState::recording_roots`), with `openat2` refusing symlinks, magic links,
@@ -161,10 +201,17 @@ spawns `serve_listener` before reporting readiness.
   each socket's write buffer holds at most one outbound message beyond its 128 KiB target.
 - A live sample entry is compared by content, not only by its CRC-32C, before the server
   decides whether to announce another initialization segment; LL-HLS applies the same rule.
-- The keyframe lookup never selects a sync fragment before its two-minute lower bound. An omitted
-  `t` is mutable and uses `private, no-store`; an explicit historical `t` may cache privately.
-- `/api/cameras` and camera detail use the running configuration, while historical catalog rows
-  remain queryable through recording routes. `live_viewers` counts external live WebSockets only.
+- The keyframe lookup never selects a sync fragment before its two-minute lower bound; a GOP
+  longer than that answers 404. An omitted `t`, or one within 30 s of the present, is mutable
+  and uses `private, no-store`; an explicit historical `t` may cache privately for an hour.
+- `/api/cameras` and camera detail use the running cameras, configured or added through the API,
+  while historical catalog rows remain queryable through recording routes. `live_viewers` counts
+  external live WebSockets only.
+- Provisioning relays through `ApiState::control`, the daemon's `CameraControl`: the route
+  validates the camera with `CameraConfig::validate`, the daemon applies the limit, the allowed
+  ports, the store, and the task lifecycle, and answers within 20 s or the route reports 503.
+  A media capability never authorizes these routes, and protected routes take at most 64 KiB
+  of request body.
 - `/metrics` coalesces catalog aggregates into one cache-owned refresh per second. The refresh
   continues if its initiating scrape is cancelled and serves its last snapshot after a failure.
   Monotonic catalog counters include failed SQLite change batches as
@@ -186,29 +233,33 @@ spawns `serve_listener` before reporting readiness.
 
 ## Tests and measurements
 
-`tests/api.rs` builds a real recording through the store and the catalog, then exercises
-health without a token, token rejection and acceptance, segment listing and playlist
-construction, range serving and export over the recording, and rejection of unknown
-segments and bad ranges. Regression coverage checks Unicode timestamps, integer bounds,
-sync preroll, per-fragment timing metadata, mixed codec export rejection, and LL-HLS timestamp
-resets. Export boundary tests verify checksum-valid fragments and positive edit durations
-for sub-tick requests and ends around sample and fragment boundaries. The `api_time` fuzz
-target compares the timestamp parser with an independent Gregorian/RFC 3339 semantic oracle.
-Synthetic loopback tests cover snapshot size, content, padding, redirect, truncation,
-cancellation, and single-flight boundaries plus WebSocket peer-close, backpressure-deadline, and
-shutdown cleanup. `tests/listener.rs` covers the serving loop: the request-head deadline for
-silent, partial, and idle kept-alive connections, a connection cap that admits exactly its limit,
-and shutdown draining an in-flight response. `tests/media_cancellation.rs` stalls, slows, and
-disconnects readers of multi-megabyte recordings through loopback sockets with small buffers:
-a stalled reader keeps its streaming slot only until the write-stall deadline, a slow reader is
-served to the end, and a disconnect returns its slot. `tests/media_binding.rs` covers a symlinked
-recording and sidecar on every media route, a path swapped after validation, truncation under a
-response, and rows outside every approved root. `tests/websocket_limits.rs` covers the 1008
-policy close for inbound data and oversized messages, the live and event socket caps, the
-oversized live frame skip and 1009 close, a message exactly at the limit, and a forged CRC-32C
-collision between sample entries. Live integration
-against real cameras, playback through ffprobe,
-ffmpeg, and GStreamer, and the hourly playlist-continuity check of the soak are recorded in
+`tests/api.rs` builds a real recording through the store and the catalog, then exercises health
+without a token, token rejection and acceptance, segment listing and playlist construction, range
+serving and export over the recording, and rejection of unknown segments and bad ranges. Regression
+coverage checks Unicode timestamps, integer bounds, sync preroll, per-fragment timing metadata,
+mixed codec export rejection, and LL-HLS timestamp resets. Export boundary tests verify
+checksum-valid fragments and positive edit durations for sub-tick requests and ends around sample
+and fragment boundaries. The `api_time` fuzz target compares the timestamp parser with a second
+Gregorian/RFC 3339 implementation and a `Display` round trip. Synthetic loopback tests cover
+snapshot size, content, padding, redirect, truncation, cancellation, and single-flight boundaries
+plus WebSocket peer-close, backpressure-deadline, and shutdown cleanup. `tests/listener.rs` covers
+the serving loop: the request-head deadline for silent, partial, and idle kept-alive connections, a
+connection cap that admits exactly its limit, shutdown draining an in-flight response, and an HTTP/2
+preface that is never answered with HTTP/2. `tests/provisioning.rs` drives both camera provisioning
+routes and both ONVIF routes through a stand-in control loop: status mapping, the JSON rejection
+statuses, the 64 KiB body cap, root-token and control gating. `tests/keyframe_bounds.rs` covers
+extreme keyframe timestamps, `tests/metrics_cancellation.rs` cancelled scrapes sharing one refresh,
+and `tests/websocket_lifetime.rs` peer close, the send deadline, shutdown, and viewer counts. The
+`api_range` fuzz target drives the raw route's `Range` parser. `tests/media_cancellation.rs` stalls,
+slows, and disconnects readers of multi-megabyte recordings through loopback sockets with small
+buffers: a stalled reader keeps its streaming slot only until the write-stall deadline, a slow
+reader is served to the end, and a disconnect returns its slot. `tests/media_binding.rs` covers a
+symlinked recording and sidecar on every media route, a path swapped after validation, truncation
+under a response, and rows outside every approved root. `tests/websocket_limits.rs` covers the 1008
+policy close for inbound data and oversized messages, the live and event socket caps, the oversized
+live frame skip and 1009 close, a message exactly at the limit, and a forged CRC-32C collision
+between sample entries. Live integration against real cameras, playback through ffprobe, ffmpeg, and
+GStreamer, and the hourly playlist-continuity check of the soak are recorded in
 `docs/research/10-phase2-results.md` and `11-multi-camera-results.md`.
 
 ## Further reading

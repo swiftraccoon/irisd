@@ -14,7 +14,7 @@ use axum::extract::{Path, Query, State};
 use axum::http::header;
 use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
-use iris_catalog::{SegmentRow, TimeRange};
+use iris_catalog::{SampleEntryId, SegmentRow, TimeRange};
 use iris_core::id::StreamKey;
 use iris_core::time::{TIMESCALE, WallUs};
 use iris_mp4::fragment::{TRAILER_LEN, decode_trailer};
@@ -30,9 +30,12 @@ use crate::error::ApiError;
 use crate::media_admission::{self, MediaPermit};
 use crate::query::{TimeParams, resolve_range};
 use crate::segments::stream_key;
-use crate::state::{ApiState, MediaClass, admitted_media_bytes};
+use crate::state::{ApiState, MediaClass};
 
-/// Fragments per HLS media segment (about six seconds at a two-second GOP).
+/// Fragments a media segment holds before the next sync fragment may start
+/// another; a continuation fragment always joins the open segment, so a
+/// segment is about six seconds at a two-second GOP and one whole GOP at
+/// longer ones.
 const FRAGMENTS_PER_MEDIA_SEGMENT: usize = 3;
 /// Maximum catalog rows considered by one time-range response.
 pub(crate) const MAX_SEGMENT_ROWS: usize = 4_096;
@@ -79,15 +82,20 @@ pub(crate) struct ValidatedMedia {
 }
 
 impl ValidatedMedia {
-    fn from_open(root: ApprovedRoot, path: PathBuf, file: &File, extent: u64) -> io::Result<Self> {
+    /// The identity of `file`, read on the blocking pool, as `(device, inode, length)`.
+    fn identity(file: &File) -> io::Result<(u64, u64, u64)> {
         let metadata = file.metadata()?;
-        Ok(Self {
+        Ok((metadata.dev(), metadata.ino(), metadata.len()))
+    }
+
+    fn new(root: ApprovedRoot, path: PathBuf, device: u64, inode: u64, extent: u64) -> Self {
+        Self {
             root,
             path,
-            device: metadata.dev(),
-            inode: metadata.ino(),
+            device,
+            inode,
             extent,
-        })
+        }
     }
 
     /// The complete media extent captured with the validated sidecar.
@@ -140,7 +148,8 @@ impl ValidatedMedia {
         std::fs::create_dir_all(path.parent().expect("layout parent")).expect("layout");
         std::fs::write(&path, bytes).expect("test recording");
         let file = File::open(&path).expect("open test recording");
-        Self::from_open(root, path, &file, extent).expect("test recording identity")
+        let (device, inode, _) = Self::identity(&file).expect("test recording identity");
+        Self::new(root, path, device, inode, extent)
     }
 
     /// The recording's path beneath its root.
@@ -195,7 +204,7 @@ pub(crate) async fn published_index(
     };
     let root = root.clone();
     let path = row.path.clone();
-    let (root, path, file, header, records, media_len) =
+    let (root, path, file, header, records, (device, inode, media_len)) =
         media_admission::blocking(permit, move || {
             let (file, index) = iris_store::open_segment_pair_beneath(&root, &path)?;
             let index = index.ok_or_else(|| {
@@ -203,13 +212,13 @@ pub(crate) async fn published_index(
             })?;
             let (header, records) = read_index_file_bounded(index, MAX_PERSISTED_INDEX_RECORDS)
                 .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-            let media_len = file.metadata()?.len();
-            Ok::<_, io::Error>((root, path, file, header, records, media_len))
+            let identity = ValidatedMedia::identity(&file)?;
+            Ok::<_, io::Error>((root, path, file, header, records, identity))
         })
         .await
         .map_err(io::Error::other)??;
     let (records, extent) = validate_index_binding(row, &header, records, media_len)?;
-    let media = ValidatedMedia::from_open(root, path, &file, extent)?;
+    let media = ValidatedMedia::new(root, path, device, inode, extent);
     Ok(PublishedIndex {
         records,
         media,
@@ -503,7 +512,7 @@ pub(crate) fn vod_playlist(
 ) -> Result<String, ApiError> {
     let mut body = BoundedText::new(MAX_PLAYLIST_BYTES);
     let mut target_ticks = 0u64;
-    let mut last_hash: Option<u32> = None;
+    let mut last_entry: Option<SampleEntryId> = None;
     for seg in segments {
         if seg
             .records
@@ -515,8 +524,10 @@ pub(crate) fn vod_playlist(
             ));
         }
         let uri = file_uri(seg.row.id.0, auth, capability_lifetime);
-        let discontinuity = last_hash.is_some()
-            && (seg.discontinuity_before || last_hash != Some(seg.row.sample_entry_hash));
+        // Sample entries are compared by catalog row, which is unique by CRC
+        // and bytes, so a CRC collision between files still gets its marker.
+        let discontinuity = last_entry.is_some()
+            && (seg.discontinuity_before || last_entry != Some(seg.row.sample_entry_id));
         if discontinuity {
             body.write_str("#EXT-X-DISCONTINUITY\n")
                 .map_err(playlist_budget_error)?;
@@ -548,7 +559,7 @@ pub(crate) fn vod_playlist(
                 .map_err(playlist_budget_error)?;
             writeln!(body, "{uri}").map_err(playlist_budget_error)?;
         }
-        last_hash = Some(seg.row.sample_entry_hash);
+        last_entry = Some(seg.row.sample_entry_id);
     }
     let target = target_ticks.div_ceil(u64::from(TIMESCALE)).max(1);
     let mut playlist = BoundedText::new(MAX_PLAYLIST_BYTES);
@@ -575,9 +586,9 @@ pub(crate) async fn vod(
     if segments.is_empty() {
         return Err(ApiError::NotFound);
     }
-    let text = admitted_media_bytes(
+    let text = media_admission::attach(
         Bytes::from(vod_playlist(&segments, &auth, capability_lifetime)?),
-        permit,
+        &permit,
     );
     Ok((
         [
@@ -618,9 +629,23 @@ mod tests {
         assert_eq!(groups[0].duration_ticks, 540_000);
     }
 
+    /// A segment runs to the first sync fragment after its third fragment;
+    /// continuation fragments always join it.
+    #[test]
+    fn continuation_fragments_join_the_open_media_segment() {
+        let records: Vec<IndexRecord> = [true, false, true, false, true, true, false, false, true]
+            .iter()
+            .enumerate()
+            .map(|(i, &sync)| record(i as u64 * 1000, 1000, sync))
+            .collect();
+        let groups = group(&records);
+        let lens: Vec<u64> = groups.iter().map(|segment| segment.len).collect();
+        assert_eq!(lens, [4000, 4000, 1000], "S C S C | S S C C | S");
+    }
+
     #[test]
     fn uses_scoped_capabilities_in_uris_without_exposing_the_root() {
-        let auth = AuthContext::for_test("root bearer", 1_234_567);
+        let auth = AuthContext::for_test(&crate::auth::test_secret(), 1_234_567);
         let capability = auth.capability("/api/segments/5/file.mp4").unwrap();
         assert_eq!(
             file_uri(5, &auth, Duration::from_hours(1)),
@@ -729,6 +754,7 @@ mod tests {
             width: 640,
             height: 480,
             sample_entry_hash: header.sample_entry_hash,
+            sample_entry_id: SampleEntryId(1),
         };
         (row, header, record)
     }
@@ -751,7 +777,7 @@ mod tests {
         }];
         let playlist = vod_playlist(
             &segments,
-            &AuthContext::for_test_at("root bearer", issued_at),
+            &AuthContext::for_test_at(&crate::auth::test_secret(), issued_at),
             lifetime,
         )
         .unwrap();
@@ -768,6 +794,41 @@ mod tests {
             .unwrap();
         assert_eq!(expires_at, issued_at + Duration::from_mins(75).as_secs());
         assert!(!playlist.contains("root bearer"));
+    }
+
+    /// Two files with byte-identical sample entries share a catalog row and
+    /// play through without a marker; a colliding CRC with other bytes is
+    /// another row and gets `EXT-X-DISCONTINUITY`.
+    #[test]
+    fn vod_discontinuities_follow_the_sample_entry_row_not_its_crc() {
+        let (row, _, record) = bound_fixture();
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let segment = |id: i64, entry: SampleEntryId| SegmentFragments {
+            row: SegmentRow {
+                id: SegmentId(id),
+                sample_entry_id: entry,
+                ..row.clone()
+            },
+            records: vec![record],
+            media: ValidatedMedia::for_test(directory.path(), &[], record.end()),
+            discontinuity_before: false,
+        };
+        let shared = [segment(1, SampleEntryId(1)), segment(2, SampleEntryId(1))];
+        let playlist =
+            vod_playlist(&shared, &AuthContext::disabled(), Duration::from_hours(1)).unwrap();
+        assert!(!playlist.contains("#EXT-X-DISCONTINUITY"), "{playlist}");
+        let colliding = [segment(1, SampleEntryId(1)), segment(2, SampleEntryId(2))];
+        let playlist = vod_playlist(
+            &colliding,
+            &AuthContext::disabled(),
+            Duration::from_hours(1),
+        )
+        .unwrap();
+        assert_eq!(
+            playlist.matches("#EXT-X-DISCONTINUITY\n").count(),
+            1,
+            "{playlist}"
+        );
     }
 
     #[test]

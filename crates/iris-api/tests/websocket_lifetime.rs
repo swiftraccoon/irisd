@@ -28,17 +28,20 @@ fn state(catalog: CatalogHandle, live: Arc<LiveRegistry>) -> Arc<ApiState> {
         live,
         events,
         tokens: Vec::new(),
+        capability_secret: iris_api::CapabilitySecret::new([1; 32]),
         recording_roots: Vec::new(),
         public_metrics: false,
-        snapshot_sources: HashMap::new(),
-        active_cameras: HashMap::from([(
+        snapshot_sources: std::sync::RwLock::new(HashMap::new()),
+        active_cameras: std::sync::RwLock::new(HashMap::from([(
             key().camera,
             ActiveCamera {
                 id: key().camera,
                 name: "Synthetic".into(),
                 vendor: Some("test".into()),
+                provisioned: false,
             },
-        )]),
+        )])),
+        control: None,
         stats: Arc::new(ApiStats::default()),
         started: WallUs::now(),
         started_monotonic: Instant::now(),

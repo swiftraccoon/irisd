@@ -37,36 +37,44 @@ ffmpeg, which matters for a long-lived archive.
 <video_root>/.irisd-root-id                                          # 128-bit storage identity
 <video_root>/<camera_id>/<stream>/<YYYY-MM-DD>/<HHMMSS.ffffff>Z.mp4  # stream ∈ main | sub
 <video_root>/<camera_id>/<stream>/<YYYY-MM-DD>/<HHMMSS.ffffff>Z.idx  # sidecar index (cache)
+<video_root>/<camera_id>/<stream>/<YYYY-MM-DD>/<HHMMSS.ffffff>Z-<n>.mp4  # n = 1..99 when the name is taken
 <state_dir>/irisd.db                                                 # SQLite catalog, on SSD/NVMe
+<state_dir>/capability.key                                           # media-capability secret
+<state_dir>/cameras.toml                                             # cameras added through the API
 ```
 
-irisd writes `.irisd-root-id` as exactly 32 lowercase hexadecimal characters encoding 128
-random bits, without a terminator. Readers also accept those 32 characters followed by one line
-feed, the form `echo` and text editors write, and reject every other framing (CR LF, a second
-line feed, any further byte, leading space, uppercase) with an error that reports the length
-found. The catalog binds each configured root spelling to this durable identity. A known root is
-available only when a no-follow directory open reaches the same marker; a missing or changed
-marker is not initialized or used as a replacement. During one daemon admission the opened
-device/inode pins that physical directory, detects pathname replacement, and rejects physical
-aliases; device/inode is not persisted as cross-restart identity.
-The marker, media files, and sidecars must be regular files. Every open of a marker, media
-file, or sidecar beneath a recording root is nonblocking, follows no link, crosses no mount, and
-checks the opened descriptor's type before any read, so a FIFO, socket, device, or symlink
-planted in a root fails that open at once instead of stalling admission, the writer's free-space
-probe, recovery, adoption, removal, or the self-check. Pair removal unlinks a special file or symlink
-in place of either member without opening or following it. Recordings, sidecars, recovery temporaries, and the
-marker are created mode 0600 and layout directories 0700 whatever the process umask. A missing
-fresh root is created through directory descriptors from the deepest ancestor that exists
-without following a link, and admission continues from the created descriptor, so a symlinked or
-swapped ancestor fails creation instead of placing directories elsewhere.
+irisd writes `.irisd-root-id` as exactly 32 lowercase hexadecimal characters encoding 128 random
+bits, without a terminator. Readers also accept those 32 characters followed by one line feed, the
+form `echo` and text editors write, and reject every other framing (CR LF, a second line feed, any
+further byte, leading space, uppercase) with an error that reports the length found. The catalog
+binds each configured root spelling to this durable identity. A known root is available only when a
+no-follow directory open reaches the same marker; a missing or changed marker is not initialized or
+used as a replacement. During one daemon admission the opened device/inode pins that physical
+directory, detects pathname replacement, and rejects physical aliases; device/inode is not persisted
+as cross-restart identity. A configured root path must hold no symbolic link in any component;
+resolution refuses links everywhere, not only at the end, so an operator configures the resolved
+physical path. The marker, media files, and sidecars must be regular files. Every open of a
+marker, media file, or sidecar already beneath an approved recording root is nonblocking, follows
+no link, crosses no mount, and checks the opened descriptor's type before any read, so a FIFO,
+socket, device, or symlink planted in a root fails that open at once instead of stalling admission,
+the writer's free-space probe, recovery, adoption, removal, or the self-check; every creation
+beneath an approved root is exclusive (`O_CREAT | O_EXCL`) through the same resolution. The
+standalone writer of `irisd record` has no admitted root and resolves its root and layout
+directories by name. Pair removal unlinks a special file or symlink in place of either member
+without opening or following it. Recordings, sidecars, recovery temporaries, and the marker are
+created mode 0600 and layout directories 0700; the process umask can only narrow those modes. A
+missing fresh root is created through directory descriptors from the
+deepest ancestor that exists without following a link, and admission continues from the created
+descriptor, so a symlinked or swapped ancestor fails creation instead of placing directories
+elsewhere.
 
 For a catalog created before the root registry, every unregistered configured root is ambiguous,
-including a root with no catalog row whose pathname is absent or was recreated
-empty. The durable migration bit keeps that rule across retries. Migration requires an operator to verify that the
-intended storage is mounted, generate 16 bytes from a cryptographically secure random source,
-encode them as 32 lowercase hexadecimal characters, create `.irisd-root-id` exclusively,
-make it readable by the daemon account, sync the file, and sync the root directory. Run as the
-daemon account (`ROOT` is the configured root):
+including a root with no catalog row whose pathname is absent or was recreated empty. The durable
+migration bit keeps that rule across retries. Migration requires an operator to verify that the
+intended storage is mounted, generate 16 bytes from a cryptographically secure random source, encode
+them as 32 lowercase hexadecimal characters, create `.irisd-root-id` exclusively, make it readable
+by the daemon account, sync the file, and sync the root directory. Run as the daemon account (`ROOT`
+is the configured root):
 
 ```sh
 umask 077
@@ -76,11 +84,12 @@ sync ROOT/.irisd-root-id ROOT
 ```
 
 Startup then adopts that marker into the catalog. An
-unregistered root in a catalog created directly at v9 can be initialized automatically only when
+unregistered root in a catalog created with the root registry (v9 or later) can be initialized
+automatically only when
 it has no catalog ownership and is absent or empty, using the same durable order.
 
 One file per configured video stream: main and sub. The 0.1 alpha rejects audio recording
-configuration. A later audio format can use a separate elementary-stream file so video `mdat`
+configuration. An audio extension could use a separate elementary-stream file so video `mdat`
 ranges remain contiguous, but no audio layout or serving contract is part of this format.
 
 A file (a *segment* in the catalog) is sealed and a new one started at the first IRAP after
@@ -91,7 +100,9 @@ entry bytes; the CRC-32C is a hint and consistency check, so two entries that sh
 rotate. A file that holds 131,072 fragments takes no further fragment: dependent fragments are
 dropped and counted until the next IRAP opens a new file as a new run, so the writer never
 produces a recording its own readers reject. Dahua cam1 at 8 Mbps rotates every ≈ 18 min by
-size; the D1 sub stream hourly by time.
+size; on that family the secondary stream recorded is the third stream (01 §5b), about 6 Mbps,
+which rotates by size roughly every 24 min, and a D1 sub stream at 1.3 Mbps rotates hourly by
+time.
 
 ## 4. Byte-level layout of a video file
 
@@ -106,11 +117,11 @@ moov                                                                            
       hdlr 'vide'
       minf  vmhd · dinf/dref · stbl
         stsd  'hvc1' sample entry (width, height) + 'hvcC' (VPS/SPS/PPS arrays,
-              array_completeness = 1, lengthSizeMinusOne = 3) [+ 'colr' nclx from VUI]
+              array_completeness = 1, lengthSizeMinusOne = 3)
         stts/stsc/stsz/stco  (empty)
   mvex  trex (track 1, default_sample_flags 0x01010000)
 
-repeat per fragment (one GOP, ≤ max_fragment_ms):
+repeat per fragment (one GOP, ≤ 1.25 × max_fragment_ms):
   prft  v1, flags 0x18, reference_track_ID 1, ntp_timestamp = NVR wall time for      32 B
         media_time, media_time = tfdt of this fragment
   moof                                                                      ≈ 96 + 8·N B
@@ -122,8 +133,8 @@ repeat per fragment (one GOP, ≤ max_fragment_ms):
       trun  v0 flags data-offset | first-sample-flags | sample-duration | sample-size,
             first_sample_flags 0x02000000 when the fragment starts with an IRAP,
             N × { duration u32, size u32 }
-  mdat  N access units, each NAL 4-byte-length-prefixed; VPS/SPS/PPS/AUD stripped,
-        SEI kept
+  mdat  N access units, each NAL 4-byte-length-prefixed; VPS/SPS/PPS stripped (they
+        live in hvcC), AUD and SEI kept
   free  size u32 = 24, 'free', 'IRX1' magic, crc32c u32 over [prft .. end of mdat],  24 B
         fragment_len u32 (prft start → end of this trailer), flags u32
 ```
@@ -133,14 +144,16 @@ repeat per fragment (one GOP, ≤ max_fragment_ms):
   (Frigate's `force_record_hvc1` exists for the same reason). cam1's parameter sets are
   byte-identical across GOPs; the writer compares each fragment's sample entry with the open
   file's and seals the file when the bytes change.
-- The `CODECS` string is derived from the SPS `profile_tier_level` per ISO/IEC 14496-15
-  Annex E (cam1 is expected to be `hvc1.1.6.L150.B0`; verify once the writer exists).
+- The `CODECS` string comes from retina's `rfc6381_codec()`, which derives it from the SPS
+  `profile_tier_level` per ISO/IEC 14496-15 Annex E; it is stored with each sample entry and in
+  the catalog's `codecs` column, and cam1's main stream reports `hvc1.1.6.L150.00` (the
+  `stream` line's `codec` field).
 - Version-1 (64-bit) `mvhd`/`tkhd`/`mdhd`/`tfdt` avoid the 13.26 h overflow of 32-bit
   90 kHz fields. `trun` per-sample durations are 32-bit, which is fine.
 - `prft` (version 1, flags 0x18, the value ffmpeg writes for `-write_prft wallclock`) makes
   each fragment self-describing in wall time. The flag semantics in ISO/IEC 14496-12:2022
   §8.16.5 are unverified against the paywalled text (§12); matching ffmpeg keeps the files
-  readable by the tools that already parse `prft`.
+  readable by the tools that parse `prft`.
 - The trailer is a standard, universally ignored 24-byte `free` box: size, `free`, the magic
   `IRX1`, a CRC-32C over `prft` through the end of `mdat`, `fragment_len` (from the start of
   `prft` to the end of the trailer), and reserved flags. `fragment_len` lets recovery and
@@ -164,8 +177,10 @@ Measured cost on cam1: ≈ 700 B per 2 MB fragment (0.03 %).
 ## 5. Sidecar index (`.idx`)
 
 Fixed-size records, appended per fragment, synced on the same cadence as the data. The file
-is a cache: it is fully rebuildable by scanning the `.mp4` (forward via box sizes, backward
-via trailers).
+caches what the fragment boxes say plus facts only the writer knows: `raw_rtp`, `run_id`, and
+the discontinuity and new-parameter flags. A scan of the `.mp4` (forward via box sizes,
+backward via trailers) rebuilds the box-derived fields; a rebuild leaves `raw_rtp` zero and
+keeps the writer-only facts only from a prior sidecar whose records match (§9).
 
 ```
 header (64 B): magic 'IRIX', version u16 = 1, record_size u16 = 40, timescale u32 (90000),
@@ -181,11 +196,14 @@ record (40 B): offset u64 (prft start), decode_time u64 (tfdt), wall_us i64,
 ```
 
 A zero `run_id` or `sample_entry_hash` means unknown. The sample-entry CRC-32C is a hint and a
-consistency check against the catalog, not an identity: the writer compares entry bytes.
+consistency check against the catalog, not an identity: the writer compares entry bytes, the
+catalog keys sample entries by CRC-32C and bytes together, and VOD playlists place
+`EXT-X-DISCONTINUITY` by the catalog row, never by the CRC alone.
 
 All integers are big-endian. Complete index records must describe contiguous byte ranges
 from `init_len`, each longer than the trailer with a non-overflowing end. A malformed range
-rejects the cache; offline HLS falls back to scanning media. A trailing partial record
+rejects the cache; offline HLS describes the media scan whatever the sidecar holds and reports a
+sidecar that disagrees. A trailing partial record
 (a crash between the data write and the index append) is ignored on read.
 Per hour at 2 s fragments this is 1,800 × 40 B = 72 KB;
 the whole index for 12 streams × 90 days is ≈ 1.9 GB on disk. Time → fragment lookup:
@@ -201,19 +219,24 @@ filesystem sandbox. Opening creates missing parent directories with mode 0700 an
 database file with mode 0600; SQLite gives the WAL and shared-memory files the database file's
 mode, and the daemon checks and repairs all three before it opens the catalog.
 
+The listing below gives the version-10 schema as `sqlite_master` holds it, constraints
+included; the migration history (§6 text) explains the column order.
+
 ```sql
 CREATE TABLE camera (id TEXT PRIMARY KEY, name TEXT NOT NULL, vendor TEXT);
-CREATE TABLE sample_entry (id INTEGER PRIMARY KEY, hash INTEGER NOT NULL UNIQUE,
+CREATE TABLE sample_entry (id INTEGER PRIMARY KEY, hash INTEGER NOT NULL,
                            codecs TEXT NOT NULL, width INTEGER NOT NULL,
-                           height INTEGER NOT NULL, config BLOB NOT NULL);
+                           height INTEGER NOT NULL, config BLOB NOT NULL,
+                           UNIQUE(hash, config));
 CREATE TABLE segment (id INTEGER PRIMARY KEY, camera_id TEXT NOT NULL, kind TEXT NOT NULL,
-                      path TEXT NOT NULL UNIQUE, root TEXT, run_seq INTEGER NOT NULL,
+                      path TEXT NOT NULL UNIQUE, run_seq INTEGER NOT NULL,
                       discontinuity INTEGER NOT NULL, wall_start_us INTEGER NOT NULL,
                       wall_end_us INTEGER NOT NULL, media_start INTEGER NOT NULL,
                       media_end INTEGER NOT NULL, init_len INTEGER NOT NULL,
                       durable_len INTEGER NOT NULL, fragments INTEGER NOT NULL,
                       bytes INTEGER NOT NULL, sealed INTEGER NOT NULL,
-                      deleting INTEGER NOT NULL, sample_entry_id INTEGER NOT NULL);
+                      sample_entry_id INTEGER NOT NULL REFERENCES sample_entry(id),
+                      deleting INTEGER NOT NULL DEFAULT 0, root TEXT);
 CREATE INDEX segment_stream_time ON segment(camera_id, kind, wall_start_us, id);
 CREATE INDEX segment_camera_horizon ON segment(camera_id, wall_start_us)
     WHERE deleting = 0;
@@ -224,9 +247,10 @@ CREATE INDEX segment_retention_root_time ON segment(root, wall_start_us, id)
 CREATE INDEX segment_retention_stream_time ON segment(camera_id, kind, wall_start_us, id)
     WHERE sealed = 1 AND deleting = 0;
 CREATE TABLE event (id INTEGER PRIMARY KEY, camera_id TEXT NOT NULL, source TEXT NOT NULL,
-                    kind TEXT NOT NULL, kind_other TEXT, state TEXT NOT NULL,
+                    kind TEXT NOT NULL, state TEXT NOT NULL,
                     nvr_time_us INTEGER NOT NULL, camera_time_us INTEGER, data TEXT,
-                    retain_until_us INTEGER, storage_bytes INTEGER NOT NULL);
+                    retain_until_us INTEGER, kind_other TEXT,
+                    storage_bytes INTEGER NOT NULL DEFAULT 0 CHECK(storage_bytes >= 0));
 CREATE INDEX event_camera_time ON event(camera_id, nvr_time_us, id);
 CREATE INDEX event_time ON event(nvr_time_us, id);
 CREATE INDEX event_retained_time ON event(nvr_time_us, id)
@@ -238,19 +262,28 @@ CREATE INDEX event_retain_until ON event(retain_until_us, id)
 CREATE INDEX event_active_camera_deadline_time
     ON event(camera_id, retain_until_us, nvr_time_us, id)
     WHERE retain_until_us IS NOT NULL;
-CREATE TABLE catalog_state (singleton INTEGER PRIMARY KEY, event_rows INTEGER NOT NULL,
-                            event_bytes INTEGER NOT NULL, pruned_events INTEGER NOT NULL);
-CREATE TABLE recording_root (path TEXT PRIMARY KEY, identity TEXT NOT NULL UNIQUE);
-CREATE TABLE recording_root_state (singleton INTEGER PRIMARY KEY,
-                                   pre_identity_catalog INTEGER NOT NULL);
+CREATE TABLE catalog_state (singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+                            event_rows INTEGER NOT NULL CHECK(event_rows >= 0),
+                            event_bytes INTEGER NOT NULL CHECK(event_bytes >= 0),
+                            pruned_events INTEGER NOT NULL CHECK(pruned_events >= 0));
+CREATE TRIGGER event_account_insert AFTER INSERT ON event ...;  -- adds the row's storage_bytes
+CREATE TRIGGER event_account_delete AFTER DELETE ON event ...;  -- subtracts them, counts a prune
+CREATE TABLE recording_root (path TEXT PRIMARY KEY,
+                             identity TEXT NOT NULL UNIQUE CHECK(length(identity) = 32));
+CREATE TABLE recording_root_state (singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+                                   pre_identity_catalog INTEGER NOT NULL
+                                       CHECK(pre_identity_catalog IN (0, 1)));
 CREATE TABLE schema_version (version INTEGER NOT NULL);
 ```
 
-Schema version 9 includes transactional triggers that maintain `catalog_state` on event insert
+Schema version 10 includes transactional triggers that maintain `catalog_state` on event insert
 and delete. Migrations add event retention in v2, durable deletion intent in v3, a separate
 `kind_other` payload in v4, root/global ordering indexes in v5, and event-capacity accounting
 in v6, followed by the partial camera-horizon index in v7 and explicit tie-key plus retention
-access paths in v8, then the durable recording-root identity registry in v9. Open reads the
+access paths in v8, then the durable recording-root identity registry in v9, then sample
+entries unique by CRC-32C and bytes together in v10 (a rebuild that keeps every id, with the
+foreign keys checked before it commits), so colliding CRCs keep separate rows and the unknown
+placeholder never merges with a real entry. Open reads the
 exact single version and validates the persisted
 `segment.sealed` and `segment.deleting` domains before persistent pragmas or writes; it rejects
 a higher version. Row decoding checks ids, enum spellings, booleans, integer conversions, and
@@ -263,28 +296,35 @@ open/seal transitions. Events reject under overload, same-path progress may coal
 the unqueried tail, lifecycle eviction cannot cross a query, and queries return a bounded
 overload error. Exhausting the lifecycle reserve requires startup filesystem reconciliation.
 Explicit shutdown or dropping the final handle closes admission, drains only this bounded
-tail, and joins the thread. Every write transaction begins `IMMEDIATE`: a deferred
-transaction that reads first cannot wait for another connection's write lock (SQLite skips
-the busy handler when a reader upgrades), so a second writer such as an operator shell, a
-checkpoint, or a backup would fail the batch at once; with `IMMEDIATE` the 5 s busy timeout
-covers lock acquisition. Alternatives (redb, fjall, sled) lose `sqlite3` inspection and
-ad-hoc queries.
+tail, and joins the thread. A drop or eviction latches an overload that refuses queries until
+the outstanding work falls below half the ordinary bound; notifications are admitted
+throughout. Every write runs in a transaction that begins `IMMEDIATE`: a deferred transaction
+that reads first cannot wait for another connection's write lock (SQLite skips the busy
+handler when a reader upgrades), so a second writer such as an operator shell, a checkpoint,
+or a backup would fail the batch at once; with `IMMEDIATE` the 5 s busy timeout covers lock
+acquisition. Deletion intent and recording-root registration commit under a scoped
+`synchronous = FULL`. Open confirms that SQLite entered WAL mode and fails otherwise, since
+the durability statements above hold only there. Path columns hold text, and a path that is
+not UTF-8 is refused rather than converted lossily. Alternatives (redb, fjall, sled) lose
+`sqlite3` inspection and ad-hoc queries.
 
 Range listings return the segments of one stream overlapping `[from, to)`. A sealed row covers
 its recorded interval. An unsealed row is listed only once it has a durable fragment, and it
-extends to the earlier of now and 30 s (`OPEN_SEGMENT_GRACE`: two default sync intervals, one
-default fragment, and margin) past its last durable progress. An open file whose writer stopped
-reporting, after a camera outage, an abandoned file, or a row recovery could not reach,
-therefore drops out of later windows; every listed row keeps its recorded `wall_end`.
+extends to the earlier of now and the open-segment grace past its last durable progress. The
+grace defaults to 30 s (`OPEN_SEGMENT_GRACE`: two default sync intervals, one default fragment
+at its cap plus a quarter, and margin); the daemon passes `2 × sync_interval_ms +
+1.25 × max_fragment_ms + 10 s`, never less than the default, so a healthy open file with a
+long sync interval never leaves the listings between two syncs. An open file whose writer
+stopped reporting, after a camera outage, an abandoned file, or a row recovery could not
+reach, therefore drops out of later windows; every listed row keeps its recorded `wall_end`.
 
 Event listing uses separate camera/global indexed statements and an exclusive
 `(nvr_time_us, id)` cursor. A call materializes at most 10,000 rows and 8 MiB of aggregate
 approximate owned-row bytes, including fixed row storage plus camera, kind, and payload
-strings. Equal-time continuation merges same-time/id and later-time index seeks. Retention
-reads payload-free protection pages of at most 512 rows, ordered and continued by
-`(retain_until_us, id)` with the same split seek while projecting receipt time for overlap
-checks. Event
-data is capped at 64 KiB and unmapped vendor kind codes at 1 KiB, both on UTF-8 boundaries.
+strings. Equal-time continuation merges same-time/id and later-time index seeks. Event protection
+is applied in SQL by the retention candidate pages and the deletion mark (§8); no query projects
+the active marks. Event data is capped at 64 KiB and unmapped vendor kind codes at 1 KiB, both on
+UTF-8 boundaries.
 Incremental maintenance spends at most 1,000 row-work units per transaction, carries progress
 across inactive pages that delete nothing, and applies the recording-horizon, 90-day age,
 two-million-row, or 512 MiB logical-string limits. Active marks remain
@@ -319,7 +359,9 @@ Units: wall time in microseconds since the Unix epoch (NVR `CLOCK_REALTIME`); me
 
 1. **The NVR clock is the authority** for search, retention, and `prft`. cam1 proves why: its
    ONVIF UTC is off by one hour while its RTCP NTP time is right; other cameras do the
-   opposite. Camera clocks are recorded (`run.sr_ntp_minus_wall_us`) but never trusted.
+   opposite. Camera clocks are observed (each RTCP sender report's NTP time minus its receipt
+   wall time, reported as the `stream` line's `cam_offset_ms` and the camera detail's
+   `camera_offset_ms`) but never stored or trusted.
 2. **Run anchoring**: after a fragment's frame durations are final, its anchor candidate is
    `min over frames (receipt_wall − cumulative_media_time_at_frame)`. A lower candidate is
    adopted immediately; upward movement is limited to 500 ppm of finalized media elapsed
@@ -334,7 +376,8 @@ Units: wall time in microseconds since the Unix epoch (NVR `CLOCK_REALTIME`); me
    the pending fragment and ends the RTSP session; reconnect anchors a separate run at a sync
    frame.
 3. **Frame durations come from a CFR regulariser**, not from raw RTP deltas, because cam1
-   stamps frames at 10 ms resolution with 4 % duplicates and 90–100 ms bunches (01 §5):
+   stamps frames at 10 ms resolution with 6 % duplicates over 15 minutes and 90–100 ms bunches
+   (01 §5):
    - nominal duration = declared rate (SDP `a=framerate`, SPS VUI) until a measured estimate
      over ≥ 16 fragments and ≥ 480 frames exists; the delivered rate replaces the declared
      one while the typical (median) fragment runs more than 1 % off it, which is what a
@@ -348,24 +391,33 @@ Units: wall time in microseconds since the Unix epoch (NVR `CLOCK_REALTIME`); me
      one frame in 170, in bursts of more than one per GOP); each hole is rendered as a
      frame-long hold on the fragment's last sample, which is what the viewer saw and keeps
      the assigned timeline locked no matter the drop rate;
-   - the residual (IDR timestamp steps of 10–40 ms, sub-frame jitter) is corrected by at most
-     1 % of the fragment per fragment, spread as ±1-tick deltas: a slow lock that absorbs a
-     30 ms step within the next two seconds without a visible rate change;
+   - a lead of the camera timeline over the assigned one of 0.6 frame or more is read as
+     dropped frames and rendered as whole-frame holds (above); the residual (IDR timestamp
+     steps of 10–40 ms, sub-frame jitter, backward steps) is corrected by at most 1 % of the
+     fragment per fragment, spread evenly over its frames (±30 ticks each on a 60-frame
+     fragment): a slow lock that absorbs a 30 ms step within two fragments without a visible
+     rate change;
    - a declared rate is also replaced when more than 5 % of camera time would be holds (a
      camera declaring 30 fps and delivering 20); the two rules together mean a hold never
-     recurs at every GOP boundary, which would stutter on playback;
-   - if the camera timeline falls behind the assigned one by more than `tolerance` (default
-     500 ms, a backwards step), durations snap to the camera's span and the estimate resets;
-     any jump > `max_jump_secs` (10 s) ends the session and starts a separate run;
+     recurs at every GOP boundary, which would stutter on playback; a fragment whose average
+     frame span deviates more than 20 % from the nominal is left out of the estimate;
+   - when the error that remains after holds and the correction exceeds the tolerance
+     (500 ms) in either direction, the fragment snaps: a camera that paused gets the span as
+     a hold on its last frame, one that ran ahead has the shorter span spread over its
+     frames, and a backwards step keeps nominal durations and takes the camera's new
+     position as the reference. A snap resets the error; three consecutive snaps also
+     restart the rate estimate. Any jump > `max_jump` (10 s) ends the session and starts a
+     separate run;
    - `timestamp_mode = "passthrough"` keeps raw RTP deltas for cameras with trustworthy clocks
      or for diagnostics. The raw RTP timestamp of each fragment's first sample is kept in the
-     sidecar in both modes, so the camera's timeline is never lost.
+     sidecar in both modes (never in the media), so the camera's timeline survives as long
+     as the sidecar does; a sidecar rebuilt from a scan carries zero (§5).
 4. **Discontinuities**: reconnect; RTP jump; writer-queue rejection; or
    `|wall − (prev_wall + media_delta)| > 2 s` (NVR clock step, detected by watching
    `CLOCK_REALTIME − CLOCK_MONOTONIC`; camera reboot) → seal the file, separate run,
    `EXT-X-DISCONTINUITY` in playlists. Moonfire lists NVR clock steps as unhandled; RTC-less
    SBCs make this common.
-5. **Audio extension**: audio is outside the 0.1 alpha format. Any later implementation must
+5. **Audio extension**: audio is outside the 0.1 alpha format. An audio implementation must
    define receipt-based alignment and may use RTCP SR pairs diagnostically; it must not stretch
    audio timestamps to hide clock disagreement.
 6. Leap seconds are assumed smeared by the NVR's NTP configuration (chrony default).
@@ -374,8 +426,10 @@ Units: wall time in microseconds since the Unix epoch (NVR `CLOCK_REALTIME`); me
 
 - **One blocking writer thread per configured root** (`std::thread`), fed by a bounded channel of
   completed fragments (`Vec<Bytes>` per fragment, no copies: the same buffers feed the live
-  ring and the socket read path). It writes each fragment with one `pwritev` (prft + moof
-  header, the sample iovecs, trailer), appends the sidecar record, and tracks dirty files.
+  ring and the socket read path). It writes each fragment with one vectored write (prft + moof
+  header, the sample iovecs, trailer; a `pwritev` takes at most 1,024 slices, so a fragment of
+  more than 1,022 samples continues in further calls), appends the sidecar record, and tracks
+  dirty files.
   Size, age, and fragment-count rotation waits for the next fragment that starts with a sync
   sample; only a fragment that needs a fresh file without one (no file open, a new run, a
   parameter-set change, an open file holding 131,072 fragments) is dropped and counted,
@@ -384,9 +438,9 @@ Units: wall time in microseconds since the Unix epoch (NVR `CLOCK_REALTIME`); me
   carry-less-multiply implementation (`iris_mp4::crc`); the table-driven one cost more than
   the RTSP depacketizer (12 §5).
   It records write and `fdatasync` latency histograms, queue depth and queued bytes with
-  their peaks, and warns about any write or sync over 1 s. On a shared HDD a single
-  `fdatasync` has been measured at 1.2 s while another writer saturated the disk; the queue
-  absorbs such stalls, and the peak queued bytes field shows their size.
+  their peaks, and warns about any write or sync over 1 s. On the soak's HDD single syncs took
+  up to 6.1 s (`11-multi-camera-results.md`, second soak window); the queue absorbs such
+  stalls, and the peak queued bytes field shows their size.
 - **Preallocation**: `fallocate(FALLOC_FL_KEEP_SIZE)` 256 MiB ahead when < 64 MiB remain;
   `ftruncate` to the real length at seal. On ext4/XFS this creates unwritten extents whose
   conversion costs some journal I/O (a 2026 ext4 series measured ≈ 25 % write-path gain from
@@ -394,8 +448,9 @@ Units: wall time in microseconds since the Unix epoch (NVR `CLOCK_REALTIME`); me
 - **Sync cadence**: `fdatasync` every open data and sidecar file every `sync_interval`
   (default 5 s), staggered across streams (each stream at its own sixteenth of the
   interval, in order of first appearance, kept across rotations); then one catalog
-  transaction. Power-loss window
-  ≤ one fragment (2 s) + 5 s; daemon-crash window ≤ one fragment (the page cache survives).
+  transaction. A daemon crash loses the fragment under construction (at most 1.25 ×
+  `max_fragment_ms`, 2.5 s at the default) and any fragments still queued for the writer; the
+  page cache survives. A power loss adds up to one `sync_interval` (5 s).
   `sync_file_range` is not used (it does not flush disk caches).
 - **Page cache**: writes and reads use the ordinary buffered path. `O_DIRECT` is rejected:
   alignment rules, no `O_SYNC` guarantee, and it fights buffered reads of the same file.
@@ -403,7 +458,8 @@ Units: wall time in microseconds since the Unix epoch (NVR `CLOCK_REALTIME`); me
   `extsize=256m` on the video root. Both are adequate; decide after the soak test in 08. No
   disk spin-down: continuous recording makes it pointless and load/unload cycles are finite.
 - **Backpressure**: each root's queue holds at most `max_queued_fragments` (default 32)
-  times the number of configured streams, in complete fragments.
+  times the configured streams plus two per camera the API may add (`provisioning.max_cameras`
+  when provisioning is enabled), in complete fragments.
   If the disk stalls, the stream task keeps reading the socket (so the camera does not drop
   the session), discards complete fragments beyond the cap, and records a gap. The first
   rejected fragment in a consecutive loss epoch ends recording continuity. If the assembler
@@ -414,11 +470,11 @@ Units: wall time in microseconds since the Unix epoch (NVR `CLOCK_REALTIME`); me
   A loss inside an ordered forwarding edge follows the same rule: the edge remembers the
   affected stream, drops dependent fragments, and marks the first sync fragment it can
   successfully forward as a new run.
-- **Retention**: when free space on a video root drops below `min_free`, when the catalogued
+- **Retention**: when free space on a video root drops below `min_free_percent`, when the catalogued
   recordings exceed an optional size quota (`quota_gib`, for a disk shared with other data),
   or when a per-camera age limit passes, delete the oldest sealed segments across streams in
   wall order, skipping segments overlapped by events whose `retain_until_us` is later than
-  the pass time (the event's time widened by 30 s on each side, `RETAIN_MARGIN_US` in `irisd`;
+  the pass time (the event's time widened by 30 s on each side, `RETAIN_MARGIN` in `irisd`;
   `POST /api/events/{id}/retain` sets or clears the time). Retention pins overlapping segment
   rows; it does not create clip copies. Deletion of a 1 GiB file is a handful of
   extent frees; FIFO churn in multi-GB units keeps fragmentation bounded (verify with
@@ -429,10 +485,13 @@ Units: wall time in microseconds since the Unix epoch (NVR `CLOCK_REALTIME`); me
   Pages order and continue by `(wall_start_us, segment id)` so tied timestamps cannot hide
   later candidates. A pass stops at 512 deletion attempts, 64 candidate pages, 1,024 scanned
   raw candidate rows, or one
-  second. Its payload-free protection projection is separately bounded to 2,048 rows and
-  100 ms and continues by `(retain_until_us, event id)`; it is an optimization rather than the
-  deletion authority. The first root rotates between passes so sustained pressure on one root
-  cannot starve another. Exact-root, global-quota, and per-stream age cursors survive pass
+  second. The candidate SQL and the atomic mark are the only protection checks; the daemon keeps
+  no projection of retained events. A root whose free-space probe fails is skipped for the
+  pass: no row beneath it is marked, the other roots' free-space, quota, and age steps run, and
+  the pass counts the root (`roots_unavailable`); rows of roots that were not admitted are left
+  alone and counted in one warning. The first root rotates between passes so sustained pressure
+  on one root cannot starve another. Exact-root, global-quota, and per-stream age cursors survive
+  pass
   budgets. They retain only the last handled candidate when a budget interrupts a page and
   adopt the raw page end only after every returned candidate is handled; an empty filtered page
   is therefore complete. Satisfied free-space and quota policies reset their cursors, while age
@@ -452,7 +511,8 @@ Units: wall time in microseconds since the Unix epoch (NVR `CLOCK_REALTIME`); me
   without a restart and cannot push the quota onto newer footage. Rows on unavailable roots
   wait for startup.
 - **Disk full / I/O error**: stop writing that root, keep recording to others if configured,
-  raise an alert event, keep the camera sessions alive.
+  log a warning naming the root and count the failure in the `writer` line's `write_errors`,
+  keep the camera sessions alive.
   One bounded writer queue and worker per configured root form an ordered fallback
   chain with shared statistics. Space is checked through a freshly identity-verified root
   descriptor before every fragment and cached for one second; the identity check remains active
@@ -479,47 +539,48 @@ The scanner publishes a nonzero initialization length only after accepting compl
 and `moov` boxes. Recovery rejects missing, wrong or incomplete initialization without
 changing media or sidecar bytes; a complete init remains a valid prefix before a torn fragment.
 
-At startup, for every `segment` with `state = writing` under an available configured root:
-CRC-scan every complete fragment from the initialization, parsing `prft/moof/mdat/free` headers;
-stop at the first invalid or zero-filled region; `ftruncate` there even when it equals the current
-logical length, releasing any `KEEP_SIZE` reservation; seal. A bounded sidecar may preserve only
-flags and raw-RTP metadata for authoritative media records at matching offsets; its prefix,
-timing, and length facts never authorize publication or catalog sealing. The media records
-neither the run id nor the sample-entry hash, so recovery preserves both in the rebuilt header:
-each comes from the prior sidecar header when that header decodes and holds a nonzero value,
-else from the catalog row (`run_seq` and the row's sample-entry hash), else stays zero, which
-readers treat as unknown. A recovered file therefore stays bound to its catalog row and
-servable. The sidecar is opened through the pinned directory descriptor without following a
-link or blocking; a missing, symlinked, unreadable, or special sidecar counts as absent and is
-replaced by the rebuilt regular file, while a sidecar that is the media inode itself is
-rejected. A file holding more than 131,072 complete fragments is refused without changing its
-media or sidecar; every scan stops after that many fragments, which bounds its memory. Files on
-disk that the catalog does not know (catalog lost or restored from
-backup) are adopted from their sidecar index when it describes the file exactly (records
-contiguous from the init segment to the end of the file, a trailer at the end that matches
-the last record), which reads kilobytes per file; a file without such an index, or whose
-sidecar cannot be opened as a regular file, is adopted
-by the same scan: the path encodes camera/stream/start time, the `moov` carries the sample
-entry, each `prft` carries wall time. A file beyond the fragment limit is skipped with a
-warning. Full re-index of a multi-terabyte disk reads only box
-headers (≈ 1,800 fragments per file), not payload, and the daemon reports progress to
-systemd and extends its start timeout while it runs.
-Recovery first builds and syncs an exclusive temporary index, atomically replaces the sidecar,
-and syncs its directory before truncating and syncing the valid media prefix. Publication
-failure therefore leaves media untouched, while the published cache describes only a verified
-prefix and remains safe if a crash occurs before media truncation. The catalog marks the file
-sealed only after the media sync succeeds. Complete
-fragments found in the page cache after a process crash still need that media sync.
-Rows on unavailable roots or behind filesystem lookup errors remain for a later startup.
-Only confirmed absence under an available root permits deleting a missing file's row.
-Confirmed absence is a missing media name or layout directory beneath the reopened and
-verified root, whatever the row's fragment count; a missing or replaced root is not absence.
-Such a row enters durable deletion intent, any orphan sidecar is removed, the row is deleted,
-and a warning counts the fragments lost. Pair removal treats a missing layout directory as
-both members absent and syncs the deepest ancestor that exists.
-Before writing recovery, startup finishes every durable deleting row under an available root;
-rows on unavailable roots or behind a filesystem error remain for a later start, and while
-the daemon runs each retention pass retries a bounded page of them (§8).
+At startup, for every `segment` with `state = writing` under an available configured root: CRC-scan
+every complete fragment from the initialization, parsing `prft/moof/mdat/free` headers; stop at the
+first invalid or zero-filled region; `ftruncate` there even when it equals the current logical
+length, releasing any `KEEP_SIZE` reservation; seal. A bounded sidecar may preserve only flags and
+raw-RTP metadata for authoritative media records at matching offsets; its prefix, timing, and length
+facts never authorize publication or catalog sealing. The media records neither the run id nor the
+sample-entry hash, so recovery preserves both in the rebuilt header: each comes from the prior
+sidecar header when that header decodes and holds a nonzero value, else from the catalog row
+(`run_seq` and the row's sample-entry hash), else stays zero, which readers treat as unknown. A
+recovered file therefore stays bound to its catalog row and servable. The sidecar is opened through
+the pinned directory descriptor without following a link or blocking; a missing, symlinked, or
+special sidecar counts as absent and is replaced by the rebuilt regular file, a sidecar that cannot
+be read for lack of a process resource fails recovery so the row is retried at a later start, any
+other read failure is logged and counts as absent, and a sidecar that is the media inode itself is
+rejected. A file holding more than 131,072 complete fragments is refused without changing its media
+or sidecar; every scan stops after that many fragments, which bounds its memory. Files on disk that
+the catalog does not know (catalog lost or restored from backup) are adopted from one header scan of
+the media; a sidecar bound to that scan (records contiguous from the init segment to the end of the
+file, a trailer at the end that matches the last record) supplies the same facts, and a sidecar that
+disagrees or cannot be opened as a regular file is reported and ignored. The path supplies the
+camera and stream, each `prft` supplies wall time (zero when the file has none), and the sample
+entry stays unknown, so exports compare initialization bytes (§10). A file beyond the fragment
+limit is skipped with a warning, and so is a directory the walk cannot read, whose files wait for a
+later start. Full re-index of a multi-terabyte disk reads only box headers (≈ 1,800 fragments per
+file), not payload, and the daemon reports progress to systemd on one heartbeat whose cadence holds
+across every await, extending its start timeout while it runs. Recovery first builds and syncs an
+exclusive temporary index, atomically replaces the sidecar, and syncs its directory before
+truncating and `fsync`ing the valid media prefix. A crash between creating that temporary
+(`.<sidecar>.irisd-recover-<pid>-<n>.tmp`) and the rename leaves it in the directory; nothing
+removes it. Publication failure therefore leaves media untouched, while the published cache
+describes only a verified prefix and remains safe if a crash occurs before media truncation. The
+catalog marks the file sealed only after the media sync succeeds. Complete fragments found in the
+page cache after a process crash still need that media sync. Rows on unavailable roots or behind
+filesystem lookup errors remain for a later startup. Only confirmed absence under an available root
+permits deleting a missing file's row. Confirmed absence is a missing media name or layout directory
+beneath the reopened and verified root, whatever the row's fragment count; a missing or replaced
+root is not absence. Such a row enters durable deletion intent, any orphan sidecar is removed, the
+row is deleted, and a warning counts the fragments lost. Pair removal treats a missing layout
+directory as both members absent and syncs the deepest ancestor that exists. Before writing
+recovery, startup finishes every durable deleting row under an available root; rows on unavailable
+roots or behind a filesystem error remain for a later start, and while the daemon runs each
+retention pass retries a bounded page of them (§8).
 
 A rotating self-check guards against silent corruption after the fact: once per cycle
 (default 24 h) divided by the stream count, the daemon scans the newest sealed file of the
@@ -533,10 +594,13 @@ seconds, when read for diagnostics or from `prft`.
 
 ## 10. Serving from the format
 
-- **HLS VOD / timeline**: `EXT-X-MAP:URI="…/segment/<id>",BYTERANGE="<init_len>@0"`, media
-  segments `#EXT-X-BYTERANGE:<len>@<offset>` covering 1–3 fragments (2–6 s; Apple recommends 6 s
-  target duration), `EXT-X-INDEPENDENT-SEGMENTS`, `EXT-X-DISCONTINUITY` at run boundaries and
-  a new `EXT-X-MAP` at sample-entry changes. Segments spanning several fragments include the
+- **HLS VOD / timeline**: one `EXT-X-MAP:URI="/api/segments/<id>/file.mp4",BYTERANGE="<init_len>@0"`
+  per file, media segments `#EXT-X-BYTERANGE:<len>@<offset>` that start at a sync fragment and
+  run until the first sync fragment after their third fragment (continuation fragments always
+  join the open segment: about 6 s at a 2 s GOP, one whole GOP at longer ones; Apple recommends
+  a 6 s target duration), `EXT-X-INDEPENDENT-SEGMENTS`, and `EXT-X-DISCONTINUITY` at run
+  boundaries, after a skipped row, and where the sample entry changes. Segments spanning several
+  fragments include the
   24-byte trailers; ISO BMFF permits `free` boxes between fragments, but AVFoundation must be
   tested (open question).
   A range beginning inside a non-sync continuation includes all preceding fragments
@@ -561,20 +625,33 @@ seconds, when read for diagnostics or from `prft`.
   Offline `--exclude-trailers` emits one range per fragment even for continuations, ending
   each range before its own trailer. Media playlists assert independent segments only if
   every emitted segment starts at sync; the offline master leaves this assertion to them.
-- **LL-HLS live**: parts (`EXT-X-PART`, default 0.5 s) are mini-fragments built from the
+- **LL-HLS live**: parts (`EXT-X-PART`, up to 0.5 s) are mini-fragments built from the
   in-RAM live ring, blocking playlist reload, `EXT-X-PRELOAD-HINT`. As built (`iris-api`'s
-  `llhls`): one feeder per requested stream keeps the frames of the last four GOPs; each GOP
-  is a media segment numbered when its sync frame arrives, cut into parts of a fixed frame
-  count (the part target over the frame duration) so a part never changes once listed;
-  segments and parts are served from memory as runs of single-sample fragments (the
-  WebSocket feed's encoding), the init segment from the sample entry, and a feeder idle
-  for 30 s stops. Full segments are therefore served from memory too, not from the file on
-  disk: about four GOPs per watched stream, nothing for streams nobody watches.
-  Non-increasing decode timestamps, codec resets, and ring lag start a discontinuity
-  epoch. Dependent frames are discarded until sync, and the playlist carries both
-  `EXT-X-DISCONTINUITY` and the sliding window's `EXT-X-DISCONTINUITY-SEQUENCE`.
-- **WebSocket live**: init segment, then one `moof+mdat` per frame (≈ 100 B overhead) from the
-  live ring; the lowest-latency path for iOS and the GUI.
+  `llhls`, after `docs/standards/ietf/draft-pantos-hls-rfc8216bis-22.txt`): one feeder per
+  requested stream starts from the frames since the ring's last sync frame, so its first
+  segment completes within one GOP, and keeps complete GOPs until the complete GOPs after
+  them cover three target durations (§6.2.2), at most 12; each GOP is a media segment
+  numbered when its sync frame arrives, cut into parts of a frame count pinned from the first
+  frame's duration (the whole frames that fit 0.5 s, at least one), so a part never changes
+  once listed and every non-final part lasts the declared `PART-TARGET` (§4.4.4.9).
+  `EXT-X-TARGETDURATION` is pinned when the first GOP completes, its length rounded up to
+  whole seconds plus one second of headroom and at most the 10 s GOP budget, and never changes
+  (§6.2.1); a GOP that would outlast it, or exceed 16 MiB or 600 frames, is cut where it is
+  with a discontinuity, so cameras whose GOP length varies by more than a second get cut
+  segments. Segments and parts are served from memory as runs of single-sample fragments (the
+  WebSocket feed's encoding), the init segment from the sample entry, and a feeder idle for
+  30 s stops. Full segments are therefore served from memory too, not from the file on disk:
+  about five GOPs per watched stream at a 2 s GOP, nothing for streams nobody watches. A
+  blocking reload waits three target durations (12 s before the first segment completes) and
+  then answers 503; a directive more than two segments, or three seconds of parts, ahead is
+  400 (§6.2.5.2). Non-increasing decode timestamps, ring lag, and budget breaches end the open
+  segment where it is and start a discontinuity epoch; a new sample entry starts the window
+  over. Dependent frames are discarded until sync, and the playlist carries
+  `EXT-X-DISCONTINUITY`, `EXT-X-PROGRAM-DATE-TIME` after it, and the sliding window's
+  `EXT-X-DISCONTINUITY-SEQUENCE`; its version is 6.
+- **WebSocket live**: init segment, then one single-sample `prft+moof+mdat`+trailer fragment
+  per frame (≈ 170 B overhead) from the live ring; a sample-entry change sends a fresh init
+  segment in-band. It is the lowest-latency path for iOS and the GUI.
 - **Export as served**: `iris-api`'s export streams the init segment followed by the whole
   fragments of the requested range, rewritten into a stand-alone recording: the init
   segment gains an `edts`/`elst` (version 1, one entry) whose media time skips the frames
@@ -603,20 +680,21 @@ seconds, when read for diagnostics or from `prft`.
 - **Keyframe / thumbnail**: `GET …/keyframe?t=` returns init + one single-sample fragment
   (sub stream by default, ≈ 20–40 KB) for client-side hardware decode; the daemon never decodes.
   The source fragment's trailer CRC and parsed timing/sample/sync facts must match its sidecar
-  record. Search never admits a sync fragment before the two-minute lower bound. An
-  unrepresentable lookback or exclusive end is rejected with HTTP 400. An implicit newest lookup
-  is mutable and uses `private, no-store`; an explicit historical time may cache privately.
+  record. Search never admits a sync fragment before the two-minute lower bound, so a GOP longer
+  than that answers 404. An unrepresentable lookback or exclusive end is rejected with HTTP 400.
+  An implicit newest lookup, or an explicit time within 30 s of the present, is mutable and uses
+  `private, no-store`; an explicit historical time may cache privately for an hour.
 
 ## 11. Budgets (per 4K stream unless noted)
 
 | Item | Budget |
 |---|---|
-| RAM | hard references per stream: fragment under construction ≤ 64 MiB / 4,096 frames; live fast-start cache ≤ 64 MiB / 600 frames; live subscriber fan-out ≤ 64 MiB / configured frame capacity; these owners share `Bytes` when their windows overlap; sidecar of open file ≈ 72 KB |
+| RAM | hard references per stream: fragment under construction ≤ 64 MiB / 4,096 frames; live fast-start cache ≤ 64 MiB / 600 frames; live subscriber fan-out ≤ 64 MiB / configured frame capacity; LL-HLS feeder of a watched stream ≤ 12 complete GOPs of ≤ 16 MiB / 600 frames / the pinned target each (about five GOPs, 15 to 30 MiB, at a 2 s 4K GOP), plus one encoded GOP per bounded-class response in flight; these owners share `Bytes` when their windows overlap; sidecar of open file ≈ 72 KB |
 | API disk serving | ≤ 4,096 catalog rows; ≤ 131,072 records per sidecar (about 5 MiB), a bound the writer guarantees by rotating at 126,976 fragments and never appending past 131,072; ≤ 100,000 selected records; ≤ 16 MiB rendered playlist; ≤ 4 MiB init; ≤ 66 MiB stored fragment; media responses in two process-wide classes, 8 streaming (whole or open-ended files, ranges above 1 MiB, exports) and 32 bounded (VOD playlists, keyframes, the memory-served LL-HLS resources, ranges of at most 1 MiB) by default, a full class answering 503 with `Retry-After: 1`, with admission held through detached work and final response-buffer/body drop or until a client that stops reading hits the 30 s write-stall deadline; raw body reads reserve a capacity-one slot before I/O and emitted chunks share admission; one export fragment materialized only after reserving its queue slot |
 | Disk writes | 1 `pwritev` per fragment (2 s); `fdatasync` every 5 s; container overhead 0.034 % |
 | Write amplification | bytes written / bytes received ≤ 1.01 (journal + sidecar + catalog) |
 | Files | 2 per stream-hour (plus daily directories) |
-| Crash loss | ≤ 2 s (daemon crash) · ≤ 7 s (power loss) |
+| Crash loss | ≤ 2.5 s plus the writer queue (daemon crash) · ≤ 7.5 s (power loss) |
 | Recovery | < 5 s for 12 open files |
 
 ## 12. Open questions and tests before freezing the format
@@ -626,4 +704,4 @@ seconds, when read for diagnostics or from `prft`.
 2. `prft` flag semantics per ISO/IEC 14496-12:2022 (irisd writes 0x18 like ffmpeg) and
    acceptance by ffprobe/AVFoundation.
 3. ext4 vs XFS multi-week soak at 12 streams: extent counts, unlink latency, journal writes.
-4. How long cam1 tolerates a stalled TCP reader (sizes `max_queue_bytes`).
+4. How long cam1 tolerates a stalled TCP reader (sizes `max_queued_fragments`).

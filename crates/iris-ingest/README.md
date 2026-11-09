@@ -5,7 +5,7 @@ H.265 access units as length-prefixed NAL units (the `hvc1` sample format, no de
 gives every frame a regularised duration, groups frames from one random access point to the
 next into fragments, and hands each fragment to a sink. In the record path (RTSP in → fMP4 on
 disk → byte-range serving) this crate is the "RTSP in" stage: it owns the camera sessions
-and the timing model, and it is the only place that talks to cameras.
+and the timing model, and it is the only place that opens RTSP sessions to cameras.
 
 ## What it provides
 
@@ -15,12 +15,20 @@ and the timing model, and it is the only place that talks to cameras.
   the credentials passed separately.
 - `IngestOptions` — the policy: fragment cap, timestamp mode, inactivity and jump limits,
   user agent, the live ring, the socket read interval, the shared read ticker, and the
-  receive low-water mark.
+  receive low-water mark. `Default` is the packet-driven policy without a low-water mark;
+  the daemon fills the read policy from `[ingest]`.
+- `ReadTicker` — the read clock every timer-driven session shares; the daemon spawns one per
+  runtime and passes it in `IngestOptions::ticker`.
 - `FragmentSink` and `SinkError` — where finished fragments go; the daemon's sink is the
-  store's writer queue, which rejects instead of blocking.
-- `StreamStats` — lock-free counters the daemon reads once a minute for its `stream` line:
-  frames, bytes, fragments, reconnects, snaps, holds, loss markers, the measured nominal,
+  store's writer queue, which rejects instead of blocking. `deliver_fragment` is the
+  delivery and accounting seam `run_stream` uses, public for the daemon's sink tests.
+- `StreamStats` — atomic counters the daemon reads once a minute for its `stream` line
+  (the codec description sits behind a mutex held only to copy a short string): frames,
+  access-unit bytes, fragments, reconnects, snaps, holds, loss markers, the nominal in use,
   the timeline error, fragment peaks, RTCP sender reports and the camera clock offset, gaps.
+- `background_teardowns` and `MAX_BACKGROUND_TEARDOWNS` — the running background `TEARDOWN`
+  tasks and their bound, the daemon's `teardowns` gauge.
+- `Url` — the URL type of `StreamSource`, re-exported so callers need not depend on `url`.
 - `LiveRing`, `LiveSubscription`, `LiveFrame`, `LiveError` — fan-out of frames to live
   viewers without copying, with the init segment and the frames since the last sync frame
   for fast joins.
@@ -39,7 +47,9 @@ use iris_core::id::{CameraId, StreamKey, StreamKind};
 use iris_ingest::{FragmentSink, IngestOptions, StreamSource, StreamStats, run_stream};
 use tokio_util::sync::CancellationToken;
 
-// `sink` implements FragmentSink (the daemon forwards to the store's writer queue).
+// `sink` is an `Arc<dyn FragmentSink>` (the daemon's forwards to the store's writer queue).
+// `IngestOptions::default()` reads packet by packet; the daemon sets `read_interval`,
+// `ticker`, and `recv_low_water` from its `[ingest]` table.
 let source = StreamSource {
     key: StreamKey {
         camera: CameraId::try_new("cam1").expect("camera id"),
@@ -62,16 +72,15 @@ access units exactly once before reconnect or shutdown.
 
 ## Invariants and limits
 
-- **Timing.** The NVR clock is the authority; RTP timestamps give relative timing through
-  the regulariser, which assigns the nominal frame duration, corrects by at most 1 % per
-  fragment, renders camera-dropped frames as frame-long holds, re-times the stream to its delivered
-  rate after warm-up when the median fragment runs more than 1 % off the declared rate (or
-  holes exceed 5 % of camera time), and snaps to the camera timeline when the error exceeds the tolerance
-  (500 ms). A parameter-set epoch carrying a different valid frame rate starts a fresh
-  timing estimate at that rate while preserving decode-time continuity and cumulative
-  diagnostics; an unchanged, absent, or invalid rate preserves the estimator. Fixed by
-  `docs/research/04-storage-format.md §7` and `05-ingest-events.md §2`; the constants live
-  at the top of `src/regularize.rs`.
+- **Timing.** The NVR clock is the authority; RTP timestamps give relative timing through the
+  regulariser, which assigns the nominal frame duration, corrects by at most 1 % per fragment,
+  renders camera-dropped frames as frame-long holds, re-times the stream to its delivered rate after
+  warm-up when the median fragment runs more than 1 % off the declared rate (or holes exceed 5 % of
+  camera time), and snaps to the camera timeline when the error exceeds the tolerance (500 ms). A
+  parameter-set epoch carrying a different valid frame rate starts a fresh timing estimate at that
+  rate while preserving decode-time continuity and cumulative diagnostics; an unchanged, absent, or
+  invalid rate preserves the estimator. Fixed by `docs/research/04-storage-format.md §7` and
+  `05-ingest-events.md §2`; the constants live at the top of `src/regularize.rs`.
 - **Fragments.** A fragment opens at a sync frame and closes at the next sync frame, at a
   parameter-set change, or once camera time, receipt time, or nominal sample time exceeds
   the cap by a quarter (default cap 2 s). Each pending fragment is also bounded at 4,096
@@ -79,14 +88,15 @@ access units exactly once before reconnect or shutdown.
   The patched H.265 depacketizer independently limits both pinned payload and projected
   frame output to 64 MiB while an access unit is assembled; exceeding either limit ends
   the session with a controlled error before the frame allocation. The assembler retains
-  its 64 MiB check as defense in depth: an oversized frame closes retained frames with
-  nominal durations and is discarded. Recording resumes at the next sync frame in a
+  its 64 MiB check as defense in depth: an oversized frame closes the retained frames as a
+  fragment and is discarded. Recording resumes at the next sync frame in a
   separate run at decode time zero, leaving the discarded interval as a gap in wall time.
   The regulariser retains its rate estimate.
   Frames before the first sync frame are dropped. A discontinuity restarts the decode
   timeline at zero and starts a new run (`04 §7`, `05 §2`).
 - **Sessions.** TCP interleaved only; 15 s setup timeout on DESCRIBE, SETUP, and PLAY;
-  30 s inactivity timeout; `TEARDOWN` on every exit; RTSP control messages are limited to
+  a 30 s inactivity timeout that any RTSP item resets, RTCP sender reports included;
+  `TEARDOWN` on every exit; RTSP control messages are limited to
   1 MiB for head and body together; timestamp jumps over 10 s end the session; backoff 1 s
   doubling to 30 s with deterministic ±20 % jitter from stream identity and retry attempt,
   reset after a 60 s healthy session (`05 §1`). The patched retina bounds camera-supplied
@@ -96,8 +106,9 @@ access units exactly once before reconnect or shutdown.
   connection reached, never to a host the camera advertised, so credentials reach only the
   configured camera; a background `TEARDOWN` gives up after the session timeout or 60 s,
   whichever is shorter; at most 64 run in the process, and a session dropped beyond that is
-  not torn down (retina logs a warning) (`05 §1`).
-- **Camera text in logs.** A session error is logged through `LogSafe` (`src/session.rs`):
+  not torn down (retina logs a warning); the daemon's `process` line reports the running count as
+  `teardowns` (`05 §1`).
+- **Camera text in logs.** A session error is logged through `iris_core::text::LogSafe`:
   line breaks, other control characters, and non-ASCII are escaped and the text stops at
   512 characters, so a camera cannot split a journal entry, forge a priority prefix, or
   flood the log. Retina quotes camera text only as escaped excerpts of at most 512 bytes
@@ -136,7 +147,8 @@ access units exactly once before reconnect or shutdown.
 ## Tests and measurements
 
 - Unit tests in `src/regularize.rs` (jitter, drift, gaps, backwards timelines, wrong
-  declared rates, passthrough), `src/assembler.rs` (first-sync drop, cap splits,
+  declared rates, passthrough, and generated timelines checked for positive durations, a
+  bounded error, and exact snaps), `src/assembler.rs` (first-sync drop, cap splits,
   discontinuities, oversized-frame gaps, parameter-set changes, hold accounting),
   `src/session.rs` (declared-rate parsing, injected realtime steps, wall-clock mapping, the
   shared tick), `src/stats.rs`, and `src/live.rs`.
@@ -154,7 +166,9 @@ access units exactly once before reconnect or shutdown.
   (a task beside the session ticks with no gap over 500 ms, through the keepalive and the
   `TEARDOWN`) and that a `TEARDOWN` never contacts an advertised host (Basic, Digest, and a
   challenged `TEARDOWN`).
-- `tests/log_bounds.rs` installs the daemon's log subscriber and checks that hostile
+- `tests/log_bounds.rs` installs a log subscriber configured like the daemon's (`info`, no
+  target) with ANSI colours off, so the byte checks see only what a camera contributed, and
+  checks that hostile
   `DESCRIBE` answers (1 MiB of invalid SDP, 18,000 media sections, unusable sections beside
   the video) log only escaped lines of at most 1 KiB, one per ended session plus retina's
   one summary. `tests/teardown_bound.rs` drops 100 sessions against a camera that never

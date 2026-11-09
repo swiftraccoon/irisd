@@ -3,6 +3,7 @@
 use std::future::Future;
 use std::sync::Arc;
 
+use bytes::Bytes;
 use tokio::sync::OwnedSemaphorePermit;
 use tokio::task::{JoinError, JoinHandle};
 
@@ -39,6 +40,27 @@ where
         let _permit = permit;
         future.await
     })
+}
+
+/// Attaches the admission slot to response bytes. Clones of the returned
+/// `Bytes` share the same owner, so admission is not released until the
+/// transport has dropped the final response buffer.
+pub(crate) fn attach(bytes: Bytes, permit: &MediaPermit) -> Bytes {
+    Bytes::from_owner(AdmittedBytes {
+        bytes,
+        _permit: Arc::clone(permit),
+    })
+}
+
+struct AdmittedBytes {
+    bytes: Bytes,
+    _permit: MediaPermit,
+}
+
+impl AsRef<[u8]> for AdmittedBytes {
+    fn as_ref(&self) -> &[u8] {
+        &self.bytes
+    }
 }
 
 #[cfg(test)]

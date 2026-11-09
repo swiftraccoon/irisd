@@ -6,15 +6,23 @@ use std::time::Duration;
 use async_trait::async_trait;
 use diqwest::{DigestAuthSession, WithDigestAuth as _};
 use futures_util::StreamExt as _;
+use iris_core::config::is_valid_host;
 use iris_core::id::CameraId;
 use oxvif::transport::{Transport, TransportError};
 use tracing::debug;
 use url::Url;
 
 use crate::endpoint::CameraEndpoint;
+use crate::onvif::SessionError;
 
 /// Maximum accepted SOAP response body on every HTTP status.
 pub(crate) const MAX_SOAP_RESPONSE_LEN: usize = 1024 * 1024;
+/// Longest URL accepted from a camera: a service, subscription, snapshot, or
+/// stream URL (the bound retina applies to RTSP `Content-Base` and control
+/// URLs).
+pub const MAX_ADVERTISED_URL_LEN: usize = 2_048;
+/// Bound on one SOAP request, connection to the last response byte.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Keeps the upstream ONVIF request bound and digest authentication while
 /// applying the same certificate policy as the CGI feed.
@@ -27,14 +35,26 @@ pub(crate) struct SoapTransport {
 }
 
 impl SoapTransport {
-    pub(crate) fn new(endpoint: &CameraEndpoint) -> Result<Self, reqwest::Error> {
-        let origin = Url::parse(&endpoint.base_url())
-            .expect("CameraEndpoint::base_url always produces a valid HTTP(S) URL");
+    /// A transport for `endpoint`: its certificate policy, a 10 s bound on
+    /// every request, no redirects, no proxy, and HTTP digest authentication
+    /// with its credentials.
+    ///
+    /// # Errors
+    ///
+    /// [`SessionError::InvalidEndpoint`] when the host is not a bare host name
+    /// or address ([`is_valid_host`]), [`SessionError::HttpClient`] when the
+    /// HTTP client cannot be built.
+    pub(crate) fn new(endpoint: &CameraEndpoint) -> Result<Self, SessionError> {
+        if !is_valid_host(&endpoint.host) {
+            return Err(SessionError::InvalidEndpoint);
+        }
+        let origin = Url::parse(&endpoint.base_url()).map_err(|_| SessionError::InvalidEndpoint)?;
         Ok(Self {
             client: reqwest::Client::builder()
                 .danger_accept_invalid_certs(!endpoint.tls_verify)
-                .timeout(Duration::from_secs(10))
+                .timeout(REQUEST_TIMEOUT)
                 .redirect(reqwest::redirect::Policy::none())
+                .no_proxy()
                 .build()?,
             digest: DigestAuthSession::new(&endpoint.username, &endpoint.password),
             origin,
@@ -46,21 +66,30 @@ impl SoapTransport {
     /// Rebases a camera-advertised service URL onto the configured origin
     /// before WS-Security credentials are constructed for it.
     ///
-    /// Only `http` and `https` URLs without userinfo or a fragment are
-    /// accepted. Their path and query are kept; the scheme, host, and port are
-    /// always the configured ones. Cameras behind NAT or a port forward, or
-    /// configured by host name, advertise addresses the recorder cannot or
-    /// must not reach, and credentials only ever go to the operator's
-    /// authority; an HTTPS configuration is never downgraded. A rebase is
-    /// logged once per transport, at debug level, with the camera only.
+    /// Only `http` and `https` URLs without userinfo or a fragment, at most
+    /// [`MAX_ADVERTISED_URL_LEN`] bytes long, are accepted. Their path and
+    /// query are kept; the scheme, host, and port are always the configured
+    /// ones. Cameras behind NAT or a port forward, or configured by host name,
+    /// advertise addresses the recorder cannot or must not reach, and
+    /// credentials only ever go to the operator's authority; an HTTPS
+    /// configuration is never downgraded. A rebase is logged once per
+    /// transport, at debug level, with the camera only.
+    ///
+    /// # Errors
+    ///
+    /// [`TransportError::EndpointPolicy`] for a URL that is refused; the URL
+    /// itself is never part of the error.
     pub(crate) fn rebase_url(&self, candidate: &str) -> Result<Url, TransportError> {
-        let parsed = Url::parse(candidate).map_err(|_| endpoint_policy_error())?;
+        if candidate.len() > MAX_ADVERTISED_URL_LEN {
+            return Err(TransportError::EndpointPolicy);
+        }
+        let parsed = Url::parse(candidate).map_err(|_| TransportError::EndpointPolicy)?;
         if !matches!(parsed.scheme(), "http" | "https")
             || !parsed.username().is_empty()
             || parsed.password().is_some()
             || parsed.fragment().is_some()
         {
-            return Err(endpoint_policy_error());
+            return Err(TransportError::EndpointPolicy);
         }
         let mut rebased = self.origin.clone();
         rebased.set_path(parsed.path());
@@ -87,6 +116,29 @@ impl SoapTransport {
     }
 }
 
+/// Maps a digest-authentication failure of the HTTP layer to a transport
+/// error that names the step without any server text.
+fn authentication_error(error: diqwest::error::Error) -> TransportError {
+    use diqwest::error::Error;
+    match error {
+        Error::Reqwest(error) => TransportError::Http(error),
+        Error::DigestAuth(_) => TransportError::Authentication {
+            kind: "unsupported or malformed digest challenge",
+        },
+        Error::AuthHeaderMissing => TransportError::Authentication {
+            kind: "401 without a WWW-Authenticate header",
+        },
+        Error::ToStr(_) | Error::InvalidHeaderValue(_) => TransportError::Authentication {
+            kind: "challenge or answer is not a valid header value",
+        },
+        Error::RequestBuilderNotCloneable | Error::LockPoisoned | Error::MissingHost => {
+            TransportError::Authentication {
+                kind: "request could not be repeated with credentials",
+            }
+        }
+    }
+}
+
 #[async_trait]
 impl Transport for SoapTransport {
     async fn soap_post(
@@ -110,27 +162,24 @@ impl Transport for SoapTransport {
             .body(body)
             .send_digest_auth(&self.digest)
             .await
-            .map_err(|error| match error {
-                diqwest::error::Error::Reqwest(error) => TransportError::Http(error),
-                _ => TransportError::HttpStatus {
-                    status: 401,
-                    body: String::new(),
-                },
-            })?;
+            .map_err(authentication_error)?;
         let status = response.status().as_u16();
-        if response
+        let declared = response
             .content_length()
-            .is_some_and(|length| length > MAX_SOAP_RESPONSE_LEN as u64)
-        {
+            .map(|length| usize::try_from(length).unwrap_or(MAX_SOAP_RESPONSE_LEN + 1));
+        if declared.is_some_and(|length| length > MAX_SOAP_RESPONSE_LEN) {
             return Err(response_too_large_error());
         }
         let mut stream = response.bytes_stream();
-        let mut bytes = Vec::new();
+        // The buffer never holds more than the bound: it starts at the declared
+        // length and grows by exactly what arrives.
+        let mut bytes = Vec::with_capacity(declared.unwrap_or(0));
         while let Some(chunk) = stream.next().await {
             let chunk = chunk?;
             if chunk.len() > MAX_SOAP_RESPONSE_LEN.saturating_sub(bytes.len()) {
                 return Err(response_too_large_error());
             }
+            bytes.reserve_exact(chunk.len());
             bytes.extend_from_slice(&chunk);
         }
         let body = String::from_utf8(bytes).map_err(|_| TransportError::InvalidResponseEncoding)?;
@@ -143,10 +192,6 @@ impl Transport for SoapTransport {
             }),
         }
     }
-}
-
-fn endpoint_policy_error() -> TransportError {
-    TransportError::EndpointPolicy
 }
 
 fn response_too_large_error() -> TransportError {
@@ -319,12 +364,15 @@ mod tests {
                 .soap_post(&endpoint.base_url(), "urn:test", "<request/>".to_owned())
                 .await
                 .unwrap_err();
-            assert!(matches!(
-                error,
-                TransportError::ResponseTooLarge {
-                    limit: MAX_SOAP_RESPONSE_LEN
-                }
-            ));
+            assert!(
+                matches!(
+                    error,
+                    TransportError::ResponseTooLarge {
+                        limit: MAX_SOAP_RESPONSE_LEN
+                    }
+                ),
+                "{status}: {error:?}"
+            );
         }
     }
 
@@ -359,17 +407,20 @@ mod tests {
                 .soap_post(&endpoint.base_url(), "urn:test", "<request/>".to_owned())
                 .await
                 .unwrap_err();
-            assert!(matches!(
-                error,
-                TransportError::ResponseTooLarge {
-                    limit: MAX_SOAP_RESPONSE_LEN
-                }
-            ));
+            assert!(
+                matches!(
+                    error,
+                    TransportError::ResponseTooLarge {
+                        limit: MAX_SOAP_RESPONSE_LEN
+                    }
+                ),
+                "{status}: {error:?}"
+            );
         }
     }
 
     #[tokio::test]
-    async fn unexpected_status_body_and_invalid_encoding_stay_bounded() {
+    async fn an_unexpected_status_hides_the_camera_body() {
         let marker = "camera-controlled\nmultiline\rmarker";
         let endpoint = serve_once(
             418,
@@ -383,9 +434,12 @@ mod tests {
             .await
             .unwrap_err();
         let rendered = error.to_string();
-        assert!(!rendered.contains("camera-controlled"));
-        assert!(rendered.len() < 128);
+        assert!(!rendered.contains("camera-controlled"), "{rendered}");
+        assert!(rendered.len() < 128, "{rendered}");
+    }
 
+    #[tokio::test]
+    async fn an_invalid_encoding_is_reported_without_the_body() {
         let invalid = vec![0xff; MAX_SOAP_RESPONSE_LEN];
         let endpoint = serve_once(
             200,
@@ -398,8 +452,11 @@ mod tests {
             .soap_post(&endpoint.base_url(), "urn:test", "<request/>".to_owned())
             .await
             .unwrap_err();
-        assert!(matches!(error, TransportError::InvalidResponseEncoding));
-        assert!(error.to_string().len() < 128);
+        assert!(
+            matches!(error, TransportError::InvalidResponseEncoding),
+            "{error:?}"
+        );
+        assert!(error.to_string().len() < 128, "{error}");
     }
 
     #[tokio::test]
@@ -450,7 +507,10 @@ mod tests {
                 )
                 .await
                 .unwrap_err();
-            assert!(error.to_string().contains(&status.to_string()));
+            assert!(
+                error.to_string().contains(&status.to_string()),
+                "{status}: {error}"
+            );
             assert!(
                 tokio::time::timeout(Duration::from_millis(200), sink.accept())
                     .await
@@ -459,5 +519,56 @@ mod tests {
             );
             server.await.unwrap();
         }
+    }
+
+    #[test]
+    fn a_host_that_is_not_a_bare_name_or_address_is_refused() {
+        for host in ["cam host", "", "192.0.2.10:80", "[2001:db8::7]", "u@h"] {
+            let mut endpoint = endpoint_for("127.0.0.1:8080".parse().unwrap());
+            endpoint.host = host.to_owned();
+            assert!(
+                matches!(
+                    SoapTransport::new(&endpoint),
+                    Err(SessionError::InvalidEndpoint)
+                ),
+                "{host:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_overlong_advertised_url_is_rejected_before_parsing() {
+        let endpoint = endpoint_for("127.0.0.1:8080".parse().unwrap());
+        let transport = SoapTransport::new(&endpoint).unwrap();
+        let prefix = "http://127.0.0.1:8080/";
+        let exact = format!(
+            "{prefix}{}",
+            "p".repeat(MAX_ADVERTISED_URL_LEN - prefix.len())
+        );
+        assert!(transport.rebase_url(&exact).is_ok());
+        assert!(matches!(
+            transport.rebase_url(&format!("{exact}p")),
+            Err(TransportError::EndpointPolicy)
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_camera_offering_only_basic_authentication_is_reported_as_such() {
+        let endpoint = serve_once(
+            401,
+            "WWW-Authenticate: Basic realm=\"camera\"\r\nContent-Length: 0\r\n",
+            Vec::new(),
+        )
+        .await;
+        let error = SoapTransport::new(&endpoint)
+            .unwrap()
+            .soap_post(&endpoint.base_url(), "urn:test", "<request/>".to_owned())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, TransportError::Authentication { .. }),
+            "{error:?}"
+        );
+        assert!(!error.to_string().contains("camera"), "{error}");
     }
 }

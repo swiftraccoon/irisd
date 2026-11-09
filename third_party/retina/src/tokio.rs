@@ -21,7 +21,6 @@ use super::{ConnectionContext, ReceivedMessage, WallTime};
 /// Default initial capacity for the read ring buffer (64 KiB).
 const DEFAULT_READ_CAPACITY: usize = 64 * 1024;
 
-/// A RTSP connection which implements `Stream`, `Sink`, and `Unpin`.
 /// The socket behind a connection: registered with tokio's reactor, or
 /// detached from it for a caller that polls on its own schedule.
 enum Io {
@@ -32,7 +31,8 @@ enum Io {
     /// its own timer; a write keeps its unsent remainder for that next poll.
     /// Nothing wakes `epoll` for this socket any more, and nothing blocks.
     Detached(std::net::TcpStream),
-    /// Transient state while detaching; never observed by callers.
+    /// The socket was consumed by a mode change that failed (`into_std` or
+    /// `from_std`); every later operation fails.
     Detaching,
 }
 
@@ -47,10 +47,15 @@ impl Io {
     }
 }
 
+/// A RTSP connection which implements `Stream`, `Sink`, and `Unpin`.
 pub(crate) struct Connection {
     stream: Io,
     /// A detached socket's last read was short, so its queue is empty.
     drained: bool,
+    /// When the last read returned; every message decoded from the bytes it
+    /// delivered carries this time, so the clock is read once per read rather
+    /// than once per message.
+    read_stamp: ReadStamp,
     ctx: ConnectionContext,
     parser: crate::rtsp::parse::Parser,
     read_buf: MarkBuf,
@@ -75,6 +80,7 @@ impl Connection {
         Ok(Self {
             stream: Io::Reactor(stream),
             drained: false,
+            read_stamp: ReadStamp::now(),
             ctx: ConnectionContext {
                 local_addr,
                 peer_addr,
@@ -100,8 +106,10 @@ impl Connection {
     pub(crate) fn set_recv_low_water(&self, bytes: u32) -> std::io::Result<()> {
         let value =
             libc::c_int::try_from(bytes).map_err(|_| std::io::Error::other("value too large"))?;
-        // SAFETY: `fd` is a valid, open socket owned by `self.stream` for the
-        // duration of the call, and `value` outlives the call.
+        // SAFETY: `value` is a live `c_int` for the whole call and the length
+        // passed is its size. The descriptor is borrowed from `self.stream`
+        // (-1 after a failed mode change, which `setsockopt` rejects with
+        // `EBADF`).
         let rc = unsafe {
             libc::setsockopt(
                 self.stream.as_raw_fd(),
@@ -121,20 +129,14 @@ impl Connection {
     /// Takes the socket out of tokio's reactor. From then on reads and writes
     /// that would block return `Pending` without a waker and never wake
     /// `epoll`; the caller polls the connection on its own timer, and a flush
-    /// continues from its unsent remainder on each poll. Idempotent.
+    /// continues from its unsent remainder on each poll. Idempotent. A failure
+    /// loses the socket (`Io::Detaching`).
     pub(crate) fn detach_from_reactor(&mut self) -> std::io::Result<()> {
-        if let Io::Reactor(_) = self.stream {
-            let Io::Reactor(reactor) = std::mem::replace(&mut self.stream, Io::Detaching) else {
-                unreachable!("checked above");
-            };
-            // `into_std` deregisters the descriptor from the reactor.
-            match reactor.into_std() {
-                Ok(std_stream) => {
-                    std_stream.set_nonblocking(true)?;
-                    self.stream = Io::Detached(std_stream);
-                }
-                Err(e) => return Err(e),
-            }
+        match std::mem::replace(&mut self.stream, Io::Detaching) {
+            // `into_std` deregisters the descriptor from the reactor and
+            // returns it in non-blocking mode.
+            Io::Reactor(reactor) => self.stream = Io::Detached(reactor.into_std()?),
+            other => self.stream = other,
         }
         Ok(())
     }
@@ -143,16 +145,16 @@ impl Connection {
     /// awaits it, such as a `TEARDOWN`: resets the receive low-water mark to
     /// one byte and returns a detached socket to tokio's reactor, so the
     /// request's writes and its short response wake the calling task. Must
-    /// be called within a tokio runtime. Idempotent.
+    /// be called within a tokio runtime. Idempotent. A failure to register
+    /// the socket loses it (`Io::Detaching`).
     pub(crate) fn return_to_reactor(&mut self) -> std::io::Result<()> {
         self.set_recv_low_water(1)?;
-        if let Io::Detached(_) = self.stream {
-            let Io::Detached(std_stream) = std::mem::replace(&mut self.stream, Io::Detaching)
-            else {
-                unreachable!("checked above");
-            };
-            self.stream = Io::Reactor(TcpStream::from_std(std_stream)?);
-            self.drained = false;
+        match std::mem::replace(&mut self.stream, Io::Detaching) {
+            Io::Detached(std_stream) => {
+                self.stream = Io::Reactor(TcpStream::from_std(std_stream)?);
+                self.drained = false;
+            }
+            other => self.stream = other,
         }
         Ok(())
     }
@@ -183,16 +185,35 @@ impl Connection {
     }
 }
 
+/// The wall and monotonic time a read returned, stamped on every message the
+/// read delivered.
+#[derive(Clone, Copy)]
+struct ReadStamp {
+    wall: WallTime,
+    instant: Instant,
+}
+
+impl ReadStamp {
+    fn now() -> Self {
+        Self {
+            wall: WallTime::now(),
+            instant: Instant::now(),
+        }
+    }
+}
+
 /// Tries to decode a message from the read buffer without I/O.
 ///
 /// Separated from `Connection` methods to avoid self-borrow issues.
 ///
 /// When `eof` is true, the TCP stream has closed. `Incomplete` and empty
-/// `Ok(None)` with leftover data are promoted to errors.
+/// `Ok(None)` with leftover data are promoted to errors. A decoded message
+/// is stamped with `stamp`, the time of the read that delivered its bytes.
 fn try_decode(
     parser: &mut crate::rtsp::parse::Parser,
     read_buf: &mut MarkBuf,
     eof: bool,
+    stamp: ReadStamp,
 ) -> Result<Option<ReceivedMessage>, CodecError> {
     use crate::rtsp::parse::FeedError;
 
@@ -218,8 +239,8 @@ fn try_decode(
                 body_len: body_len as u32,
                 ctx: RtspMessageContext {
                     pos,
-                    received_wall: WallTime::now(),
-                    received: Instant::now(),
+                    received_wall: stamp.wall,
+                    received: stamp.instant,
                 },
             }))
         }
@@ -270,7 +291,7 @@ impl Stream for Connection {
         let this = &mut *self;
         loop {
             // Try decoding from existing buffered data.
-            match try_decode(&mut this.parser, &mut this.read_buf, false) {
+            match try_decode(&mut this.parser, &mut this.read_buf, false, this.read_stamp) {
                 Ok(Some(msg)) => return std::task::Poll::Ready(Some(Ok(msg))),
                 // A detached read shorter than the space offered left the
                 // socket's queue empty: the caller, which polls until
@@ -345,7 +366,12 @@ impl Stream for Connection {
             match read {
                 Ok(0) => {
                     // EOF. Try decode with eof=true.
-                    return match try_decode(&mut this.parser, &mut this.read_buf, true) {
+                    return match try_decode(
+                        &mut this.parser,
+                        &mut this.read_buf,
+                        true,
+                        ReadStamp::now(),
+                    ) {
                         Ok(Some(msg)) => std::task::Poll::Ready(Some(Ok(msg))),
                         Ok(None) => std::task::Poll::Ready(None),
                         Err(e) => std::task::Poll::Ready(Some(Err(codec_err_to_error(
@@ -358,6 +384,7 @@ impl Stream for Connection {
                 }
                 Ok(n) => {
                     this.read_buf.advance_end(n);
+                    this.read_stamp = ReadStamp::now();
                     this.drained = matches!(this.stream, Io::Detached(_)) && n < offered;
                     // Loop to try decoding again.
                 }
@@ -559,7 +586,7 @@ mod tests {
         read_buf.advance_end(data.len());
 
         let mut parser = crate::rtsp::parse::Parser::default();
-        let msg = try_decode(&mut parser, &mut read_buf, false)
+        let msg = try_decode(&mut parser, &mut read_buf, false, ReadStamp::now())
             .unwrap()
             .unwrap();
         // Read body from ring buffer.
@@ -578,7 +605,7 @@ mod tests {
         read_buf.advance_end(data.len());
 
         let mut parser = crate::rtsp::parse::Parser::default();
-        let msg = try_decode(&mut parser, &mut read_buf, false)
+        let msg = try_decode(&mut parser, &mut read_buf, false, ReadStamp::now())
             .unwrap()
             .unwrap();
         assert!(matches!(msg.msg, crate::rtsp::msg::Message::Response(_)));

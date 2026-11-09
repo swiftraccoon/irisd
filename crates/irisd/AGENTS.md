@@ -7,22 +7,51 @@ Scope: this crate only. Read the root `AGENTS.md` first.
 - Statistics line field names (`stream`, `events`, `writer`, `catalog`, `root`, `process`,
   and the one-off `gap`, `retention pass`, `slow write`, `slow sync`, `selfcheck` lines) are
   parsed by `iris-tools daemon-stats` and `iris-tools soak-report` and documented in
-  `docs/research/07-architecture.md §9`; a change updates all three.
+  `docs/research/07-architecture.md §9`; a change updates all three. So are the startup
+  messages before reconciliation (the configuration-exposure and unauthenticated-API warnings,
+  the descriptor limit, state-mode repairs, unavailable and aliased roots, the sandbox decision,
+  `catalog open`, `catalog reconciled`), which `soak-report` matches by their text to find run
+  boundaries.
 - The sandbox spec (`sandbox_spec` in `run.rs`) is derived from the configuration and applied
   before any thread is spawned; its paths and ports are the ones in
   `docs/research/07-architecture.md §6` and `packaging/README.md`. Landlock ABI 1 filesystem
   and ABI 4 TCP rights are hard requirements (startup fails without them unless
-  `--no-sandbox`); later rights are best effort. Keep the kernel-facing build in
-  `sandbox::restrict` and the decision in the pure `sandbox::decide`, which the tests drive.
+  `--no-sandbox`); later rights and the ABI 6 scopes are best effort. The writable paths get
+  every right except execution, special-file creation, and device `ioctl`; the read-only paths
+  get reading without execution. Keep the kernel-facing build in `sandbox::restrict` and the
+  decision in the pure `sandbox::decide`, which the tests drive; `sandboxed` runs the real
+  ruleset on a test thread where the kernel has Landlock.
+- Camera provisioning runs in the monitor loop: `add_camera` checks the id against the
+  configured and added cameras, the limit, the stream URLs (`parsed_sources`, before any
+  registry insert), and `provisioning.connect_ports` (`ProvisioningConfig::refused_port`; the
+  sandbox allows those ports at startup, so a run-time camera never needs a further Landlock
+  rule), registers the camera in the catalog, persists the store off the runtime thread
+  (`save_store`), and starts its tasks under a child token of the shutdown token.
+  `remove_camera` rewrites the store without the camera first (a failed write changes nothing),
+  cancels that token, hands the tasks to a retirement task in `Daemon::retiring`
+  (`retire_camera`: joined within `CAMERA_STOP_GRACE`, then aborted), and forgets the camera
+  in the API's registries. A successful change re-points the self-check and hands the statistics
+  report its next stream and feed lists (`ReportJob::refresh`, adopted at the next launch).
+  Configured cameras answer `ProvisionError::Configured`. The ONVIF lookups
+  (`ControlRequest::Discover`, `ControlRequest::StreamUrls`) run in a `JoinSet` beside the loop
+  under a four-permit semaphore (`Lookups`, `spawn_lookup`): the loop refuses a fifth lookup
+  with `ProvisionError::Busy` and a stream lookup on a port outside `connect_ports` with
+  `ProvisionError::Port`, so it never waits on the network; finished lookups are observed before
+  the next spawn, and shutdown cancels and observes the rest.
 - Before the catalog opens, `permissions::secure_state_directory` checks and repairs the state
-  directory and catalog files; it must run before any SQLite connection, because SQLite copies
-  the database file's mode to new WAL and shared-memory files.
+  directory, the catalog files, `capability.key` (the media-capability secret
+  `capability::load_or_create` then reads or creates), and `cameras.toml`; it must run before any
+  SQLite connection, because SQLite copies the database file's mode to the WAL and shared-memory
+  files it creates.
 - The watchdog ping is gated on every stream having made progress since the last check
   (`all_streams_progressed`); never ping unconditionally.
-- Retention order and bounds (event maintenance, free-space floor, quota, age; oldest sealed
-  first; at most 512 attempts, 64 pages, 1,024 raw scanned candidate rows, or one second per pass) follow
-  `docs/research/04-storage-format.md §8`. Protection projection is separately bounded to
-  2,048 minimal rows and 100 ms and continues by `(retain_until, event id)`.
+- Retention order and bounds (event maintenance, free-space floor, quota, age; oldest sealed first;
+  at most 512 attempts, 64 pages, 1,024 raw scanned candidate rows, or one second per pass) follow
+  `docs/research/04-storage-format.md §8`. Event protection is the catalog's: the candidate SQL
+  excludes protected rows and the atomic mark rechecks them; the daemon keeps no projection. A
+  root whose free-space probe fails is skipped for the pass (`DeleteOutcome::RootUnavailable`
+  leaves its rows alone) and counted in `PassReport::roots_unavailable`; the other roots' steps
+  run.
 - Free-space retention selects files beneath the pressured root; quota retention spans
   roots. Indexed candidate SQL caps raw input before active-protection filtering and returns
   scan progress even for an empty filtered page. Pagination uses `(wall_start, segment id)`;
@@ -34,19 +63,23 @@ Scope: this crate only. Read the root `AGENTS.md` first.
   reconciliation includes the free-space floor and prunes or resets bounded state.
 - Startup resolves durable root identities synchronously before the sandbox or threads, rejects
   marker/physical aliases, and only visits `ApprovedRoot`s. Catalog rows are paged; root walks
-  are streaming and no-follow; one elapsed heartbeat covers every reconciliation phase. A writing
+  are streaming and no-follow; `adopt::Progress` carries one heartbeat whose cadence holds across
+  every await of a reconciliation phase, and a directory the walk cannot read is sent as a
+  `WalkFailure`, logged, and skipped. A writing
   row on an unavailable root or behind a filesystem lookup error is preserved; only confirmed
   absence under its exact admitted persisted root permits cleanup. Confirmed absence
   (`RecoverError::Absent`: a missing media name or layout directory beneath the verified root)
   applies whatever the row's fragment count; a missing root is never absence.
 - Recovery passes the row's `run_seq` and sample-entry hash as the `IndexBinding`, so a rebuilt
-  sidecar stays bound to its row. Reconciliation opens never block or follow a final symlink:
-  adoption scans the media when its sidecar cannot be opened, and skips a file beyond the
-  131,072-fragment limit.
+  sidecar stays bound to its row. Reconciliation opens never block or follow a final symlink.
+  Adoption always header-scans the media; a sidecar bound to that scan supplies the same facts,
+  a sidecar that cannot be opened or disagrees is reported and ignored, and a file beyond the
+  131,072-fragment limit is skipped.
 - Startup registers configured roots and completes durable deletion intents on available roots
   before writing recovery and adoption. Retention unlinks only after
-  `mark_deleting_if_unprotected` returns `Marked`; `Protected` and `NotFound` do not mutate the
-  filesystem. It removes the row only after the directory barrier; failed transitions count
+  `mark_deleting_if_unprotected_at_root` returns `Marked`; `Protected` and `NotFound` do not
+  mutate the filesystem. It removes the row only after the directory barrier; failed transitions
+  count
   neither deletion nor quota progress. It never marks a row whose path is outside its root's
   layout (`adopt::parse_segment_path`), and each pass retries one bounded page of deletion
   intents (16 rows or 100 ms, cursor in `RetentionState`) before its quota arithmetic.
@@ -56,14 +89,16 @@ Scope: this crate only. Read the root `AGENTS.md` first.
   tombstone until both names are absent and the directory barrier succeeds.
 - Shutdown has one absolute budget: cancel once, await all producers against one shared grace,
   abort and observe every remainder, then attempt writer, API, and catalog closure exactly once
-  while preserving the first failure. Periodic maintenance and self-check owners participate in
-  the same bound.
+  while preserving the first failure. Periodic maintenance and self-check owners, camera
+  retirements, and ONVIF lookups participate in the same bound; every owner is a `ShutdownOwner`
+  or `ShutdownGroup`, so a further owner is added in `shutdown_owners` alone.
 - The API listener is bound successfully before recording tasks and `READY=1`; serving consumes
   that same listener. A bind failure must not emit readiness or leave recording work running.
-- Offline HLS treats a bounded sidecar only as a cache physically bound to the selected media,
-  rejects generated-file/source aliases and reserved basenames, validates playlist text, and
-  publishes through exclusive temporaries plus atomic rename. It excludes each trailer separately;
-  continuation segments cannot claim independent decoding.
+- Offline HLS describes the media scan alone and reads the sidecar only to report one that
+  disagrees, rejects generated-file/source aliases and reserved basenames, refuses to replace a
+  file at the link's name that is not a link, validates playlist text, declares RFC 8216 peak and
+  average bit rates, and publishes through exclusive temporaries plus atomic rename. It excludes
+  each trailer separately; continuation segments cannot claim independent decoding.
 - An API task consumed by the monitor is removed before ordered shutdown; a completed
   join handle cannot be polled twice.
 - Configuration keys are the ones in `config/cameras.example.toml`; a change to the schema
@@ -78,10 +113,17 @@ Scope: this crate only. Read the root `AGENTS.md` first.
 - `adopt.rs` — start-up reconciliation of the catalog with the files on disk.
 - `catalog_observer.rs` — store notifications and camera events into the catalog.
 - `retention.rs` — the retention pass and its report.
+- `raw_calls.rs` — `RawCalls`, the count of uncancellable filesystem calls a maintenance owner
+  has in flight.
 - `selfcheck.rs` — the rotating CRC check of sealed files.
 - `sandbox.rs` — the Landlock ruleset and the enforcement decision.
+- `capability.rs` — the media-capability secret (`capability.key`), loaded or created at startup.
+- `provision.rs` — the store of cameras the API added (`cameras.toml`, rewritten whole through
+  a private temporary file); `run.rs` holds the control loop side (`Provisioning`,
+  `add_camera`, `remove_camera`, `retire_camera`).
 - `permissions.rs` — startup checks of the configuration file, the state directory, and the
-  catalog files.
+  state files in it (catalog files, `capability.key`, `cameras.toml`), plus the shared
+  no-follow open (`open_private_file`).
 - `systemd.rs` — readiness, watchdog, and stopping notifications.
 - `proc.rs` — CPU, RSS, thread, and descriptor sampling from `/proc/self`.
 
@@ -116,9 +158,12 @@ A change to the statistics lines is checked by feeding a log to
   removal is retry-safe.
 - The select arms in `monitor` borrow disjoint fields of `Daemon`; a helper that takes the
   whole struct will not compile.
-- `start_recording` opens two RTSP sessions per camera; the limit is three per camera, and
-  the family of cameras described in `docs/research/01-camera-probe.md §5b` drops its sub
+- A camera opens one RTSP session per recorded stream (at most two), started by
+  `StreamSpawner::spawn` for configured and added cameras alike; the limit is three per camera,
+  and the family of cameras described in `docs/research/01-camera-probe.md §5b` drops its sub
   stream when another session opens.
+- `add_camera` awaits one catalog round trip and one store rewrite on the blocking pool, both
+  bounded (the catalog busy timeout, the disk); nothing else in the control handlers awaits.
 - A non-standard RTSP port must be allowed by the sandbox (`CameraConfig::rtsp_ports`), or
   connections fail with "Permission denied".
 - Counters reset on restart; tools that sum them handle restarts by positive deltas.

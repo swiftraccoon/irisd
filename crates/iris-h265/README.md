@@ -16,25 +16,30 @@ and the fragment encoder on the record path (RTSP in → fMP4 on disk → byte-r
   parameter-set bytes of one access unit.
 - `strip_parameter_sets` — a copy of the access unit without VPS, SPS, and PPS, or `None`
   when there is nothing to strip.
-- `FramingError` — the error type of the walkers.
+- `FramingError` — the error type of the walkers: an incomplete length prefix, a length past
+  the end, or a unit shorter than its header.
 
 ## How it is used
 
 ```rust
-use iris_h265::{NalType, inspect_access_unit, nal_type, strip_parameter_sets};
+use iris_h265::{FramingError, NalType, inspect_access_unit, nal_type, strip_parameter_sets};
 
-// A length-prefixed access unit: a VPS (type 32) followed by an IDR_W_RADL slice (type 19).
-let au = [0, 0, 0, 2, 32 << 1, 1, 0, 0, 0, 3, 19 << 1, 1, 0xaa];
-assert_eq!(nal_type(au[4]), NalType::Vps);
-let info = inspect_access_unit(&au)?;
-assert!(info.is_irap && info.has_parameter_sets);
-let stripped = strip_parameter_sets(&au)?.expect("parameter sets were present");
-assert_eq!(stripped, [0, 0, 0, 3, 19 << 1, 1, 0xaa]);
-# Ok::<(), iris_h265::FramingError>(())
+fn main() -> Result<(), FramingError> {
+    // A length-prefixed access unit: a VPS (type 32), then an IDR_W_RADL slice (type 19).
+    let au = [0, 0, 0, 2, 32 << 1, 1, 0, 0, 0, 3, 19 << 1, 1, 0xaa];
+    assert_eq!(nal_type(au[4]), NalType::Vps);
+    let info = inspect_access_unit(&au)?;
+    assert!(info.is_irap && info.has_parameter_sets);
+    let stripped = strip_parameter_sets(&au)?.expect("parameter sets were present");
+    assert_eq!(stripped, [0, 0, 0, 3, 19 << 1, 1, 0xaa]);
+    Ok(())
+}
 ```
 
-Ingest calls `inspect_access_unit` on every frame to learn whether it is a random access
-point and `strip_parameter_sets` before the frame becomes a sample.
+Ingest takes the random-access flag from the RTSP client and passes every frame through
+`strip_parameter_sets` before it becomes a sample, a safety net because the client's frame
+format already omits parameter sets. The replay server uses `inspect_access_unit` and
+`LengthPrefixedNals` to classify and walk recorded samples.
 
 ## Invariants and limits
 
@@ -43,8 +48,9 @@ point and `strip_parameter_sets` before the frame becomes a sample.
 - A NAL unit is at least two bytes (its header); shorter units are a `FramingError`.
 - Classification preserves the six-bit type code. Types 0..=31, including reserved types
   24..=31, are VCL; only types 16..=23 are IRAP.
-- A truncation error points to the start of its length prefix, including when only one to
-  three prefix bytes remain. The iterator yields the error once and then stays exhausted.
+- A framing error points to the start of its length prefix; one to three leftover bytes are
+  reported as an incomplete prefix. The iterator yields the error once and then stays
+  exhausted.
 - Parameter sets (VPS, SPS, PPS) live only in `hvcC`; the recorder strips in-band copies
   and seals a file when they change (`04 §4`, `05-ingest-events.md §2`).
 - Every function accepts arbitrary bytes without panicking; the fuzz target
@@ -56,8 +62,8 @@ Unit tests cover all 256 first-header bytes, stripping with slices kept, partial
 offsets and truncation/short-header termination; the crate-level doctest exercises `nal_type`.
 The fuzz target `access_unit`
 feeds arbitrary bytes through the walkers. The elementary-stream facts the helpers rely on
-(FU-only packetisation, parameter sets before every IDR, no AUD) are measured in
-`docs/research/01-camera-probe.md §3`.
+(FU packets for slices and single-NAL packets for parameter sets, §4; parameter sets before
+every IDR and no AUD, §3) are measured in `docs/research/01-camera-probe.md`.
 
 ## Further reading
 

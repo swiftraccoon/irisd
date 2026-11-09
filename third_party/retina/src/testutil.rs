@@ -249,3 +249,24 @@ pub fn parse_describe_response(request_url: &str, mut raw: &[u8]) -> Result<usiz
     crate::client::parse::parse_describe(request_url, &response, &body)
         .map(|presentation| presentation.streams.len())
 }
+
+/// Packet metadata for driving a [`crate::codec::Depacketizer`] through
+/// [`DepacketizeBuf`] outside a session: a dummy context, stream 0, SSRC 0,
+/// no loss, and the timestamp and marker given. For fuzz tests.
+pub fn packet_meta(
+    sequence_number: u16,
+    timestamp: i64,
+    clock_rate: std::num::NonZeroU32,
+    mark: bool,
+) -> crate::rtp::PacketMeta {
+    crate::rtp::PacketMeta {
+        ctx: crate::PacketContext::dummy(),
+        stream_id: 0,
+        timestamp: crate::Timestamp::new(timestamp, clock_rate, 0)
+            .expect("a non-negative timestamp with a zero start"),
+        sequence_number,
+        ssrc: 0,
+        mark,
+        loss: 0,
+    }
+}

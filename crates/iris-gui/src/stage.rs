@@ -17,11 +17,13 @@ use tracing::warn;
 pub enum BranchEvent {
     /// The branch posted an error; the text is the error's message.
     Error(String),
-    /// The branch's sink received its first frame.
+    /// The branch's sink received its first frame since the branch started
+    /// or last restarted.
     Ready,
 }
 
 /// The shared pipeline and the listeners of its branches by bin name.
+#[derive(Debug)]
 pub struct Stage {
     pipeline: gst::Pipeline,
     listeners: Rc<RefCell<HashMap<String, async_channel::Sender<BranchEvent>>>>,
@@ -138,8 +140,9 @@ impl Stage {
         Ok(())
     }
 
-    /// Restarts `bin` in place (after a reconnection): down to Null and back
-    /// to the pipeline's state, so its demuxer starts clean.
+    /// Restarts `bin` in place after its feed's session ends: down to Null and
+    /// back to the pipeline's state, so the next session's init segment meets a
+    /// clean demuxer.
     pub fn restart(bin: &gst::Bin) -> anyhow::Result<()> {
         bin.set_state(gst::State::Null)
             .context("stopping the branch")?;
@@ -151,7 +154,9 @@ impl Stage {
     /// Stops and removes `bin`.
     pub fn remove(&self, bin: &gst::Bin) {
         let name = bin.name().to_string();
-        let _ = bin.set_state(gst::State::Null);
+        if let Err(error) = bin.set_state(gst::State::Null) {
+            warn!(%name, %error, "cannot stop a branch");
+        }
         if let Err(error) = self.pipeline.remove(bin) {
             warn!(%name, %error, "cannot remove a branch");
         }
@@ -161,7 +166,9 @@ impl Stage {
 
 impl Drop for Stage {
     fn drop(&mut self) {
-        let _ = self.pipeline.set_state(gst::State::Null);
+        if let Err(error) = self.pipeline.set_state(gst::State::Null) {
+            warn!(%error, "cannot stop the stage");
+        }
     }
 }
 
@@ -233,7 +240,7 @@ mod tests {
         {
             let bin = gst::parse::bin_from_description(
                 "fakesink async=false state-error=paused-to-playing",
-                false,
+                /* ghost_unlinked_pads */ false,
             )
             .unwrap();
             bin.set_state(gst::State::Ready).unwrap();

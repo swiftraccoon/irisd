@@ -4,6 +4,10 @@
 use std::fmt;
 use std::iter::FusedIterator;
 
+use iris_core::time::WallUs;
+
+use crate::media::Ticks;
+
 /// RTP header length.
 pub const RTP_HEADER_LEN: usize = 12;
 /// Smallest supported RTP packet size, including its header.
@@ -19,15 +23,21 @@ pub const PAYLOAD_TYPE: u8 = 96;
 const FU_TYPE: u8 = 49;
 
 /// Error while packetizing or framing RTP.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum RtpError {
     /// The MTU is outside the supported operational range.
+    #[error(
+        "RTP MTU {mtu} is outside the supported {}..={} range",
+        MIN_MTU,
+        MAX_MTU
+    )]
     InvalidMtu {
         /// Rejected value.
         mtu: usize,
     },
     /// An H.265 NAL unit does not contain its two-byte header.
+    #[error("NAL unit {index} has {len} bytes; at least 2 required")]
     NalTooShort {
         /// Position in the access unit.
         index: usize,
@@ -35,39 +45,67 @@ pub enum RtpError {
         len: usize,
     },
     /// The number of packets cannot be represented by `usize`.
+    #[error("RTP packet count overflow")]
     PacketCountOverflow,
     /// A packet cannot fit the RTSP interleaved-frame length field.
+    #[error(
+        "RTP/RTCP packet has {len} bytes; at most {} fit an interleaved frame",
+        MAX_MTU
+    )]
     InterleavedPacketTooLarge {
         /// Packet bytes, excluding the four-byte interleaved header.
         len: usize,
     },
 }
 
-impl fmt::Display for RtpError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::InvalidMtu { mtu } => write!(
-                formatter,
-                "RTP MTU {mtu} is outside the supported {MIN_MTU}..={MAX_MTU} range"
-            ),
-            Self::NalTooShort { index, len } => {
-                write!(
-                    formatter,
-                    "NAL unit {index} has {len} bytes; at least 2 required"
-                )
-            }
-            Self::PacketCountOverflow => formatter.write_str("RTP packet count overflow"),
-            Self::InterleavedPacketTooLarge { len } => write!(
-                formatter,
-                "RTP/RTCP packet has {len} bytes; at most {MAX_MTU} fit an interleaved frame"
-            ),
-        }
+/// An RTP synchronization source identifier (RFC 3550 §5.1).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Ssrc(u32);
+
+impl Ssrc {
+    /// Wraps an identifier.
+    #[must_use]
+    pub const fn new(id: u32) -> Self {
+        Self(id)
+    }
+
+    /// The identifier.
+    #[must_use]
+    pub const fn get(self) -> u32 {
+        self.0
     }
 }
 
-impl std::error::Error for RtpError {}
+/// A value of an RTP stream's 90 kHz media clock, which wraps at 32 bits
+/// (RFC 3550 §5.1).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct RtpTimestamp(u32);
+
+impl RtpTimestamp {
+    /// Wraps a clock value.
+    #[must_use]
+    pub const fn new(value: u32) -> Self {
+        Self(value)
+    }
+
+    /// The clock value.
+    #[must_use]
+    pub const fn get(self) -> u32 {
+        self.0
+    }
+
+    /// The clock `ticks` later, wrapping as the 32-bit field does.
+    #[must_use]
+    pub const fn after(self, ticks: Ticks) -> Self {
+        Self(self.0.wrapping_add(ticks.get() as u32))
+    }
+}
 
 /// Validates an RTP MTU used by the packetizer and replay server.
+///
+/// # Errors
+///
+/// [`RtpError::InvalidMtu`] when `mtu` is outside [`MIN_MTU`]..=[`MAX_MTU`].
 pub fn validate_mtu(mtu: usize) -> Result<(), RtpError> {
     if !(MIN_MTU..=MAX_MTU).contains(&mtu) {
         return Err(RtpError::InvalidMtu { mtu });
@@ -75,21 +113,19 @@ pub fn validate_mtu(mtu: usize) -> Result<(), RtpError> {
     Ok(())
 }
 
-/// Sequence and SSRC state of one RTP stream.
+/// Sequence, SSRC, and counter state of one RTP stream.
 #[derive(Debug)]
 pub struct Packetizer {
-    ssrc: u32,
+    ssrc: Ssrc,
     seq: u16,
-    /// RTP packets produced.
-    pub packets: u64,
-    /// RTP payload bytes produced (headers excluded).
-    pub octets: u64,
+    packets: u64,
+    octets: u64,
 }
 
 impl Packetizer {
-    /// Starts a stream at `seq` with `ssrc`.
+    /// Starts a stream at sequence number `seq` with `ssrc`.
     #[must_use]
-    pub fn new(ssrc: u32, seq: u16) -> Self {
+    pub fn new(ssrc: Ssrc, seq: u16) -> Self {
         Self {
             ssrc,
             seq,
@@ -100,8 +136,27 @@ impl Packetizer {
 
     /// The SSRC.
     #[must_use]
-    pub fn ssrc(&self) -> u32 {
+    pub fn ssrc(&self) -> Ssrc {
         self.ssrc
+    }
+
+    /// RTP packets produced.
+    #[must_use]
+    pub fn packets(&self) -> u64 {
+        self.packets
+    }
+
+    /// RTP payload bytes produced, headers excluded.
+    #[must_use]
+    pub fn octets(&self) -> u64 {
+        self.octets
+    }
+
+    /// Sets the counters, for rollover tests.
+    #[cfg(test)]
+    fn set_counts(&mut self, packets: u64, octets: u64) {
+        self.packets = packets;
+        self.octets = octets;
     }
 
     /// The sequence number the next packet will carry.
@@ -124,7 +179,7 @@ impl Packetizer {
     pub fn access_unit<'packetizer, 'data>(
         &'packetizer mut self,
         nals: &'data [&'data [u8]],
-        timestamp: u32,
+        timestamp: RtpTimestamp,
         mtu: usize,
     ) -> Result<AccessUnitPackets<'packetizer, 'data>, RtpError> {
         validate_mtu(mtu)?;
@@ -158,13 +213,13 @@ impl Packetizer {
         })
     }
 
-    fn packet(&mut self, timestamp: u32, marker: bool, payload: &[u8]) -> Vec<u8> {
+    fn packet(&mut self, timestamp: RtpTimestamp, marker: bool, payload: &[u8]) -> Vec<u8> {
         let mut p = Vec::with_capacity(RTP_HEADER_LEN + payload.len());
         p.push(0x80);
         p.push(PAYLOAD_TYPE | (u8::from(marker) << 7));
         p.extend_from_slice(&self.seq.to_be_bytes());
-        p.extend_from_slice(&timestamp.to_be_bytes());
-        p.extend_from_slice(&self.ssrc.to_be_bytes());
+        p.extend_from_slice(&timestamp.get().to_be_bytes());
+        p.extend_from_slice(&self.ssrc.get().to_be_bytes());
         p.extend_from_slice(payload);
         self.seq = self.seq.wrapping_add(1);
         self.packets += 1;
@@ -172,19 +227,20 @@ impl Packetizer {
         p
     }
 
-    /// An RTCP sender report for the stream's current counters.
+    /// An RTCP sender report for the stream's current counters, mapping the
+    /// wall time `wall` (sent as a 64-bit NTP timestamp) to `rtp_timestamp`.
     ///
     /// RFC 3550 wire counters are 32 bits, so the low 32 bits are transmitted
     /// and naturally roll over while the public totals continue in `u64`.
     #[must_use]
-    pub fn sender_report(&self, ntp: u64, rtp_timestamp: u32) -> Vec<u8> {
+    pub fn sender_report(&self, wall: WallUs, rtp_timestamp: RtpTimestamp) -> Vec<u8> {
         let mut p = Vec::with_capacity(28);
         p.push(0x80); // V=2, no padding, zero report blocks
         p.push(200); // SR
         p.extend_from_slice(&6u16.to_be_bytes()); // length in words minus one
-        p.extend_from_slice(&self.ssrc.to_be_bytes());
-        p.extend_from_slice(&ntp.to_be_bytes());
-        p.extend_from_slice(&rtp_timestamp.to_be_bytes());
+        p.extend_from_slice(&self.ssrc.get().to_be_bytes());
+        p.extend_from_slice(&wall.to_ntp64().to_be_bytes());
+        p.extend_from_slice(&rtp_timestamp.get().to_be_bytes());
         p.extend_from_slice(&(self.packets as u32).to_be_bytes());
         p.extend_from_slice(&(self.octets as u32).to_be_bytes());
         p
@@ -196,7 +252,7 @@ impl Packetizer {
 pub struct AccessUnitPackets<'packetizer, 'data> {
     packetizer: &'packetizer mut Packetizer,
     nals: &'data [&'data [u8]],
-    timestamp: u32,
+    timestamp: RtpTimestamp,
     max_payload: usize,
     nal_index: usize,
     fragment_offset: usize,
@@ -281,11 +337,11 @@ mod tests {
 
     #[test]
     fn small_nal_units_become_single_packets_with_marker_on_the_last() {
-        let mut p = Packetizer::new(0x1234_5678, 65_534);
+        let mut p = Packetizer::new(Ssrc::new(0x1234_5678), 65_534);
         let out = p
             .access_unit(
                 &[&[0x40, 0x01, 0xaa], &[0x42, 0x01, 0xbb, 0xcc]],
-                90_000,
+                RtpTimestamp::new(90_000),
                 1_400,
             )
             .unwrap()
@@ -298,16 +354,16 @@ mod tests {
         assert_eq!(&out[0][4..8], &90_000u32.to_be_bytes());
         assert_eq!(&out[1][12..], &[0x42, 0x01, 0xbb, 0xcc]);
         assert_eq!(p.next_seq(), 0);
-        assert_eq!((p.packets, p.octets), (2, 7));
+        assert_eq!((p.packets(), p.octets()), (2, 7));
     }
 
     #[test]
     fn large_nal_units_become_fragmentation_units_that_reassemble() {
         let mut nal = vec![0x26, 0x01]; // IDR_W_RADL, layer 0, tid 1
         nal.extend((0..5_000u32).map(|i| (i % 251) as u8));
-        let mut p = Packetizer::new(1, 0);
+        let mut p = Packetizer::new(Ssrc::new(1), 0);
         let out = p
-            .access_unit(&[&nal], 7, 1_400)
+            .access_unit(&[&nal], RtpTimestamp::new(7), 1_400)
             .unwrap()
             .collect::<Vec<_>>();
         assert!(out.len() > 3);
@@ -327,19 +383,35 @@ mod tests {
         assert_eq!(body, nal[2..]);
     }
 
-    #[test]
-    fn sender_report_and_interleaving_have_the_standard_layout() {
-        let mut p = Packetizer::new(0xdead_beef, 10);
+    /// A sender report after one three-byte packet, mapping `wall` to RTP time 90.
+    fn report_after_one_packet(wall: WallUs) -> Vec<u8> {
+        let mut p = Packetizer::new(Ssrc::new(0xdead_beef), 10);
         let nals = [&[0x40, 0x01, 0x00][..]];
-        assert_eq!(p.access_unit(&nals, 0, 1_400).unwrap().count(), 1);
-        let sr = p.sender_report(0x1122_3344_5566_7788, 90);
+        assert_eq!(
+            p.access_unit(&nals, RtpTimestamp::new(0), 1_400)
+                .unwrap()
+                .count(),
+            1
+        );
+        p.sender_report(wall, RtpTimestamp::new(90))
+    }
+
+    #[test]
+    fn sender_reports_have_the_rfc_3550_layout() {
+        let wall = WallUs::new(1_700_000_000_000_000);
+        let sr = report_after_one_packet(wall);
         assert_eq!(sr.len(), 28);
         assert_eq!(&sr[..4], &[0x80, 200, 0, 6]);
         assert_eq!(&sr[4..8], &0xdead_beefu32.to_be_bytes());
-        assert_eq!(&sr[8..16], &0x1122_3344_5566_7788u64.to_be_bytes());
+        assert_eq!(&sr[8..16], &wall.to_ntp64().to_be_bytes());
         assert_eq!(&sr[16..20], &90u32.to_be_bytes());
         assert_eq!(&sr[20..24], &1u32.to_be_bytes());
         assert_eq!(&sr[24..28], &3u32.to_be_bytes());
+    }
+
+    #[test]
+    fn interleaving_prefixes_the_channel_and_length() {
+        let sr = report_after_one_packet(WallUs::new(0));
         let mut out = Vec::new();
         interleave(&mut out, 1, &sr).unwrap();
         assert_eq!(&out[..4], &[b'$', 1, 0, 28]);
@@ -347,7 +419,19 @@ mod tests {
     }
 
     #[test]
-    fn mtu_and_interleaved_length_boundaries_are_fallible() {
+    fn rtp_timestamps_wrap_at_32_bits() {
+        assert_eq!(
+            RtpTimestamp::new(u32::MAX).after(Ticks::new(2)),
+            RtpTimestamp::new(1)
+        );
+        assert_eq!(
+            RtpTimestamp::new(5).after(Ticks::new(u64::from(u32::MAX) + 1)),
+            RtpTimestamp::new(5)
+        );
+    }
+
+    #[test]
+    fn mtus_are_admitted_only_inside_the_supported_range() {
         assert!(matches!(
             validate_mtu(MIN_MTU - 1),
             Err(RtpError::InvalidMtu { .. })
@@ -358,7 +442,10 @@ mod tests {
             validate_mtu(MAX_MTU + 1),
             Err(RtpError::InvalidMtu { .. })
         ));
+    }
 
+    #[test]
+    fn a_packet_too_large_to_interleave_leaves_the_buffer_unchanged() {
         let mut framed = vec![1, 2, 3];
         interleave(&mut framed, 4, &vec![0; MAX_MTU]).unwrap();
         let committed_len = framed.len();
@@ -370,24 +457,32 @@ mod tests {
     }
 
     #[test]
-    fn packetization_streams_and_rejects_short_nals() {
-        let mut p = Packetizer::new(1, 0);
+    fn nal_units_shorter_than_their_header_are_rejected() {
+        let mut p = Packetizer::new(Ssrc::new(1), 0);
         let short = [&[0x40][..]];
         assert!(matches!(
-            p.access_unit(&short, 0, 1_400),
+            p.access_unit(&short, RtpTimestamp::new(0), 1_400),
             Err(RtpError::NalTooShort { index: 0, len: 1 })
         ));
+    }
 
+    #[test]
+    fn packetization_streams_an_exact_packet_count() {
+        let mut p = Packetizer::new(Ssrc::new(1), 0);
         let nal = vec![0x26; 10_000];
         let nals = [nal.as_slice()];
-        let packets = p.access_unit(&nals, 0, MIN_MTU).unwrap();
+        let packets = p.access_unit(&nals, RtpTimestamp::new(0), MIN_MTU).unwrap();
         assert_eq!(packets.len(), (nal.len() - 2).div_ceil(MIN_MTU - 15));
         assert_eq!(packets.count(), 42);
+    }
 
+    #[test]
+    fn packets_at_the_largest_mtu_fit_interleaving() {
+        let mut p = Packetizer::new(Ssrc::new(1), 0);
         let maximum_nal = vec![0x26; MAX_MTU * 2];
         let maximum_nals = [maximum_nal.as_slice()];
         let maximum_packets = p
-            .access_unit(&maximum_nals, 0, MAX_MTU)
+            .access_unit(&maximum_nals, RtpTimestamp::new(0), MAX_MTU)
             .unwrap()
             .collect::<Vec<_>>();
         assert!(maximum_packets.len() > 1);
@@ -404,22 +499,20 @@ mod tests {
 
     #[test]
     fn sender_report_counts_roll_over_instead_of_freezing() {
-        let mut p = Packetizer::new(1, 0);
-        p.packets = u64::from(u32::MAX);
-        p.octets = u64::from(u32::MAX);
-        let exact = p.sender_report(0, 0);
+        let report = |p: &Packetizer| p.sender_report(WallUs::new(0), RtpTimestamp::new(0));
+        let mut p = Packetizer::new(Ssrc::new(1), 0);
+        p.set_counts(u64::from(u32::MAX), u64::from(u32::MAX));
+        let exact = report(&p);
         assert_eq!(&exact[20..24], &u32::MAX.to_be_bytes());
         assert_eq!(&exact[24..28], &u32::MAX.to_be_bytes());
 
-        p.packets += 1;
-        p.octets += 2;
-        let first_rollover = p.sender_report(0, 0);
+        p.set_counts(u64::from(u32::MAX) + 1, u64::from(u32::MAX) + 2);
+        let first_rollover = report(&p);
         assert_eq!(&first_rollover[20..24], &0u32.to_be_bytes());
         assert_eq!(&first_rollover[24..28], &1u32.to_be_bytes());
 
-        p.packets = u64::from(u32::MAX) + 7;
-        p.octets = u64::from(u32::MAX) + 9;
-        let later = p.sender_report(0, 0);
+        p.set_counts(u64::from(u32::MAX) + 7, u64::from(u32::MAX) + 9);
+        let later = report(&p);
         assert_eq!(&later[20..24], &6u32.to_be_bytes());
         assert_eq!(&later[24..28], &8u32.to_be_bytes());
         assert_ne!(first_rollover[20..28], later[20..28]);

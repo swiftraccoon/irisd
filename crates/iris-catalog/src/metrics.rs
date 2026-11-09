@@ -5,7 +5,8 @@ use std::time::Duration;
 
 use iris_core::metrics::{Histogram, Peak};
 
-/// Counters the catalog thread maintains, readable from any thread.
+/// Counters maintained by the catalog thread and its producers, readable
+/// from any thread.
 #[derive(Debug, Default)]
 pub struct CatalogMetrics {
     transaction: Histogram,
@@ -25,7 +26,7 @@ pub struct CatalogMetrics {
     rejected_events: AtomicU64,
     rejected_progress: AtomicU64,
     rejected_queries: AtomicU64,
-    rejected_critical: AtomicU64,
+    rejected_lifecycle: AtomicU64,
     reconciliation_required: AtomicBool,
 }
 
@@ -46,7 +47,7 @@ impl CatalogMetrics {
         &self.query
     }
 
-    /// Time a query waited in the channel before the thread picked it up.
+    /// Time a query waited in the command queue before the thread picked it up.
     #[must_use]
     pub fn wait(&self) -> &Histogram {
         &self.wait
@@ -82,13 +83,13 @@ impl CatalogMetrics {
         &self.batch_peak
     }
 
-    /// Commands admitted but not yet completed by the catalog thread.
+    /// Commands admitted and still outstanding on the catalog thread.
     #[must_use]
     pub fn queue_depth(&self) -> u64 {
         self.queue_depth.load(Ordering::Relaxed)
     }
 
-    /// Estimated owned bytes admitted but not yet completed.
+    /// Estimated owned bytes admitted and still outstanding.
     #[must_use]
     pub fn queue_bytes(&self) -> u64 {
         self.queue_bytes.load(Ordering::Relaxed)
@@ -112,13 +113,16 @@ impl CatalogMetrics {
         self.coalesced.load(Ordering::Relaxed)
     }
 
-    /// Commands rejected by bounded admission.
+    /// Commands rejected by bounded admission: events, progress reports,
+    /// queries, and lifecycle changes. Events omitted at the state-database
+    /// capacity count in [`CatalogMetrics::rejected_events`] only.
     #[must_use]
     pub fn rejected(&self) -> u64 {
         self.rejected.load(Ordering::Relaxed)
     }
 
-    /// Event notifications rejected by queue or state-capacity admission.
+    /// Event notifications rejected by bounded admission or omitted at the
+    /// state-database capacity.
     #[must_use]
     pub fn rejected_events(&self) -> u64 {
         self.rejected_events.load(Ordering::Relaxed)
@@ -138,8 +142,8 @@ impl CatalogMetrics {
 
     /// Lifecycle notifications that exhausted even reserved admission capacity.
     #[must_use]
-    pub fn rejected_critical(&self) -> u64 {
-        self.rejected_critical.load(Ordering::Relaxed)
+    pub fn rejected_lifecycle(&self) -> u64 {
+        self.rejected_lifecycle.load(Ordering::Relaxed)
     }
 
     /// Whether startup filesystem reconciliation is required because reserved
@@ -149,16 +153,19 @@ impl CatalogMetrics {
         self.reconciliation_required.load(Ordering::Relaxed)
     }
 
-    /// Records the outcome of one batch.
-    pub(crate) fn record_batch(&self, changes: usize, elapsed: Duration, committed: bool) {
+    /// Records a committed batch of `changes` changes.
+    pub(crate) fn record_committed_batch(&self, changes: usize, elapsed: Duration) {
         self.transaction.record(elapsed);
         self.batch_peak.observe(changes as u64);
-        if committed {
-            self.batches.fetch_add(1, Ordering::Relaxed);
-            self.changes.fetch_add(changes as u64, Ordering::Relaxed);
-        } else {
-            self.failures.fetch_add(1, Ordering::Relaxed);
-        }
+        self.batches.fetch_add(1, Ordering::Relaxed);
+        self.changes.fetch_add(changes as u64, Ordering::Relaxed);
+    }
+
+    /// Records a batch of `changes` changes whose transaction failed.
+    pub(crate) fn record_failed_batch(&self, changes: usize, elapsed: Duration) {
+        self.transaction.record(elapsed);
+        self.batch_peak.observe(changes as u64);
+        self.failures.fetch_add(1, Ordering::Relaxed);
     }
 
     pub(crate) fn set_queue_usage(&self, depth: usize, bytes: usize) {
@@ -175,12 +182,14 @@ impl CatalogMetrics {
     }
 
     pub(crate) fn reject_event(&self) {
-        self.reject_events(1);
+        self.rejected.fetch_add(1, Ordering::Relaxed);
+        self.rejected_events.fetch_add(1, Ordering::Relaxed);
     }
 
-    pub(crate) fn reject_events(&self, count: usize) {
+    /// Counts events that were admitted and then omitted at the
+    /// state-database capacity; they are not admission rejections.
+    pub(crate) fn omit_events(&self, count: usize) {
         let count = u64::try_from(count).unwrap_or(u64::MAX);
-        self.rejected.fetch_add(count, Ordering::Relaxed);
         self.rejected_events.fetch_add(count, Ordering::Relaxed);
     }
 
@@ -194,9 +203,9 @@ impl CatalogMetrics {
         self.rejected_queries.fetch_add(1, Ordering::Relaxed);
     }
 
-    pub(crate) fn reject_critical(&self) {
+    pub(crate) fn reject_lifecycle(&self) {
         self.rejected.fetch_add(1, Ordering::Relaxed);
-        self.rejected_critical.fetch_add(1, Ordering::Relaxed);
+        self.rejected_lifecycle.fetch_add(1, Ordering::Relaxed);
         self.reconciliation_required.store(true, Ordering::Relaxed);
     }
 }

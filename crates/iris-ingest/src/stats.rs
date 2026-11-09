@@ -9,9 +9,11 @@ use iris_core::time::WallUs;
 /// Counters for one ingest stream, shared between the ingest task and the
 /// daemon's statistics reporter.
 ///
-/// Every accessor is a relaxed atomic load, so reading them never contends
-/// with the ingest task. Byte counts are RTP payload bytes received; tick
-/// counts are 90 kHz media ticks; peaks reset when taken.
+/// Every counter is a relaxed atomic, so reading it never contends with the
+/// ingest task; the codec description sits behind a mutex held only to copy a
+/// short string. Byte counts are access-unit bytes received (4-byte length
+/// prefixes included, parameter sets excluded); tick counts are 90 kHz media
+/// ticks; peaks reset when taken.
 #[derive(Debug)]
 pub struct StreamStats {
     frames: AtomicU64,
@@ -84,7 +86,8 @@ impl StreamStats {
         self.fragments.load(Ordering::Relaxed)
     }
 
-    /// Payload bytes received.
+    /// Access-unit bytes received: 4-byte length prefixes included, parameter
+    /// sets excluded.
     pub fn bytes(&self) -> u64 {
         self.bytes.load(Ordering::Relaxed)
     }
@@ -173,8 +176,8 @@ impl StreamStats {
         }
     }
 
-    /// Gaps logged: reconnections with frames before them, and camera holds
-    /// of a second or more.
+    /// Gaps logged: reconnections with frames before them, camera holds of a
+    /// second or more, and the first sink rejection of each loss epoch.
     pub fn gaps(&self) -> u64 {
         self.gaps.load(Ordering::Relaxed)
     }
@@ -248,12 +251,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn timing_peaks_reports_and_gaps_accumulate() {
+    fn counters_start_empty() {
         let s = StreamStats::new();
         assert_eq!(s.camera_offset_us(), None);
         assert_eq!(s.nominal_ticks(), None);
         assert_eq!(StreamStats::default().camera_offset_us(), None);
+        assert_eq!((s.frames(), s.bytes(), s.gaps()), (0, 0, 0));
+        assert!(!s.connected());
+    }
 
+    #[test]
+    fn timing_accumulates_holds_and_keeps_the_last_regulariser_state() {
+        let s = StreamStats::new();
         s.record_timing(2, 6_000, Some(3000), -40);
         s.record_timing(1, 3_000, Some(3000), 10);
         assert_eq!(
@@ -267,7 +276,11 @@ mod tests {
         );
         s.record_timing(0, 0, None, 0);
         assert_eq!(s.nominal_ticks(), None);
+    }
 
+    #[test]
+    fn fragment_peaks_reset_when_taken() {
+        let s = StreamStats::new();
         s.record_fragment_size(1_000, 180_000);
         s.record_fragment_size(500, 90_000);
         assert_eq!(
@@ -276,12 +289,30 @@ mod tests {
         );
         assert_eq!(s.fragment_bytes_peak().take(), 1_000);
         assert_eq!(s.fragment_bytes_peak().get(), 0);
+    }
 
+    #[test]
+    fn sender_reports_keep_the_last_camera_offset() {
+        let s = StreamStats::new();
         s.record_sender_report(-1_500);
         s.record_sender_report(2_500);
         assert_eq!((s.sender_reports(), s.camera_offset_us()), (2, Some(2_500)));
+    }
 
+    #[test]
+    fn frames_fragments_gaps_and_connection_state_are_recorded() {
+        let s = StreamStats::new();
+        s.record_frame(100, WallUs::new(7), true);
+        s.record_frame(50, WallUs::new(9), false);
+        s.record_fragment(true);
+        s.record_fragment(false);
+        s.record_reconnect();
         s.record_gap();
-        assert_eq!(s.gaps(), 1);
+        s.set_connected(true);
+        assert_eq!((s.frames(), s.bytes(), s.loss_events()), (2, 150, 1));
+        assert_eq!(s.last_frame_wall(), Some(WallUs::new(9)));
+        assert_eq!((s.fragments(), s.dropped_sink()), (2, 1));
+        assert_eq!((s.reconnects(), s.gaps()), (1, 1));
+        assert!(s.connected());
     }
 }

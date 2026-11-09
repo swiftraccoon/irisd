@@ -1,9 +1,10 @@
-//! Public row types, identifiers, and the change enum.
+//! Public row types, identifiers, cursors, and the change enum.
 
+use std::fmt;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use serde::{Deserialize, Serialize, Serializer};
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use iris_core::event::Event;
@@ -16,10 +17,65 @@ use iris_mp4::init::SampleEntry;
 #[serde(transparent)]
 pub struct SegmentId(pub i64);
 
+/// Row id of a sample entry. Sample entries are unique by CRC-32C and bytes
+/// together, so equal ids mean byte-identical entries; playlists decide
+/// `EXT-X-DISCONTINUITY` by comparing ids, never by the CRC alone.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct SampleEntryId(pub i64);
+
 /// Row id of an event.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct EventId(pub i64);
+
+impl fmt::Display for SegmentId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl fmt::Display for SampleEntryId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl fmt::Display for EventId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+/// Stable continuation position for segment pages ordered by start time and
+/// row id. Both values are needed: a time-only cursor skips recordings that
+/// share a start time.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct SegmentCursor {
+    /// Start time of the last row returned by the preceding page.
+    pub wall_start: WallUs,
+    /// Row id of the last row returned by the preceding page.
+    pub id: SegmentId,
+}
+
+impl From<&SegmentRow> for SegmentCursor {
+    fn from(row: &SegmentRow) -> Self {
+        Self {
+            wall_start: row.wall_start,
+            id: row.id,
+        }
+    }
+}
+
+/// One row of a startup reconciliation page with the root the catalog
+/// persisted for it, `None` for a row recorded before roots were assigned.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StartupRow {
+    /// The segment.
+    pub row: SegmentRow,
+    /// The configured root spelling persisted with the row.
+    pub root: Option<PathBuf>,
+}
 
 /// Stable continuation position for event listings ordered by receipt time and row id.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -30,35 +86,13 @@ pub struct EventCursor {
     pub id: EventId,
 }
 
-/// Stable continuation position for active protections ordered by retention deadline.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct EventProtectionCursor {
-    /// Retention deadline of the last protection returned by the preceding page.
-    pub retain_until: WallUs,
-    /// Row id of the last protection returned by the preceding page.
-    pub id: EventId,
-}
-
-/// Minimal event fields needed to decide whether footage is protected.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct EventProtection {
-    /// Stable event row id used for paging equal timestamps.
-    pub id: EventId,
-    /// Camera whose footage the event protects.
-    pub camera: CameraId,
-    /// Authoritative event placement on the NVR clock.
-    pub time: WallUs,
-    /// Time through which the protection remains active.
-    pub retain_until: WallUs,
-}
-
 /// One bounded page of sealed segments inspected for retention.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RetentionPage {
     /// Rows that were unprotected when the catalog query ran.
     pub rows: Vec<SegmentRow>,
     /// Last raw indexed segment inspected, including when every inspected row was protected.
-    pub next: Option<(WallUs, SegmentId)>,
+    pub next: Option<SegmentCursor>,
     /// Number of raw indexed segments inspected before protection filtering.
     pub scanned: usize,
 }
@@ -71,7 +105,9 @@ pub enum DeleteMarkResult {
     Marked,
     /// An active retained event overlaps the segment.
     Protected,
-    /// No ordinary sealed row has this id.
+    /// No row is eligible for this transition: the id is unknown, the row is
+    /// in deletion intent, or it fails the producing method's precondition
+    /// (sealed, open, or at the expected root).
     NotFound,
 }
 
@@ -90,7 +126,6 @@ pub struct SegmentRow {
     /// Row id.
     pub id: SegmentId,
     /// Owning camera and stream kind.
-    #[serde(serialize_with = "serialize_key")]
     pub key: StreamKey,
     /// Path of the `.mp4` file.
     pub path: PathBuf,
@@ -100,7 +135,8 @@ pub struct SegmentRow {
     pub discontinuity: bool,
     /// Wall time of the first fragment.
     pub wall_start: WallUs,
-    /// Wall time of the last fragment written (equals `wall_start` until the first progress report).
+    /// Wall time of the last fragment written (equals `wall_start` until the
+    /// first progress report).
     pub wall_end: WallUs,
     /// Decode time of the first fragment, in 90 kHz ticks.
     pub media_start: u64,
@@ -122,21 +158,10 @@ pub struct SegmentRow {
     pub width: u16,
     /// Display height.
     pub height: u16,
-    /// CRC-32C of the sample entry.
+    /// CRC-32C of the sample entry: a hint and consistency check, not an identity.
     pub sample_entry_hash: u32,
-}
-
-fn serialize_key<S: Serializer>(key: &StreamKey, serializer: S) -> Result<S::Ok, S::Error> {
-    #[derive(Serialize)]
-    struct Key<'a> {
-        camera: &'a CameraId,
-        kind: iris_core::id::StreamKind,
-    }
-    Key {
-        camera: &key.camera,
-        kind: key.kind,
-    }
-    .serialize(serializer)
+    /// The catalog's sample entry row; equal ids mean byte-identical entries.
+    pub sample_entry_id: SampleEntryId,
 }
 
 /// A stored event with its row id.
@@ -189,10 +214,18 @@ pub struct CatalogStats {
     pub wal_bytes: u64,
 }
 
-/// A fire-and-forget change, applied in send order and committed with the
-/// other pending changes in one transaction within 100 ms, at 1,000 pending,
-/// or before the next query, whichever comes first.
+/// A fire-and-forget change offered to the catalog's bounded ingress.
+///
+/// An admitted change is applied in send order and committed with the other
+/// pending changes in one transaction within 100 ms of the catalog thread
+/// taking the first of them, at 1,000 pending, or before the next query.
+/// Admission can withhold a change: an event or progress report beyond the
+/// ordinary capacity is dropped and counted, a later progress report for the
+/// same path replaces a queued one, a lifecycle change that cannot use the
+/// reserve is rejected and latches reconciliation, and every change of a
+/// failed batch is lost ([`crate::CatalogHandle::notify`]).
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub enum Change {
     /// A recording file was created.
     SegmentOpened {
@@ -206,7 +239,7 @@ pub enum Change {
         discontinuity: bool,
         /// Wall time of the first fragment.
         wall_start: WallUs,
-        /// Decode time of the first fragment.
+        /// Decode time of the first fragment, in 90 kHz ticks.
         media_start: u64,
         /// Length of `ftyp` + `moov`.
         init_len: u32,
@@ -223,7 +256,7 @@ pub enum Change {
         fragments: u32,
         /// Wall time of the last durable fragment.
         wall_end: WallUs,
-        /// End of the last durable fragment's decode time.
+        /// End of the last durable fragment's decode time, in 90 kHz ticks.
         media_end: u64,
     },
     /// The file was closed and is complete.
@@ -236,7 +269,7 @@ pub enum Change {
         fragments: u32,
         /// Wall time of the last fragment.
         wall_end: WallUs,
-        /// End of the last fragment's decode time.
+        /// End of the last fragment's decode time, in 90 kHz ticks.
         media_end: u64,
     },
     /// A camera event.
@@ -250,7 +283,7 @@ pub struct NewSegment {
     pub key: StreamKey,
     /// Path of the `.mp4` file.
     pub path: PathBuf,
-    /// The writer's run counter, if known.
+    /// The writer's run counter; zero when the scan cannot recover it.
     pub run_seq: u64,
     /// Whether a timing discontinuity precedes the file.
     pub discontinuity: bool,
@@ -258,9 +291,9 @@ pub struct NewSegment {
     pub wall_start: WallUs,
     /// Wall time of the last fragment.
     pub wall_end: WallUs,
-    /// Decode time of the first fragment.
+    /// Decode time of the first fragment, in 90 kHz ticks.
     pub media_start: u64,
-    /// End of the last fragment's decode time.
+    /// End of the last fragment's decode time, in 90 kHz ticks.
     pub media_end: u64,
     /// Length of `ftyp` + `moov`.
     pub init_len: u32,
@@ -274,10 +307,24 @@ pub struct NewSegment {
 
 /// Errors from the catalog.
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum CatalogError {
     /// SQLite failed.
     #[error("catalog database error: {0}")]
     Sqlite(#[from] rusqlite::Error),
+    /// The database could not enter write-ahead-log mode, which the crate's
+    /// durability statements assume.
+    #[error("catalog journal mode is {0}, not wal")]
+    JournalMode(String),
+    /// A configured recording root is registered with another identity.
+    #[error("configured recording root {} has a different catalog identity", .0.display())]
+    RootIdentityMismatch(PathBuf),
+    /// A recording-root identity is registered for another path.
+    #[error("recording-root identity is registered for another path, {}", .0.display())]
+    RootIdentityInUse(PathBuf),
+    /// A path handed to the catalog is not UTF-8, which the path columns require.
+    #[error("path {} is not UTF-8", .0.display())]
+    NonUtf8Path(PathBuf),
     /// The database was created by a catalog schema this binary cannot safely write.
     #[error("unsupported catalog schema version {found}; this binary supports up to {supported}")]
     UnsupportedSchema {
@@ -317,5 +364,5 @@ pub enum CatalogError {
     NotFound(PathBuf),
     /// No event has the id.
     #[error("no event {0}")]
-    UnknownEvent(i64),
+    UnknownEvent(EventId),
 }

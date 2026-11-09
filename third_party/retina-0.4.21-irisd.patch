@@ -43,7 +43,6 @@
  
 -[profile.bench]
 -debug = 2
-diff -ruN src/client/mod.rs src/client/mod.rs
 --- src/client/mod.rs
 +++ src/client/mod.rs
 @@ -27,13 +27,14 @@
@@ -62,7 +61,7 @@ diff -ruN src/client/mod.rs src/client/mod.rs
  
  /// Internal API, public for a benchmark only.
  #[doc(hidden)]
-@@ -700,9 +701,24 @@
+@@ -700,9 +701,26 @@
      initial_seq: InitialSequenceNumberPolicy,
      enforce_timestamps_with_max_jump_secs: Option<NonZeroU32>,
      unknown_rtcp_ssrc: UnknownRtcpSsrcPolicy,
@@ -74,9 +73,11 @@ diff -ruN src/client/mod.rs src/client/mod.rs
 +    /// After `PLAY` on a TCP session, takes the socket out of tokio's reactor:
 +    /// reads that would block return `Pending` without a waker and never wake
 +    /// `epoll`, so a caller that polls the session on its own timer pays no
-+    /// per-packet wake-up. Writes (keepalives, `TEARDOWN`) block briefly.
-+    /// Only for callers that poll on a timer: with an ordinary `.await` the
-+    /// session would hang.
++    /// per-packet wake-up. Writes never block: a flush that would block
++    /// returns `Pending`, keeps the unsent bytes, and continues on a later
++    /// poll; a `TEARDOWN` first returns the socket to the reactor. Only for
++    /// callers that poll on a timer: with an ordinary `.await` the session
++    /// would hang. A failed detach fails the `PLAY`, since it loses the socket.
 +    pub fn detach_from_reactor(self, detach: bool) -> Self {
 +        Self {
 +            detach_from_reactor: detach,
@@ -87,7 +88,7 @@ diff -ruN src/client/mod.rs src/client/mod.rs
      /// Sets the policy for handling the `rtptime` parameter normally seem in the `RTP-Info` header.
      pub fn initial_timestamp(self, initial_timestamp: InitialTimestampPolicy) -> Self {
          Self {
-@@ -753,6 +769,18 @@
+@@ -753,6 +771,18 @@
              ..self
          }
      }
@@ -106,7 +107,7 @@ diff -ruN src/client/mod.rs src/client/mod.rs
  }
  
  #[derive(Debug)]
-@@ -783,9 +811,10 @@
+@@ -783,9 +813,10 @@
      }
  }
  
@@ -118,7 +119,7 @@ diff -ruN src/client/mod.rs src/client/mod.rs
      }
  }
  
-@@ -997,12 +1026,23 @@
+@@ -997,12 +1028,23 @@
  }
  
  /// Username and password authentication credentials.
@@ -143,7 +144,7 @@ diff -ruN src/client/mod.rs src/client/mod.rs
  /// Marker trait for the state of a [Session].
  /// This doesn't closely match [RFC 2326
  /// A.1](https://tools.ietf.org/html/rfc2326#appendix-A.1). In practice, we've
-@@ -1108,6 +1148,11 @@
+@@ -1108,6 +1150,11 @@
      /// exception is during drop.
      conn: Option<RtspConnection>,
  
@@ -155,7 +156,7 @@ diff -ruN src/client/mod.rs src/client/mod.rs
      options: SessionOptions,
      requested_auth: Option<http_auth::PasswordClient>,
      presentation: Presentation,
-@@ -1160,6 +1205,10 @@
+@@ -1160,6 +1207,10 @@
      /// Set if an `OPTIONS` request has completed and advertised supported for
      /// `GET_PARAMETER`.
      GetParameterSupported = 0x10,
@@ -166,7 +167,7 @@ diff -ruN src/client/mod.rs src/client/mod.rs
  }
  
  impl RtspConnection {
-@@ -1170,12 +1219,26 @@
+@@ -1170,12 +1221,26 @@
          let inner = crate::tokio::Connection::connect(host, port)
              .await
              .map_err(|e| wrap!(ErrorInt::ConnectError(e)))?;
@@ -195,7 +196,7 @@ diff -ruN src/client/mod.rs src/client/mod.rs
      }
  
      fn validate_url(url: &Url) -> Result<url::Host<&str>, String> {
-@@ -1301,6 +1364,20 @@
+@@ -1301,6 +1366,20 @@
                      })
                  }
                  let www_authenticate: &str = www_authenticate;
@@ -216,7 +217,7 @@ diff -ruN src/client/mod.rs src/client/mod.rs
                  *requested_auth = match http_auth::PasswordClient::try_from(www_authenticate) {
                      Ok(c) => Some(c),
                      Err(e) => bail!(ErrorInt::RtspResponseError {
-@@ -1502,9 +1579,11 @@
+@@ -1502,9 +1581,11 @@
              })?;
          let describe_status = response.status_code;
          let sdp = resp_body;
@@ -228,7 +229,7 @@ diff -ruN src/client/mod.rs src/client/mod.rs
                  options,
                  requested_auth,
                  presentation,
-@@ -1931,6 +2010,18 @@
+@@ -1931,6 +2012,18 @@
              };
          }
          *inner.keepalive_timer = Some(Box::pin(tokio::time::sleep(keepalive_interval(session))));
@@ -238,16 +239,16 @@ diff -ruN src/client/mod.rs src/client/mod.rs
 +        {
 +            warn!("unable to set SO_RCVLOWAT to {bytes} on the RTSP socket: {e}");
 +        }
-+        if policy.detach_from_reactor
-+            && (*inner.flags & (SessionFlag::TcpStreams as u8)) != 0
-+            && let Err(e) = conn.inner.detach_from_reactor()
-+        {
-+            warn!("unable to detach the RTSP socket from the reactor: {e}");
++        if policy.detach_from_reactor && (*inner.flags & (SessionFlag::TcpStreams as u8)) != 0 {
++            // A failed detach loses the socket, so the session cannot go on.
++            conn.inner
++                .detach_from_reactor()
++                .map_err(|e| wrap!(ErrorInt::Internal(e.into())))?;
 +        }
          Ok(Session(self.0, Playing(())))
      }
  }
-@@ -2603,10 +2694,23 @@
+@@ -2603,10 +2696,23 @@
                          continue;
                      }
                      msg::Message::Request(request) => {
@@ -275,7 +276,7 @@ diff -ruN src/client/mod.rs src/client/mod.rs
                      }
                  },
                  Poll::Ready(Some(Err(e))) => {
-@@ -2683,9 +2787,19 @@
+@@ -2683,9 +2789,19 @@
              None => return,
          };
  
@@ -297,7 +298,7 @@ diff -ruN src/client/mod.rs src/client/mod.rs
  
          // Track the session, if there is a group.
          let (teardown_tx, teardown_rx) = tokio::sync::watch::channel(None);
-@@ -2711,9 +2825,10 @@
+@@ -2711,9 +2827,10 @@
              None
          };
  
@@ -309,7 +310,7 @@ diff -ruN src/client/mod.rs src/client/mod.rs
              this.presentation.tool.take(),
              session.id,
              just_try_once,
-@@ -2722,10 +2837,31 @@
+@@ -2722,10 +2839,31 @@
              this.conn.take(),
              teardown_tx,
              expires,
@@ -342,7 +343,7 @@ diff -ruN src/client/mod.rs src/client/mod.rs
  impl futures::Stream for Session<Playing> {
      type Item = Result<PacketItem, Error>;
  
-@@ -3662,4 +3798,240 @@
+@@ -3662,4 +3800,240 @@
              Some(crate::rtcp::TypedPacketRef::ReceiverReport(_))
          ));
      }
@@ -583,13 +584,1762 @@ diff -ruN src/client/mod.rs src/client/mod.rs
 +        assert!(error.contains("exceeds the 4096-byte limit"), "{error}");
 +    }
  }
-diff -ruN src/tokio.rs src/tokio.rs
+--- src/client/parse.rs
++++ src/client/parse.rs
+@@ -4,10 +4,100 @@
+ use bytes::Bytes;
+ use log::{debug, warn};
+ use sdp_types::Media;
+-use std::{net::IpAddr, num::NonZeroU16};
++use std::{borrow::Cow, net::IpAddr, num::NonZeroU16};
+ use url::Url;
+ 
+ use super::{Presentation, Stream};
++use crate::mostly_ascii::Excerpt;
++
++/// Longest URL accepted from a server, as `Content-Base`, `Content-Location`,
++/// or a joined control URL. Requests carry these as their Request-URI (and
++/// digest authentication repeats it), so the limit bounds every request built
++/// from a server's answers.
++pub(crate) const MAX_URL_BYTES: usize = 2048;
++
++/// Longest `Session` identifier accepted from a `SETUP` response; keepalives
++/// and `TEARDOWN` repeat it.
++pub(crate) const MAX_SESSION_ID_BYTES: usize = 512;
++
++/// Longest `WWW-Authenticate` value accepted; a digest response repeats its
++/// realm, nonce, and opaque values.
++pub(crate) const MAX_WWW_AUTHENTICATE_BYTES: usize = 4096;
++
++/// Most media sections accepted in one SDP.
++pub(crate) const MAX_MEDIA_SECTIONS: usize = 64;
++
++/// Problems found while interpreting one `DESCRIBE` response. They are
++/// reported together, as one bounded line, however many there are.
++#[derive(Default)]
++struct DescribeNotes {
++    count: usize,
++    first: Option<String>,
++}
++
++impl DescribeNotes {
++    /// Counts a problem; only the first one's description is formatted.
++    fn note(&mut self, description: impl FnOnce() -> String) {
++        self.count += 1;
++        if self.first.is_none() {
++            self.first = Some(description());
++        }
++    }
++}
++
++/// Returns `sdp` with each line that is not in `<type>=<value>` form emptied
++/// and noted, lines split as `sdp-types` splits them. Empty lines are skipped
++/// but still counted, so later line numbers stay true.
++///
++/// `sdp-types` 0.1.8 cannot be given such a line: its peek discards the
++/// line's error and parsing resumes at the following line, which an assertion
++/// then requires to start a media section, so any other line there panics.
++/// Where the following line is `m=`, it ignores the bad line, which is what
++/// emptying it here does in every case.
++fn without_malformed_lines<'a>(sdp: &'a [u8], notes: &mut DescribeNotes) -> Cow<'a, [u8]> {
++    let mut kept: Option<Vec<u8>> = None;
++    let mut start = 0;
++    let mut number = 0;
++    while start < sdp.len() {
++        number += 1;
++        let end = sdp[start..]
++            .iter()
++            .position(|&b| b == b'\n')
++            .map_or(sdp.len(), |i| start + i + 1);
++        let whole = &sdp[start..end];
++        let line = match whole.strip_suffix(b"\n") {
++            Some(line) => line.strip_suffix(b"\r").unwrap_or(line),
++            None => whole,
++        };
++        if !line.is_empty() && line.iter().position(|&b| b == b'=') != Some(1) {
++            let kept = kept.get_or_insert_with(|| sdp[..start].to_vec());
++            if whole.ends_with(b"\n") {
++                kept.push(b'\n');
++            }
++            notes.note(|| {
++                format!(
++                    "ignoring SDP line {number}, which is not in type=value form: \"{}\"",
++                    Excerpt(line)
++                )
++            });
++        } else if let Some(kept) = &mut kept {
++            kept.extend_from_slice(whole);
++        }
++        start = end;
++    }
++    kept.map_or(Cow::Borrowed(sdp), Cow::Owned)
++}
++
++/// Fails unless `url` is at most [`MAX_URL_BYTES`] long.
++fn check_url_len(what: &str, url: &Url) -> Result<(), String> {
++    let len = url.as_str().len();
++    if len > MAX_URL_BYTES {
++        return Err(format!(
++            "{what} of {len} bytes exceeds the {MAX_URL_BYTES}-byte limit"
++        ));
++    }
++    Ok(())
++}
+ 
+ /// A static payload type in the [RTP parameters
+ /// registry](https://www.iana.org/assignments/rtp-parameters/rtp-parameters.xhtml#rtp-parameters-1).
+@@ -191,11 +281,18 @@
+     if control == "*" {
+         return Ok(base_url.clone());
+     }
++    if control.len() > MAX_URL_BYTES {
++        return Err(format!(
++            "control URL of {} bytes exceeds the {MAX_URL_BYTES}-byte limit",
++            control.len()
++        ));
++    }
+     if let Ok(absolute_url) = Url::parse(control) {
++        check_url_len("control URL", &absolute_url)?;
+         return Ok(absolute_url);
+     }
+ 
+-    Url::parse(&format!(
++    let joined = Url::parse(&format!(
+         "{}{}{}",
+         base_url.as_str(),
+         if base_url.as_str().ends_with('/') {
+@@ -205,7 +302,14 @@
+         },
+         control
+     ))
+-    .map_err(|e| format!("unable to join base url {base_url} with control url {control:?}: {e}"))
++    .map_err(|e| {
++        format!(
++            "unable to join base url {base_url} with control url \"{}\": {e}",
++            Excerpt::of(control)
++        )
++    })?;
++    check_url_len("control URL", &joined)?;
++    Ok(joined)
+ }
+ 
+ /// Returns the `CSeq` from an RTSP response as a `u32`, or `None` if missing/unparseable.
+@@ -217,9 +321,13 @@
+ }
+ 
+ /// Parses a [MediaDescription] to a [Stream].
+-/// On failure, returns an error which is expected to be supplemented with
+-/// the [MediaDescription] debug string and packed into a `RtspResponseError`.
+-fn parse_media(base_url: &Url, media_description: &Media) -> Result<Stream, String> {
++/// On failure, returns an error which the caller notes in `notes`; tolerated
++/// problems are noted there directly.
++fn parse_media(
++    base_url: &Url,
++    media_description: &Media,
++    notes: &mut DescribeNotes,
++) -> Result<Stream, String> {
+     let media = media_description.media.clone().into_boxed_str();
+ 
+     // https://tools.ietf.org/html/rfc8866#section-5.14 says "If the <proto>
+@@ -246,7 +354,7 @@
+         .fmt
+         .split_ascii_whitespace()
+         .next()
+-        .unwrap();
++        .ok_or_else(|| "no RTP payload type".to_string())?;
+     let rtp_payload_type = u8::from_str_radix(rtp_payload_type_str, 10)
+         .map_err(|_| format!("invalid RTP payload type {rtp_payload_type_str:?}"))?;
+     if (rtp_payload_type & 0x80) != 0 {
+@@ -302,7 +410,7 @@
+                 } else {
+                     // Ubiquiti cameras sometimes have e.g. "a=fmtp:96": payload
+                     // type only, no actual attributes. Don't fail on this.
+-                    warn!("ignoring invalid fmtp attribute value {:?}", v);
++                    notes.note(|| format!("ignoring invalid fmtp attribute value \"{v}\""));
+                 }
+             }
+             "control" => {
+@@ -385,34 +493,43 @@
+     })
+ }
+ 
+-use crate::mostly_ascii::MostlyAscii;
+-
+ /// Parses a successful RTSP `DESCRIBE` response into a [Presentation].
+ /// On error, returns a string which is expected to be packed into an `RtspProtocolError`.
++///
++/// Problems that still leave a usable stream are logged together as one
++/// warning; a failure is described by the returned error alone. Either quotes
++/// server-supplied text only as an [`Excerpt`], never the whole SDP.
+ pub(crate) fn parse_describe(
+     request_url: Url,
+     response: &crate::rtsp::msg::Response,
+     body: &Bytes,
+ ) -> Result<Presentation, String> {
++    let mut notes = DescribeNotes::default();
+     match response.headers.get("Content-Type") {
+         Some(v) if &**v == "application/sdp" => {}
+         Some(v) => {
+             return Err(format!(
+                 "DESCRIBE response at {} has unexpected content type {}",
+                 request_url.as_str(),
+-                v,
++                Excerpt::of(v),
+             ));
+         }
+-        None => {
+-            warn!(
+-                "DESCRIBE response at {} has no content type; trying sdp anyway",
+-                request_url.as_str()
+-            );
+-        }
++        None => notes.note(|| "no content type; trying SDP anyway".to_owned()),
++    }
++    let well_formed = without_malformed_lines(body, &mut notes);
++    let sdp = sdp_types::Session::parse(&well_formed).map_err(|e| {
++        format!(
++            "Unable to parse SDP: {}; SDP: {}",
++            Excerpt::of(&e.to_string()),
++            Excerpt(body),
++        )
++    })?;
++    if sdp.medias.len() > MAX_MEDIA_SECTIONS {
++        return Err(format!(
++            "SDP has {} media sections; at most {MAX_MEDIA_SECTIONS} are accepted",
++            sdp.medias.len()
++        ));
+     }
+-    let raw_sdp = MostlyAscii::new(&body[..]);
+-    let sdp = sdp_types::Session::parse(raw_sdp.bytes)
+-        .map_err(|e| format!("Unable to parse SDP: {e}\n\n{raw_sdp:#?}",))?;
+ 
+     // https://tools.ietf.org/html/rfc2326#appendix-C.1.1
+     let base_url = response
+@@ -426,15 +543,24 @@
+                 .map(|v| ("Content-Location", v))
+         })
+         .map(|(h, v)| {
+-            Url::parse(v).or_else(|_| {
++            if v.len() > MAX_URL_BYTES {
++                return Err(format!(
++                    "{h} of {} bytes exceeds the {MAX_URL_BYTES}-byte limit",
++                    v.len()
++                ));
++            }
++            let url = Url::parse(v).or_else(|_| {
+                 // Some cameras (e.g. Anjvision) send a Content-Base without a
+                 // scheme prefix. Try prepending the request URL's scheme.
+                 // See <https://github.com/scottlamb/moonfire-nvr/issues/356>.
+                 let fixed = format!("{}://{v}", request_url.scheme());
+-                let url = Url::parse(&fixed).map_err(|e| format!("bad {h} {v:?}: {e}"))?;
+-                warn!("repaired schemeless {h} {v:?} to {url}");
++                let url = Url::parse(&fixed)
++                    .map_err(|e| format!("bad {h} \"{}\": {e}", Excerpt::of(v)))?;
++                notes.note(|| format!("repaired schemeless {h} \"{v}\" to {url}"));
+                 Ok::<_, String>(url)
+-            })
++            })?;
++            check_url_len(h, &url)?;
++            Ok(url)
+         })
+         .unwrap_or_else(|| Ok(request_url.clone()))?;
+ 
+@@ -451,35 +577,43 @@
+             tool = a.value.as_deref().map(super::Tool::new);
+         }
+     }
+-    let control = control.unwrap_or(request_url);
++    let control = control.unwrap_or_else(|| request_url.clone());
+ 
+-    let streams: Box<[Stream]> = sdp
+-        .medias
+-        .iter()
+-        .enumerate()
+-        .filter_map(|(i, m)| {
+-            parse_media(&base_url, m).map_or_else(
+-                |e| {
+-                    warn!(
+-                        "Ignoring unparseable stream {}: {}\nraw SDP: {:#?}",
+-                        i, e, raw_sdp
+-                    );
+-                    None
+-                },
+-                Some,
+-            )
+-        })
+-        .collect();
++    let mut streams = Vec::with_capacity(sdp.medias.len());
++    let mut first_unparseable = None;
++    for (i, m) in sdp.medias.iter().enumerate() {
++        match parse_media(&base_url, m, &mut notes) {
++            Ok(stream) => streams.push(stream),
++            Err(e) => {
++                if first_unparseable.is_none() {
++                    first_unparseable = Some(format!("stream {i}: {e}"));
++                }
++                notes.note(|| format!("ignoring unparseable stream {i}: {e}"));
++            }
++        }
++    }
+ 
+     if streams.is_empty() {
+-        return Err(format!(
+-            "No parseable streams (and {} unparseable streams)",
+-            sdp.medias.len()
+-        ));
++        return Err(match first_unparseable {
++            Some(first) => format!(
++                "No parseable streams among {} media sections; first problem: {}",
++                sdp.medias.len(),
++                Excerpt::of(&first),
++            ),
++            None => "SDP has no media sections".to_owned(),
++        });
++    }
++    if let Some(first) = &notes.first {
++        warn!(
++            "DESCRIBE response at {}: ignored {} SDP problem(s); first: {}",
++            request_url.as_str(),
++            notes.count,
++            Excerpt::of(first),
++        );
+     }
+ 
+     Ok(Presentation {
+-        streams,
++        streams: streams.into_boxed_slice(),
+         base_url,
+         control,
+         tool,
+@@ -530,6 +664,15 @@
+         .get("Session")
+         .ok_or_else(|| "Missing Session header".to_string())?;
+     let session_str: &str = session;
++    let id = session_str
++        .split_once(';')
++        .map_or(session_str, |(id, _)| id);
++    if id.len() > MAX_SESSION_ID_BYTES {
++        return Err(format!(
++            "Session id of {} bytes exceeds the {MAX_SESSION_ID_BYTES}-byte limit",
++            id.len()
++        ));
++    }
+     let session = match session_str.split_once(';') {
+         None => SessionHeader {
+             id: session_str.into(),
+@@ -537,14 +680,14 @@
+         },
+         Some((id, timeout_str)) => {
+             if let Some(v) = timeout_str.trim().strip_prefix("timeout=") {
+-                let timeout_sec =
+-                    u32::from_str_radix(v, 10).map_err(|_| format!("Unparseable timeout {v}"))?;
++                let timeout_sec = u32::from_str_radix(v, 10)
++                    .map_err(|_| format!("Unparseable timeout {}", Excerpt::of(v)))?;
+ 
+                 if timeout_sec == 0 {
+                     // This would make Retina send keepalives at an absurd rate; reject.
+                     return Err(format!(
+-                        "Invalid timeout=0 in Session header {:?}",
+-                        session_str
++                        "Invalid timeout=0 in Session header \"{}\"",
++                        Excerpt::of(session_str)
+                     ));
+                 }
+                 SessionHeader {
+@@ -552,7 +695,10 @@
+                     timeout_sec,
+                 }
+             } else {
+-                return Err(format!("Unparseable Session header {:?}", session_str));
++                return Err(format!(
++                    "Unparseable Session header \"{}\"",
++                    Excerpt::of(session_str)
++                ));
+             }
+         }
+     };
+@@ -564,6 +710,7 @@
+     let mut ssrc = None;
+     let mut source = None;
+     let mut server_port = None;
++    let mut ignored_ssrc = None;
+     let transport_str: &str = transport;
+     for part in transport_str.split(';') {
+         if let Some(v) = part.strip_prefix("ssrc=") {
+@@ -575,35 +722,51 @@
+             // when absent, the SSRC is learned from the first RTP packet. So
+             // warn and ignore one that does not parse or has four digits or
+             // fewer. Fewer than eight is fine otherwise: Hikvision drops a
+-            // leading zero (`ssrc= d6d6627`), and its value is real.
++            // leading zero (`ssrc= d6d6627`), and its value is real. One
++            // warning per response, however many `ssrc` parameters it repeats.
+             let v = v.trim();
+             match u32::from_str_radix(v, 16) {
+                 Ok(parsed) if v.len() > 4 => ssrc = Some(parsed),
+-                _ => warn!("Ignoring nonconforming ssrc in Transport header {transport_str:?}"),
++                _ => {
++                    ignored_ssrc.get_or_insert(v);
++                }
+             }
+         } else if let Some(interleaved) = part.strip_prefix("interleaved=") {
+             let mut channels = interleaved.splitn(2, '-');
+             let n = channels.next().expect("splitn returns at least one part");
+-            let n = u8::from_str_radix(n, 10).map_err(|_| format!("bad channel number {n}"))?;
++            let n = u8::from_str_radix(n, 10)
++                .map_err(|_| format!("bad channel number {}", Excerpt::of(n)))?;
+             if let Some(m) = channels.next() {
+                 let m = u8::from_str_radix(m, 10)
+-                    .map_err(|_| format!("bad second channel number {m}"))?;
++                    .map_err(|_| format!("bad second channel number {}", Excerpt::of(m)))?;
+                 if n.checked_add(1) != Some(m) {
+                     return Err(format!("Expected adjacent channels; got {n}-{m}"));
+                 }
+             }
+             channel_id = Some(n);
+         } else if let Some(s) = part.strip_prefix("source=") {
+-            source = Some(
+-                s.parse()
+-                    .map_err(|_| format!("Transport header has unparseable source {s:?}"))?,
+-            );
++            source = Some(s.parse().map_err(|_| {
++                format!(
++                    "Transport header has unparseable source \"{}\"",
++                    Excerpt::of(s)
++                )
++            })?);
+         } else if let Some(s) = part.strip_prefix("server_port=") {
+             server_port = Some(parse_server_port(s).map_err(|()| {
+-                format!("Transport header {:?} has bad server_port", &**transport)
++                format!(
++                    "Transport header \"{}\" has bad server_port",
++                    Excerpt::of(transport_str)
++                )
+             })?);
+         }
+     }
++    if let Some(v) = ignored_ssrc {
++        warn!(
++            "Ignoring nonconforming ssrc \"{}\" in Transport header \"{}\"",
++            Excerpt::of(v),
++            Excerpt::of(transport_str)
++        );
++    }
+     Ok(SetupResponse {
+         session,
+         ssrc,
+@@ -623,6 +786,10 @@
+         Some(rtsp_info) => rtsp_info,
+         None => return Ok(()),
+     };
++    // One warning of each kind per response, however many entries repeat it.
++    let mut unknown_streams = 0usize;
++    let mut first_unknown_stream = None;
++    let mut bad_rtptime = None;
+     for s in rtp_info.split(',') {
+         let s = s.trim();
+         let mut parts = s.split(';');
+@@ -651,7 +818,8 @@
+         let stream = match stream {
+             Some(s) => s,
+             None => {
+-                log::warn!("RTP-Info contains unknown stream {}", url);
++                unknown_streams += 1;
++                first_unknown_stream.get_or_insert(url);
+                 continue;
+             }
+         };
+@@ -678,13 +846,15 @@
+                 .ok_or_else(|| "RTP-Info param has no =".to_string())?;
+             match key {
+                 "seq" => {
+-                    let seq =
+-                        u16::from_str_radix(value, 10).map_err(|_| format!("bad seq {value:?}"))?;
++                    let seq = u16::from_str_radix(value, 10)
++                        .map_err(|_| format!("bad seq \"{}\"", Excerpt::of(value)))?;
+                     state.initial_seq = Some(seq);
+                 }
+                 "rtptime" => match u32::from_str_radix(value, 10) {
+                     Ok(v) => state.initial_rtptime = Some(v),
+-                    Err(_) => warn!("Unparseable rtptime in RTP-Info header {:?}", rtp_info),
++                    Err(_) => {
++                        bad_rtptime.get_or_insert(value);
++                    }
+                 },
+                 // `ssrc` is deliberately not read here. RTSP/1.0 defines no
+                 // `ssrc` parameter for `RTP-Info` (RFC 2326 section 12.33);
+@@ -701,6 +871,19 @@
+             }
+         }
+     }
++    if let Some(url) = first_unknown_stream {
++        warn!(
++            "RTP-Info contains {unknown_streams} unknown stream(s), the first {}",
++            Excerpt::of(url.as_str())
++        );
++    }
++    if let Some(value) = bad_rtptime {
++        warn!(
++            "Unparseable rtptime \"{}\" in RTP-Info header \"{}\"",
++            Excerpt::of(value),
++            Excerpt::of(rtp_info)
++        );
++    }
+     Ok(())
+ }
+ 
+@@ -1722,4 +1905,310 @@
+             Some(Url::parse("rtsp://192.168.1.10:554/stream0/trackID=1").unwrap())
+         );
+     }
++
++    /// An SDP with one H.264 stream, for the generated cases below.
++    const SDP_HEAD: &[u8] = b"v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=test\r\nt=0 0\r\n\
++        a=control:*\r\nm=video 0 RTP/AVP 96\r\na=rtpmap:96 H264/90000\r\na=control:trackID=0\r\n";
++
++    /// A `DESCRIBE` response for a generated body, with `extra` headers.
++    fn generated_describe(
++        extra: &[(&str, &str)],
++        body: Vec<u8>,
++    ) -> (crate::rtsp::msg::Response, Bytes) {
++        use crate::rtsp::msg::*;
++        let mut headers: Headers = [(
++            HeaderName::CONTENT_TYPE,
++            HeaderValue::try_from("application/sdp").unwrap(),
++        )]
++        .into();
++        for (name, value) in extra {
++            headers.insert(
++                HeaderName::try_from(*name).unwrap(),
++                HeaderValue::try_from(*value).unwrap(),
++            );
++        }
++        let response = Response {
++            status_code: StatusCode::OK,
++            reason_phrase: "OK".into(),
++            headers,
++        };
++        (response, Bytes::from(body))
++    }
++
++    /// A response with the given headers and no body.
++    fn generated_response(headers: &[(&str, String)]) -> crate::rtsp::msg::Response {
++        use crate::rtsp::msg::*;
++        let mut map = Headers::default();
++        for (name, value) in headers {
++            map.insert(
++                HeaderName::try_from(*name).unwrap(),
++                HeaderValue::try_from(value.as_str()).unwrap(),
++            );
++        }
++        Response {
++            status_code: StatusCode::OK,
++            reason_phrase: "OK".into(),
++            headers: map,
++        }
++    }
++
++    fn loopback_url() -> Url {
++        Url::parse("rtsp://127.0.0.1:554/cam").unwrap()
++    }
++
++    /// The warning-level records in `records`.
++    fn warnings(records: &[(log::Level, String)]) -> Vec<&str> {
++        records
++            .iter()
++            .filter(|(level, _)| *level <= log::Level::Warn)
++            .map(|(_, message)| message.as_str())
++            .collect()
++    }
++
++    /// One printable line short enough for a log.
++    fn assert_bounded_line(text: &str) {
++        assert!(text.len() <= 2048, "{} bytes: {text:.200}", text.len());
++        assert!(!text.bytes().any(|b| b.is_ascii_control()), "{text:?}");
++    }
++
++    #[test]
++    fn describe_problems_make_one_bounded_warning() {
++        let mut sdp = SDP_HEAD.to_vec();
++        // An fmtp attribute without parameters carrying terminal controls.
++        sdp.extend_from_slice(b"a=fmtp:96\x1b]0;forged\x07\x1b[31m\r\n");
++        for _ in 1..MAX_MEDIA_SECTIONS {
++            sdp.extend_from_slice(b"m=a 0 X 0\r\n");
++        }
++        let (response, body) = generated_describe(&[], sdp);
++        let (presentation, records) = crate::testutil::capture_logs(|| {
++            super::parse_describe(loopback_url(), &response, &body)
++        });
++        assert_eq!(presentation.unwrap().streams.len(), 1);
++        let warnings = warnings(&records);
++        assert_eq!(warnings.len(), 1, "{records:?}");
++        assert!(
++            warnings[0].contains(&format!("ignored {MAX_MEDIA_SECTIONS} SDP problem(s)")),
++            "{}",
++            warnings[0]
++        );
++        assert!(
++            warnings[0].contains("\\x1B]0;forged\\x07"),
++            "{}",
++            warnings[0]
++        );
++        assert_bounded_line(warnings[0]);
++    }
++
++    #[test]
++    fn describe_rejects_more_media_sections_than_the_limit() {
++        let mut sdp = SDP_HEAD.to_vec();
++        for _ in 0..10_000 {
++            sdp.extend_from_slice(b"m=a 0 X 0\r\n");
++        }
++        let (response, body) = generated_describe(&[], sdp);
++        let (result, records) = crate::testutil::capture_logs(|| {
++            super::parse_describe(loopback_url(), &response, &body)
++        });
++        let error = result.expect_err("too many media sections");
++        assert!(error.contains("10001 media sections"), "{error}");
++        assert_bounded_line(&error);
++        assert!(warnings(&records).is_empty(), "{records:?}");
++    }
++
++    #[test]
++    fn invalid_sdp_error_quotes_a_bounded_excerpt() {
++        // The version value reaches the parser's error text as sent.
++        let mut sdp = b"v=\x1b]0;forged\x07\r\n<0>forged emergency line\n".to_vec();
++        while sdp.len() < crate::rtsp::parse::MAX_CONTROL_MESSAGE_BYTES - 64 {
++            sdp.extend_from_slice(b"a=pad:xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n");
++        }
++        let (response, body) = generated_describe(&[], sdp);
++        let (result, records) = crate::testutil::capture_logs(|| {
++            super::parse_describe(loopback_url(), &response, &body)
++        });
++        let error = result.expect_err("an invalid SDP");
++        assert!(
++            error
++                .starts_with("Unable to parse SDP: Invalid version at line 1: \\x1B]0;forged\\x07"),
++            "{error:.200}"
++        );
++        assert!(error.contains("\\n<0>forged"), "{error:.600}");
++        assert_bounded_line(&error);
++        assert!(records.is_empty(), "{records:?}");
++    }
++
++    /// `sdp-types` panics on a malformed line followed by any line but `m=`;
++    /// such lines are ignored and noted instead, anywhere in the SDP.
++    #[test]
++    fn malformed_sdp_lines_are_ignored_and_noted() {
++        let mut sdp = b"v=0\r\nnot an sdp line\r\na=tool:x\r\n".to_vec();
++        sdp.extend_from_slice(b"m=video 0 RTP/AVP 96\r\na=rtpmap:96 H264/90000\r\n");
++        sdp.extend_from_slice(b"=no type\r\na=control:trackID=0\r\nab=two\n\n");
++        let (response, body) = generated_describe(&[], sdp);
++        let (presentation, records) = crate::testutil::capture_logs(|| {
++            super::parse_describe(loopback_url(), &response, &body)
++        });
++        let presentation = presentation.unwrap();
++        assert_eq!(presentation.streams.len(), 1);
++        assert_eq!(
++            presentation.streams[0].control.as_ref().map(Url::as_str),
++            Some("rtsp://127.0.0.1:554/cam/trackID=0")
++        );
++        assert_eq!(presentation.tool.as_deref(), Some("x"));
++        let warnings = warnings(&records);
++        assert_eq!(warnings.len(), 1, "{records:?}");
++        assert!(
++            warnings[0].contains("ignored 3 SDP problem(s); first: ignoring SDP line 2"),
++            "{}",
++            warnings[0]
++        );
++    }
++
++    #[test]
++    fn emptied_lines_keep_the_line_numbers() {
++        let mut notes = DescribeNotes::default();
++        let kept = without_malformed_lines(b"v=0\r\nbad\r\no=x\nbad\nt=", &mut notes);
++        assert_eq!(&*kept, &b"v=0\r\n\no=x\n\nt="[..]);
++        assert_eq!(notes.count, 2);
++        let clean = b"v=0\r\nt=0 0\r\n";
++        assert!(matches!(
++            without_malformed_lines(clean, &mut DescribeNotes::default()),
++            Cow::Borrowed(_)
++        ));
++    }
++
++    #[test]
++    fn describe_rejects_an_oversized_content_base() {
++        let base = format!("rtsp://127.0.0.1/{}/", "a".repeat(MAX_URL_BYTES));
++        let (response, body) = generated_describe(&[("Content-Base", &base)], SDP_HEAD.to_vec());
++        let error = super::parse_describe(loopback_url(), &response, &body)
++            .expect_err("an oversized Content-Base");
++        assert!(error.starts_with("Content-Base of "), "{error}");
++        assert!(error.ends_with("exceeds the 2048-byte limit"), "{error}");
++
++        let base = format!("rtsp://127.0.0.1/{}/", "a".repeat(MAX_URL_BYTES - 64));
++        let (response, body) = generated_describe(&[("Content-Base", &base)], SDP_HEAD.to_vec());
++        super::parse_describe(loopback_url(), &response, &body).unwrap();
++    }
++
++    #[test]
++    fn describe_rejects_an_oversized_control_url() {
++        let control = format!("rtsp://127.0.0.1/{}", "c".repeat(MAX_URL_BYTES));
++        let mut sdp = b"v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=test\r\nt=0 0\r\n".to_vec();
++        sdp.extend_from_slice(format!("a=control:{control}\r\n").as_bytes());
++        sdp.extend_from_slice(b"m=video 0 RTP/AVP 96\r\na=rtpmap:96 H264/90000\r\n");
++        let (response, body) = generated_describe(&[], sdp);
++        let error = super::parse_describe(loopback_url(), &response, &body)
++            .expect_err("an oversized presentation control URL");
++        assert!(error.starts_with("control URL of "), "{error}");
++
++        // A stream's own control URL makes that stream unusable.
++        let mut sdp = b"v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=test\r\nt=0 0\r\n".to_vec();
++        sdp.extend_from_slice(b"m=video 0 RTP/AVP 96\r\na=rtpmap:96 H264/90000\r\n");
++        sdp.extend_from_slice(format!("a=control:{}\r\n", "c".repeat(MAX_URL_BYTES)).as_bytes());
++        let (response, body) = generated_describe(&[], sdp);
++        let error =
++            super::parse_describe(loopback_url(), &response, &body).expect_err("no usable stream");
++        assert!(error.contains("stream 0: control URL of "), "{error}");
++    }
++
++    #[test]
++    fn setup_rejects_an_oversized_session_id() {
++        let transport = (
++            "Transport",
++            "RTP/AVP/TCP;unicast;interleaved=0-1".to_owned(),
++        );
++        let longest = "S".repeat(MAX_SESSION_ID_BYTES);
++        let setup = super::parse_setup(&generated_response(&[
++            ("Session", format!("{longest};timeout=60")),
++            transport.clone(),
++        ]))
++        .unwrap();
++        assert_eq!(&*setup.session.id, longest);
++
++        let error = super::parse_setup(&generated_response(&[
++            ("Session", format!("{longest}S;timeout=4294967295")),
++            transport,
++        ]))
++        .expect_err("an oversized session id");
++        assert_eq!(error, "Session id of 513 bytes exceeds the 512-byte limit");
++    }
++
++    #[test]
++    fn setup_warns_once_for_repeated_nonconforming_ssrc() {
++        let transport = format!(
++            "RTP/AVP/TCP;unicast;interleaved=0-1{}",
++            ";ssrc=1".repeat(10_000)
++        );
++        let response = generated_response(&[
++            ("Session", "abc;timeout=60".to_owned()),
++            ("Transport", transport),
++        ]);
++        let (setup, records) = crate::testutil::capture_logs(|| super::parse_setup(&response));
++        assert_eq!(setup.unwrap().ssrc, None);
++        let warnings = warnings(&records);
++        assert_eq!(warnings.len(), 1, "{} warnings", warnings.len());
++        assert!(
++            warnings[0].starts_with("Ignoring nonconforming ssrc \"1\""),
++            "{}",
++            warnings[0]
++        );
++        assert_bounded_line(warnings[0]);
++    }
++
++    #[test]
++    fn play_warns_once_for_repeated_rtp_info_problems() {
++        let mut sdp = SDP_HEAD.to_vec();
++        sdp.extend_from_slice(b"m=video 0 RTP/AVP 96\r\na=rtpmap:96 H264/90000\r\n");
++        sdp.extend_from_slice(b"a=control:trackID=1\r\n");
++        let (response, body) = generated_describe(&[], sdp);
++        let mut p = super::parse_describe(loopback_url(), &response, &body).unwrap();
++        assert_eq!(p.streams.len(), 2);
++        p.streams[0].state = dummy_stream_state_init(None);
++        let entry = "url=rtsp://127.0.0.1:554/cam/trackID=0;seq=1;rtptime=x";
++        let unknown = "url=rtsp://127.0.0.1:554/cam/unknown;seq=1";
++        let rtp_info = [entry; 2_000]
++            .into_iter()
++            .chain([unknown; 2_000])
++            .collect::<Vec<_>>()
++            .join(",");
++        let play = generated_response(&[("RTP-Info", rtp_info)]);
++        let (result, records) = crate::testutil::capture_logs(|| super::parse_play(&play, &mut p));
++        result.unwrap();
++        let warnings = warnings(&records);
++        assert_eq!(warnings.len(), 2, "{} warnings", warnings.len());
++        assert!(
++            warnings
++                .iter()
++                .any(|w| w.starts_with("RTP-Info contains 2000 unknown stream(s)")),
++            "{warnings:?}"
++        );
++        assert!(
++            warnings
++                .iter()
++                .any(|w| w.starts_with("Unparseable rtptime \"x\"")),
++            "{warnings:?}"
++        );
++        for warning in warnings {
++            assert_bounded_line(warning);
++        }
++    }
++
++    #[test]
++    fn media_section_without_a_payload_type_is_unusable() {
++        let mut sdp = SDP_HEAD.to_vec();
++        sdp.extend_from_slice(b"m=video 0 RTP/AVP \t\r\n");
++        let (response, body) = generated_describe(&[], sdp);
++        let (presentation, records) = crate::testutil::capture_logs(|| {
++            super::parse_describe(loopback_url(), &response, &body)
++        });
++        assert_eq!(presentation.unwrap().streams.len(), 1);
++        let warnings = warnings(&records);
++        assert_eq!(warnings.len(), 1, "{records:?}");
++        assert!(
++            warnings[0].contains("ignoring unparseable stream 1: no RTP payload type"),
++            "{}",
++            warnings[0]
++        );
++    }
+ }
+--- src/client/teardown.rs
++++ src/client/teardown.rs
+@@ -1,24 +1,78 @@
+ // Copyright (C) The Retina Authors
+ // SPDX-License-Identifier: MIT OR Apache-2.0
+ 
++use std::net::SocketAddr;
++use std::sync::atomic::{AtomicUsize, Ordering};
++
+ use bytes::Bytes;
+ use url::Url;
+ 
+ use crate::rtsp::msg::{self, OwnedMessage, StatusCode};
+ 
+-use super::{ResponseMode, RtspConnection, SessionOptions, Tool};
++use super::{MAX_BACKGROUND_TEARDOWNS, ResponseMode, RtspConnection, SessionOptions, Tool};
+ use crate::{Error, error::ErrorInt};
+ 
+ const EXISTING_CONN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+ const FRESH_CONN_INITIAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
+ const FRESH_CONN_MAX_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(16);
+ 
++/// Longest a background `TEARDOWN` keeps trying, whatever session timeout the
++/// server announced.
++pub(super) const MAX_LIFETIME: std::time::Duration = std::time::Duration::from_secs(60);
++
++/// Background `TEARDOWN` tasks running in this process.
++static RUNNING: AtomicUsize = AtomicUsize::new(0);
++
++/// One of the [`MAX_BACKGROUND_TEARDOWNS`] places for a background
++/// `TEARDOWN` task, released when dropped.
++pub(super) struct Slot(&'static AtomicUsize);
++
++impl Slot {
++    /// Takes a place, or returns `None` when all are taken.
++    pub(super) fn acquire() -> Option<Self> {
++        Self::acquire_from(&RUNNING, MAX_BACKGROUND_TEARDOWNS)
++    }
++
++    fn acquire_from(counter: &'static AtomicUsize, max: usize) -> Option<Self> {
++        let mut taken = counter.load(Ordering::Acquire);
++        loop {
++            if taken >= max {
++                return None;
++            }
++            match counter.compare_exchange_weak(
++                taken,
++                taken + 1,
++                Ordering::AcqRel,
++                Ordering::Acquire,
++            ) {
++                Ok(_) => return Some(Self(counter)),
++                Err(actual) => taken = actual,
++            }
++        }
++    }
++
++    /// Returns how many places are taken.
++    pub(super) fn in_use() -> usize {
++        RUNNING.load(Ordering::Acquire)
++    }
++}
++
++impl Drop for Slot {
++    fn drop(&mut self) {
++        self.0.fetch_sub(1, Ordering::AcqRel);
++    }
++}
++
+ /// Handles `TEARDOWN` loop in the background, removing the stale session entry on success or
+ /// session expiry.
++///
++/// `base_url` is only the Request-URI: fresh connections go to `peer`, the
++/// address the session's own connection reached.
+ #[allow(clippy::too_many_arguments)]
+ pub(super) async fn background_teardown(
+     seqnum: Option<u64>,
+     base_url: Url,
++    peer: SocketAddr,
+     tool: Option<Tool>,
+     session_id: Box<str>,
+     just_try_once: bool,
+@@ -37,6 +91,7 @@
+         expires,
+         teardown_loop_forever(
+             base_url,
++            peer,
+             tool,
+             &session_id,
+             just_try_once,
+@@ -76,6 +131,7 @@
+ #[allow(clippy::too_many_arguments)]
+ pub(super) async fn teardown_loop_forever(
+     url: Url,
++    peer: SocketAddr,
+     tool: Option<Tool>,
+     session_id: &str,
+     just_try_once: bool,
+@@ -97,6 +153,17 @@
+         body: Bytes::new(),
+     };
+ 
++    // A session read on its owner's timer left its socket outside the reactor
++    // with a raised low-water mark, so neither the request's writes nor the
++    // response would wake this task. Undo both so the attempt below makes
++    // progress as I/O allows and `attempt_deadline` bounds it.
++    if let Some(c) = conn.as_mut()
++        && let Err(e) = c.inner.return_to_reactor()
++    {
++        log::debug!("TEARDOWN {session_id} skips the session's own connection: {e}");
++        conn = None;
++    }
++
+     let attempt_deadline = tokio::time::sleep(EXISTING_CONN_TIMEOUT);
+     tokio::pin!(attempt_deadline);
+     if let Some(conn) = conn.take() {
+@@ -157,7 +224,10 @@
+             .as_mut()
+             .reset(tokio::time::Instant::now() + timeout);
+         let attempt = async {
+-            let conn = RtspConnection::connect(&url).await?;
++            // The session's own peer, never the host in `url`: a server may
++            // advertise any `Content-Base`, and this request carries
++            // credentials.
++            let conn = RtspConnection::connect_peer(peer).await?;
+             attempt(&mut req, tool.as_ref(), options, &mut requested_auth, conn).await
+         };
+         tokio::select! {
+@@ -229,3 +299,23 @@
+         _ => Err(e),
+     }
+ }
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn slots_are_bounded_and_released_on_drop() {
++        static COUNTER: AtomicUsize = AtomicUsize::new(0);
++        let held: Vec<Slot> = (0..3)
++            .map(|_| Slot::acquire_from(&COUNTER, 3).expect("a free slot"))
++            .collect();
++        assert!(Slot::acquire_from(&COUNTER, 3).is_none());
++        assert_eq!(COUNTER.load(Ordering::Acquire), 3);
++        drop(held);
++        assert_eq!(COUNTER.load(Ordering::Acquire), 0);
++        let again = Slot::acquire_from(&COUNTER, 3);
++        assert!(again.is_some());
++        assert_eq!(COUNTER.load(Ordering::Acquire), 1);
++    }
++}
+--- src/codec/h264.rs
++++ src/codec/h264.rs
+@@ -303,7 +303,11 @@
+             Some(fp) => match InternalParameters::parse_format_specific_params(fp) {
+                 Ok(p) => Some(p),
+                 Err(e) => {
+-                    log::warn!("Ignoring bad H.264 format-specific-params {:?}: {}", fp, e);
++                    log::warn!(
++                        "Ignoring bad H.264 format-specific-params \"{}\": {}",
++                        crate::mostly_ascii::Excerpt::of(fp),
++                        crate::mostly_ascii::Excerpt::of(&e)
++                    );
+                     None
+                 }
+             },
+--- src/codec/h265.rs
++++ src/codec/h265.rs
+@@ -24,6 +24,61 @@
+ 
+ use super::VideoFrame;
+ 
++/// Maximum payload/output bytes accumulated for one H.265 access unit.
++const MAX_ACCESS_UNIT_BYTES: usize = 64 * 1024 * 1024;
++const ACCESS_UNIT_TOO_LARGE: &str = "H.265 access unit exceeds 64 MiB";
++
++#[derive(Debug)]
++struct AccessUnitBudget {
++    pinned_payload: usize,
++    projected_output: usize,
++    limit: usize,
++}
++
++impl AccessUnitBudget {
++    fn new() -> Self {
++        Self {
++            pinned_payload: 0,
++            projected_output: 0,
++            limit: MAX_ACCESS_UNIT_BYTES,
++        }
++    }
++
++    fn add_pinned_payload(&mut self, bytes: usize) -> Result<(), String> {
++        self.pinned_payload = bounded_sum(self.pinned_payload, bytes, self.limit)?;
++        Ok(())
++    }
++
++    fn add_projected_output(&mut self, bytes: usize) -> Result<(), String> {
++        self.projected_output = bounded_sum(self.projected_output, bytes, self.limit)?;
++        Ok(())
++    }
++
++    fn ensure_output(&self, bytes: usize) -> Result<(), String> {
++        if bytes > self.limit {
++            Err(ACCESS_UNIT_TOO_LARGE.to_owned())
++        } else {
++            Ok(())
++        }
++    }
++
++    fn reset(&mut self) {
++        self.pinned_payload = 0;
++        self.projected_output = 0;
++    }
++}
++
++fn bounded_sum(current: usize, additional: usize, limit: usize) -> Result<usize, String> {
++    let projected = current
++        .checked_add(additional)
++        .ok_or_else(|| ACCESS_UNIT_TOO_LARGE.to_owned())?;
++    if projected > limit {
++        Err(ACCESS_UNIT_TOO_LARGE.to_owned())
++    } else {
++        Ok(projected)
++    }
++}
++
+ /// A [super::Depacketizer] implementation which finds access unit boundaries
+ /// and produces unfragmented NAL units as specified in [RFC
+ /// 7798](https://tools.ietf.org/html/rfc7798).
+@@ -58,6 +113,9 @@
+     /// Kept around (empty) in other states to re-use the backing allocation.
+     nals: Vec<Nal>,
+ 
++    /// Payload pinned and output projected for the access unit in progress.
++    au_budget: AccessUnitBudget,
++
+     /// True if we've seen a FU sequence where the NAL headers differ between
+     /// fragments.
+     seen_inconsistent_fu_nal_hdr: bool,
+@@ -137,7 +195,11 @@
+             Some(fp) => match InternalParameters::parse_format_specific_params(fp) {
+                 Ok(p) => Some(p),
+                 Err(e) => {
+-                    log::warn!("Ignoring bad H.265 format-specific-params {:?}: {}", fp, e);
++                    log::warn!(
++                        "Ignoring bad H.265 format-specific-params \"{}\": {}",
++                        crate::mostly_ascii::Excerpt::of(fp),
++                        crate::mostly_ascii::Excerpt::of(&e)
++                    );
+                     None
+                 }
+             },
+@@ -148,6 +210,7 @@
+             mark: None,
+             pieces: Vec::new(),
+             nals: Vec::new(),
++            au_budget: AccessUnitBudget::new(),
+             parameters,
+             seen_inconsistent_fu_nal_hdr: false,
+             seen_single_fragment_fu: false,
+@@ -182,6 +245,8 @@
+             assert!(self.nals.is_empty());
+             assert!(self.pieces.is_empty());
+             assert!(self.mark.is_none());
++            assert_eq!(self.au_budget.pinned_payload, 0);
++            assert_eq!(self.au_budget.projected_output, 0);
+         }
+     }
+ 
+@@ -189,6 +254,7 @@
+         self.nals.clear();
+         self.pieces.clear();
+         self.mark = None;
++        self.au_budget.reset();
+     }
+ 
+     pub(super) fn parameters(&self) -> Option<super::ParametersRef<'_>> {
+@@ -315,6 +381,8 @@
+         if payload_len < 2 {
+             return Err("Short NAL".into());
+         }
++        self.au_budget
++            .add_pinned_payload(usize::from(payload_len))?;
+         if self.mark.is_none() {
+             self.mark = Some(pkt.mark());
+         }
+@@ -332,6 +400,8 @@
+                         "Non-fragmented NAL {hdr:?} while fragment in progress"
+                     ));
+                 }
++                self.au_budget
++                    .add_projected_output(4 + usize::from(payload_len))?;
+                 let next_piece_idx = self.add_piece(BufRange {
+                     pos: payload_pos + 2,
+                     len: payload_len - 2,
+@@ -369,6 +439,8 @@
+                     }
+                     let nal_hdr_bytes = payload.peek_array::<2>();
+                     let nal_hdr = nal::Header::try_from(nal_hdr_bytes).map_err(|e| e.0)?;
++                    self.au_budget
++                        .add_projected_output(4 + usize::from(nal_len))?;
+                     let next_piece_idx = self.add_piece(BufRange {
+                         pos: pos + 2,
+                         len: nal_len - 2,
+@@ -421,6 +493,8 @@
+                             );
+                             self.seen_single_fragment_fu = true;
+                         }
++                        self.au_budget
++                            .add_projected_output(6 + usize::from(frag_len))?;
+                         let pieces = self.add_piece(BufRange {
+                             pos: payload_pos + 3,
+                             len: frag_len,
+@@ -433,6 +507,7 @@
+                         access_unit.in_fu = !end;
+                     }
+                     (false, true) => {
++                        self.au_budget.add_projected_output(usize::from(frag_len))?;
+                         let pieces = self.add_piece(BufRange {
+                             pos: payload_pos + 3,
+                             len: frag_len,
+@@ -610,7 +685,11 @@
+                 nal.hdr.unit_type(),
+                 nal::UnitType::VpsNut | nal::UnitType::SpsNut | nal::UnitType::PpsNut
+             ) {
+-                retained_len += 4usize + crate::to_usize(nal.len);
++                retained_len = bounded_sum(
++                    retained_len,
++                    4usize + crate::to_usize(nal.len),
++                    self.au_budget.limit,
++                )?;
+             }
+             piece_idx = next_piece_idx;
+         }
+@@ -656,9 +735,17 @@
+             };
+         if prepend_params && let Some(ref p) = self.parameters {
+             // 4-byte prefix + VPS + 4-byte prefix + SPS + 4-byte prefix + PPS
+-            retained_len += 4 + p.vps_nal.len() + 4 + p.sps_nal.len() + 4 + p.pps_nal.len();
++            let parameter_len = 4usize
++                .checked_add(p.vps_nal.len())
++                .and_then(|length| length.checked_add(4))
++                .and_then(|length| length.checked_add(p.sps_nal.len()))
++                .and_then(|length| length.checked_add(4))
++                .and_then(|length| length.checked_add(p.pps_nal.len()))
++                .ok_or_else(|| ACCESS_UNIT_TOO_LARGE.to_owned())?;
++            retained_len = bounded_sum(retained_len, parameter_len, self.au_budget.limit)?;
+         }
+ 
++        self.au_budget.ensure_output(retained_len)?;
+         let mut data = Vec::with_capacity(retained_len);
+ 
+         // Prepend parameter sets if requested.
+@@ -706,6 +793,7 @@
+         self.nals.clear();
+         self.pieces.clear();
+         self.mark = None;
++        self.au_budget.reset();
+ 
+         Ok(VideoFrame {
+             has_new_parameters,
+@@ -1048,6 +1136,105 @@
+         d.push(&PacketRef::new(meta, buf, pos, payload.len() as u16))
+     }
+ 
++    fn packet_meta(sequence_number: u16, mark: bool) -> crate::rtp::PacketMeta {
++        crate::rtp::PacketMeta {
++            ctx: PacketContext::dummy(),
++            stream_id: 0,
++            timestamp: crate::Timestamp {
++                timestamp: 0,
++                clock_rate: NonZeroU32::new(90_000).unwrap(),
++                start: 0,
++            },
++            ssrc: 0,
++            sequence_number,
++            loss: 0,
++            mark,
++        }
++    }
++
++    fn assert_au_released(d: &super::Depacketizer) {
++        assert!(d.mark.is_none());
++        assert!(d.nals.is_empty());
++        assert!(d.pieces.is_empty());
++        assert_eq!(d.au_budget.pinned_payload, 0);
++        assert_eq!(d.au_budget.projected_output, 0);
++    }
++
++    #[test]
++    fn access_unit_budget_accepts_the_limit_and_rejects_integer_overflow() {
++        let mut budget = super::AccessUnitBudget::new();
++        budget
++            .add_pinned_payload(super::MAX_ACCESS_UNIT_BYTES)
++            .unwrap();
++        budget
++            .add_projected_output(super::MAX_ACCESS_UNIT_BYTES)
++            .unwrap();
++        assert!(budget.add_pinned_payload(1).is_err());
++        assert!(budget.add_projected_output(1).is_err());
++        assert!(super::bounded_sum(usize::MAX, 1, usize::MAX).is_err());
++    }
++
++    #[test]
++    fn many_complete_nals_release_the_access_unit_at_the_budget() {
++        let mut d = super::Depacketizer::new(90_000, None).unwrap();
++        d.au_budget.limit = 20;
++        let mut buf = MarkBuf::new(128);
++        for sequence in 0..2 {
++            push_via_buf(
++                &mut d,
++                packet_meta(sequence, false),
++                b"\x02\x01abcd",
++                &mut buf,
++            )
++            .unwrap();
++        }
++        let error =
++            push_via_buf(&mut d, packet_meta(2, false), b"\x02\x01abcd", &mut buf).unwrap_err();
++        assert_eq!(error, super::ACCESS_UNIT_TOO_LARGE);
++        assert_au_released(&d);
++    }
++
++    #[test]
++    fn indefinitely_extended_fu_releases_the_access_unit_at_the_budget() {
++        let mut d = super::Depacketizer::new(90_000, None).unwrap();
++        d.au_budget.limit = 28;
++        let mut buf = MarkBuf::new(128);
++        push_via_buf(&mut d, packet_meta(0, false), b"\x62\x01\x81abcd", &mut buf).unwrap();
++        for sequence in 1..4 {
++            push_via_buf(
++                &mut d,
++                packet_meta(sequence, false),
++                b"\x62\x01\x01abcd",
++                &mut buf,
++            )
++            .unwrap();
++        }
++        let error =
++            push_via_buf(&mut d, packet_meta(4, false), b"\x62\x01\x01abcd", &mut buf).unwrap_err();
++        assert_eq!(error, super::ACCESS_UNIT_TOO_LARGE);
++        assert_au_released(&d);
++    }
++
++    #[test]
++    fn completed_access_unit_obeys_the_exact_output_limit() {
++        let payload = b"\x02\x01abcd";
++        let mut buf = MarkBuf::new(128);
++        let mut exact = super::Depacketizer::new(90_000, None).unwrap();
++        exact.au_budget.limit = 10;
++        push_via_buf(&mut exact, packet_meta(0, true), payload, &mut buf).unwrap();
++        let Some(Ok(CodecItem::VideoFrame(frame))) = exact.pull() else {
++            panic!("expected a frame at the exact limit");
++        };
++        assert_eq!(frame.data().len(), 10);
++        assert_au_released(&exact);
++
++        let mut over = super::Depacketizer::new(90_000, None).unwrap();
++        over.au_budget.limit = 9;
++        let error = push_via_buf(&mut over, packet_meta(0, true), payload, &mut buf).unwrap_err();
++        assert_eq!(error, super::ACCESS_UNIT_TOO_LARGE);
++        assert_au_released(&over);
++    }
++
+     #[test]
+     fn depacketize() {
+         init_logging();
+--- src/codec/mod.rs
++++ src/codec/mod.rs
+@@ -893,11 +893,10 @@
+                 onvif::Depacketizer::new(CompressionType::ExiInBand),
+             )),
+             (_, _) => {
+-                log::info!(
+-                    "no depacketizer for media/encoding_name {}/{}",
+-                    media,
+-                    encoding_name
+-                );
++                // Server-chosen names: logged and returned as bounded excerpts.
++                let media = crate::mostly_ascii::Excerpt::of(media);
++                let encoding_name = crate::mostly_ascii::Excerpt::of(encoding_name);
++                log::info!("no depacketizer for media/encoding_name {media}/{encoding_name}");
+                 return Err(format!(
+                     "no depacketizer for media/encoding_name {media}/{encoding_name}"
+                 ));
+--- src/lib.rs
++++ src/lib.rs
+@@ -300,9 +300,10 @@
+     /// can be compared to the relative TCP sequence number.
+     pos: u64,
+ 
+-    /// Time when the application parsed the message. Caveat: this may not
+-    /// closely match the time on a packet capture if the application is
+-    /// overloaded (or if `CLOCK_REALTIME` jumps).
++    /// Time when the read that delivered the message returned; every message
++    /// decoded from one read shares it, so the clock is read once per read.
++    /// Caveat: this may not closely match the time on a packet capture if the
++    /// application is overloaded (or if `CLOCK_REALTIME` jumps).
+     received_wall: WallTime,
+     received: std::time::Instant,
+ }
+--- src/mostly_ascii.rs
++++ src/mostly_ascii.rs
+@@ -17,6 +17,7 @@
+ }
+ 
+ impl<'a> MostlyAscii<'a> {
++    #[cfg(test)]
+     pub fn new(bytes: &'a [u8]) -> Self {
+         Self {
+             bytes,
+@@ -25,6 +26,52 @@
+     }
+ }
+ 
++/// Longest escaped text an [`Excerpt`] writes before it stops.
++pub(crate) const MAX_EXCERPT_BYTES: usize = 512;
++
++/// Peer-supplied bytes for a log line or an error message: one line of at
++/// most [`MAX_EXCERPT_BYTES`] escaped bytes, so the peer can neither split
++/// the line, carry terminal controls into it, nor make it grow with the input.
++///
++/// Printable ASCII is written as is; `\n`, `\r`, and `\t` are written as
++/// those two-character escapes and every other byte as `\xNN`. An excerpt
++/// that stops early ends with `...` and the input's full length.
++#[derive(Clone, Copy)]
++pub(crate) struct Excerpt<'a>(pub &'a [u8]);
++
++impl<'a> Excerpt<'a> {
++    pub fn of(text: &'a str) -> Self {
++        Self(text.as_bytes())
++    }
++}
++
++impl fmt::Display for Excerpt<'_> {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        let mut written = 0;
++        for &b in self.0 {
++            let mut hex = [b'\\', b'x', 0, 0];
++            let escaped: &[u8] = match b {
++                b'\n' => b"\\n",
++                b'\r' => b"\\r",
++                b'\t' => b"\\t",
++                0x20..=0x7E => std::slice::from_ref(&b),
++                _ => {
++                    const DIGITS: &[u8; 16] = b"0123456789ABCDEF";
++                    hex[2] = DIGITS[usize::from(b >> 4)];
++                    hex[3] = DIGITS[usize::from(b & 0xF)];
++                    &hex
++                }
++            };
++            if written + escaped.len() > MAX_EXCERPT_BYTES {
++                return write!(f, "...({} bytes)", self.0.len());
++            }
++            f.write_str(std::str::from_utf8(escaped).expect("escapes are ASCII"))?;
++            written += escaped.len();
++        }
++        Ok(())
++    }
++}
++
+ impl fmt::Debug for MostlyAscii<'_> {
+     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+         write!(f, "\"")?;
+@@ -79,4 +126,26 @@
+         let m = MostlyAscii::new(b"hello\x80\xFF");
+         assert_eq!(format!("{m:?}"), "\"hello\\x80\\xFF\"");
+     }
++
++    #[test]
++    fn excerpt_escapes_every_control_byte() {
++        let e = Excerpt(b"a\nb\r\tc\x1b[31m\x00\x7f\xc3\xa9\"\\");
++        assert_eq!(
++            e.to_string(),
++            "a\\nb\\r\\tc\\x1B[31m\\x00\\x7F\\xC3\\xA9\"\\"
++        );
++    }
++
++    #[test]
++    fn excerpt_stops_at_the_limit_with_the_full_length() {
++        let input = vec![b'\n'; 4 * MAX_EXCERPT_BYTES];
++        let text = Excerpt(&input).to_string();
++        assert!(text.starts_with("\\n\\n"));
++        assert!(text.ends_with(&format!("...({} bytes)", input.len())));
++        assert!(text.len() <= MAX_EXCERPT_BYTES + "...(2048 bytes)".len());
++        assert!(!text.bytes().any(|b| b.is_ascii_control()));
++
++        let exact = vec![b'x'; MAX_EXCERPT_BYTES];
++        assert_eq!(Excerpt(&exact).to_string(), "x".repeat(MAX_EXCERPT_BYTES));
++    }
+ }
+--- src/rtsp/parse.rs
++++ src/rtsp/parse.rs
+@@ -16,6 +16,9 @@
+ use super::table::is_tchar;
+ use crate::inputs::Input;
+ 
++/// Maximum head-plus-body bytes accepted for one production RTSP control message.
++pub(crate) const MAX_CONTROL_MESSAGE_BYTES: usize = 1024 * 1024;
++
+ /// Error detail carried by [`FeedError::Invalid`].
+ #[derive(Debug, Default, derive_more::Error)]
+ pub struct Invalid {
+@@ -206,6 +209,17 @@
+         self.stream_pos
+     }
+ 
++    /// Maximum unparsed bytes needed before the current message must decode or fail.
++    pub(crate) fn max_buffered_bytes(&self) -> usize {
++        match &self.state {
++            ParserState::Idle => self.max_message_size,
++            ParserState::Head { head_bytes, .. } => {
++                self.max_message_size.saturating_sub(*head_bytes)
++            }
++            ParserState::Body(_, body_len) => *body_len,
++        }
++    }
++
+     /// Parses the next message from `input`.
+     ///
+     /// Returns `Ok(Some(...))` when a complete message has been parsed.
+@@ -235,6 +249,7 @@
+         loop {
+             match std::mem::take(&mut self.state) {
+                 ParserState::Idle => {
++                    ensure_first_line_fits(input, self.max_message_size)?;
+                     let checkpoint = *input;
+                     let before = input.len();
+                     match parse_head(input) {
+@@ -267,6 +282,7 @@
+                     };
+                     let checkpoint = *input;
+                     let before = input.len();
++                    ensure_header_line_fits(input, head_bytes, self.max_message_size, context)?;
+                     match parse_header_line(input) {
+                         Ok(Some((name, value))) => {
+                             head_bytes += before - input.len();
+@@ -321,6 +337,80 @@
+     }
+ }
+ 
++fn ensure_first_line_fits<'i, I: Input<'i>>(
++    input: &I,
++    max_message_size: usize,
++) -> Result<(), FeedError> {
++    let mut offset = 0usize;
++    while offset < input.len() && input.byte_at(offset) == b'\r' {
++        if offset + 1 >= input.len() {
++            return ensure_incomplete_line_fits(input.len(), max_message_size, "first-line");
++        }
++        if input.byte_at(offset + 1) != b'\n' {
++            return Ok(());
++        }
++        offset += 2;
++    }
++    if offset < input.len() && input.byte_at(offset) == b'$' {
++        return Ok(());
++    }
++    let mut line = *input;
++    line.advance(offset);
++    ensure_line_fits(&line, offset, max_message_size, "first-line")
++}
++
++fn ensure_header_line_fits<'i, I: Input<'i>>(
++    input: &I,
++    head_bytes: usize,
++    max_message_size: usize,
++    context: &'static str,
++) -> Result<(), FeedError> {
++    ensure_line_fits(input, head_bytes, max_message_size, context)
++}
++
++fn ensure_line_fits<'i, I: Input<'i>>(
++    input: &I,
++    bytes_before_line: usize,
++    max_message_size: usize,
++    context: &'static str,
++) -> Result<(), FeedError> {
++    let delimiter = (0..input.len()).find(|&index| matches!(input.byte_at(index), b'\r' | b'\n'));
++    if let Some(index) = delimiter {
++        let line_bytes = if input.byte_at(index) == b'\r'
++            && index + 1 < input.len()
++            && input.byte_at(index + 1) == b'\n'
++        {
++            index + 2
++        } else {
++            index + 1
++        };
++        let total = bytes_before_line.checked_add(line_bytes);
++        if total.is_none_or(|total| total > max_message_size) {
++            return Err(invalid("message-too-large").context(context));
++        }
++        Ok(())
++    } else {
++        let buffered = bytes_before_line.checked_add(input.len());
++        if buffered.is_none_or(|total| total >= max_message_size) {
++            Err(invalid("message-too-large").context(context))
++        } else {
++            Ok(())
++        }
++    }
++}
++
++fn ensure_incomplete_line_fits(
++    buffered: usize,
++    max_message_size: usize,
++    context: &'static str,
++) -> Result<(), FeedError> {
++    if buffered >= max_message_size {
++        Err(invalid("message-too-large").context(context))
++    } else {
++        Ok(())
++    }
++}
++
+ /// Skips any leading CRLFs, then parses the first line of the next message.
+ /// Returns `Ok(None)` when the input is empty (caller decides if that's
+ /// clean EOF or needs more data).
+@@ -821,6 +911,55 @@
+     }
+ 
+     #[test]
++    fn max_message_size_rejects_an_unterminated_first_line_incrementally() {
++        let data = vec![b'A'; 64];
++        let mut input = Split::new(&data, &[]);
++        let error = Parser::builder()
++            .max_message_size(64)
++            .build()
++            .feed(&mut input)
++            .unwrap_err();
++        let FeedError::Invalid(invalid) = error else {
++            panic!("expected Invalid");
++        };
++        assert_eq!(invalid.context, ["message-too-large", "first-line"]);
++    }
++
++    #[test]
++    fn max_message_size_rejects_a_fragmented_header_before_allocating_it() {
++        let first = b"RTSP/1.0 200 OK\r\n";
++        let mut parser = Parser::builder().max_message_size(64).build();
++        let mut input = Split::new(first, &[]);
++        assert!(matches!(
++            parser.feed(&mut input),
++            Err(FeedError::Incomplete(_))
++        ));
++        let header = vec![b'x'; 64 - first.len()];
++        let mut input = Split::new(&header, &[]);
++        let error = parser.feed(&mut input).unwrap_err();
++        let FeedError::Invalid(invalid) = error else {
++            panic!("expected Invalid");
++        };
++        assert_eq!(invalid.context, ["message-too-large", "response"]);
++        assert!(invalid.to_string().len() < 256);
++    }
++
++    #[test]
++    fn max_message_size_rejects_declared_body_before_body_bytes() {
++        let data = b"RTSP/1.0 200 OK\r\nContent-Length: 100\r\n\r\n";
++        let mut input = Split::new(data, &[]);
++        let error = Parser::builder()
++            .max_message_size(data.len() + 99)
++            .build()
++            .feed(&mut input)
++            .unwrap_err();
++        let FeedError::Invalid(invalid) = error else {
++            panic!("expected Invalid");
++        };
++        assert_eq!(invalid.context, ["message-too-large", "response"]);
++    }
++
++    #[test]
+     fn incomplete_truncated_request() {
+         // Truncated request: the parser returns Incomplete (the caller
+         // decides whether to wait for more data or treat it as an error).
+--- src/testutil.rs
++++ src/testutil.rs
+@@ -2,7 +2,7 @@
+ // SPDX-License-Identifier: MIT OR Apache-2.0
+ 
+ #[cfg(test)]
+-use std::sync::Once;
++use std::cell::RefCell;
+ use std::sync::OnceLock;
+ 
+ #[cfg(test)]
+@@ -10,8 +10,6 @@
+ use derive_more::Debug;
+ use pretty_hex::{HexConfig, PrettyHex as _};
+ 
+-#[cfg(test)]
+-static INIT_LOGGING: Once = Once::new();
+ static FINDER: OnceLock<memchr::memmem::Finder> = OnceLock::new();
+ 
+ pub const NONASCII_HEX_CONFIG: HexConfig = HexConfig {
+@@ -137,7 +135,7 @@
+ #[cfg(test)]
+ macro_rules! assert_eq_hex {
+     ($left:expr, $right:expr) => {{
+-        pretty_assertions::assert_eq!(
++        assert_eq!(
+             $crate::testutil::HexDebug(Vec::from(AsRef::<[u8]>::as_ref(&$left))),
+             $crate::testutil::HexDebug(Vec::from(AsRef::<[u8]>::as_ref(&$right))),
+         );
+@@ -155,29 +153,65 @@
+             .iter()
+             .map(|x| $crate::testutil::HexDebug(Vec::from(AsRef::<[u8]>::as_ref(x))))
+             .collect::<Vec<_>>();
+-        pretty_assertions::assert_eq!(left, right);
++        assert_eq!(left, right);
+     }};
+ }
+ 
+ #[cfg(test)]
+ pub(crate) use {assert_eq_hex, assert_eq_hexes};
+ 
++/// Installs the tests' logger, which keeps records only for [`capture_logs`].
+ #[cfg(test)]
+ pub(crate) fn init_logging() {
+-    use std::str::FromStr as _;
+-    INIT_LOGGING.call_once(|| {
+-        let h = mylog::Builder::new()
+-            .is_test(true)
+-            .format(
+-                ::std::env::var("RUST_FORMAT")
+-                    .map_err(|_| ())
+-                    .and_then(|s| mylog::Format::from_str(&s))
+-                    .unwrap_or(mylog::Format::Google),
+-            )
+-            .spec(::std::env::var("RUST_LOG").as_deref().unwrap_or("info"))
+-            .build();
+-        h.install().unwrap();
+-    })
++    static INIT: std::sync::Once = std::sync::Once::new();
++    INIT.call_once(|| {
++        log::set_logger(&ThreadCapture).expect("no other logger in tests");
++        log::set_max_level(log::LevelFilter::Trace);
++    });
++}
++
++#[cfg(test)]
++thread_local! {
++    static CAPTURED: RefCell<Option<Vec<(log::Level, String)>>> = const { RefCell::new(None) };
++}
++
++/// Keeps the records of threads inside [`capture_logs`] and drops the rest.
++#[cfg(test)]
++struct ThreadCapture;
++
++#[cfg(test)]
++impl log::Log for ThreadCapture {
++    fn enabled(&self, _metadata: &log::Metadata<'_>) -> bool {
++        true
++    }
++
++    fn log(&self, record: &log::Record<'_>) {
++        if CAPTURED.with_borrow(Option::is_none) {
++            return;
++        }
++        // Formatted before the borrow, in case formatting itself logs.
++        let message = record.args().to_string();
++        CAPTURED.with_borrow_mut(|captured| {
++            if let Some(records) = captured {
++                records.push((record.level(), message));
++            }
++        });
++    }
++
++    fn flush(&self) {}
++}
++
++/// Runs `f`, returning its result and the log records it emitted on this
++/// thread (level and message).
++#[cfg(test)]
++pub(crate) fn capture_logs<R>(f: impl FnOnce() -> R) -> (R, Vec<(log::Level, String)>) {
++    init_logging();
++    CAPTURED.with_borrow_mut(|captured| *captured = Some(Vec::new()));
++    let result = f();
++    let records = CAPTURED
++        .with_borrow_mut(Option::take)
++        .expect("capture started above");
++    (result, records)
+ }
+ 
+ #[cfg(test)]
+@@ -190,3 +224,49 @@
+         _ => panic!("unexpected message type"),
+     }
+ }
++
++/// Interprets `raw` as a complete response to a `DESCRIBE` of `request_url`,
++/// as a session does: returns the number of streams, or the error a session
++/// would report. Warnings go to the `log` crate. For fuzz tests.
++///
++/// # Panics
++///
++/// If `request_url` is not a URL.
++pub fn parse_describe_response(request_url: &str, mut raw: &[u8]) -> Result<usize, String> {
++    let request_url = url::Url::parse(request_url).expect("a valid request URL");
++    let mut parser = crate::rtsp::parse::Parser::builder()
++        .max_message_size(crate::rtsp::parse::MAX_CONTROL_MESSAGE_BYTES)
++        .build();
++    let (message, body) = match parser.feed(&mut raw) {
++        Ok(Some(parsed)) => parsed,
++        Ok(None) => return Err("no message".to_owned()),
++        Err(e) => return Err(format!("not one RTSP message: {e}")),
++    };
++    let crate::rtsp::msg::Message::Response(response) = message else {
++        return Err("not a response".to_owned());
++    };
++    let body = bytes::Bytes::copy_from_slice(body);
++    crate::client::parse::parse_describe(request_url, &response, &body)
++        .map(|presentation| presentation.streams.len())
++}
++
++/// Packet metadata for driving a [`crate::codec::Depacketizer`] through
++/// [`DepacketizeBuf`] outside a session: a dummy context, stream 0, SSRC 0,
++/// no loss, and the timestamp and marker given. For fuzz tests.
++pub fn packet_meta(
++    sequence_number: u16,
++    timestamp: i64,
++    clock_rate: std::num::NonZeroU32,
++    mark: bool,
++) -> crate::rtp::PacketMeta {
++    crate::rtp::PacketMeta {
++        ctx: crate::PacketContext::dummy(),
++        stream_id: 0,
++        timestamp: crate::Timestamp::new(timestamp, clock_rate, 0)
++            .expect("a non-negative timestamp with a zero start"),
++        sequence_number,
++        ssrc: 0,
++        mark,
++        loss: 0,
++    }
++}
 --- src/tokio.rs
 +++ src/tokio.rs
-@@ -22,8 +22,35 @@
+@@ -21,9 +21,41 @@
+ /// Default initial capacity for the read ring buffer (64 KiB).
  const DEFAULT_READ_CAPACITY: usize = 64 * 1024;
  
- /// A RTSP connection which implements `Stream`, `Sink`, and `Unpin`.
 +/// The socket behind a connection: registered with tokio's reactor, or
 +/// detached from it for a caller that polls on its own schedule.
 +enum Io {
@@ -600,7 +2350,8 @@ diff -ruN src/tokio.rs src/tokio.rs
 +    /// its own timer; a write keeps its unsent remainder for that next poll.
 +    /// Nothing wakes `epoll` for this socket any more, and nothing blocks.
 +    Detached(std::net::TcpStream),
-+    /// Transient state while detaching; never observed by callers.
++    /// The socket was consumed by a mode change that failed (`into_std` or
++    /// `from_std`); every later operation fails.
 +    Detaching,
 +}
 +
@@ -615,21 +2366,27 @@ diff -ruN src/tokio.rs src/tokio.rs
 +    }
 +}
 +
+ /// A RTSP connection which implements `Stream`, `Sink`, and `Unpin`.
  pub(crate) struct Connection {
 -    stream: TcpStream,
 +    stream: Io,
 +    /// A detached socket's last read was short, so its queue is empty.
 +    drained: bool,
++    /// When the last read returned; every message decoded from the bytes it
++    /// delivered carries this time, so the clock is read once per read rather
++    /// than once per message.
++    read_stamp: ReadStamp,
      ctx: ConnectionContext,
      parser: crate::rtsp::parse::Parser,
      read_buf: MarkBuf,
-@@ -46,13 +73,16 @@
+@@ -46,13 +78,17 @@
          let local_addr = stream.local_addr()?;
          let peer_addr = stream.peer_addr()?;
          Ok(Self {
 -            stream,
 +            stream: Io::Reactor(stream),
 +            drained: false,
++            read_stamp: ReadStamp::now(),
              ctx: ConnectionContext {
                  local_addr,
                  peer_addr,
@@ -642,7 +2399,7 @@ diff -ruN src/tokio.rs src/tokio.rs
              read_buf: MarkBuf::new(DEFAULT_READ_CAPACITY),
              write_buf: Vec::new(),
          })
-@@ -62,6 +92,71 @@
+@@ -62,6 +98,67 @@
          &self.ctx
      }
  
@@ -654,8 +2411,10 @@ diff -ruN src/tokio.rs src/tokio.rs
 +    pub(crate) fn set_recv_low_water(&self, bytes: u32) -> std::io::Result<()> {
 +        let value =
 +            libc::c_int::try_from(bytes).map_err(|_| std::io::Error::other("value too large"))?;
-+        // SAFETY: `fd` is a valid, open socket owned by `self.stream` for the
-+        // duration of the call, and `value` outlives the call.
++        // SAFETY: `value` is a live `c_int` for the whole call and the length
++        // passed is its size. The descriptor is borrowed from `self.stream`
++        // (-1 after a failed mode change, which `setsockopt` rejects with
++        // `EBADF`).
 +        let rc = unsafe {
 +            libc::setsockopt(
 +                self.stream.as_raw_fd(),
@@ -675,20 +2434,14 @@ diff -ruN src/tokio.rs src/tokio.rs
 +    /// Takes the socket out of tokio's reactor. From then on reads and writes
 +    /// that would block return `Pending` without a waker and never wake
 +    /// `epoll`; the caller polls the connection on its own timer, and a flush
-+    /// continues from its unsent remainder on each poll. Idempotent.
++    /// continues from its unsent remainder on each poll. Idempotent. A failure
++    /// loses the socket (`Io::Detaching`).
 +    pub(crate) fn detach_from_reactor(&mut self) -> std::io::Result<()> {
-+        if let Io::Reactor(_) = self.stream {
-+            let Io::Reactor(reactor) = std::mem::replace(&mut self.stream, Io::Detaching) else {
-+                unreachable!("checked above");
-+            };
-+            // `into_std` deregisters the descriptor from the reactor.
-+            match reactor.into_std() {
-+                Ok(std_stream) => {
-+                    std_stream.set_nonblocking(true)?;
-+                    self.stream = Io::Detached(std_stream);
-+                }
-+                Err(e) => return Err(e),
-+            }
++        match std::mem::replace(&mut self.stream, Io::Detaching) {
++            // `into_std` deregisters the descriptor from the reactor and
++            // returns it in non-blocking mode.
++            Io::Reactor(reactor) => self.stream = Io::Detached(reactor.into_std()?),
++            other => self.stream = other,
 +        }
 +        Ok(())
 +    }
@@ -697,16 +2450,16 @@ diff -ruN src/tokio.rs src/tokio.rs
 +    /// awaits it, such as a `TEARDOWN`: resets the receive low-water mark to
 +    /// one byte and returns a detached socket to tokio's reactor, so the
 +    /// request's writes and its short response wake the calling task. Must
-+    /// be called within a tokio runtime. Idempotent.
++    /// be called within a tokio runtime. Idempotent. A failure to register
++    /// the socket loses it (`Io::Detaching`).
 +    pub(crate) fn return_to_reactor(&mut self) -> std::io::Result<()> {
 +        self.set_recv_low_water(1)?;
-+        if let Io::Detached(_) = self.stream {
-+            let Io::Detached(std_stream) = std::mem::replace(&mut self.stream, Io::Detaching)
-+            else {
-+                unreachable!("checked above");
-+            };
-+            self.stream = Io::Reactor(TcpStream::from_std(std_stream)?);
-+            self.drained = false;
++        match std::mem::replace(&mut self.stream, Io::Detaching) {
++            Io::Detached(std_stream) => {
++                self.stream = Io::Reactor(TcpStream::from_std(std_stream)?);
++                self.drained = false;
++            }
++            other => self.stream = other,
 +        }
 +        Ok(())
 +    }
@@ -714,9 +2467,60 @@ diff -ruN src/tokio.rs src/tokio.rs
      pub(crate) fn read_buf(&self) -> &MarkBuf {
          &self.read_buf
      }
-@@ -177,6 +272,15 @@
+@@ -88,16 +185,35 @@
+     }
+ }
+ 
++/// The wall and monotonic time a read returned, stamped on every message the
++/// read delivered.
++#[derive(Clone, Copy)]
++struct ReadStamp {
++    wall: WallTime,
++    instant: Instant,
++}
++
++impl ReadStamp {
++    fn now() -> Self {
++        Self {
++            wall: WallTime::now(),
++            instant: Instant::now(),
++        }
++    }
++}
++
+ /// Tries to decode a message from the read buffer without I/O.
+ ///
+ /// Separated from `Connection` methods to avoid self-borrow issues.
+ ///
+ /// When `eof` is true, the TCP stream has closed. `Incomplete` and empty
+-/// `Ok(None)` with leftover data are promoted to errors.
++/// `Ok(None)` with leftover data are promoted to errors. A decoded message
++/// is stamped with `stamp`, the time of the read that delivered its bytes.
+ fn try_decode(
+     parser: &mut crate::rtsp::parse::Parser,
+     read_buf: &mut MarkBuf,
+     eof: bool,
++    stamp: ReadStamp,
+ ) -> Result<Option<ReceivedMessage>, CodecError> {
+     use crate::rtsp::parse::FeedError;
+ 
+@@ -123,8 +239,8 @@
+                 body_len: body_len as u32,
+                 ctx: RtspMessageContext {
+                     pos,
+-                    received_wall: WallTime::now(),
+-                    received: Instant::now(),
++                    received_wall: stamp.wall,
++                    received: stamp.instant,
+                 },
+             }))
+         }
+@@ -175,8 +291,17 @@
+         let this = &mut *self;
+         loop {
              // Try decoding from existing buffered data.
-             match try_decode(&mut this.parser, &mut this.read_buf, false) {
+-            match try_decode(&mut this.parser, &mut this.read_buf, false) {
++            match try_decode(&mut this.parser, &mut this.read_buf, false, this.read_stamp) {
                  Ok(Some(msg)) => return std::task::Poll::Ready(Some(Ok(msg))),
 +                // A detached read shorter than the space offered left the
 +                // socket's queue empty: the caller, which polls until
@@ -730,7 +2534,7 @@ diff -ruN src/tokio.rs src/tokio.rs
                  Ok(None) => {}
                  Err(e) => {
                      return std::task::Poll::Ready(Some(Err(codec_err_to_error(
-@@ -190,28 +294,55 @@
+@@ -190,31 +315,63 @@
  
              // Need more data. Read from the stream into the ring buffer
              // using vectored I/O to fill both halves of the ring.
@@ -803,11 +2607,21 @@ diff -ruN src/tokio.rs src/tokio.rs
 +            match read {
                  Ok(0) => {
                      // EOF. Try decode with eof=true.
-                     return match try_decode(&mut this.parser, &mut this.read_buf, true) {
-@@ -227,11 +358,16 @@
+-                    return match try_decode(&mut this.parser, &mut this.read_buf, true) {
++                    return match try_decode(
++                        &mut this.parser,
++                        &mut this.read_buf,
++                        true,
++                        ReadStamp::now(),
++                    ) {
+                         Ok(Some(msg)) => std::task::Poll::Ready(Some(Ok(msg))),
+                         Ok(None) => std::task::Poll::Ready(None),
+                         Err(e) => std::task::Poll::Ready(Some(Err(codec_err_to_error(
+@@ -227,11 +384,17 @@
                  }
                  Ok(n) => {
                      this.read_buf.advance_end(n);
++                    this.read_stamp = ReadStamp::now();
 +                    this.drained = matches!(this.stream, Io::Detached(_)) && n < offered;
                      // Loop to try decoding again.
                  }
@@ -823,7 +2637,7 @@ diff -ruN src/tokio.rs src/tokio.rs
                  }
                  Err(error) => {
                      let pos = this.parser.stream_pos() + this.read_buf.unparsed_len() as u64;
-@@ -283,9 +419,15 @@
+@@ -283,9 +446,15 @@
  
      fn poll_ready(
          self: std::pin::Pin<&mut Self>,
@@ -841,7 +2655,7 @@ diff -ruN src/tokio.rs src/tokio.rs
      }
  
      fn start_send(
-@@ -304,7 +446,27 @@
+@@ -304,7 +473,27 @@
      ) -> std::task::Poll<Result<(), Self::Error>> {
          let this = &mut *self;
          while !this.write_buf.is_empty() {
@@ -870,7 +2684,7 @@ diff -ruN src/tokio.rs src/tokio.rs
                  std::task::Poll::Ready(Ok(n)) => {
                      this.write_buf.drain(..n);
                  }
-@@ -317,7 +479,11 @@
+@@ -317,7 +506,11 @@
                  std::task::Poll::Pending => return std::task::Poll::Pending,
              }
          }
@@ -883,7 +2697,7 @@ diff -ruN src/tokio.rs src/tokio.rs
              std::task::Poll::Ready(Ok(())) => std::task::Poll::Ready(Ok(())),
              std::task::Poll::Ready(Err(e)) => std::task::Poll::Ready(Err(ErrorInt::WriteError {
                  conn_ctx: this.ctx,
-@@ -336,7 +502,14 @@
+@@ -336,7 +529,14 @@
              other => return other,
          }
          let this = &mut *self;
@@ -899,7 +2713,7 @@ diff -ruN src/tokio.rs src/tokio.rs
              std::task::Poll::Ready(Ok(())) => std::task::Poll::Ready(Ok(())),
              std::task::Poll::Ready(Err(e)) => std::task::Poll::Ready(Err(ErrorInt::WriteError {
                  conn_ctx: this.ctx,
-@@ -369,6 +542,12 @@
+@@ -369,6 +569,12 @@
  
  #[cfg(test)]
  mod tests {
@@ -912,7 +2726,24 @@ diff -ruN src/tokio.rs src/tokio.rs
      use super::*;
  
      #[test]
-@@ -406,4 +585,185 @@
+@@ -380,7 +586,7 @@
+         read_buf.advance_end(data.len());
+ 
+         let mut parser = crate::rtsp::parse::Parser::default();
+-        let msg = try_decode(&mut parser, &mut read_buf, false)
++        let msg = try_decode(&mut parser, &mut read_buf, false, ReadStamp::now())
+             .unwrap()
+             .unwrap();
+         // Read body from ring buffer.
+@@ -399,11 +605,192 @@
+         read_buf.advance_end(data.len());
+ 
+         let mut parser = crate::rtsp::parse::Parser::default();
+-        let msg = try_decode(&mut parser, &mut read_buf, false)
++        let msg = try_decode(&mut parser, &mut read_buf, false, ReadStamp::now())
+             .unwrap()
+             .unwrap();
+         assert!(matches!(msg.msg, crate::rtsp::msg::Message::Response(_)));
          assert_eq!(msg.body_len, 0);
          assert_eq!(read_buf.unparsed_len(), 0);
      }

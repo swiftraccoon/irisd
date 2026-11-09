@@ -1,5 +1,7 @@
 //! Segment listing and file serving.
 
+mod range;
+
 use std::io;
 use std::sync::Arc;
 
@@ -20,7 +22,8 @@ use crate::error::ApiError;
 use crate::hls::{MAX_SEGMENT_ROWS, PublishedIndex, published_index};
 use crate::media_admission::{self, MediaPermit};
 use crate::query::{TimeParams, resolve_range};
-use crate::state::{ApiState, MediaClass, admitted_media_bytes};
+use crate::segments::range::{RangeRequest, Unsatisfiable, parse_range, requested_len};
+use crate::state::{ApiState, MediaClass};
 
 const RAW_BODY_CHUNK_BYTES: u64 = 64 * 1024;
 /// Longest raw range admitted in the bounded media class; whole files,
@@ -127,20 +130,7 @@ pub(crate) async fn file(
 /// most [`BOUNDED_RANGE_BYTES`], streaming otherwise. The served length never
 /// exceeds the requested one, so a bounded request cannot stream more.
 fn raw_admission_class(range: Option<&HeaderValue>) -> MediaClass {
-    let requested = range
-        .and_then(|value| value.to_str().ok())
-        .and_then(|raw| raw.strip_prefix("bytes="))
-        .map(str::trim)
-        .filter(|range| !range.contains(','))
-        .and_then(|range| range.split_once('-'))
-        .and_then(|(start, end)| {
-            if start.is_empty() {
-                return end.parse::<u64>().ok();
-            }
-            let start: u64 = start.parse().ok()?;
-            let end: u64 = end.parse().ok()?;
-            end.checked_sub(start)?.checked_add(1)
-        });
+    let requested = requested_len(range.and_then(|value| value.to_str().ok()));
     if requested.is_some_and(|len| len <= BOUNDED_RANGE_BYTES) {
         MediaClass::Bounded
     } else {
@@ -155,12 +145,20 @@ async fn serve_extent(
     permit: MediaPermit,
 ) -> Result<Response, ApiError> {
     let extent = published.media.extent();
-    let Ok(range) = parse_range(req.headers().get(header::RANGE), extent) else {
+    // A header that is not valid text is a malformed range.
+    let range = match req.headers().get(header::RANGE) {
+        None => parse_range(None, extent),
+        Some(value) => value
+            .to_str()
+            .map_err(|_| Unsatisfiable)
+            .and_then(|raw| parse_range(Some(raw), extent)),
+    };
+    let Ok(range) = range else {
         return Ok(range_not_satisfiable(extent));
     };
     let (status, start, len, content_range) = match range {
-        None => (StatusCode::OK, 0, extent, None),
-        Some((start, end)) => (
+        RangeRequest::Whole => (StatusCode::OK, 0, extent, None),
+        RangeRequest::Bytes(start, end) => (
             StatusCode::PARTIAL_CONTENT,
             start,
             end - start + 1,
@@ -253,9 +251,9 @@ where
                 Ok(read) => {
                     buffer.truncate(read);
                     remaining -= u64::try_from(read).expect("read length fits u64");
-                    slot.send(Ok(admitted_media_bytes(
+                    slot.send(Ok(media_admission::attach(
                         Bytes::from(buffer),
-                        Arc::clone(&chunk_permit),
+                        &chunk_permit,
                     )));
                 }
                 Err(error) => {
@@ -266,43 +264,6 @@ where
         }
     });
     (rx, producer)
-}
-
-fn parse_range(value: Option<&HeaderValue>, extent: u64) -> Result<Option<(u64, u64)>, ()> {
-    let Some(value) = value else {
-        return Ok(None);
-    };
-    let raw = value.to_str().map_err(|_| ())?;
-    let range = raw.strip_prefix("bytes=").ok_or(())?.trim();
-    if range.contains(',') {
-        return Err(());
-    }
-    let (start, end) = range.split_once('-').ok_or(())?;
-    if extent == 0 {
-        return Err(());
-    }
-    if start.is_empty() {
-        let suffix: u64 = end.parse().map_err(|_| ())?;
-        if suffix == 0 {
-            return Err(());
-        }
-        let start = extent.saturating_sub(suffix);
-        return Ok(Some((start, extent - 1)));
-    }
-    let start: u64 = start.parse().map_err(|_| ())?;
-    if start >= extent {
-        return Err(());
-    }
-    let end = if end.is_empty() {
-        extent - 1
-    } else {
-        let end: u64 = end.parse().map_err(|_| ())?;
-        if end < start {
-            return Err(());
-        }
-        end.min(extent - 1)
-    };
-    Ok(Some((start, end)))
 }
 
 fn range_not_satisfiable(extent: u64) -> Response {
@@ -352,30 +313,37 @@ mod tests {
 
     #[test]
     fn ranges_are_clamped_to_the_published_extent() {
-        assert_eq!(parse_range(None, 100), Ok(None));
-        assert_eq!(
-            parse_range(Some(&header("bytes=10-20")), 100),
-            Ok(Some((10, 20)))
-        );
-        assert_eq!(
-            parse_range(Some(&header("bytes=90-200")), 100),
-            Ok(Some((90, 99)))
-        );
-        assert_eq!(
-            parse_range(Some(&header("bytes=90-")), 100),
-            Ok(Some((90, 99)))
-        );
-        assert_eq!(
-            parse_range(Some(&header("bytes=-10")), 100),
-            Ok(Some((90, 99)))
-        );
-        assert_eq!(
-            parse_range(Some(&header("bytes=-200")), 100),
-            Ok(Some((0, 99)))
-        );
-        assert_eq!(parse_range(Some(&header("bytes=100-")), 100), Err(()));
-        assert_eq!(parse_range(Some(&header("bytes=0-1,4-5")), 100), Err(()));
-        assert_eq!(parse_range(Some(&header("items=0-1")), 100), Err(()));
+        assert_eq!(parse_range(None, 100), Ok(RangeRequest::Whole));
+        for (raw, first, last) in [
+            ("bytes=10-20", 10, 20),
+            ("bytes=90-200", 90, 99),
+            ("bytes=90-", 90, 99),
+            ("bytes=-10", 90, 99),
+            ("bytes=-200", 0, 99),
+        ] {
+            assert_eq!(
+                parse_range(Some(raw), 100),
+                Ok(RangeRequest::Bytes(first, last)),
+                "{raw}"
+            );
+        }
+        for raw in [
+            "bytes=100-",
+            "bytes=0-1,4-5",
+            "bytes=5-4",
+            "bytes=-0",
+            "bytes=x-1",
+        ] {
+            assert_eq!(parse_range(Some(raw), 100), Err(Unsatisfiable), "{raw}");
+        }
+        assert_eq!(parse_range(Some("bytes=0-1"), 0), Err(Unsatisfiable));
+    }
+
+    /// RFC 9110 §14.2: a range unit the server does not understand is ignored.
+    #[test]
+    fn an_unknown_range_unit_serves_the_whole_extent() {
+        assert_eq!(parse_range(Some("items=0-1"), 100), Ok(RangeRequest::Whole));
+        assert_eq!(requested_len(Some("items=0-1")), None);
     }
 
     #[test]

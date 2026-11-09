@@ -2,21 +2,23 @@
 
 use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
-use std::fs::{File, OpenOptions};
+use std::fs::{File, Metadata, OpenOptions};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use iris_core::time::WallUs;
-#[cfg(test)]
-use iris_mp4::index::RECORD_LEN;
+use iris_core::time::{MediaTicks, WallUs};
 use iris_mp4::index::{
-    FLAG_DISCONTINUITY_BEFORE, FLAG_NEW_PARAMETERS, HEADER_LEN, IndexHeader, IndexRecord,
-    IndexWriter, MAX_PERSISTED_INDEX_RECORDS, read_index_file_bounded,
+    FLAG_DISCONTINUITY_BEFORE, FLAG_NEW_PARAMETERS, HEADER_LEN, IndexError, IndexHeader,
+    IndexRecord, IndexWriter, MAX_PERSISTED_INDEX_RECORDS, read_index_file_bounded,
 };
 use iris_mp4::reader::{ScanOptions, ScanReport, ScanStop, scan_with_limit};
 use rustix::fs::{AtFlags, CWD, FileType, Mode, OFlags};
 use thiserror::Error;
+use tracing::warn;
+
+use crate::fs::ApprovedRoot;
+use crate::layout;
 
 static RECOVERY_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -83,8 +85,10 @@ impl IndexBinding {
     }
 }
 
-/// What recovery did to one file.
+/// What recovery did to one file. Passive data: every field is public, and
+/// the struct may grow.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct RecoveryReport {
     /// The media file.
     pub path: PathBuf,
@@ -108,8 +112,6 @@ pub struct RecoveryReport {
     pub truncated: bool,
     /// Why the scan stopped before the original end, if it did.
     pub stop: Option<ScanStop>,
-    /// Whether the sidecar index was rewritten (always, on success).
-    pub index_rewritten: bool,
     /// The run and sample-entry binding written into the rebuilt sidecar
     /// header.
     pub binding: IndexBinding,
@@ -117,8 +119,11 @@ pub struct RecoveryReport {
 
 /// Errors from recovery.
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum RecoverError {
-    /// An I/O failure on the named path.
+    /// An I/O failure on the named path, including a sidecar that could not be
+    /// read for lack of a process resource; the daemon retries such a row at a
+    /// later start.
     #[error("{path}: {source}")]
     Io {
         /// The file involved.
@@ -126,6 +131,25 @@ pub enum RecoverError {
         /// The underlying error.
         #[source]
         source: io::Error,
+    },
+    /// Recovery refused to touch the file: the recording path is also its
+    /// derived sidecar path, the sidecar destination is a directory, or the
+    /// sidecar is the media inode itself. Every byte is left unchanged.
+    #[error("{path}: {reason}")]
+    Refused {
+        /// The file involved.
+        path: PathBuf,
+        /// What was found.
+        reason: &'static str,
+    },
+    /// The verified fragments do not form a timeline: a decode time decreases
+    /// or an end overflows. Every byte is left unchanged.
+    #[error("{path}: {reason}")]
+    InvalidTimeline {
+        /// The file involved.
+        path: PathBuf,
+        /// What was found.
+        reason: &'static str,
     },
     /// The file does not start with `ftyp` + `moov`.
     #[error("{0} is not an irisd recording")]
@@ -156,15 +180,23 @@ pub enum RecoverError {
 /// Directory components resolve normally and a final media symlink is
 /// followed, as suits an operator naming a file. The sidecar beside that name
 /// is opened through the directory's descriptor without following a symlink
-/// or blocking on a FIFO; anything but a regular sidecar counts as absent and
-/// is replaced by the rebuilt one.
+/// or blocking on a FIFO; a missing, symlinked, or special sidecar counts as
+/// absent and is replaced by the rebuilt one, and so, after a warning, does a
+/// sidecar whose bytes cannot be read.
+///
+/// A crash between creating the rebuilt sidecar's temporary
+/// (`.<sidecar>.irisd-recover-<pid>-<n>.tmp`) and renaming it leaves that
+/// temporary in the directory; nothing removes it.
 ///
 /// # Errors
 ///
 /// [`RecoverError::NotARecording`] without a complete initialization,
 /// [`RecoverError::TooManyFragments`] when the media holds more than
-/// [`MAX_PERSISTED_INDEX_RECORDS`] fragments (both leave every byte
-/// unchanged), and [`RecoverError::Io`] for file-system failures.
+/// [`MAX_PERSISTED_INDEX_RECORDS`] fragments, [`RecoverError::Refused`] for a
+/// sidecar path that cannot be used, [`RecoverError::InvalidTimeline`] for
+/// fragments whose decode times do not form a timeline (all four leave every
+/// byte unchanged), and [`RecoverError::Io`] for file-system failures,
+/// including a sidecar unreadable for lack of a process resource.
 pub fn recover_segment(mp4_path: &Path) -> Result<RecoveryReport, RecoverError> {
     recover_path(
         mp4_path,
@@ -191,7 +223,7 @@ pub fn recover_segment(mp4_path: &Path) -> Result<RecoveryReport, RecoverError> 
 /// missing beneath the verified root, plus the errors of
 /// [`recover_segment`].
 pub fn recover_segment_beneath(
-    root: &crate::ApprovedRoot,
+    root: &ApprovedRoot,
     mp4_path: &Path,
     expected: IndexBinding,
 ) -> Result<RecoveryReport, RecoverError> {
@@ -286,21 +318,27 @@ fn recover_open(
         path: display.to_path_buf(),
         source,
     };
-    let index_name = Path::new(media_name).with_extension("idx").into_os_string();
+    let refused = |reason: &'static str| RecoverError::Refused {
+        path: display.to_path_buf(),
+        reason,
+    };
+    let index_name = layout::index_path(Path::new(media_name)).into_os_string();
     if index_name == media_name {
-        return Err(io_err(io::Error::new(
-            io::ErrorKind::InvalidInput,
+        return Err(refused(
             "the recording path is also its derived .idx sidecar path",
-        )));
+        ));
     }
     if is_directory_at(directory, &index_name) {
-        return Err(io_err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "the derived sidecar destination is a directory",
-        )));
+        return Err(refused("the derived sidecar destination is a directory"));
     }
     let media_metadata = media.metadata().map_err(io_err)?;
-    let prior = prior_index(directory, &index_name, &media_metadata).map_err(io_err)?;
+    let prior = match prior_index(directory, &index_name, &media_metadata) {
+        Ok(prior) => prior,
+        Err(PriorIndexError::Alias) => {
+            return Err(refused("the derived sidecar aliases the recording inode"));
+        }
+        Err(PriorIndexError::Io(source)) => return Err(io_err(source)),
+    };
     let original_len = media_metadata.len();
     let report = scan_for_recovery(media, max_fragments).map_err(io_err)?;
     if report.init_len == 0 {
@@ -332,7 +370,7 @@ fn recover_open(
         ..IndexHeader::default()
     };
     let idx_err = |source: io::Error| RecoverError::Io {
-        path: display.with_extension("idx"),
+        path: layout::index_path(display),
         source,
     };
     let mut rebuilt = Vec::with_capacity(report.fragments.len());
@@ -345,8 +383,11 @@ fn recover_open(
         rebuilt.push(record);
     }
     let final_wall = report.fragments.last().and_then(|fragment| fragment.wall);
-    let (wall_start, wall_end, media_start, media_end) =
-        recovered_times(&rebuilt, final_wall).map_err(io_err)?;
+    let (wall_start, wall_end, media_start, media_end) = recovered_times(&rebuilt, final_wall)
+        .map_err(|reason| RecoverError::InvalidTimeline {
+            path: display.to_path_buf(),
+            reason,
+        })?;
     publish_rebuilt_index(
         directory,
         &index_name,
@@ -363,8 +404,9 @@ fn recover_open(
     // the supported filesystems, just as normal sealing does.
     media.set_len(report.valid_len).map_err(io_err)?;
     // Complete fragments can survive a process crash only in the page cache.
-    // Recovery must make them durable before the catalog can seal the file.
-    media.sync_data().map_err(io_err)?;
+    // Recovery must make them durable before the catalog can seal the file,
+    // and `fsync` also covers the metadata of the released reservation.
+    media.sync_all().map_err(io_err)?;
 
     Ok(RecoveryReport {
         path: display.to_path_buf(),
@@ -378,52 +420,99 @@ fn recover_open(
         media_end,
         truncated,
         stop: report.stop,
-        index_rewritten: true,
         binding,
     })
 }
 
+/// Why a prior sidecar could not be used.
+enum PriorIndexError {
+    /// The sidecar name resolves to the media inode itself.
+    Alias,
+    /// The sidecar could not be opened or read for lack of a process resource.
+    Io(io::Error),
+}
+
 /// Opens the prior sidecar `index_name` beside the media. A missing,
-/// symlinked, unreadable, or special sidecar is absent: publication replaces
-/// its name with a regular file and never opens it. A sidecar that is the
-/// media inode itself is rejected.
+/// symlinked, or special sidecar is absent: publication replaces its name with
+/// a regular file and never opens it. A sidecar that cannot be opened for lack
+/// of a process resource is an error, so the caller retries later rather than
+/// losing the sidecar's flags; any other open failure is logged and counts as
+/// absent. A sidecar that is the media inode itself is rejected.
 fn prior_index(
     directory: &File,
     index_name: &OsStr,
-    media: &std::fs::Metadata,
-) -> io::Result<PriorIndex> {
-    let Ok(index) =
-        crate::fs::open_regular_beneath(directory, index_name, OFlags::RDONLY, "recording sidecar")
-    else {
-        return Ok(PriorIndex::default());
+    media: &Metadata,
+) -> Result<PriorIndex, PriorIndexError> {
+    let index = match crate::fs::open_regular_beneath(
+        directory,
+        index_name,
+        OFlags::RDONLY,
+        "recording sidecar",
+    ) {
+        Ok(index) => index,
+        Err(error) if crate::fs::is_transient_resource_error(&error) => {
+            return Err(PriorIndexError::Io(error));
+        }
+        Err(error) => {
+            if !matches!(
+                error.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::InvalidData
+            ) && error.raw_os_error() != Some(rustix::io::Errno::LOOP.raw_os_error())
+            {
+                warn!(
+                    sidecar = %Path::new(index_name).display(),
+                    %error,
+                    "ignoring an unreadable prior sidecar"
+                );
+            }
+            return Ok(PriorIndex::default());
+        }
     };
-    if same_file(media, &index.metadata()?) {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "the derived sidecar aliases the recording inode",
-        ));
+    let index_metadata = index.metadata().map_err(PriorIndexError::Io)?;
+    if same_file(media, &index_metadata) {
+        return Err(PriorIndexError::Alias);
     }
-    Ok(read_prior_index(index))
+    read_prior_index(index, index_name).map_err(PriorIndexError::Io)
 }
 
 /// Reads what a prior sidecar can contribute: the header's binding whenever
 /// the header decodes, even if the records do not, and the records when the
-/// whole file is within the persisted-record ceiling.
-fn read_prior_index(index: File) -> PriorIndex {
+/// whole file is within the persisted-record ceiling. A read that fails for
+/// lack of a process resource is returned; any other read failure is logged
+/// and leaves the affected part unknown.
+fn read_prior_index(index: File, index_name: &OsStr) -> io::Result<PriorIndex> {
     use std::os::unix::fs::FileExt as _;
 
     let mut header = [0u8; HEADER_LEN];
-    let binding = index
-        .read_exact_at(&mut header, 0)
-        .ok()
-        .and_then(|()| IndexHeader::decode(&header).ok())
-        .map_or(IndexBinding::UNKNOWN, |header| {
+    let binding = match index.read_exact_at(&mut header, 0) {
+        Ok(()) => IndexHeader::decode(&header).map_or(IndexBinding::UNKNOWN, |header| {
             IndexBinding::new(header.run_id, header.sample_entry_hash)
-        });
-    let records = read_index_file_bounded(index, MAX_PERSISTED_INDEX_RECORDS)
-        .map(|(_, records)| records)
-        .unwrap_or_default();
-    PriorIndex { binding, records }
+        }),
+        Err(error) if crate::fs::is_transient_resource_error(&error) => return Err(error),
+        Err(error) => {
+            warn!(
+                sidecar = %Path::new(index_name).display(),
+                %error,
+                "ignoring an unreadable prior sidecar header"
+            );
+            IndexBinding::UNKNOWN
+        }
+    };
+    let records = match read_index_file_bounded(index, MAX_PERSISTED_INDEX_RECORDS) {
+        Ok((_, records)) => records,
+        Err(IndexError::Io(error)) if crate::fs::is_transient_resource_error(&error) => {
+            return Err(error);
+        }
+        Err(error) => {
+            warn!(
+                sidecar = %Path::new(index_name).display(),
+                %error,
+                "ignoring unreadable prior sidecar records"
+            );
+            Vec::new()
+        }
+    };
+    Ok(PriorIndex { binding, records })
 }
 
 fn is_directory_at(directory: &File, name: &OsStr) -> bool {
@@ -439,7 +528,19 @@ fn publish_rebuilt_index(
     mut publication_step: impl FnMut(RecoveryPublicationStep) -> io::Result<()>,
 ) -> io::Result<()> {
     let (temporary, temporary_file) = create_index_temporary(directory, index_name)?;
-    let temporary_claimed = temporary_file.try_clone()?;
+    let temporary_claimed = match rustix::fs::fstat(&temporary_file) {
+        Ok(stat) => (stat.st_dev, stat.st_ino),
+        Err(error) => {
+            // The temporary was created exclusively a moment ago and nothing
+            // else refers to it; unlinking the name is the complete rollback.
+            if let Err(unlink) =
+                rustix::fs::unlinkat(directory, temporary.as_os_str(), AtFlags::empty())
+            {
+                warn!(%unlink, "recovery temporary could not be removed");
+            }
+            return Err(error.into());
+        }
+    };
     let mut temporary_owned = true;
     let result = (|| {
         let mut writer = IndexWriter::from_claimed_file(temporary_file, header)?;
@@ -449,7 +550,7 @@ fn publish_rebuilt_index(
         writer.sync()?;
         drop(writer);
         publication_step(RecoveryPublicationStep::BeforeRename)?;
-        if !claimed_temporary_matches(directory, &temporary, &temporary_claimed) {
+        if !claimed_temporary_matches(directory, &temporary, temporary_claimed) {
             return Err(io::Error::other(
                 "recovery sidecar temporary ownership changed",
             ));
@@ -460,15 +561,17 @@ fn publish_rebuilt_index(
         directory.sync_all()
     })();
     if result.is_err() && temporary_owned {
-        remove_claimed_temporary(directory, &temporary, &temporary_claimed);
+        remove_claimed_temporary(directory, &temporary, temporary_claimed);
     }
     result
 }
 
+/// The wall and media bounds of the rebuilt records, or why they form no
+/// timeline.
 fn recovered_times(
     records: &[IndexRecord],
     final_wall: Option<WallUs>,
-) -> io::Result<(WallUs, WallUs, u64, u64)> {
+) -> Result<(WallUs, WallUs, u64, u64), &'static str> {
     let (Some(first), Some(last)) = (records.first(), records.last()) else {
         return Ok((WallUs::default(), WallUs::default(), 0, 0));
     };
@@ -476,58 +579,43 @@ fn recovered_times(
         .windows(2)
         .any(|pair| pair[1].decode_time < pair[0].decode_time)
     {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "recovered media timeline is nonmonotonic",
-        ));
+        return Err("recovered media timeline is nonmonotonic");
     }
     let media_end = last
         .decode_time
         .checked_add(u64::from(last.duration))
-        .ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                "recovered media timeline overflows u64",
-            )
-        })?;
-    let wall_micros = i64::from(last.duration)
-        .checked_mul(100)
-        .expect("u32 duration times 100 fits i64")
-        .div_euclid(9);
+        .ok_or("recovered media timeline overflows u64")?;
+    let wall_micros = MediaTicks::new(i64::from(last.duration)).as_micros();
     let wall_end = match final_wall {
         Some(wall) => wall
             .get()
             .checked_add(wall_micros)
             .map(WallUs::new)
-            .ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "recovered wall timeline overflows i64",
-                )
-            })?,
+            .ok_or("recovered wall timeline overflows i64")?,
         None => WallUs::default(),
     };
     Ok((first.wall, wall_end, first.decode_time, media_end))
 }
 
-fn same_file(left: &std::fs::Metadata, right: &std::fs::Metadata) -> bool {
+fn same_file(left: &Metadata, right: &Metadata) -> bool {
     use std::os::unix::fs::MetadataExt as _;
     left.dev() == right.dev() && left.ino() == right.ino()
 }
 
-fn claimed_temporary_matches(directory: &File, name: &OsStr, claimed: &File) -> bool {
-    let (Ok(identity), Ok(found)) = (
-        rustix::fs::fstat(claimed),
-        rustix::fs::statat(directory, name, AtFlags::SYMLINK_NOFOLLOW),
-    ) else {
+/// Whether `name` still refers to the temporary created as `claimed`
+/// (device and inode).
+fn claimed_temporary_matches(directory: &File, name: &OsStr, claimed: (u64, u64)) -> bool {
+    let Ok(found) = rustix::fs::statat(directory, name, AtFlags::SYMLINK_NOFOLLOW) else {
         return false;
     };
-    identity.st_dev == found.st_dev && identity.st_ino == found.st_ino
+    (found.st_dev, found.st_ino) == claimed
 }
 
-fn remove_claimed_temporary(directory: &File, name: &OsStr, claimed: &File) {
-    if claimed_temporary_matches(directory, name, claimed) {
-        let _ = rustix::fs::unlinkat(directory, name, AtFlags::empty());
+fn remove_claimed_temporary(directory: &File, name: &OsStr, claimed: (u64, u64)) {
+    if claimed_temporary_matches(directory, name, claimed)
+        && let Err(error) = rustix::fs::unlinkat(directory, name, AtFlags::empty())
+    {
+        warn!(%error, "recovery temporary could not be removed");
     }
 }
 
@@ -541,12 +629,7 @@ fn create_index_temporary(directory: &File, index_name: &OsStr) -> io::Result<(O
             ".{name}.irisd-recover-{}-{sequence}.tmp",
             std::process::id()
         ));
-        match crate::fs::open_file_beneath(
-            directory,
-            &temporary,
-            OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL,
-            Mode::RUSR | Mode::WUSR,
-        ) {
+        match crate::fs::create_file_beneath(directory, &temporary, Mode::RUSR | Mode::WUSR) {
             Ok(file) => return Ok((temporary, file)),
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
             Err(error) => return Err(error),
@@ -580,7 +663,7 @@ mod tests {
     use bytes::Bytes;
     use iris_core::time::WallUs;
     use iris_mp4::fragment::{FragmentHeader, Sample, encode_fragment};
-    use iris_mp4::index::{FLAG_STARTS_WITH_SYNC, read_index_bounded};
+    use iris_mp4::index::{FLAG_STARTS_WITH_SYNC, RECORD_LEN, read_index_bounded};
     use iris_mp4::init::{SampleEntry, build_init_segment};
     use iris_mp4::reader::scan;
 
@@ -636,7 +719,7 @@ mod tests {
         fragments: usize,
     ) -> (
         tempfile::TempDir,
-        crate::ApprovedRoot,
+        ApprovedRoot,
         PathBuf,
         Vec<u8>,
         IndexHeader,
@@ -783,12 +866,13 @@ mod tests {
             .collect();
         assert_eq!(rebuilt, records);
         assert_eq!(report.valid_len, bytes.len() as u64);
+        assert_eq!(report.stop, None);
 
         assert!(reader.bytes_read >= bytes.len() as u64);
     }
 
     #[test]
-    fn a_structurally_valid_boundary_before_the_actual_init_falls_back() {
+    fn a_forged_sidecar_init_length_does_not_change_the_rebuilt_index() {
         let (bytes, mut header, mut records) = recording(1);
         header.init_len = 1;
         records[0].offset = 1;
@@ -848,7 +932,7 @@ mod tests {
     }
 
     #[test]
-    fn a_genuine_cached_scan_reader_failure_is_propagated() {
+    fn a_read_error_during_the_scan_is_returned_not_treated_as_a_torn_tail() {
         let (bytes, _, _) = recording(2);
         let error = scan_for_recovery(
             FailOneRead {
@@ -859,15 +943,6 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::Other);
-    }
-
-    #[test]
-    fn authoritative_recovery_scan_returns_all_media_facts() {
-        let (bytes, _, records) = recording(4);
-        let report = scan_for_recovery(Cursor::new(&bytes), MAX_PERSISTED_INDEX_RECORDS).unwrap();
-        assert_eq!(report.fragments.len(), records.len());
-        assert_eq!(report.valid_len, bytes.len() as u64);
-        assert_eq!(report.stop, None);
     }
 
     #[test]
@@ -897,10 +972,10 @@ mod tests {
         }
     }
 
-    #[test]
-    fn recovery_rebuilds_media_facts_and_keeps_a_readable_prior_binding() {
-        let dir = tempfile::tempdir().unwrap();
-        let media = dir.path().join("recording.mp4");
+    /// A recording with a prior sidecar whose header claims a start wall time
+    /// the media does not have and carries a binding.
+    fn recording_with_forged_header(dir: &Path) -> (PathBuf, PathBuf) {
+        let media = dir.join("recording.mp4");
         let index = media.with_extension("idx");
         let (bytes, mut header, records) = recording(2);
         header.start_wall = WallUs::new(9_000_000);
@@ -908,10 +983,23 @@ mod tests {
         header.sample_entry_hash = u32::MAX;
         std::fs::write(&media, &bytes).unwrap();
         write_sidecar(&index, &header, &records);
+        (media, index)
+    }
 
+    #[test]
+    fn a_rebuilt_header_takes_its_start_wall_from_the_media() {
+        let dir = tempfile::tempdir().unwrap();
+        let (media, index) = recording_with_forged_header(dir.path());
+        recover_segment(&media).unwrap();
+        assert_eq!(rebuilt_header(&index).start_wall, WallUs::new(0));
+    }
+
+    #[test]
+    fn a_readable_prior_header_keeps_its_binding() {
+        let dir = tempfile::tempdir().unwrap();
+        let (media, index) = recording_with_forged_header(dir.path());
         let report = recover_segment(&media).unwrap();
         let rebuilt = rebuilt_header(&index);
-        assert_eq!(rebuilt.start_wall, WallUs::new(0));
         assert_eq!(rebuilt.run_id, u64::MAX);
         assert_eq!(rebuilt.sample_entry_hash, u32::MAX);
         assert_eq!(report.binding, IndexBinding::new(u64::MAX, u32::MAX));
@@ -1354,7 +1442,7 @@ mod tests {
     }
 
     #[test]
-    fn oversized_sidecar_falls_back_to_media_and_is_rebuilt_within_the_limit() {
+    fn an_oversized_sidecar_is_ignored_and_rebuilt_from_media() {
         let dir = tempfile::tempdir().unwrap();
         let media = dir.path().join("recording.mp4");
         let index = media.with_extension("idx");

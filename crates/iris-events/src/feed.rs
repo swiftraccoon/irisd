@@ -4,6 +4,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use futures_util::StreamExt as _;
+use iris_core::text::LogSafe;
+use iris_core::time::WallUs;
 use reqwest::StatusCode;
 use thiserror::Error;
 use tokio::time::{Instant, timeout, timeout_at};
@@ -12,13 +14,11 @@ use tracing::{debug, info, warn};
 
 use crate::backoff::Backoff;
 use crate::dahua;
-use crate::digest::{DigestAuth, parse_challenge};
-use crate::endpoint::{CameraEndpoint, EventSink};
-use crate::multipart::{
-    DEFAULT_BOUNDARY, MultipartError, MultipartReader, boundary_from_content_type,
-};
+use crate::digest::{self, DigestAuth};
+use crate::endpoint::CameraEndpoint;
+use crate::multipart::{self, DEFAULT_BOUNDARY, MultipartError, MultipartReader};
+use crate::sink::EventSink;
 use crate::stats::EventStats;
-use iris_core::time::WallUs;
 
 /// Heartbeat interval requested from the camera, in seconds.
 const HEARTBEAT_SECS: u64 = 5;
@@ -52,13 +52,19 @@ impl PartDeadline {
     }
 }
 
-/// Why a feed session ended.
+/// Why a feed session ended. `Display` may carry camera text through the
+/// HTTP error; a log line takes it through [`LogSafe`].
 #[derive(Debug, Error)]
 enum SessionError {
     #[error("HTTP request failed: {0}")]
     Http(#[from] reqwest::Error),
+    /// A second fresh challenge, or a third after a stale nonce: the camera
+    /// rejected the credentials.
     #[error("camera rejected the credentials")]
     Unauthorized,
+    /// A 401 without a digest challenge irisd can answer (RFC 7616, MD5).
+    #[error("camera sent no supported digest challenge")]
+    NoDigestChallenge,
     #[error("unexpected HTTP status {0}")]
     Status(StatusCode),
     #[error("no part received for {STALL:?}")]
@@ -115,7 +121,11 @@ pub async fn run_dahua_cgi(
                 info!(camera = %endpoint.camera, "event feed ended; reconnecting");
             }
             Err(error) => {
-                warn!(camera = %endpoint.camera, %error, "event feed session failed; reconnecting");
+                warn!(
+                    camera = %endpoint.camera,
+                    error = %LogSafe(error),
+                    "event feed session failed; reconnecting"
+                );
             }
         }
         stats.record_reconnect();
@@ -132,12 +142,14 @@ pub async fn run_dahua_cgi(
 }
 
 /// The HTTP client of the CGI feed: the camera's certificate policy, a connect
-/// bound, and no redirects, so a camera cannot steer requests elsewhere.
+/// bound, no redirects, and no proxy, so a camera or the environment cannot
+/// steer requests and credentials elsewhere.
 fn cgi_client(endpoint: &CameraEndpoint) -> Result<reqwest::Client, reqwest::Error> {
     reqwest::Client::builder()
         .danger_accept_invalid_certs(!endpoint.tls_verify)
         .connect_timeout(Duration::from_secs(10))
         .redirect(reqwest::redirect::Policy::none())
+        .no_proxy()
         .build()
 }
 
@@ -174,7 +186,7 @@ async fn attached(
         .headers()
         .get(reqwest::header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
-        .and_then(boundary_from_content_type)
+        .and_then(multipart::boundary_from_content_type)
         .unwrap_or_else(|| DEFAULT_BOUNDARY.to_owned());
     let mut reader = MultipartReader::new(&boundary);
     let mut stream = response.bytes_stream();
@@ -195,10 +207,15 @@ async fn attached(
             stats.record_message(now);
             let text = String::from_utf8_lossy(&part);
             let Some(raw) = dahua::parse_part(&text) else {
-                continue; // heartbeat
+                continue; // a heartbeat or a part without an event
             };
             if let Some(event) = dahua::normalize(&endpoint.camera, &raw, now) {
-                debug!(camera = %endpoint.camera, code = %raw.code, action = %raw.action, "event");
+                debug!(
+                    camera = %endpoint.camera,
+                    code = %LogSafe(&raw.code),
+                    action = %LogSafe(&raw.action),
+                    "event"
+                );
                 stats.record_event(now);
                 sink.publish(event);
             }
@@ -207,7 +224,8 @@ async fn attached(
 }
 
 /// Performs a GET with HTTP digest authentication: reuses a known challenge,
-/// answers one 401 with a fresh challenge, and gives up on a second 401.
+/// answers one 401 with a fresh challenge, answers one more when that fresh
+/// challenge only reports a stale nonce, and gives up on the 401 after that.
 async fn get_with_digest(
     client: &reqwest::Client,
     url: &str,
@@ -228,7 +246,9 @@ async fn get_with_digest_inner(
     uri: &str,
     auth: &mut DigestAuth,
 ) -> Result<reqwest::Response, SessionError> {
-    for attempt in 0..2 {
+    let mut challenged = false;
+    let mut stale_retried = false;
+    loop {
         let mut request = client.get(url);
         if let Some(header) = auth.authorization("GET", uri) {
             request = request.header(reqwest::header::AUTHORIZATION, header);
@@ -241,19 +261,21 @@ async fn get_with_digest_inner(
                     .headers()
                     .get_all(reqwest::header::WWW_AUTHENTICATE)
                     .iter()
-                    .filter_map(|v| v.to_str().ok())
-                    .find_map(parse_challenge);
-                match challenge {
-                    Some(challenge) if attempt == 0 || challenge.stale => {
-                        auth.set_challenge(challenge);
-                    }
-                    _ => return Err(SessionError::Unauthorized),
+                    .filter_map(|value| value.to_str().ok())
+                    .find_map(digest::parse_challenge)
+                    .ok_or(SessionError::NoDigestChallenge)?;
+                if !challenged {
+                    challenged = true;
+                } else if challenge.stale && !stale_retried {
+                    stale_retried = true;
+                } else {
+                    return Err(SessionError::Unauthorized);
                 }
+                auth.set_challenge(challenge);
             }
             status => return Err(SessionError::Status(status)),
         }
     }
-    Err(SessionError::Unauthorized)
 }
 
 #[cfg(test)]
@@ -378,10 +400,125 @@ mod tests {
         )
         .await;
         server.abort();
+        let result = result.expect("a connected server cannot hold attach open indefinitely");
         assert!(
-            result.is_ok(),
-            "a connected server cannot hold attach open indefinitely"
+            matches!(result, Err(SessionError::AttachTimeout)),
+            "{:?}",
+            result.map(|response| response.status())
         );
-        assert!(matches!(result.unwrap(), Err(SessionError::AttachTimeout)));
+    }
+
+    /// Serves `responses` on successive connections, each as the status line
+    /// and headers given, and reports the `Authorization` header of every
+    /// request (`None` when absent).
+    async fn scripted_camera(
+        responses: Vec<&'static str>,
+    ) -> (
+        std::net::SocketAddr,
+        tokio::task::JoinHandle<Vec<Option<String>>>,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let mut authorizations = Vec::new();
+            for response in responses {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = vec![0; 8_192];
+                let length = socket.read(&mut request).await.unwrap();
+                let head = String::from_utf8_lossy(&request[..length]).into_owned();
+                authorizations.push(
+                    head.lines()
+                        .find_map(|line| line.strip_prefix("authorization: "))
+                        .map(str::to_owned),
+                );
+                tokio::io::AsyncWriteExt::write_all(
+                    &mut socket,
+                    format!("{response}Content-Length: 0\r\nConnection: close\r\n\r\n").as_bytes(),
+                )
+                .await
+                .unwrap();
+            }
+            authorizations
+        });
+        (address, server)
+    }
+
+    const DIGEST_CHALLENGE: &str = "HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Digest realm=\"camera\", nonce=\"first-nonce\", qop=\"auth\"\r\n";
+    const STALE_CHALLENGE: &str = "HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Digest realm=\"camera\", nonce=\"second-nonce\", qop=\"auth\", stale=true\r\n";
+    const BASIC_CHALLENGE: &str =
+        "HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Basic realm=\"camera\"\r\n";
+    const OK: &str = "HTTP/1.1 200 OK\r\nContent-Type: multipart/x-mixed-replace; boundary=b\r\n";
+
+    async fn attach(address: std::net::SocketAddr) -> Result<reqwest::Response, SessionError> {
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap();
+        get_with_digest(
+            &client,
+            &format!("http://{address}/feed"),
+            "/feed",
+            &mut DigestAuth::new("user", "password"),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn a_fresh_challenge_is_answered_once() {
+        let (address, server) = scripted_camera(vec![DIGEST_CHALLENGE, OK]).await;
+        attach(address)
+            .await
+            .expect("the second request is authorized");
+        let authorizations = server.await.unwrap();
+        assert_eq!(authorizations[0], None);
+        let answer = authorizations[1]
+            .as_deref()
+            .expect("an Authorization header");
+        assert!(answer.starts_with("Digest username=\"user\""), "{answer}");
+        assert!(
+            answer.contains("nonce=\"first-nonce\"") && answer.contains("nc=00000001"),
+            "{answer}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stale_nonce_gets_one_more_attempt() {
+        let (address, server) = scripted_camera(vec![DIGEST_CHALLENGE, STALE_CHALLENGE, OK]).await;
+        attach(address)
+            .await
+            .expect("the third request is authorized");
+        let authorizations = server.await.unwrap();
+        let nonces: Vec<Option<&str>> = authorizations
+            .iter()
+            .map(|answer| {
+                answer.as_deref().map(|answer| {
+                    if answer.contains("second-nonce") {
+                        "second"
+                    } else {
+                        "first"
+                    }
+                })
+            })
+            .collect();
+        assert_eq!(nonces, [None, Some("first"), Some("second")]);
+    }
+
+    #[tokio::test]
+    async fn a_second_fresh_challenge_means_rejected_credentials() {
+        let (address, server) = scripted_camera(vec![DIGEST_CHALLENGE, DIGEST_CHALLENGE]).await;
+        let error = attach(address).await.unwrap_err();
+        assert!(matches!(error, SessionError::Unauthorized), "{error:?}");
+        assert_eq!(server.await.unwrap().len(), 2, "no third request");
+    }
+
+    #[tokio::test]
+    async fn a_camera_without_a_digest_challenge_is_not_reported_as_rejecting_credentials() {
+        let (address, server) = scripted_camera(vec![BASIC_CHALLENGE]).await;
+        let error = attach(address).await.unwrap_err();
+        assert!(
+            matches!(error, SessionError::NoDigestChallenge),
+            "{error:?}"
+        );
+        assert_eq!(server.await.unwrap(), [None]);
     }
 }

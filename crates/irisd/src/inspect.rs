@@ -7,10 +7,10 @@ use std::path::PathBuf;
 
 use anyhow::{Context, bail};
 use clap::Args as ClapArgs;
-use iris_core::time::TIMESCALE;
+use iris_core::time::{MediaTicks, TIMESCALE};
 use iris_mp4::index::{MAX_PERSISTED_INDEX_RECORDS, read_index_file_bounded};
-use iris_mp4::reader::{FragmentInfo, ScanOptions, scan};
-use iris_store::layout::index_path;
+use iris_mp4::reader::{self, FragmentInfo, ScanOptions};
+use iris_store::layout;
 use iris_store::open_regular_file;
 
 /// Arguments for `inspect`.
@@ -30,12 +30,15 @@ pub struct Args {
 pub fn run(args: &Args) -> anyhow::Result<()> {
     let file =
         File::open(&args.file).with_context(|| format!("opening {}", args.file.display()))?;
-    let file_len = file.metadata()?.len();
+    let file_len = file
+        .metadata()
+        .with_context(|| format!("reading the status of {}", args.file.display()))?
+        .len();
     let options = ScanOptions {
         verify_crc: args.verify,
         collect_samples: true,
     };
-    let report = scan(BufReader::new(file), options)
+    let report = reader::scan(BufReader::new(file), options)
         .with_context(|| format!("scanning {}", args.file.display()))?;
     let fragments = &report.fragments;
 
@@ -57,10 +60,10 @@ pub fn run(args: &Args) -> anyhow::Result<()> {
         report_timing(fragments, first, last, report.valid_len)?;
     }
     match &report.stop {
-        Some(stop) => println!("scan stopped:       {stop:?}"),
+        Some(stop) => println!("scan stopped:       {stop}"),
         None => println!("scan stopped:       clean end of file"),
     }
-    report_sidecar(args, fragments);
+    println!("sidecar index:      {}", sidecar_report(args, fragments));
     if args.samples {
         print_fragments(fragments);
     }
@@ -138,13 +141,14 @@ fn report_timing(
     }
     let mut top: Vec<(u32, usize)> = histogram.into_iter().collect();
     top.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    let ticks_per_ms = f64::from(TIMESCALE) / 1_000.0;
     let summary: Vec<String> = top
         .iter()
         .take(5)
         .map(|(ticks, count)| {
             format!(
                 "{ticks} ticks ({:.2} ms) x{count}",
-                f64::from(*ticks) / 90.0
+                f64::from(*ticks) / ticks_per_ms
             )
         })
         .collect();
@@ -162,7 +166,8 @@ fn report_timing(
                 .context("invalid media timeline: final decode time precedes first")?;
             let media_ticks = i64::try_from(media_ticks)
                 .context("invalid media timeline: decode-time delta exceeds i64")?;
-            let media_delta = checked_ticks_to_micros(media_ticks)
+            let media_delta = MediaTicks::new(media_ticks)
+                .checked_as_micros()
                 .context("invalid media timeline: media delta in microseconds exceeds i64")?;
             let drift = wall_delta
                 .checked_sub(media_delta)
@@ -177,25 +182,17 @@ fn report_timing(
     Ok(())
 }
 
-fn checked_ticks_to_micros(ticks: i64) -> Option<i64> {
-    i64::try_from(i128::from(ticks).checked_mul(100)?.div_euclid(9)).ok()
-}
-
-/// Reports the sidecar beside the recording. It is opened without following
+/// Describes the sidecar beside the recording. It is opened without following
 /// a final symlink or blocking on a FIFO, and read within the shared record
 /// limit.
-fn report_sidecar(args: &Args, fragments: &[FragmentInfo]) {
-    let path = index_path(&args.file);
+fn sidecar_report(args: &Args, fragments: &[FragmentInfo]) -> String {
+    let path = layout::index_path(&args.file);
     let index = match open_regular_file(&path) {
         Ok(index) => index,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            println!("sidecar index:      none at {}", path.display());
-            return;
+            return format!("none at {}", path.display());
         }
-        Err(error) => {
-            println!("sidecar index:      unusable: {error}");
-            return;
-        }
+        Err(error) => return format!("unusable: {error}"),
     };
     match read_index_file_bounded(index, MAX_PERSISTED_INDEX_RECORDS) {
         Ok((header, records)) => {
@@ -203,16 +200,16 @@ fn report_sidecar(args: &Args, fragments: &[FragmentInfo]) {
                 && records.iter().zip(fragments).all(|(r, f)| {
                     r.offset == f.offset && r.len == f.len && r.decode_time == f.decode_time
                 });
-            println!(
-                "sidecar index:      {} records (scanned {} fragments); init_len {}; run {}; offsets {}",
+            format!(
+                "{} records (scanned {} fragments); init_len {}; run {}; offsets {}",
                 records.len(),
                 fragments.len(),
                 header.init_len,
                 header.run_id,
                 if offsets_agree { "agree" } else { "DISAGREE" }
-            );
+            )
         }
-        Err(err) => println!("sidecar index:      unreadable: {err}"),
+        Err(err) => format!("unreadable: {err}"),
     }
 }
 
@@ -239,8 +236,9 @@ fn print_fragments(fragments: &[FragmentInfo]) {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use iris_core::time::WallUs;
+
+    use super::*;
 
     fn fragment(decode_time: u64, duration: u32, wall: Option<WallUs>) -> FragmentInfo {
         FragmentInfo {
@@ -297,10 +295,10 @@ mod tests {
     }
 
     #[test]
-    fn oversized_sidecar_is_reported_without_loading_past_the_shared_limit() {
+    fn an_oversized_sidecar_is_reported_unreadable_without_loading_past_the_limit() {
         let dir = tempfile::tempdir().unwrap();
         let media = dir.path().join("recording.mp4");
-        let sidecar = File::create(media.with_extension("idx")).unwrap();
+        let sidecar = File::create(layout::index_path(&media)).unwrap();
         let oversized = iris_mp4::index::HEADER_LEN
             + MAX_PERSISTED_INDEX_RECORDS * iris_mp4::index::RECORD_LEN
             + iris_mp4::index::RECORD_LEN;
@@ -310,6 +308,22 @@ mod tests {
             verify: false,
             samples: false,
         };
-        report_sidecar(&args, &[]);
+        let report = sidecar_report(&args, &[]);
+        assert!(report.starts_with("unreadable: "), "{report}");
+    }
+
+    #[test]
+    fn a_missing_sidecar_is_reported_with_its_expected_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let media = dir.path().join("recording.mp4");
+        let args = Args {
+            file: media.clone(),
+            verify: false,
+            samples: false,
+        };
+        assert_eq!(
+            sidecar_report(&args, &[]),
+            format!("none at {}", layout::index_path(&media).display())
+        );
     }
 }

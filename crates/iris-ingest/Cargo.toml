@@ -1,29 +1,30 @@
 [package]
 name = "iris-ingest"
-description = "RTSP ingest, timestamp regularisation, and fragment assembly for irisd"
 version.workspace = true
 edition.workspace = true
-rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "RTSP ingest, timestamp regularisation, and fragment assembly for irisd"
 
 [dependencies]
 bytes = { workspace = true }
 futures = { workspace = true }
+iris-core = { workspace = true }
+iris-h265 = { workspace = true }
+iris-mp4 = { workspace = true }
 retina = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 tracing = { workspace = true }
 url = { workspace = true }
-iris-core = { workspace = true }
-iris-h265 = { workspace = true }
-iris-mp4 = { workspace = true }
 
 [lints]
 workspace = true
 
 [dev-dependencies]
+iris-replay = { workspace = true }
 socket2 = { workspace = true }
 tracing-subscriber = { workspace = true }
-iris-replay = { workspace = true }

@@ -1,25 +1,25 @@
 //! The catalog thread and the handle that talks to it.
 
 use std::collections::VecDeque;
-use std::mem::size_of;
+use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::sync::{Arc, Condvar, Mutex};
-use std::thread::JoinHandle;
+use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use tokio::sync::oneshot;
 use tracing::{debug, error, info};
 
-use crate::db::Db;
+use crate::db::{Db, OPEN_SEGMENT_GRACE};
 use crate::metrics::CatalogMetrics;
 use crate::types::{
     CameraRow, CatalogError, CatalogStats, Change, DeleteMarkResult, EventCursor, EventId,
-    EventProtection, EventProtectionCursor, EventRow, NewSegment, RetentionPage, SegmentId,
-    SegmentRow, TimeRange,
+    EventRow, NewSegment, RetentionPage, SegmentCursor, SegmentId, SegmentRow, StartupRow,
+    TimeRange,
 };
-use iris_core::event::Event;
-use iris_core::id::{CameraId, StreamKey};
+use iris_core::event::{Event, EventKind};
+use iris_core::id::{CameraId, RootIdentity, StreamKey};
 use iris_core::time::WallUs;
 
 /// Longest a change waits before it is committed.
@@ -37,6 +37,12 @@ const MAX_QUEUED_BYTES: usize = 16 * 1024 * 1024;
 const RESERVED_COMMANDS: usize = 128;
 /// Owned-byte reserve paired with [`RESERVED_COMMANDS`].
 const RESERVED_BYTES: usize = 1024 * 1024;
+/// Outstanding commands below which an overload latch releases: half the
+/// ordinary bound, so queries resume with room to spare instead of at the
+/// edge of the next rejection.
+const OVERLOAD_RELEASE_COMMANDS: usize = (MAX_QUEUED_COMMANDS - RESERVED_COMMANDS) / 2;
+/// Outstanding owned bytes below which an overload latch releases.
+const OVERLOAD_RELEASE_BYTES: usize = (MAX_QUEUED_BYTES - RESERVED_BYTES) / 2;
 /// Conservative allocation overhead for a boxed query closure and reply path.
 const QUERY_OVERHEAD: usize = 256;
 
@@ -164,7 +170,7 @@ impl CommandQueue {
             }
             if !fits(&state, bytes, MAX_QUEUED_COMMANDS, MAX_QUEUED_BYTES) {
                 self.metrics.set_queue_usage(state.outstanding, state.bytes);
-                self.metrics.reject_critical();
+                self.metrics.reject_lifecycle();
                 return ChangeAdmission::Reconcile;
             }
         } else if !fits(
@@ -249,9 +255,7 @@ impl CommandQueue {
         };
         state.outstanding = state.outstanding.saturating_sub(count);
         state.bytes = state.bytes.saturating_sub(bytes);
-        if state.outstanding < (MAX_QUEUED_COMMANDS - RESERVED_COMMANDS) / 2
-            && state.bytes < (MAX_QUEUED_BYTES - RESERVED_BYTES) / 2
-        {
+        if state.outstanding < OVERLOAD_RELEASE_COMMANDS && state.bytes < OVERLOAD_RELEASE_BYTES {
             state.overloaded = false;
         }
         self.metrics.set_queue_usage(state.outstanding, state.bytes);
@@ -349,7 +353,7 @@ fn key_owned_bytes(key: &StreamKey) -> usize {
 
 fn event_owned_bytes(event: &Event) -> usize {
     let kind = match &event.kind {
-        iris_core::event::EventKind::Other(code) => code.capacity(),
+        EventKind::Other(code) => code.capacity(),
         _ => 0,
     };
     event
@@ -378,11 +382,11 @@ struct Inner {
 impl Drop for Inner {
     fn drop(&mut self) {
         self.queue.close();
-        let handle = match self.join.get_mut() {
-            Ok(slot) => slot.take(),
-            Err(poisoned) => poisoned.into_inner().take(),
+        let Ok(slot) = self.join.get_mut() else {
+            error!("catalog join slot poisoned; the thread is not joined");
+            return;
         };
-        if handle.is_some_and(|handle| handle.join().is_err()) {
+        if slot.take().is_some_and(|handle| handle.join().is_err()) {
             error!("catalog thread panicked");
         }
     }
@@ -393,31 +397,66 @@ impl Drop for Inner {
 /// Commands are processed in send order. A query sent after
 /// [`CatalogHandle::notify`] therefore observes that change, because the
 /// thread commits every pending change before running a query.
+///
+/// # Errors
+///
+/// Every query can fail with [`CatalogError::Overloaded`] while the bounded
+/// ingress is overloaded or has not drained below its release threshold,
+/// [`CatalogError::Closed`] after shutdown, [`CatalogError::Sqlite`] for a
+/// statement failure, [`CatalogError::NonUtf8Path`] for a path argument that
+/// is not UTF-8, and [`CatalogError::Corrupt`] for a persisted value that
+/// fails checked decoding. Methods list only the errors specific to them.
 #[derive(Clone)]
 pub struct CatalogHandle {
     inner: Arc<Inner>,
 }
 
-impl std::fmt::Debug for CatalogHandle {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Debug for CatalogHandle {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("CatalogHandle").finish_non_exhaustive()
     }
 }
 
 impl CatalogHandle {
     /// Opens (creating and migrating if needed) the database at `path` and
-    /// starts the catalog thread.
+    /// starts the catalog thread, with the default
+    /// [`OPEN_SEGMENT_GRACE`](crate::OPEN_SEGMENT_GRACE).
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`CatalogHandle::open_with_grace`].
     pub fn open(path: &Path) -> Result<Self, CatalogError> {
+        Self::open_with_grace(path, OPEN_SEGMENT_GRACE)
+    }
+
+    /// Opens (creating and migrating if needed) the database at `path` and
+    /// starts the catalog thread. `open_segment_grace` is how far an unsealed
+    /// row extends past its last durable progress in range listings; a
+    /// deployment derives it from its sync interval and fragment cap so a
+    /// healthy open file never leaves the listings between two syncs.
+    ///
+    /// # Errors
+    ///
+    /// [`CatalogError::Io`] when the state directory or file cannot be
+    /// created or the thread cannot be spawned, [`CatalogError::UnsupportedSchema`]
+    /// for a database from a later schema, [`CatalogError::Corrupt`] for an
+    /// ambiguous version or invalid `sealed`/`deleting` domains,
+    /// [`CatalogError::JournalMode`] when SQLite cannot enter WAL mode, and
+    /// [`CatalogError::Sqlite`] for any other statement failure.
+    pub fn open_with_grace(
+        path: &Path,
+        open_segment_grace: Duration,
+    ) -> Result<Self, CatalogError> {
         let (ready_tx, ready_rx) = mpsc::channel::<Result<(), CatalogError>>();
         let path: PathBuf = path.to_path_buf();
         let metrics = Arc::new(CatalogMetrics::new());
         let thread_metrics = Arc::clone(&metrics);
         let queue = Arc::new(CommandQueue::new(Arc::clone(&metrics)));
         let thread_queue = Arc::clone(&queue);
-        let join = std::thread::Builder::new()
+        let join = thread::Builder::new()
             .name("iris-catalog".into())
             .spawn(move || {
-                let mut db = match Db::open(&path) {
+                let mut db = match Db::open_with_grace(&path, open_segment_grace) {
                     Ok(db) => {
                         let _ = ready_tx.send(Ok(()));
                         db
@@ -451,8 +490,24 @@ impl CatalogHandle {
         })
     }
 
-    /// Queues a change; never blocks. Changes are committed within 100 ms or
-    /// before the next query, whichever comes first.
+    /// Offers a change to the bounded ingress without blocking.
+    ///
+    /// An admitted change is committed with its batch within 100 ms of the
+    /// catalog thread taking the first pending change, at 1,000 pending, or
+    /// before the next query; a running query or a busy wait for the write
+    /// lock delays that. Admission can withhold a change: an event or progress
+    /// report beyond the ordinary capacity (2,048 commands and 16 MiB minus
+    /// the lifecycle reserve) is dropped and counted in
+    /// [`CatalogMetrics::rejected_events`] or
+    /// [`CatalogMetrics::rejected_progress`]; a later progress report for the
+    /// same path replaces a queued one (`coalesced`); a lifecycle change that
+    /// cannot use the reserve, even after evicting unqueried events and
+    /// progress, is rejected and latches
+    /// [`CatalogMetrics::reconciliation_required`]; a change after shutdown is
+    /// dropped. Every change of a failed batch is lost and counted in
+    /// [`CatalogMetrics::failures`], not retried. Any drop or eviction also
+    /// latches an overload that refuses queries until the outstanding work
+    /// falls below half the ordinary bound.
     pub fn notify(&self, change: Change) {
         match self.inner.queue.push_change(change) {
             ChangeAdmission::Queued | ChangeAdmission::Coalesced => {}
@@ -509,6 +564,10 @@ impl CatalogHandle {
     }
 
     /// Inserts or updates a camera.
+    ///
+    /// # Errors
+    ///
+    /// Only the errors every query shares (see [`CatalogHandle`]).
     pub async fn ensure_camera(
         &self,
         id: &CameraId,
@@ -529,24 +588,35 @@ impl CatalogHandle {
         .await
     }
 
-    /// Registers the configured recording roots used by root-specific
-    /// retention queries and assigns pre-existing rows to those exact roots.
+    /// Durably binds one configured root `path` to its `identity`.
+    /// Registering the same pair again changes nothing. Row ownership is
+    /// assigned separately by [`CatalogHandle::configure_video_roots`].
+    ///
+    /// # Errors
+    ///
+    /// [`CatalogError::RootIdentityMismatch`] when the path is registered
+    /// with another identity, [`CatalogError::RootIdentityInUse`] when the
+    /// identity is registered for another path.
     pub async fn register_recording_root(
         &self,
         path: &Path,
-        identity: &str,
+        identity: RootIdentity,
     ) -> Result<(), CatalogError> {
         let path = path.to_path_buf();
-        let identity = identity.to_owned();
-        let owned_bytes = path_owned_bytes(&path).saturating_add(identity.len());
+        let owned_bytes = path_owned_bytes(&path);
         self.query_with_owned_bytes(owned_bytes, move |db| {
-            db.register_recording_root(&path, &identity)
+            db.register_recording_root(&path, identity)
         })
         .await
     }
 
-    /// Assigns persisted rows to the exact configured roots used by
-    /// root-specific retention queries.
+    /// Assigns persisted rows without a root to the exact configured roots
+    /// used by root-specific retention queries, the deepest matching root
+    /// winning; a non-null root assignment is never rewritten.
+    ///
+    /// # Errors
+    ///
+    /// Only the errors every query shares (see [`CatalogHandle`]).
     pub async fn configure_video_roots(&self, roots: &[PathBuf]) -> Result<(), CatalogError> {
         let roots = roots.to_vec();
         let owned_bytes = roots.iter().fold(
@@ -558,35 +628,29 @@ impl CatalogHandle {
     }
 
     /// Lists cameras.
+    ///
+    /// # Errors
+    ///
+    /// Only the errors every query shares (see [`CatalogHandle`]).
     pub async fn cameras(&self) -> Result<Vec<CameraRow>, CatalogError> {
         self.query(Db::cameras).await
     }
 
-    /// Segments of a stream overlapping `range`, ordered by start time.
+    /// At most `limit` segments of a stream overlapping `range`, ordered by
+    /// start time and id.
     ///
     /// A sealed row covers its recorded interval. An unsealed row is listed only
     /// once it has a durable fragment, and it extends to the earlier of now and
-    /// [`OPEN_SEGMENT_GRACE`](crate::OPEN_SEGMENT_GRACE) past its last durable
-    /// progress, so an open file whose writer stopped reporting does not claim
-    /// later windows. Each row keeps its recorded `wall_end`.
-    pub async fn segments(
-        &self,
-        key: &StreamKey,
-        range: TimeRange,
-    ) -> Result<Vec<SegmentRow>, CatalogError> {
-        let key = key.clone();
-        let owned_bytes = key_owned_bytes(&key);
-        self.query_with_owned_bytes(owned_bytes, move |db| db.segments(&key, range))
-            .await
-    }
-
-    /// At most `limit` segments of a stream overlapping `range`, ordered by start time.
+    /// the open-segment grace past its last durable progress, so an open file
+    /// whose writer stopped reporting does not claim later windows. Each row
+    /// keeps its recorded `wall_end`. The SQL limit is applied before catalog
+    /// rows and their owned strings are materialized, so serving callers can
+    /// probe with `budget + 1` and reject excessive cardinality without first
+    /// allocating the full result; `limit` is applied as given.
     ///
-    /// Overlap follows [`CatalogHandle::segments`], including its rule for
-    /// unsealed rows. The SQL limit is applied before catalog rows and their
-    /// owned strings are materialized, so serving callers can probe with
-    /// `budget + 1` and reject excessive cardinality without first allocating
-    /// the full result.
+    /// # Errors
+    ///
+    /// Only the errors every query shares (see [`CatalogHandle`]).
     pub async fn segments_limited(
         &self,
         key: &StreamKey,
@@ -601,12 +665,23 @@ impl CatalogHandle {
         .await
     }
 
-    /// One segment by id.
+    /// One segment by id; `None` for an unknown id and for a row in deletion
+    /// intent, which only [`CatalogHandle::contains_segment_path`] and the
+    /// deletion-intent pages see.
+    ///
+    /// # Errors
+    ///
+    /// Only the errors every query shares (see [`CatalogHandle`]).
     pub async fn segment(&self, id: SegmentId) -> Result<Option<SegmentRow>, CatalogError> {
         self.query(move |db| db.segment(id)).await
     }
 
-    /// One segment by path.
+    /// One segment by path; `None` for an unknown path and for a row in
+    /// deletion intent.
+    ///
+    /// # Errors
+    ///
+    /// Only the errors every query shares (see [`CatalogHandle`]).
     pub async fn segment_by_path(&self, path: &Path) -> Result<Option<SegmentRow>, CatalogError> {
         let path = path.to_path_buf();
         let owned_bytes = path_owned_bytes(&path);
@@ -614,27 +689,51 @@ impl CatalogHandle {
             .await
     }
 
-    /// Segments not yet sealed (open when the daemon last ran).
+    /// Every unsealed segment, by start time and id. Test support (the
+    /// `test-support` feature): the daemon pages with
+    /// [`CatalogHandle::writing_segments_page`].
+    ///
+    /// # Errors
+    ///
+    /// Only the errors every query shares (see [`CatalogHandle`]).
+    #[cfg(any(test, feature = "test-support"))]
     pub async fn writing_segments(&self) -> Result<Vec<SegmentRow>, CatalogError> {
         self.query(Db::writing_segments).await
     }
 
-    /// One stable bounded startup page of open segments.
+    /// One stable page of open segments (not in deletion intent) after the
+    /// exclusive `after` cursor, ordered by `(wall_start, id)`, at most
+    /// `limit` rows clamped to 1 to 512, each with the root persisted for it.
+    ///
+    /// # Errors
+    ///
+    /// Only the errors every query shares (see [`CatalogHandle`]).
     pub async fn writing_segments_page(
         &self,
-        after: Option<(WallUs, SegmentId)>,
+        after: Option<SegmentCursor>,
         limit: usize,
-    ) -> Result<Vec<(SegmentRow, Option<PathBuf>)>, CatalogError> {
+    ) -> Result<Vec<StartupRow>, CatalogError> {
         self.query(move |db| db.writing_segments_page(after, limit))
             .await
     }
 
-    /// The oldest sealed segments, candidates for retention.
+    /// The oldest sealed segments by start time, ignoring event protection
+    /// and roots. Test support (the `test-support` feature): retention uses
+    /// [`CatalogHandle::retention_candidates`].
+    ///
+    /// # Errors
+    ///
+    /// Only the errors every query shares (see [`CatalogHandle`]).
+    #[cfg(any(test, feature = "test-support"))]
     pub async fn oldest_sealed(&self, limit: usize) -> Result<Vec<SegmentRow>, CatalogError> {
         self.query(move |db| db.oldest_sealed(limit)).await
     }
 
     /// The sealed segment of `key` that ends last.
+    ///
+    /// # Errors
+    ///
+    /// Only the errors every query shares (see [`CatalogHandle`]).
     pub async fn newest_sealed(&self, key: &StreamKey) -> Result<Option<SegmentRow>, CatalogError> {
         let key = key.clone();
         let owned_bytes = key_owned_bytes(&key);
@@ -643,18 +742,37 @@ impl CatalogHandle {
     }
 
     /// Bytes of every segment in the catalog, open files at their written length.
+    ///
+    /// # Errors
+    ///
+    /// Only the errors every query shares (see [`CatalogHandle`]).
     pub async fn total_bytes(&self) -> Result<u64, CatalogError> {
         self.query(Db::total_bytes).await
     }
 
-    /// Deletes a segment row (the caller removes the files).
+    /// Deletes a row in deletion intent once the caller has removed its
+    /// files. A row that left deletion intent in the meantime, because a
+    /// writer reopened the path, is kept.
+    ///
+    /// # Errors
+    ///
+    /// Only the errors every query shares (see [`CatalogHandle`]).
     pub async fn delete_segment(&self, id: SegmentId) -> Result<(), CatalogError> {
         self.query(move |db| db.delete_segment(id)).await
     }
 
-    /// Durably marks a sealed segment for deletion before the caller mutates
-    /// its media/index pair.
-    pub async fn mark_deleting(&self, id: SegmentId) -> Result<(), CatalogError> {
+    /// Durably marks a sealed segment for deletion without the event
+    /// protection check. Test support (the `test-support` feature) for
+    /// exercising deletion intents; the daemon marks only through
+    /// [`CatalogHandle::mark_deleting_if_unprotected`] and its root-bound
+    /// variant. Returns [`DeleteMarkResult::NotFound`] for an unknown, open,
+    /// or already marked row.
+    ///
+    /// # Errors
+    ///
+    /// Only the errors every query shares (see [`CatalogHandle`]).
+    #[cfg(any(test, feature = "test-support"))]
+    pub async fn mark_deleting(&self, id: SegmentId) -> Result<DeleteMarkResult, CatalogError> {
         self.query(move |db| db.mark_deleting(id)).await
     }
 
@@ -663,6 +781,10 @@ impl CatalogHandle {
     /// for an open row whose recording pair is empty or confirmed absent beneath
     /// its approved root. A sealed, already deleting, or unknown row returns
     /// [`DeleteMarkResult::NotFound`] and is left unchanged.
+    ///
+    /// # Errors
+    ///
+    /// Only the errors every query shares (see [`CatalogHandle`]).
     pub async fn mark_empty_writing_deleting(
         &self,
         id: SegmentId,
@@ -671,12 +793,18 @@ impl CatalogHandle {
             .await
     }
 
-    /// Durably marks a sealed segment for deletion only if current event
-    /// protection does not overlap it.
+    /// Durably marks a sealed segment for deletion only if no active retained
+    /// event of the same camera overlaps it: active means a retention deadline
+    /// after `now`, and the segment's interval is widened by `margin` on both
+    /// sides for the overlap test.
     ///
     /// The protection check and deletion-intent update share one FULL-synchronous
     /// transaction. A successful [`CatalogHandle::retain_event`] ordered before
     /// this call is therefore honored before this result is returned.
+    ///
+    /// # Errors
+    ///
+    /// Only the errors every query shares (see [`CatalogHandle`]).
     pub async fn mark_deleting_if_unprotected(
         &self,
         id: SegmentId,
@@ -688,8 +816,13 @@ impl CatalogHandle {
             .await
     }
 
-    /// Root-bound durable deletion mark. A row whose persisted root differs
-    /// from `expected_root` is returned as [`DeleteMarkResult::NotFound`].
+    /// [`CatalogHandle::mark_deleting_if_unprotected`] bound to a root: a row
+    /// whose persisted root differs from `expected_root` is returned as
+    /// [`DeleteMarkResult::NotFound`] and left unchanged.
+    ///
+    /// # Errors
+    ///
+    /// Only the errors every query shares (see [`CatalogHandle`]).
     pub async fn mark_deleting_if_unprotected_at_root(
         &self,
         id: SegmentId,
@@ -706,22 +839,39 @@ impl CatalogHandle {
         .await
     }
 
-    /// Segments with deletion intent that startup must finish.
+    /// Every segment in deletion intent, by start time and id. Test support
+    /// (the `test-support` feature): the daemon pages with
+    /// [`CatalogHandle::deleting_segments_page`].
+    ///
+    /// # Errors
+    ///
+    /// Only the errors every query shares (see [`CatalogHandle`]).
+    #[cfg(any(test, feature = "test-support"))]
     pub async fn deleting_segments(&self) -> Result<Vec<SegmentRow>, CatalogError> {
         self.query(Db::deleting_segments).await
     }
 
-    /// One stable bounded startup page of deletion intents.
+    /// One stable page of segments in deletion intent after the exclusive
+    /// `after` cursor, ordered by `(wall_start, id)`, at most `limit` rows
+    /// clamped to 1 to 512, each with the root persisted for it.
+    ///
+    /// # Errors
+    ///
+    /// Only the errors every query shares (see [`CatalogHandle`]).
     pub async fn deleting_segments_page(
         &self,
-        after: Option<(WallUs, SegmentId)>,
+        after: Option<SegmentCursor>,
         limit: usize,
-    ) -> Result<Vec<(SegmentRow, Option<PathBuf>)>, CatalogError> {
+    ) -> Result<Vec<StartupRow>, CatalogError> {
         self.query(move |db| db.deleting_segments_page(after, limit))
             .await
     }
 
     /// Whether any ordinary or deletion-intent segment owns this exact path.
+    ///
+    /// # Errors
+    ///
+    /// Only the errors every query shares (see [`CatalogHandle`]).
     pub async fn contains_segment_path(&self, path: &Path) -> Result<bool, CatalogError> {
         let path = path.to_path_buf();
         let owned_bytes = path_owned_bytes(&path);
@@ -730,11 +880,16 @@ impl CatalogHandle {
     }
 
     /// Persisted recording-root spelling for one segment id.
+    ///
+    /// # Errors
+    ///
+    /// Only the errors every query shares (see [`CatalogHandle`]).
     pub async fn segment_root(&self, id: SegmentId) -> Result<Option<PathBuf>, CatalogError> {
         self.query(move |db| db.segment_root(id)).await
     }
 
-    /// Marks a segment sealed with its final lengths.
+    /// Marks a segment sealed with its final lengths (`media_end` in 90 kHz
+    /// ticks).
     ///
     /// # Errors
     ///
@@ -755,21 +910,17 @@ impl CatalogHandle {
         .await
     }
 
-    /// Adopts a sealed file found on disk.
+    /// Adopts a sealed file found on disk: an upsert by path that replaces a
+    /// row the path already has and clears its deletion intent, so startup
+    /// finishes deletion intents before it adopts.
+    ///
+    /// # Errors
+    ///
+    /// Only the errors every query shares (see [`CatalogHandle`]).
     pub async fn adopt_segment(&self, row: NewSegment) -> Result<SegmentId, CatalogError> {
         let owned_bytes = new_segment_owned_bytes(&row);
         self.query_with_owned_bytes(owned_bytes, move |db| db.adopt_segment(&row))
             .await
-    }
-
-    /// Events in `range`, oldest first, at most `limit`.
-    pub async fn events(
-        &self,
-        camera: Option<&CameraId>,
-        range: TimeRange,
-        limit: usize,
-    ) -> Result<Vec<EventRow>, CatalogError> {
-        self.events_after(camera, range, None, limit).await
     }
 
     /// Events in `range` after an optional `(receipt time, id)` cursor, oldest
@@ -777,7 +928,14 @@ impl CatalogHandle {
     ///
     /// A cursor is exclusive. Use the final row of one page as the next
     /// cursor so pages split inside an equal-timestamp group without repeats
-    /// or omissions.
+    /// or omissions. `limit` is capped at 10,000, and a page ends earlier when
+    /// its rows would exceed 8 MiB of owned strings, so a short page does not
+    /// mean the range is exhausted: continue until a page comes back empty.
+    ///
+    /// # Errors
+    ///
+    /// [`CatalogError::EventReadTooLarge`] when one row alone exceeds the
+    /// 8 MiB budget.
     pub async fn events_after(
         &self,
         camera: Option<&CameraId>,
@@ -797,7 +955,9 @@ impl CatalogHandle {
     ///
     /// # Errors
     ///
-    /// Returns [`CatalogError::UnknownEvent`] when no event has that id.
+    /// [`CatalogError::UnknownEvent`] when no event has that id;
+    /// [`CatalogError::EventRetentionLimit`] when a mark that becomes active
+    /// would exceed 100,000 active marks or 128 MiB of their logical bytes.
     pub async fn retain_event(
         &self,
         id: EventId,
@@ -806,43 +966,22 @@ impl CatalogHandle {
         self.query(move |db| db.retain_event(id, until)).await
     }
 
-    /// Events whose retention time is after `now`.
-    pub async fn retained_events(&self, now: WallUs) -> Result<Vec<EventRow>, CatalogError> {
-        self.query(move |db| db.retained_events(now)).await
-    }
-
-    /// A bounded page of active event-protection intervals containing no
-    /// vendor payload, source, state, or kind strings.
-    pub async fn event_protections(
-        &self,
-        now: WallUs,
-        after: Option<EventProtectionCursor>,
-        limit: usize,
-    ) -> Result<Vec<EventProtection>, CatalogError> {
-        self.query(move |db| db.event_protections(now, after, limit))
-            .await
-    }
-
-    /// The oldest sealed segments after the `(start time, id)` cursor, at most
-    /// `limit`. The id makes pagination lossless when start times are equal.
-    pub async fn oldest_sealed_after(
-        &self,
-        after: (WallUs, SegmentId),
-        limit: usize,
-    ) -> Result<Vec<SegmentRow>, CatalogError> {
-        self.query(move |db| db.oldest_sealed_after(after, limit))
-            .await
-    }
-
-    /// Root-aware sealed retention page after an optional stable cursor.
+    /// Root-aware sealed retention page after an optional stable cursor: the
+    /// oldest sealed rows by `(wall_start, id)`, from every root when `root`
+    /// is `None`, that no active retained event protects (`now` and `margin`
+    /// as in [`CatalogHandle::mark_deleting_if_unprotected`]).
     ///
-    /// Raw indexed input is capped before event-protection filtering. The
-    /// returned cursor and scanned count therefore advance even when every
-    /// inspected row is protected.
+    /// Raw indexed input is capped at `limit` rows, applied as given, before
+    /// event-protection filtering. The returned cursor and scanned count
+    /// therefore advance even when every inspected row is protected.
+    ///
+    /// # Errors
+    ///
+    /// Only the errors every query shares (see [`CatalogHandle`]).
     pub async fn retention_candidates(
         &self,
         root: Option<&Path>,
-        after: Option<(WallUs, SegmentId)>,
+        after: Option<SegmentCursor>,
         now: WallUs,
         margin: Duration,
         limit: usize,
@@ -857,12 +996,18 @@ impl CatalogHandle {
     }
 
     /// Expired sealed retention page for one stream after an optional stable
-    /// cursor, with raw scan progress independent of protection filtering.
+    /// cursor: at most `limit` raw rows that start before `cutoff`, of which
+    /// those that also end before `cutoff` and are unprotected are returned,
+    /// with raw scan progress independent of protection filtering.
+    ///
+    /// # Errors
+    ///
+    /// Only the errors every query shares (see [`CatalogHandle`]).
     pub async fn expired_candidates(
         &self,
         key: &StreamKey,
         cutoff: WallUs,
-        after: Option<(WallUs, SegmentId)>,
+        after: Option<SegmentCursor>,
         now: WallUs,
         margin: Duration,
         limit: usize,
@@ -877,6 +1022,11 @@ impl CatalogHandle {
     }
 
     /// Inserts an event and returns its id.
+    ///
+    /// # Errors
+    ///
+    /// [`CatalogError::EventStorageLimit`] when the event does not fit after
+    /// one bounded pruning step.
     pub async fn insert_event(&self, event: &Event) -> Result<EventId, CatalogError> {
         let event = event.clone().bounded();
         let owned_bytes = event_owned_bytes(&event);
@@ -885,12 +1035,24 @@ impl CatalogHandle {
     }
 
     /// Runs one bounded event-lifecycle maintenance step using the recording
-    /// horizon and fixed state-database row, byte, and age ceilings.
+    /// horizon and fixed state-database row, byte, and age ceilings. A step
+    /// spends at most 1,000 row-work units: expired marks first, then the
+    /// horizon and age scan from the carried cursor, then, with whatever work
+    /// remains, the oldest inactive rows while either ceiling is exceeded.
+    ///
+    /// # Errors
+    ///
+    /// Only the errors every query shares (see [`CatalogHandle`]).
     pub async fn maintain_events(&self, now: WallUs) -> Result<(), CatalogError> {
         self.query(move |db| db.maintain_events(now)).await
     }
 
-    /// Aggregate counts.
+    /// Aggregate counts. The segment totals scan the segment table; the
+    /// daemon refreshes them at most once a second.
+    ///
+    /// # Errors
+    ///
+    /// Only the errors every query shares (see [`CatalogHandle`]).
     pub async fn stats(&self) -> Result<CatalogStats, CatalogError> {
         self.query(Db::stats).await
     }
@@ -901,19 +1063,15 @@ impl CatalogHandle {
         Arc::clone(&self.inner.metrics)
     }
 
-    /// Commits pending changes and stops the thread. Later calls are no-ops;
-    /// later queries from any clone return [`CatalogError::Closed`].
+    /// Closes admission, commits the admitted tail, and stops the thread,
+    /// blocking the caller until the thread has exited; call it off async
+    /// worker threads. Later calls are no-ops; later queries from any clone
+    /// return [`CatalogError::Closed`]. Dropping the final handle does the
+    /// same.
     pub fn shutdown(&self) {
-        let handle = self
-            .inner
-            .join
-            .lock()
-            .map_or(None, |mut guard| guard.take());
-        let Some(handle) = handle else {
-            return;
-        };
         self.inner.queue.close();
-        if handle.join().is_err() {
+        let handle = self.inner.join.lock().ok().and_then(|mut slot| slot.take());
+        if handle.is_some_and(|handle| handle.join().is_err()) {
             error!("catalog thread panicked");
         }
     }
@@ -1008,8 +1166,8 @@ fn flush(
     match result {
         Ok(outcome) => {
             let committed_changes = pending.len().saturating_sub(outcome.rejected_events);
-            metrics.record_batch(committed_changes, elapsed, true);
-            metrics.reject_events(outcome.rejected_events);
+            metrics.record_committed_batch(committed_changes, elapsed);
+            metrics.omit_events(outcome.rejected_events);
             debug!(
                 changes = committed_changes,
                 rejected_events = outcome.rejected_events,
@@ -1024,7 +1182,7 @@ fn flush(
             }
         }
         Err(e) => {
-            metrics.record_batch(pending.len(), elapsed, false);
+            metrics.record_failed_batch(pending.len(), elapsed);
             error!(changes = pending.len(), error = ?e, "catalog batch failed");
         }
     }
@@ -1067,8 +1225,23 @@ mod tests {
         }
     }
 
-    #[test]
-    fn stalled_consumer_stays_within_count_and_owned_byte_budgets() {
+    fn sealed(path: &str) -> Change {
+        Change::SegmentSealed {
+            path: PathBuf::from(path),
+            len: 1,
+            fragments: 1,
+            wall_end: WallUs::new(2),
+            media_end: 1,
+        }
+    }
+
+    fn query() -> Command {
+        Command::Query(Box::new(|_| {}), Instant::now())
+    }
+
+    /// Fills the ordinary capacity with maximum-size events and returns the
+    /// queue with how many were admitted.
+    fn stalled_queue() -> (Arc<CatalogMetrics>, CommandQueue, usize) {
         let metrics = Arc::new(CatalogMetrics::new());
         let queue = CommandQueue::new(Arc::clone(&metrics));
         let mut queued = 0usize;
@@ -1079,25 +1252,41 @@ mod tests {
                 other => panic!("unexpected admission result: {}", admission_name(&other)),
             }
         }
-        assert!(queued > 0);
-        assert!(metrics.queue_depth() <= MAX_QUEUED_COMMANDS as u64);
-        assert!(metrics.queue_bytes() <= MAX_QUEUED_BYTES as u64);
-        assert!(metrics.rejected_events() > 0);
+        (metrics, queue, queued)
+    }
 
-        let query: Query = Box::new(|_| {});
+    #[test]
+    fn stalled_consumer_stays_within_count_and_owned_byte_budgets() {
+        let (metrics, _queue, queued) = stalled_queue();
+        assert!(queued > 0, "no event was admitted");
+        assert!(
+            metrics.queue_depth() <= MAX_QUEUED_COMMANDS as u64,
+            "queue depth {}",
+            metrics.queue_depth()
+        );
+        assert!(
+            metrics.queue_bytes() <= MAX_QUEUED_BYTES as u64,
+            "queue bytes {}",
+            metrics.queue_bytes()
+        );
+        assert!(metrics.rejected_events() > 0, "nothing was dropped");
+    }
+
+    #[test]
+    fn a_stalled_consumer_refuses_queries_as_overloaded() {
+        let (metrics, queue, _) = stalled_queue();
         assert!(matches!(
-            queue.push_query(Command::Query(query, Instant::now()), QUERY_OVERHEAD),
+            queue.push_query(query(), QUERY_OVERHEAD),
             QueryAdmission::Overloaded
         ));
+        assert_eq!(metrics.rejected_queries(), 1);
+    }
 
+    #[test]
+    fn a_lifecycle_change_uses_the_reserve_and_the_queue_drains_to_zero() {
+        let (metrics, queue, _) = stalled_queue();
         assert!(matches!(
-            queue.push_change(Change::SegmentSealed {
-                path: PathBuf::from("/video/critical.mp4"),
-                len: 1,
-                fragments: 1,
-                wall_end: WallUs::new(2),
-                media_end: 1,
-            }),
+            queue.push_change(sealed("/video/critical.mp4")),
             ChangeAdmission::Queued
         ));
         let mut saw_critical = false;
@@ -1114,7 +1303,49 @@ mod tests {
     }
 
     #[test]
-    fn progress_is_coalesced_only_within_the_unqueried_tail() {
+    fn queries_are_refused_until_outstanding_work_falls_below_the_release_threshold() {
+        let (_metrics, queue, _) = stalled_queue();
+        let mut received = Vec::new();
+        while let Receive::Command(command) = queue.receive(Duration::ZERO) {
+            received.push(command.bytes);
+        }
+        let mut outstanding = received.len();
+        let mut outstanding_bytes: usize = received.iter().sum();
+        let mut released_at = None;
+        for bytes in received {
+            queue.complete(1, bytes);
+            outstanding -= 1;
+            outstanding_bytes -= bytes;
+            let admission = queue.push_query(query(), QUERY_OVERHEAD);
+            if outstanding < OVERLOAD_RELEASE_COMMANDS && outstanding_bytes < OVERLOAD_RELEASE_BYTES
+            {
+                let QueryAdmission::Queued = admission else {
+                    panic!(
+                        "query refused with {outstanding} commands and {outstanding_bytes} bytes outstanding"
+                    );
+                };
+                released_at.get_or_insert((outstanding, outstanding_bytes));
+                // The admitted probe is outstanding itself; take it back out.
+                let Receive::Command(probe) = queue.receive(Duration::ZERO) else {
+                    panic!("the admitted query did not arrive");
+                };
+                queue.complete(1, probe.bytes);
+            } else {
+                assert!(
+                    matches!(admission, QueryAdmission::Overloaded),
+                    "query admitted with {outstanding} commands and {outstanding_bytes} bytes outstanding"
+                );
+            }
+        }
+        let (commands, bytes) = released_at.expect("the latch released before the queue drained");
+        assert!(
+            commands > 0 && bytes > 0,
+            "the latch released at {commands} commands and {bytes} bytes, not at empty"
+        );
+    }
+
+    #[test]
+    fn consecutive_progress_for_one_path_is_coalesced() {
         let metrics = Arc::new(CatalogMetrics::new());
         let queue = CommandQueue::new(Arc::clone(&metrics));
         assert!(matches!(
@@ -1135,6 +1366,91 @@ mod tests {
         };
         assert_eq!(durable_len, 2);
         queue.complete(1, command.bytes);
+    }
+
+    #[test]
+    fn progress_is_not_coalesced_across_a_query() {
+        let metrics = Arc::new(CatalogMetrics::new());
+        let queue = CommandQueue::new(Arc::clone(&metrics));
+        assert!(matches!(
+            queue.push_change(progress(1)),
+            ChangeAdmission::Queued
+        ));
+        assert!(matches!(
+            queue.push_query(query(), QUERY_OVERHEAD),
+            QueryAdmission::Queued
+        ));
+        assert!(matches!(
+            queue.push_change(progress(2)),
+            ChangeAdmission::Queued
+        ));
+        assert_eq!(metrics.coalesced(), 0);
+        assert_eq!(metrics.queue_depth(), 3);
+    }
+
+    #[test]
+    fn progress_is_not_coalesced_across_a_same_path_seal() {
+        let metrics = Arc::new(CatalogMetrics::new());
+        let queue = CommandQueue::new(Arc::clone(&metrics));
+        assert!(matches!(
+            queue.push_change(progress(1)),
+            ChangeAdmission::Queued
+        ));
+        assert!(matches!(
+            queue.push_change(sealed("/video/open.mp4")),
+            ChangeAdmission::Queued
+        ));
+        assert!(matches!(
+            queue.push_change(progress(2)),
+            ChangeAdmission::Queued
+        ));
+        assert_eq!(metrics.coalesced(), 0);
+        assert_eq!(metrics.queue_depth(), 3);
+    }
+
+    #[test]
+    fn a_lifecycle_change_evicts_the_oldest_unqueried_event() {
+        let metrics = Arc::new(CatalogMetrics::new());
+        let queue = CommandQueue::new(Arc::clone(&metrics));
+        assert!(matches!(
+            queue.push_change(event(1)),
+            ChangeAdmission::Queued
+        ));
+        assert!(matches!(
+            queue.push_query(query(), QUERY_OVERHEAD),
+            QueryAdmission::Queued
+        ));
+        // Fill the whole bound: small events to the ordinary capacity, then
+        // lifecycle changes through the reserve.
+        let ordinary = MAX_QUEUED_COMMANDS - RESERVED_COMMANDS - 2;
+        for _ in 0..ordinary {
+            assert!(matches!(
+                queue.push_change(event(1)),
+                ChangeAdmission::Queued
+            ));
+        }
+        for index in 0..RESERVED_COMMANDS {
+            assert!(matches!(
+                queue.push_change(sealed(&format!("/video/{index}.mp4"))),
+                ChangeAdmission::Queued
+            ));
+        }
+        assert_eq!(metrics.queue_depth(), MAX_QUEUED_COMMANDS as u64);
+        assert!(matches!(
+            queue.push_change(sealed("/video/one-more.mp4")),
+            ChangeAdmission::Queued
+        ));
+        assert_eq!(metrics.rejected_events(), 1, "one event made room");
+        let state = queue.state.lock().unwrap();
+        assert!(
+            matches!(
+                &state.commands[0].command,
+                Command::Change(Change::Event(_))
+            ),
+            "the event before the query barrier is kept"
+        );
+        assert!(matches!(&state.commands[1].command, Command::Query(_, _)));
+        assert_eq!(state.commands.len(), MAX_QUEUED_COMMANDS);
     }
 
     #[test]
@@ -1163,7 +1479,7 @@ mod tests {
             }),
             ChangeAdmission::Reconcile
         ));
-        assert_eq!(metrics.rejected_critical(), 1);
+        assert_eq!(metrics.rejected_lifecycle(), 1);
         assert!(metrics.reconciliation_required());
     }
 
@@ -1203,16 +1519,19 @@ mod tests {
             ChangeAdmission::Reconcile
         ));
         let state = queue.state.lock().unwrap();
-        assert!(matches!(
-            &state.commands[0].command,
-            Command::Change(Change::Event(_))
-        ));
+        assert!(
+            matches!(
+                &state.commands[0].command,
+                Command::Change(Change::Event(_))
+            ),
+            "the event before the query barrier was evicted"
+        );
         assert!(matches!(&state.commands[1].command, Command::Query(_, _)));
         assert_eq!(metrics.rejected_events(), 0);
     }
 
     #[test]
-    fn event_boundary_releases_unaccounted_backing_capacity() {
+    fn bounding_an_event_releases_capacity_before_accounting() {
         let metrics = Arc::new(CatalogMetrics::new());
         let queue = CommandQueue::new(Arc::clone(&metrics));
         let mut value = event(1);

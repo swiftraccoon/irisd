@@ -8,12 +8,13 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, bail};
 use clap::Args as ClapArgs;
 use iris_core::config::{CameraConfig, Config};
-use iris_core::id::{StreamKey, StreamKind};
+use iris_core::id::{CameraId, StreamKey, StreamKind};
 use iris_ingest::{FragmentSink, IngestOptions, SinkError, StreamSource, StreamStats, run_stream};
 use iris_mp4::fragment::Fragment;
 use iris_store::{StoragePolicy, WriterHandle, WriterStats, create_recording_root};
+use tokio::signal::unix::{Signal, SignalKind, signal};
 use tokio::task::JoinHandle;
-use tokio::time::MissedTickBehavior;
+use tokio::time::{MissedTickBehavior, Sleep};
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
@@ -56,11 +57,17 @@ pub struct Args {
     /// Which streams to record, comma separated.
     #[arg(long, value_delimiter = ',', default_value = "main,sub")]
     streams: Vec<StreamKind>,
-    /// Restrict recording to these camera ids, comma separated.
+    /// Restrict recording to these camera ids, comma separated; each must be
+    /// configured.
     #[arg(long, value_delimiter = ',', value_name = "ID")]
-    cameras: Option<Vec<String>>,
+    cameras: Option<Vec<CameraId>>,
     /// Log statistics this often.
-    #[arg(long, value_parser = humantime::parse_duration, default_value = "10s", value_name = "DURATION")]
+    #[arg(
+        long,
+        value_parser = humantime::parse_duration,
+        default_value = "10s",
+        value_name = "DURATION"
+    )]
     stats_interval: Duration,
 }
 
@@ -86,26 +93,37 @@ struct MonitorState {
     cpu: CpuMeter,
     peak_rss: u64,
     ticker: tokio::time::Interval,
-    sigint: tokio::signal::unix::Signal,
-    deadline: Pin<Box<tokio::time::Sleep>>,
+    sigint: Signal,
+    sigterm: Signal,
+    /// When `--duration` ends the recording; `None` runs until a signal.
+    deadline: Option<Pin<Box<Sleep>>>,
 }
 
 impl MonitorState {
-    fn new(args: &Args) -> anyhow::Result<Self> {
+    fn try_new(args: &Args) -> anyhow::Result<Self> {
         validate_args(args)?;
         let now = tokio::time::Instant::now();
         let mut ticker = tokio::time::interval_at(now + args.stats_interval, args.stats_interval);
         ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        let deadline = args
+            .duration
+            .map(|duration| Box::pin(tokio::time::sleep_until(now + duration)));
         Ok(Self {
-            cpu: CpuMeter::new().context("reading /proc/self/stat")?,
+            cpu: CpuMeter::try_new().context("reading /proc/self/stat")?,
             peak_rss: 0,
             ticker,
-            sigint: tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
-                .context("installing the SIGINT handler")?,
-            deadline: Box::pin(tokio::time::sleep(
-                args.duration.unwrap_or(Duration::from_hours(876_600)),
-            )),
+            sigint: signal(SignalKind::interrupt()).context("installing the SIGINT handler")?,
+            sigterm: signal(SignalKind::terminate()).context("installing the SIGTERM handler")?,
+            deadline,
         })
+    }
+}
+
+/// Resolves when the `--duration` deadline passes; never without the flag.
+async fn deadline_elapsed(deadline: Option<&mut Pin<Box<Sleep>>>) {
+    match deadline {
+        Some(sleep) => sleep.as_mut().await,
+        None => std::future::pending().await,
     }
 }
 
@@ -118,7 +136,7 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
     let queue_capacity =
         crate::run::checked_queue_capacity(config.storage.max_queued_fragments, sources.len())?;
     let max_fragment = crate::run::checked_fragment_ticks(config.storage.max_fragment_ms)?;
-    let mut monitor_state = MonitorState::new(&args)?;
+    let mut monitor_state = MonitorState::try_new(&args)?;
     prepare_recording_root(&args.root)?;
 
     let policy = StoragePolicy::from(&config.storage);
@@ -293,8 +311,8 @@ fn validate_args(args: &Args) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Logs statistics until Ctrl-C or the configured duration; returns the CPU
-/// meter and the peak RSS observed.
+/// Logs statistics until SIGINT (Ctrl-C), SIGTERM, or the configured
+/// duration, keeping the peak RSS in `state`.
 async fn monitor(state: &mut MonitorState, tasks: &[StreamTask], writer_stats: &WriterStats) {
     loop {
         tokio::select! {
@@ -308,7 +326,11 @@ async fn monitor(state: &mut MonitorState, tasks: &[StreamTask], writer_stats: &
                 info!("interrupted; stopping");
                 break;
             }
-            () = state.deadline.as_mut() => {
+            _ = state.sigterm.recv() => {
+                info!("SIGTERM; stopping");
+                break;
+            }
+            () = deadline_elapsed(state.deadline.as_mut()) => {
                 info!("duration elapsed; stopping");
                 break;
             }
@@ -326,9 +348,9 @@ fn print_summary(
     let peak_rss = peak_rss.max(proc::rss_bytes().unwrap_or(0));
     let mean_cpu = cpu.mean().unwrap_or(f64::NAN);
     // Every sink rejection is already part of the writer aggregate. Per-stream
-    // dropped_sink counters remain the attribution for the stream lines.
-    let stream_dropped = tasks.iter().map(|task| task.stats.dropped_sink()).sum();
-    let dropped = summary_dropped(writer_stats.dropped(), stream_dropped);
+    // dropped_sink counters remain the attribution for the stream lines and
+    // must not be added to the final total.
+    let dropped = writer_stats.dropped();
     let reconnects: u64 = tasks.iter().map(|t| t.stats.reconnects()).sum();
     println!("elapsed:          {:.1} s", elapsed.as_secs_f64());
     println!("mean cpu:         {mean_cpu:.3} % of one core");
@@ -359,24 +381,27 @@ fn print_summary(
     }
 }
 
-/// The writer aggregate already includes every public sink rejection. Stream
-/// counters are attribution only and must not be added to the final total.
-fn summary_dropped(writer_dropped: u64, _stream_dropped: u64) -> u64 {
-    writer_dropped
-}
-
-/// Resolves the (camera, kind, URL) triples to record.
+/// Resolves the (camera, kind, URL) triples to record. Every id named by
+/// `--cameras` must be configured; a misspelt id is an error, never a silent
+/// omission.
 fn select_sources<'a>(
     config: &'a Config,
     args: &Args,
 ) -> anyhow::Result<Vec<(&'a CameraConfig, StreamKind, iris_ingest::Url)>> {
+    if let Some(ids) = &args.cameras {
+        for id in ids {
+            if !config.cameras.iter().any(|camera| camera.id == *id) {
+                bail!("camera {id} is not configured in {}", args.config.display());
+            }
+        }
+    }
     let selected: Vec<&CameraConfig> = config
         .cameras
         .iter()
         .filter(|camera| {
             args.cameras
                 .as_ref()
-                .is_none_or(|ids| ids.iter().any(|id| id == camera.id.as_str()))
+                .is_none_or(|ids| ids.contains(&camera.id))
         })
         .collect();
     if selected.is_empty() {
@@ -473,11 +498,10 @@ mod tests {
     }
 
     #[test]
-    fn standalone_root_preparation_durably_creates_a_nonexistent_root() {
+    fn standalone_root_preparation_creates_a_nonexistent_root() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("nested/recordings");
         prepare_recording_root(&root).unwrap();
-        eprintln!("standalone recording root prepared");
         assert!(root.is_dir());
     }
 
@@ -490,7 +514,7 @@ mod tests {
             assert!(validate_args(&args(streams)).is_err());
         }
         assert!(validate_args(&args(vec![StreamKind::Main, StreamKind::Sub])).is_ok());
-        assert!(validate_args(&args(vec![StreamKind::Main, StreamKind::Sub])).is_ok());
+        assert!(validate_args(&args(vec![StreamKind::Sub, StreamKind::Main])).is_ok());
     }
 
     #[test]
@@ -503,24 +527,56 @@ mod tests {
     #[test]
     fn malformed_source_error_does_not_echo_the_url() {
         let marker = "validation-secret";
-        for raw in [
-            format!("rtsp://{marker}@"),
-            format!("not-a-url?password={marker}"),
-            format!("not-a-url#{marker}"),
-            format!("not-a-url-{marker}"),
+        let toml = |raw: &str| {
+            format!(
+                "[api]\nallow_unauthenticated=true\n[[camera]]\nid='cam1'\nname=''\n\
+                 rtsp_url='{raw}'\nusername=''\npassword=''\nrecord=['main']\n"
+            )
+        };
+        // Shapes the configuration refuses name the field and the rule, never the value.
+        let host_rule = "rtsp_url must be an rtsp:// URL with a host";
+        let credentials_rule = "rtsp_url must not embed credentials";
+        for (raw, rule) in [
+            (format!("rtsp://{marker}@"), credentials_rule),
+            (format!("rtsp://{marker}@192.0.2.7/x"), credentials_rule),
+            (format!("not-a-url?password={marker}"), host_rule),
+            (format!("not-a-url#{marker}"), host_rule),
+            (format!("not-a-url-{marker}"), host_rule),
         ] {
-            let parser_cause = raw.parse::<iris_ingest::Url>().unwrap_err().to_string();
-            let config = Config::from_toml_str(&format!(
-                "[api]\nallow_unauthenticated=true\n[[camera]]\nid='cam1'\nname=''\nrtsp_url='{raw}'\nusername=''\npassword=''\nrecord=['main']\n"
-            ))
-            .unwrap();
-            let error = select_sources(&config, &args(vec![StreamKind::Main])).unwrap_err();
-            let text = format!("{error:#}");
+            let text = Config::from_toml_str(&toml(&raw)).unwrap_err().to_string();
             assert!(!text.contains(marker), "{text}");
             assert!(!text.contains(&raw), "{text}");
-            assert!(text.contains("camera cam1 main URL"), "{text}");
-            assert!(text.contains(&parser_cause), "{text}");
+            assert!(text.contains(rule), "{raw}: {text}");
         }
+        // A URL of the accepted shape that the parser still refuses is reported
+        // without its text.
+        let raw = format!("rtsp://192.0.2.7:99999/x?password={marker}");
+        let parser_cause = raw.parse::<iris_ingest::Url>().unwrap_err().to_string();
+        let config = Config::from_toml_str(&toml(&raw)).unwrap();
+        let error = select_sources(&config, &args(vec![StreamKind::Main])).unwrap_err();
+        let text = format!("{error:#}");
+        assert!(!text.contains(marker), "{text}");
+        assert!(!text.contains(&raw), "{text}");
+        assert!(text.contains("camera cam1 main URL"), "{text}");
+        assert!(text.contains(&parser_cause), "{text}");
+    }
+
+    #[test]
+    fn an_unconfigured_camera_id_is_refused() {
+        let config = Config::from_toml_str(
+            "[api]\nallow_unauthenticated=true\n[[camera]]\nid='front'\nname=''\n\
+             rtsp_url='rtsp://192.0.2.7/x'\nusername=''\npassword=''\nrecord=['main']\n",
+        )
+        .unwrap();
+        let mut selection = args(vec![StreamKind::Main]);
+        selection.cameras = Some(vec!["front".parse().unwrap(), "frnt".parse().unwrap()]);
+        let error = select_sources(&config, &selection).unwrap_err();
+        assert!(
+            error.to_string().contains("camera frnt is not configured"),
+            "{error:#}"
+        );
+        selection.cameras = Some(vec!["front".parse().unwrap()]);
+        assert_eq!(select_sources(&config, &selection).unwrap().len(), 1);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -543,7 +599,7 @@ mod tests {
                 sync_interval: Duration::from_secs(60),
                 preallocate_bytes: 0,
                 rotate_bytes: u64::MAX,
-                rotate_secs: u64::MAX,
+                rotate_age: Duration::MAX,
             },
             4,
         )
@@ -625,7 +681,7 @@ mod tests {
         writer.shutdown().unwrap();
 
         let key = StreamKey {
-            camera: iris_core::id::CameraId::try_new("cam1").unwrap(),
+            camera: CameraId::try_new("cam1").unwrap(),
             kind: StreamKind::Main,
         };
         let stream_stats = StreamStats::new();
@@ -634,10 +690,10 @@ mod tests {
         assert!(!accepted, "the disconnected public queue must reject");
         assert_eq!(stream_stats.fragments(), 1);
         assert_eq!(stream_stats.dropped_sink(), 1);
-        assert_eq!(writer_stats.dropped(), 1);
         assert_eq!(
-            summary_dropped(writer_stats.dropped(), stream_stats.dropped_sink()),
-            1
+            writer_stats.dropped(),
+            1,
+            "the summary total is the writer's"
         );
     }
 

@@ -1,64 +1,36 @@
-//! Thin wrappers over the file-system calls the store relies on.
+//! File-system calls the store relies on, and the recording-root identity
+//! model: durable markers, admission against the catalog's expectation, and
+//! descriptor-relative opens and removals that never follow a link or cross a
+//! mount.
 
 use std::ffi::{OsStr, OsString};
-use std::fmt;
 use std::fs::{self, File};
 use std::io::{self, IoSlice, Read, Write};
 use std::mem::MaybeUninit;
 use std::os::fd::OwnedFd;
 use std::path::{Component, Path, PathBuf};
-use std::str::FromStr;
 
 use rustix::fs::{AtFlags, CWD, FallocateFlags, FileType, Mode, OFlags, RawDir, ResolveFlags};
 use rustix::io::Errno;
 
+/// The identity types the recorder's crates share, re-exported for callers of
+/// this crate's root admission.
+pub use iris_core::id::{InvalidRootIdentity, RootIdentity};
+
 /// Marker stored inside every admitted recording root.
 pub const ROOT_IDENTITY_MARKER: &str = ".irisd-root-id";
 
-/// Hexadecimal characters in a root identity marker.
-const ROOT_IDENTITY_HEX_LEN: usize = 32;
 /// Bytes read from a marker: the identity, one optional newline, and one more
 /// byte to detect anything after it.
 const ROOT_MARKER_READ_LIMIT: u64 = 34;
 
-/// Durable random identity of one recording root.
+/// Device and inode of an admitted root directory. The identity holds for one
+/// daemon run only: it rejects configured aliases and detects a physical
+/// replacement, and is never persisted.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct RootIdentity([u8; 16]);
-
-impl fmt::Display for RootIdentity {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        for byte in self.0 {
-            write!(formatter, "{byte:02x}")?;
-        }
-        Ok(())
-    }
-}
-
-impl FromStr for RootIdentity {
-    type Err = io::Error;
-
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
-        if value.len() != 32
-            || !value
-                .bytes()
-                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "recording-root identity must be exactly 32 lowercase hexadecimal characters",
-            ));
-        }
-        let mut identity = [0u8; 16];
-        for (index, output) in identity.iter_mut().enumerate() {
-            *output = u8::from_str_radix(&value[index * 2..index * 2 + 2], 16).map_err(|_| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "invalid recording-root identity",
-                )
-            })?;
-        }
-        Ok(Self(identity))
-    }
+pub struct PhysicalIdentity {
+    device: u64,
+    inode: u64,
 }
 
 /// A recording root admitted against its durable marker and physical inode.
@@ -95,11 +67,31 @@ impl ApprovedRoot {
         self.identity
     }
 
-    /// Stable physical identity used to reject configured aliases.
+    /// The device and inode admitted for this daemon run, compared to reject
+    /// configured aliases and later physical replacement.
     #[must_use]
-    pub const fn physical_identity(&self) -> (u64, u64) {
-        (self.device, self.inode)
+    pub const fn physical_identity(&self) -> PhysicalIdentity {
+        PhysicalIdentity {
+            device: self.device,
+            inode: self.inode,
+        }
     }
+}
+
+/// Whether a file-system call failed because the process lacked a resource
+/// rather than because the file or root is unavailable: descriptors (`EMFILE`,
+/// `ENFILE`), memory (`ENOMEM`), or a retryable call (`EAGAIN`, which is also
+/// `EWOULDBLOCK`, and `EINTR`). Every other error, including `ENOENT`, `EIO`,
+/// `ESTALE`, `ENOTDIR`, and an identity mismatch, means the target itself
+/// failed.
+pub(crate) fn is_transient_resource_error(error: &io::Error) -> bool {
+    matches!(
+        Errno::from_io_error(error),
+        Some(Errno::MFILE | Errno::NFILE | Errno::NOMEM | Errno::AGAIN | Errno::INTR)
+    ) || matches!(
+        error.kind(),
+        io::ErrorKind::OutOfMemory | io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock
+    )
 }
 
 /// Returns the directory containing `path`; a basename is contained by the
@@ -143,9 +135,16 @@ pub(crate) fn preallocate(file: &File, offset: u64, len: u64) -> io::Result<()> 
     }
 }
 
-/// Flushes a directory so that a created or truncated entry is durable.
+/// Flushes a directory so that a created or truncated entry is durable. The
+/// open requires a directory, so a FIFO or device planted at the path fails at
+/// once instead of blocking the writer thread.
 pub(crate) fn fsync_dir(path: &Path) -> io::Result<()> {
-    File::open(path)?.sync_all()
+    let directory = rustix::fs::open(
+        path,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+        Mode::empty(),
+    )?;
+    File::from(directory).sync_all()
 }
 
 /// Opens the regular file `name` beneath `directory`.
@@ -274,6 +273,15 @@ pub fn create_recording_root(path: &Path) -> io::Result<()> {
 /// Creates `path` as [`create_recording_root`] does and returns the
 /// descriptor of the final directory, so admission never reopens it by name.
 fn create_root_directory(path: &Path) -> io::Result<File> {
+    create_root_directory_with(path, &mut |directory| directory.sync_all())
+}
+
+/// [`create_root_directory`] with the directory barrier injected, so tests
+/// observe the child-then-parent order and a failed barrier.
+fn create_root_directory_with(
+    path: &Path,
+    sync: &mut dyn FnMut(&File) -> io::Result<()>,
+) -> io::Result<File> {
     let mut missing = Vec::new();
     let mut ancestor = path;
     let mut directory = loop {
@@ -298,8 +306,8 @@ fn create_root_directory(path: &Path) -> io::Result<File> {
             Err(error) => return Err(error.into()),
         }
         let child = open_directory_beneath(&directory, name)?;
-        child.sync_all()?;
-        directory.sync_all()?;
+        sync(&child)?;
+        sync(&directory)?;
         directory = child;
     }
     Ok(directory)
@@ -336,32 +344,31 @@ fn read_root_identity(root: &File) -> io::Result<Option<RootIdentity>> {
         .take(ROOT_MARKER_READ_LIMIT)
         .read_to_end(&mut bytes)?;
     let hex = bytes.strip_suffix(b"\n").unwrap_or(&bytes);
-    if hex.len() != ROOT_IDENTITY_HEX_LEN {
+    let framing_error = || {
         let found = marker
             .metadata()
             .map_or(bytes.len() as u64, |metadata| metadata.len());
-        return Err(io::Error::new(
+        io::Error::new(
             io::ErrorKind::InvalidData,
             format!(
                 "recording-root marker must contain exactly 32 lowercase hexadecimal characters, optionally followed by one newline; found {found} bytes"
             ),
-        ));
+        )
+    };
+    if hex.len() != RootIdentity::HEX_LEN {
+        return Err(framing_error());
     }
     std::str::from_utf8(hex)
-        .map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                "recording-root marker is not ASCII text",
-            )
-        })?
-        .parse()
+        .ok()
+        .and_then(|text| text.parse().ok())
         .map(Some)
+        .ok_or_else(framing_error)
 }
 
 fn create_root_identity(root: &File) -> io::Result<RootIdentity> {
     let mut random = [0u8; 16];
     getrandom::fill(&mut random).map_err(io::Error::other)?;
-    let identity = RootIdentity(random);
+    let identity = RootIdentity::from_bytes(random);
     let fd = rustix::fs::openat(
         root,
         ROOT_IDENTITY_MARKER,
@@ -409,7 +416,17 @@ fn approved_from_open(
 /// A known or legacy-owned root is never created or initialized. A fresh
 /// absent or empty root receives a durable marker. A legacy-owned root
 /// without an operator-installed marker fails closed even when its current
-/// pathname is absent or empty.
+/// pathname is absent or empty. `path` must hold no symbolic link in any
+/// component: resolution refuses links everywhere, not only at the end.
+///
+/// # Errors
+///
+/// `NotFound` for a missing known or legacy-owned root, or a known root
+/// without a marker; `InvalidData` for a marker that differs from the
+/// catalog, a marker that is not a regular file of the documented framing, a
+/// nonempty fresh root without a marker, or a legacy-owned root without a
+/// marker; `ELOOP` for a symbolic link in any component of `path`; otherwise
+/// the first open, creation, or sync error.
 pub fn admit_recording_root(path: &Path, expectation: RootExpectation) -> io::Result<ApprovedRoot> {
     let may_initialize = expectation == RootExpectation::Fresh;
     let root = match open_root_nofollow(path) {
@@ -437,7 +454,7 @@ pub fn admit_recording_root(path: &Path, expectation: RootExpectation) -> io::Re
         (RootExpectation::LegacyOwned, None) => {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "legacy recording root owns catalog rows but has no identity marker; verify the intended mount and create .irisd-root-id before restart",
+                "recording root predates root identities and owns catalog rows but has no identity marker; verify the intended mount and create .irisd-root-id before restart",
             ));
         }
         (RootExpectation::Fresh, None) if root_is_empty(&root)? => create_root_identity(&root)?,
@@ -453,8 +470,14 @@ pub fn admit_recording_root(path: &Path, expectation: RootExpectation) -> io::Re
     Ok(approved)
 }
 
-/// Reopens an approved root without following its final component and verifies
-/// both its durable marker and physical inode.
+/// Reopens an approved root without following a symbolic link in any
+/// component and verifies both its durable marker and physical inode.
+///
+/// # Errors
+///
+/// `NotFound` when the root is gone; `InvalidData` when its marker changed or
+/// the directory was physically replaced since admission; `ELOOP` for a
+/// symbolic link in any component of its path.
 pub fn verify_approved_root(approved: &ApprovedRoot) -> io::Result<()> {
     open_approved_root(approved).map(drop)
 }
@@ -480,6 +503,10 @@ fn open_approved_root(approved: &ApprovedRoot) -> io::Result<File> {
 /// Opens and verifies an approved recording-root directory without following
 /// any configured-path symlink. The returned descriptor pins the admitted
 /// physical root for descriptor-relative discovery.
+///
+/// # Errors
+///
+/// As [`verify_approved_root`].
 pub fn open_approved_root_directory(approved: &ApprovedRoot) -> io::Result<File> {
     open_approved_root(approved)
 }
@@ -494,6 +521,10 @@ pub struct FreeSpace {
 }
 
 /// Reports the space of the file system holding `root` (`statvfs`).
+///
+/// # Errors
+///
+/// The `statvfs` error, for example `NotFound` for a missing root.
 pub fn free_space(root: &Path) -> io::Result<FreeSpace> {
     let v = rustix::fs::statvfs(root)?;
     Ok(FreeSpace {
@@ -505,6 +536,10 @@ pub fn free_space(root: &Path) -> io::Result<FreeSpace> {
 /// Reports free space through a reopened and identity-verified recording-root
 /// descriptor. A replaced path is rejected before its filesystem can influence
 /// an approved writer or retention decision.
+///
+/// # Errors
+///
+/// The errors of [`verify_approved_root`], then the `fstatvfs` error.
 pub fn free_space_approved(root: &ApprovedRoot) -> io::Result<FreeSpace> {
     let directory = open_approved_root(root)?;
     let value = rustix::fs::fstatvfs(&directory)?;
@@ -512,31 +547,6 @@ pub fn free_space_approved(root: &ApprovedRoot) -> io::Result<FreeSpace> {
         total: value.f_blocks.saturating_mul(value.f_frsize),
         available: value.f_bavail.saturating_mul(value.f_frsize),
     })
-}
-
-/// Deletes a recording (`.mp4` and its `.idx`), flushes the directory, and
-/// returns the bytes found before deletion. Either member may already be
-/// absent; success means both are absent and the containing directory is
-/// durable.
-pub fn remove_segment(mp4_path: &Path) -> io::Result<u64> {
-    let index_path = crate::layout::index_path(mp4_path);
-    let mp4_len = existing_len(mp4_path)?;
-    let index_len = existing_len(&index_path)?;
-    let mut first_error = None;
-    for path in [mp4_path, index_path.as_path()] {
-        match fs::remove_file(path) {
-            Ok(()) => {}
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => {
-                first_error.get_or_insert(error);
-            }
-        }
-    }
-    if let Some(error) = first_error {
-        return Err(error);
-    }
-    fsync_dir(parent_dir(mp4_path))?;
-    Ok(mp4_len + index_len)
 }
 
 fn recording_components(approved: &ApprovedRoot, path: &Path) -> io::Result<Vec<OsString>> {
@@ -580,16 +590,13 @@ fn open_directory_beneath(directory: &File, name: &OsStr) -> io::Result<File> {
     .map_err(Into::into)
 }
 
-pub(crate) fn open_file_beneath(
-    directory: &File,
-    name: &OsStr,
-    flags: OFlags,
-    mode: Mode,
-) -> io::Result<File> {
+/// Creates `name` exclusively beneath `directory` as a regular file open for
+/// writing: nothing already at the path is opened, followed, or truncated.
+pub(crate) fn create_file_beneath(directory: &File, name: &OsStr, mode: Mode) -> io::Result<File> {
     rustix::fs::openat2(
         directory,
         name,
-        flags | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
         mode,
         ResolveFlags::BENEATH
             | ResolveFlags::NO_SYMLINKS
@@ -638,8 +645,21 @@ fn recording_parent_or_missing(approved: &ApprovedRoot, path: &Path) -> io::Resu
 
 pub(crate) fn create_recording_parent_beneath(
     approved: &ApprovedRoot,
+    directory: File,
+    path: &Path,
+) -> io::Result<(File, OsString)> {
+    create_recording_parent_beneath_with(approved, directory, path, &mut |directory| {
+        directory.sync_all()
+    })
+}
+
+/// [`create_recording_parent_beneath`] with the directory barrier injected,
+/// so tests observe the child-then-parent order and a failed barrier.
+fn create_recording_parent_beneath_with(
+    approved: &ApprovedRoot,
     mut directory: File,
     path: &Path,
+    sync: &mut dyn FnMut(&File) -> io::Result<()>,
 ) -> io::Result<(File, OsString)> {
     let components = recording_components(approved, path)?;
     for component in &components[..3] {
@@ -651,8 +671,8 @@ pub(crate) fn create_recording_parent_beneath(
                     Err(error) => return Err(error.into()),
                 }
                 let child = open_directory_beneath(&directory, component)?;
-                child.sync_all()?;
-                directory.sync_all()?;
+                sync(&child)?;
+                sync(&directory)?;
                 child
             }
             Err(error) => return Err(error),
@@ -684,6 +704,14 @@ pub(crate) fn open_recording_beneath(
 ///
 /// The open never blocks: a FIFO, socket, or device at the recording's name
 /// is rejected with [`io::ErrorKind::InvalidData`].
+///
+/// # Errors
+///
+/// The errors of [`verify_approved_root`]; `InvalidInput` when `path` is not
+/// beneath the root in the four-component layout; `NotFound` when a layout
+/// directory or the recording is absent; `InvalidData` when the name holds
+/// anything but a regular file; `ELOOP` or `EXDEV` when a symbolic link or a
+/// mount lies on the way.
 pub fn open_segment_beneath(approved: &ApprovedRoot, path: &Path) -> io::Result<File> {
     let (directory, name) = recording_parent_beneath(approved, path)?;
     open_regular_beneath(&directory, &name, OFlags::RDONLY, "recording path")
@@ -692,13 +720,17 @@ pub fn open_segment_beneath(approved: &ApprovedRoot, path: &Path) -> io::Result<
 /// Opens a recording and its optional sidecar from one pinned no-follow parent
 /// directory. A sidecar symlink or non-regular entry is rejected rather than
 /// followed; neither open blocks on a FIFO or device.
+///
+/// # Errors
+///
+/// As [`open_segment_beneath`]; an absent sidecar is not an error.
 pub fn open_segment_pair_beneath(
     approved: &ApprovedRoot,
     path: &Path,
 ) -> io::Result<(File, Option<File>)> {
     let (directory, media_name) = recording_parent_beneath(approved, path)?;
     let media = open_regular_beneath(&directory, &media_name, OFlags::RDONLY, "recording path")?;
-    let index_name = Path::new(&media_name).with_extension("idx");
+    let index_name = crate::layout::index_path(Path::new(&media_name));
     let index = match open_regular_beneath(
         &directory,
         index_name.as_os_str(),
@@ -751,6 +783,12 @@ fn existing_regular_len_at(directory: &File, name: &OsStr) -> io::Result<u64> {
 /// bytes and is unlinked without being opened or followed, so a link's
 /// target outside the pair is never touched. A directory in place of a
 /// member is an error.
+///
+/// # Errors
+///
+/// The errors of [`verify_approved_root`]; `InvalidInput` when `mp4_path` is
+/// not beneath the root in the four-component layout; a directory in place of
+/// a member; the first unlink or directory sync error.
 pub fn remove_segment_beneath(approved: &ApprovedRoot, mp4_path: &Path) -> io::Result<u64> {
     remove_segment_beneath_with(
         approved,
@@ -775,9 +813,7 @@ fn remove_segment_beneath_with(
             return Ok(0);
         }
     };
-    let index_name = Path::new(&media_name)
-        .with_extension("idx")
-        .into_os_string();
+    let index_name = crate::layout::index_path(Path::new(&media_name)).into_os_string();
     let media_len = existing_regular_len_at(&directory, &media_name)?;
     let index_len = existing_regular_len_at(&directory, &index_name)?;
     let mut first_error = None;
@@ -795,14 +831,6 @@ fn remove_segment_beneath_with(
     }
     sync_directory(&directory)?;
     Ok(media_len + index_len)
-}
-
-fn existing_len(path: &Path) -> io::Result<u64> {
-    match fs::metadata(path) {
-        Ok(metadata) => Ok(metadata.len()),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(0),
-        Err(error) => Err(error),
-    }
 }
 
 #[cfg(test)]
@@ -1163,25 +1191,6 @@ mod tests {
     }
 
     #[test]
-    fn pair_removal_is_idempotent_when_either_member_is_already_missing() {
-        for missing_media in [false, true] {
-            let dir = tempfile::tempdir().unwrap();
-            let media = dir.path().join("recording.mp4");
-            let index = media.with_extension("idx");
-            if !missing_media {
-                fs::write(&media, b"media").unwrap();
-            }
-            if missing_media {
-                fs::write(&index, b"index").unwrap();
-            }
-            assert_eq!(remove_segment(&media).unwrap(), 5);
-            assert!(!media.exists());
-            assert!(!index.exists());
-            assert_eq!(remove_segment(&media).unwrap(), 0);
-        }
-    }
-
-    #[test]
     fn a_new_recording_root_is_synced_through_each_parent_in_order() {
         let dir = tempfile::tempdir().unwrap();
         let parent = dir.path().join("parent");
@@ -1195,6 +1204,76 @@ mod tests {
         assert_eq!(
             synced,
             [parent.clone(), dir.path().to_path_buf(), root, parent]
+        );
+    }
+
+    /// The directory a descriptor refers to, for asserting barrier order.
+    fn directory_path(file: &File) -> PathBuf {
+        use std::os::fd::AsRawFd as _;
+        fs::read_link(format!("/proc/self/fd/{}", file.as_raw_fd())).unwrap()
+    }
+
+    #[test]
+    fn a_created_root_is_synced_through_each_parent_in_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = fs::canonicalize(dir.path()).unwrap();
+        let parent = base.join("parent");
+        let root = parent.join("root");
+        let mut synced = Vec::new();
+        create_root_directory_with(&root, &mut |directory| {
+            synced.push(directory_path(directory));
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(synced, [parent.clone(), base, root, parent]);
+    }
+
+    #[test]
+    fn a_created_root_parent_barrier_failure_is_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = fs::canonicalize(dir.path()).unwrap();
+        let root = base.join("root");
+        let mut synced = Vec::new();
+        let error = create_root_directory_with(&root, &mut |directory| {
+            let path = directory_path(directory);
+            synced.push(path.clone());
+            if path == base {
+                Err(io::Error::other("injected parent sync failure"))
+            } else {
+                Ok(())
+            }
+        })
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        assert_eq!(synced, [root.clone(), base]);
+        assert!(root.is_dir(), "creation preceded the failed parent barrier");
+    }
+
+    #[test]
+    fn layout_directories_beneath_a_root_are_synced_through_each_parent_in_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(dir.path()).unwrap();
+        let approved = admit_recording_root(&root, RootExpectation::Fresh).unwrap();
+        let directory = open_approved_root_directory(&approved).unwrap();
+        let camera = root.join("cam1");
+        let kind = camera.join("main");
+        let day = kind.join("2026-01-01");
+        let mut synced = Vec::new();
+        let (parent, name) = create_recording_parent_beneath_with(
+            &approved,
+            directory,
+            &day.join("recording.mp4"),
+            &mut |directory| {
+                synced.push(directory_path(directory));
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(directory_path(&parent), day);
+        assert_eq!(name, "recording.mp4");
+        assert_eq!(
+            synced,
+            [camera.clone(), root, kind.clone(), camera, day, kind]
         );
     }
 
@@ -1215,23 +1294,6 @@ mod tests {
         assert_eq!(error.kind(), io::ErrorKind::Other);
         assert_eq!(synced, [root.clone(), dir.path().to_path_buf()]);
         assert!(root.is_dir(), "creation preceded the failed parent barrier");
-    }
-
-    #[test]
-    fn an_index_unlink_failure_can_be_retried_after_media_is_gone() {
-        let dir = tempfile::tempdir().unwrap();
-        let media = dir.path().join("recording.mp4");
-        let index = media.with_extension("idx");
-        fs::write(&media, b"media").unwrap();
-        fs::create_dir(&index).unwrap();
-        remove_segment(&media).unwrap_err();
-        assert!(!media.exists());
-        assert!(index.is_dir());
-
-        fs::remove_dir(&index).unwrap();
-        fs::write(&index, b"index").unwrap();
-        assert_eq!(remove_segment(&media).unwrap(), 5);
-        assert!(!index.exists());
     }
 
     #[test]
@@ -1377,17 +1439,11 @@ mod tests {
         let (directory, name) = recording_parent_beneath(&approved, &requested).unwrap();
         for flags in [OFlags::RDONLY, OFlags::RDWR] {
             assert_cross_device(
-                &open_file_beneath(&directory, &name, flags, Mode::empty()).unwrap_err(),
+                &open_regular_beneath(&directory, &name, flags, "recording path").unwrap_err(),
             );
         }
         assert_cross_device(
-            &open_file_beneath(
-                &directory,
-                &name,
-                OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL,
-                Mode::RUSR | Mode::WUSR,
-            )
-            .unwrap_err(),
+            &create_file_beneath(&directory, &name, Mode::RUSR | Mode::WUSR).unwrap_err(),
         );
         assert_cross_device(&existing_regular_len_at(&directory, &name).unwrap_err());
         assert_cross_device(&open_segment_beneath(&approved, &requested).unwrap_err());

@@ -2,6 +2,7 @@
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufReader, Write};
+use std::num::NonZeroUsize;
 use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -9,10 +10,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use anyhow::{Context, bail};
 use clap::Args as ClapArgs;
 use iris_core::time::TIMESCALE;
-use iris_mp4::hls::{PlaylistOptions, master_playlist, media_playlist};
+use iris_mp4::hls::{self as playlist, PlaylistOptions};
 use iris_mp4::index::{IndexRecord, MAX_PERSISTED_INDEX_RECORDS, read_index_file_bound_to_media};
-use iris_mp4::reader::{ScanOptions, ScanStop, scan};
-use iris_store::layout::index_path;
+use iris_mp4::reader::{self, ScanOptions, ScanStop};
+use iris_store::layout;
 use iris_store::open_regular_file;
 use tracing::warn;
 
@@ -25,13 +26,16 @@ static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 pub struct Args {
     /// The recording (`.mp4`).
     file: PathBuf,
-    /// Output directory for `master.m3u8`, `index.m3u8`, and a link to the recording.
+    /// Output directory for `master.m3u8`, `index.m3u8`, and a link to the
+    /// recording.
     #[arg(long, value_name = "DIR")]
     out: PathBuf,
-    /// Fragments (GOPs) per segment; grouping starts at sync fragments.
-    #[arg(long, default_value_t = 3)]
-    fragments_per_segment: usize,
-    /// Make every segment exactly one fragment with its trailer excluded from the range.
+    /// Fragments (GOPs) per segment, at least one; grouping starts at sync
+    /// fragments.
+    #[arg(long, default_value = "3")]
+    fragments_per_segment: NonZeroUsize,
+    /// Make every segment exactly one fragment with its trailer excluded from
+    /// the range.
     #[arg(long)]
     exclude_trailers: bool,
     /// RFC 6381 codecs string for the master playlist.
@@ -58,7 +62,7 @@ pub fn run(args: &Args) -> anyhow::Result<()> {
         .file_name()
         .and_then(|n| n.to_str())
         .map(str::to_owned)
-        .context("recording path has no file name")?;
+        .context("recording path has no UTF-8 file name")?;
     if matches!(file_name.as_str(), MEDIA_PLAYLIST | MASTER_PLAYLIST) {
         bail!("recording basename {file_name:?} is reserved for an HLS playlist");
     }
@@ -74,42 +78,36 @@ pub fn run(args: &Args) -> anyhow::Result<()> {
 
     let duration_secs: f64 =
         records.iter().map(|r| f64::from(r.duration)).sum::<f64>() / f64::from(TIMESCALE);
-    let total_bytes = records
-        .iter()
-        .try_fold(u64::from(init_len), |total, record| {
-            total.checked_add(u64::from(record.len))
-        })
-        .context("recording byte total overflows u64")?;
-    let bandwidth = if duration_secs > 0.0 {
-        (total_bytes as f64 * 8.0 / duration_secs) as u64
-    } else {
-        0
-    };
-
     let options = PlaylistOptions {
         media_uri: encode_uri_segment(&file_name),
-        fragments_per_segment: args.fragments_per_segment,
+        fragments_per_segment: args.fragments_per_segment.get(),
         include_trailers: !args.exclude_trailers,
     };
-    let media = media_playlist(init_len, &records, &options);
-    let master = master_playlist(
+    let rates = playlist::variant_bit_rates(&records, &options);
+    let media = playlist::media_playlist(init_len, &records, &options)
+        .context("the media file name cannot be written into a playlist")?;
+    let master = playlist::master_playlist(
         MEDIA_PLAYLIST,
         &codecs,
-        bandwidth,
+        rates,
         args.resolution.0,
         args.resolution.1,
-    );
+    )
+    .context("the codecs string cannot be written into a playlist")?;
     publish_playlists(&args.out, &media, &master)?;
 
     let segments = records.len().div_ceil(if args.exclude_trailers {
         1
     } else {
-        args.fragments_per_segment.max(1)
+        args.fragments_per_segment.get()
     });
     println!(
-        "wrote {}/master.m3u8 and index.m3u8: {} fragments, about {segments} segments, {duration_secs:.1} s, {bandwidth} bps",
+        "wrote {}/master.m3u8 and index.m3u8: {} fragments, about {segments} segments, \
+         {duration_secs:.1} s, {} bps peak, {} bps mean",
         args.out.display(),
-        records.len()
+        records.len(),
+        rates.peak,
+        rates.average
     );
     println!("serve it with: irisd serve --dir {}", args.out.display());
     Ok(())
@@ -119,17 +117,21 @@ fn load_records(file: &Path) -> anyhow::Result<(u32, Vec<IndexRecord>)> {
     // Media is authoritative. Scanning every fragment binds every range,
     // duration and sync fact emitted into the playlist to this physical file.
     let mut media = File::open(file).with_context(|| format!("opening {}", file.display()))?;
-    let media_len = media.metadata()?.len();
-    let report = scan(
+    let media_len = media
+        .metadata()
+        .with_context(|| format!("reading the status of {}", file.display()))?
+        .len();
+    let report = reader::scan(
         BufReader::new(&mut media),
         ScanOptions {
             verify_crc: false,
             collect_samples: false,
         },
-    )?;
+    )
+    .with_context(|| format!("scanning {}", file.display()))?;
     if let Some(ScanStop::FragmentLimit { limit, .. }) = report.stop {
         bail!(
-            "{} holds more than {limit} fragments, more than one playlist source may describe",
+            "{} holds more than {limit} fragments, the most one playlist may describe",
             file.display()
         );
     }
@@ -138,9 +140,11 @@ fn load_records(file: &Path) -> anyhow::Result<(u32, Vec<IndexRecord>)> {
         .iter()
         .map(IndexRecord::from_scan)
         .collect();
-    // The sidecar is only a cache: it is opened without following a final
-    // symlink or blocking on a FIFO, and any failure falls back to the scan.
-    let sidecar = index_path(file);
+    // Every playlist fact comes from the scan. The sidecar is read only to
+    // report one that disagrees with the media: it is opened without
+    // following a final symlink or blocking on a FIFO, and a failure is a
+    // warning.
+    let sidecar = layout::index_path(file);
     match open_regular_file(&sidecar) {
         Ok(index) => match read_index_file_bound_to_media(
             index,
@@ -150,15 +154,27 @@ fn load_records(file: &Path) -> anyhow::Result<(u32, Vec<IndexRecord>)> {
         ) {
             Ok(Some(_)) => {}
             Ok(None) => {
-                warn!(path = %sidecar.display(), "sidecar index disagrees with media; using scan-derived facts");
+                warn!(
+                    path = %sidecar.display(),
+                    "sidecar index disagrees with the media; the playlists describe the media"
+                );
             }
             Err(error) => {
-                warn!(path = %sidecar.display(), %error, "sidecar index unreadable or over limit; using scan-derived facts");
+                warn!(
+                    path = %sidecar.display(),
+                    %error,
+                    "sidecar index is unreadable or over the limit; the playlists describe the \
+                     media"
+                );
             }
         },
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => {
-            warn!(path = %sidecar.display(), %error, "sidecar index cannot be opened; using scan-derived facts");
+            warn!(
+                path = %sidecar.display(),
+                %error,
+                "sidecar index cannot be opened; the playlists describe the media"
+            );
         }
     }
     Ok((report.init_len, records))
@@ -209,7 +225,8 @@ fn same_file(left: &fs::Metadata, right: &fs::Metadata) -> bool {
     left.dev() == right.dev() && left.ino() == right.ino()
 }
 
-fn claimed_temporary_matches(path: &Path, claimed: &File) -> bool {
+/// Whether the entry at `path` is still the inode `claimed` holds open.
+fn claimed_matches(path: &Path, claimed: &File) -> bool {
     claimed.metadata().is_ok_and(|identity| {
         fs::symlink_metadata(path).is_ok_and(|found| same_file(&identity, &found))
     })
@@ -232,14 +249,8 @@ fn pin_symlink(path: &Path) -> std::io::Result<File> {
     }
 }
 
-fn claimed_symlink_matches(path: &Path, claimed: &File) -> bool {
-    claimed.metadata().is_ok_and(|identity| {
-        fs::symlink_metadata(path).is_ok_and(|found| same_file(&identity, &found))
-    })
-}
-
 fn remove_claimed_temporary(path: &Path, claimed: &File) {
-    if claimed_temporary_matches(path, claimed) {
+    if claimed_matches(path, claimed) {
         let _ = fs::remove_file(path);
     }
 }
@@ -324,7 +335,10 @@ fn publish_playlists_with(
             }
             Ok(_) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error.into()),
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("inspecting {}", out.join(destination).display()));
+            }
         }
     }
     let (media_temp, media_file) = create_temp(out, MEDIA_PLAYLIST, media.as_bytes())?;
@@ -341,7 +355,7 @@ fn publish_playlists_with(
     let mut master_temp_owned = true;
     let result = (|| -> std::io::Result<()> {
         step(PublicationStep::BeforeMediaRename)?;
-        if !claimed_temporary_matches(&media_temp, &media_file) {
+        if !claimed_matches(&media_temp, &media_file) {
             return Err(std::io::Error::other(
                 "media playlist temporary ownership changed",
             ));
@@ -353,7 +367,7 @@ fn publish_playlists_with(
         media_temp_owned = false;
         step(PublicationStep::AfterMediaRename)?;
         step(PublicationStep::BeforeMasterRename)?;
-        if !claimed_temporary_matches(&master_temp, &master_file) {
+        if !claimed_matches(&master_temp, &master_file) {
             return Err(std::io::Error::other(
                 "master playlist temporary ownership changed",
             ));
@@ -375,7 +389,11 @@ fn publish_playlists_with(
             remove_claimed_temporary(&master_temp, &master_file);
         }
         if let Err(sync_error) = File::open(out).and_then(|directory| directory.sync_all()) {
-            warn!(path = %out.display(), %sync_error, "could not sync failed playlist publication state");
+            warn!(
+                path = %out.display(),
+                %sync_error,
+                "could not sync failed playlist publication state"
+            );
         }
         return Err(error).with_context(|| format!("publishing playlists in {}", out.display()));
     }
@@ -399,6 +417,19 @@ fn link_recording_with(
     if link.canonicalize().is_ok_and(|path| path == target) {
         return Ok(());
     }
+    // Only an absent entry or a symbolic link is replaced; anything else at
+    // the link's name is someone else's file.
+    match fs::symlink_metadata(link) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {}
+        Ok(_) => bail!(
+            "{} exists and is not a link to the recording",
+            link.display()
+        ),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error).with_context(|| format!("inspecting {}", link.display()));
+        }
+    }
     let parent = link
         .parent()
         .filter(|path| !path.as_os_str().is_empty())
@@ -420,7 +451,7 @@ fn link_recording_with(
                 // for a replacement at the same pathname.
                 let claimed = pin_symlink(&temporary)?;
                 let result = before_rename(&temporary).and_then(|()| {
-                    if !claimed_symlink_matches(&temporary, &claimed) {
+                    if !claimed_matches(&temporary, &claimed) {
                         return Err(std::io::Error::other(
                             "media-link temporary ownership changed",
                         ));
@@ -428,7 +459,7 @@ fn link_recording_with(
                     fs::rename(&temporary, link)
                 });
                 if let Err(error) = result {
-                    if claimed_symlink_matches(&temporary, &claimed) {
+                    if claimed_matches(&temporary, &claimed) {
                         let _ = fs::remove_file(&temporary);
                     }
                     return Err(error)
@@ -454,7 +485,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn invalid_sidecar_ranges_fall_back_to_native_media() {
+    fn playlist_facts_come_from_the_media_whatever_the_sidecar_holds() {
         use bytes::Bytes;
         use iris_core::time::WallUs;
         use iris_mp4::fragment::{FragmentHeader, Sample, encode_fragment};
@@ -488,7 +519,7 @@ mod tests {
                 file.extend_from_slice(&slice);
             }
         }
-        let report = scan(Cursor::new(&file), ScanOptions::default()).unwrap();
+        let report = reader::scan(Cursor::new(&file), ScanOptions::default()).unwrap();
         let expected: Vec<_> = report
             .fragments
             .iter()
@@ -519,13 +550,13 @@ mod tests {
             for record in records {
                 bytes.extend(record.encode());
             }
-            fs::write(index_path(&media), bytes).unwrap();
+            fs::write(layout::index_path(&media), bytes).unwrap();
             let (init_len, loaded) = load_records(&media).unwrap();
             assert_eq!(init_len, report.init_len);
             assert_eq!(loaded, expected);
         }
 
-        let sidecar = File::create(index_path(&media)).unwrap();
+        let sidecar = File::create(layout::index_path(&media)).unwrap();
         let oversized = iris_mp4::index::HEADER_LEN
             + MAX_PERSISTED_INDEX_RECORDS * iris_mp4::index::RECORD_LEN
             + iris_mp4::index::RECORD_LEN;
@@ -533,6 +564,34 @@ mod tests {
         let (init_len, loaded) = load_records(&media).unwrap();
         assert_eq!(init_len, report.init_len);
         assert_eq!(loaded, expected);
+    }
+
+    #[test]
+    fn an_unrelated_file_at_the_link_path_is_not_replaced() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("recording.mp4");
+        let output = dir.path().join("output");
+        fs::create_dir(&output).unwrap();
+        fs::write(&source, b"recording bytes").unwrap();
+        let other = output.join("recording.mp4");
+        fs::write(&other, b"someone else's recording").unwrap();
+        let error = link_recording(&source, &other).unwrap_err();
+        assert!(
+            error.to_string().contains("is not a link to the recording"),
+            "{error:#}"
+        );
+        assert_eq!(fs::read(&other).unwrap(), b"someone else's recording");
+        assert!(
+            !fs::symlink_metadata(&other)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+
+        fs::remove_file(&other).unwrap();
+        std::os::unix::fs::symlink(dir.path().join("stale"), &other).unwrap();
+        link_recording(&source, &other).unwrap();
+        assert_eq!(fs::read(&other).unwrap(), b"recording bytes");
     }
 
     #[test]
@@ -642,7 +701,7 @@ mod tests {
                 let error = run(&Args {
                     file: source.clone(),
                     out: out.clone(),
-                    fragments_per_segment: 3,
+                    fragments_per_segment: NonZeroUsize::new(3).unwrap(),
                     exclude_trailers: false,
                     codecs: "hvc1.1.6.L150.B0".into(),
                     resolution: (1920, 1080),
@@ -939,7 +998,7 @@ mod tests {
                 .any(|byte| matches!(byte, b'#' | b'\"' | b'\r' | b'\n' | b' '))
         );
 
-        let playlist = media_playlist(
+        let playlist = playlist::media_playlist(
             700,
             &[IndexRecord {
                 offset: 700,
@@ -953,7 +1012,8 @@ mod tests {
                 fragments_per_segment: 1,
                 include_trailers: true,
             },
-        );
+        )
+        .unwrap();
         assert_eq!(
             playlist
                 .lines()

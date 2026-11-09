@@ -24,8 +24,8 @@ Scope: this crate only. Read the root `AGENTS.md` first.
   `TEARDOWN` only to the session's own peer address, stops a background `TEARDOWN` after
   min(session timeout, 60 s), and runs at most 64 of them per process. These are local
   contracts listed in `third_party/README.md`; keep `05 §1` in step with them.
-- Camera-supplied text reaches a log line only through `LogSafe` (escaped, at most 512
-  characters) or as one of Retina's bounded excerpts; never log a `retina::Error`, an SDP,
+- Camera-supplied text reaches a log line only through `iris_core::text::LogSafe` (escaped, at
+  most 512 characters) or as one of Retina's bounded excerpts; never log a `retina::Error`, an SDP,
   or a header value with `%` or `?` directly. `StreamSource`'s `Debug` stays redacting.
 - The read policy (noop-waker drain, the shared `ReadTicker`, the socket detached from
   the reactor after `PLAY`) and the low-water mark are measured decisions in
@@ -44,8 +44,9 @@ Scope: this crate only. Read the root `AGENTS.md` first.
 - The live fast-start cache and subscriber fan-out have independent 64 MiB payload-reference
   budgets in addition to their frame-count limits. Overflow abandons fast start or reports
   lag, respectively; neither path resumes delivery before a sync frame.
-- The names of `StreamStats` accessors are read by `irisd`'s statistics line and by
-  `iris-tools daemon-stats`; renaming one changes the log format.
+- The names of `StreamStats` accessors are read by `irisd`'s statistics line, by
+  `iris-tools daemon-stats`, and by the API's camera detail; renaming one changes the log
+  format and the HTTP answer.
 
 ## Where things are
 
@@ -62,7 +63,8 @@ Scope: this crate only. Read the root `AGENTS.md` first.
 - `tests/adversarial_rtsp.rs` — bounded loopback regressions for terminal flushes, wall
   placement, network allocation limits, and sink-loss continuity in both read modes, and
   hostile cameras that stop reading or advertise another host.
-- `tests/log_bounds.rs` — the daemon's log subscriber against hostile `DESCRIBE` answers;
+- `tests/log_bounds.rs` — a subscriber configured like the daemon's against hostile
+  `DESCRIBE` answers;
   `tests/teardown_bound.rs` — the process-wide bound on background `TEARDOWN`s. Each owns
   process-wide state, so each is a test binary of its own.
 
@@ -116,4 +118,5 @@ recording from `iris-replay` on a loopback port. Never point a test at a live ca
 - `docs/research/05-ingest-events.md`, `04-storage-format.md §7–8`, `12-ingest-cost.md`,
   `01-camera-probe.md`, `docs/design/phase2-interfaces.md`.
 - Depends on `iris-core`, `iris-h265`, `iris-mp4`, and `retina` (patched copy under
-  `third_party/retina`). Depended on by `irisd`; `iris-replay` is a dev-dependency.
+  `third_party/retina`). Depended on by `irisd` and `iris-api` (live ring, statistics);
+  `iris-replay` is a dev-dependency.

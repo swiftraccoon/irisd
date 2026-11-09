@@ -9,25 +9,37 @@ fault-tested without hardware: cost measurements, chaos runs, and the integratio
 
 - The `iris-replay` binary: `--mount NAME=PATH` serves a recording at
   `rtsp://<listen>/NAME`; `--synth NAME[=GOPS]` serves a synthetic 1080p stream built from
-  real parameter sets and dummy slices; `--listen` (default `127.0.0.1:8554`; an address
-  outside loopback also needs `--allow-remote`), `--max-connections N` (default 256),
-  `--mtu`, `--once`, `--burst`, `--pace`, `--drop-every N`, `--stall-after DURATION`,
-  `--stall-for DURATION`.
+  real parameter sets and dummy slices, 30 frames per second in groups of 60 (GOPS defaults
+  to 30, a 60-second loop); `--listen` (default `127.0.0.1:8554`; an address outside
+  loopback also needs `--allow-remote`), `--max-connections N` (default 256), `--mtu`,
+  `--once`, `--burst` or `--pace` (not both), `--drop-every N` (N at least 1),
+  `--stall-after DURATION`, `--stall-for DURATION`. Recordings load before the runtime
+  starts; an unparsable `RUST_LOG` is reported and `info` applies.
 - `media` — `Media` loads a recording into memory, extracts VPS, SPS, and PPS from its
   `hvcC`, and indexes every frame with its decode time (relative to the file's first
-  fragment, since stored decode times run on across the files of a run) and sync flag.
+  fragment, since stored decode times run on across the files of a run) and sync flag. Its
+  validated state is private behind `frames`, `parameter_sets`, and `total_ticks`, and
+  `sample` returns `None` for a frame that does not lie inside the recording. Times are
+  `Ticks` of the 90 kHz clock; refusals are `MediaError` and `HvccError` variants.
 - `rtp` — `Packetizer` returns a fallible streaming iterator of RFC 7798 packets (single
   NAL units and fragmentation units, marker bit on the last) and builds RTCP sender
-  reports; fallible `interleave` frames one packet for a TCP channel.
+  reports from a `WallUs`; fallible `interleave` frames one packet for a TCP channel. SSRCs
+  and RTP clock values are `Ssrc` and `RtpTimestamp`, which wraps at 32 bits.
 - `rtsp` — a request parser and response builder for `OPTIONS`, `DESCRIBE`, `SETUP`, `PLAY`,
-  `TEARDOWN`, `GET_PARAMETER`, and `SET_PARAMETER`. `PAUSE` is deliberately unsupported:
-  replay is start-once so its advertised RTP state remains truthful.
+  `TEARDOWN`, `GET_PARAMETER`, and `SET_PARAMETER`, the `Transport` and `Session` header
+  parsers (`interleaved_transport`, `session_id`), and `MountName`, a validated mount. `PAUSE`
+  is deliberately unsupported: replay is start-once so its advertised RTP state remains
+  truthful.
 - `sdp` — the session description with `sprop-vps`, `sprop-sps`, `sprop-pps`.
 - `server` — `Server` binds a listener and runs one session per connection; `Options`
-  carries the delivery and fault settings, the connection cap, and the request and idle
-  deadlines.
+  carries the delivery (`Delivery::PerPacket`, `Burst`, or `Paced`) and fault settings, the
+  connection cap, and the request and idle deadlines. `Server::bind` binds any address it is
+  given; refusing one outside loopback is the binary's decision. Refusals are `ServerError`
+  variants.
 - `synth` — `Plan` and fallible `recording` build a bounded, valid irisd recording in
-  memory.
+  memory; `slice` builds one `SliceKind::Idr` or `SliceKind::Trail` NAL unit.
+
+The library returns `thiserror` types; only the binary uses `anyhow`.
 
 ## How it is used
 
@@ -55,7 +67,8 @@ the two-mode recording test in `iris-ingest` do.
   default, and `--pace` spreads a frame's packets over the frame interval; this reproduces
   the receiver's per-packet cost, which `--burst` understates by four times
   (`docs/research/12-ingest-cost.md §2`).
-- A dropped packet (`--drop-every`) is simply not sent; a stall (`--stall-after`) pauses
+- A dropped packet (`--drop-every`) is simply not sent and keeps its sequence number, as a
+  packet lost on the network does; a stall (`--stall-after`) pauses
   once and then sends the paused frames in a burst with their original timestamps, as a
   network stall would deliver them. Sender reports sample wall and RTP clocks at the same
   instant; this does not change the intentional catch-up burst.
@@ -65,29 +78,37 @@ the two-mode recording test in `iris-ingest` do.
   `--max-connections` (default 256, the most cameras `replay-bench` drives) connections are
   served at once; the listener closes further connections as it accepts them. Before `PLAY`,
   each request must arrive complete within 10 s of the previous one, or of the connection,
-  however slowly its bytes trickle in; after `PLAY`, a connection that sends no request or
-  interleaved frame for 120 s is closed, four times the recorder's keepalive period (retina
-  sends one every 30 s for the default 60-s session timeout). A connection must select one
+  however slowly its bytes trickle in and whatever interleaved frames arrive meanwhile; after
+  `PLAY`, a connection that sends no request or interleaved frame for 120 s is closed, four
+  times the recorder's keepalive period (retina sends one every 30 s for the default 60-s
+  session timeout). A reply that cannot be queued within the deadline in force, because the
+  peer stopped reading and its queue filled, ends the connection instead of holding its slot.
+  A request head is at most 64 KiB and a body at most 64 KiB; a `Content-Length` that is not
+  a decimal count, or repeats with another value, refuses the request. A connection must select one
   mount, complete a valid `SETUP`, and return
   the issued `Session` before `PLAY`; cross-mount and repeated/finished plays fail closed,
   and `TEARDOWN` preserves prior control replies but bypasses stale queued media on a bounded,
   delivery-acknowledged terminal path.
 - Mount names are one URI segment and must be unique. Recordings must be CRC-clean irisd
-  files through exact EOF, start with a truthful sync sample, contain completely framed
-  access units, have a nonoverlapping representable timeline, and carry a version-1
-  four-byte-length `hvcC` with VPS, SPS, and PPS. Valid forward timeline gaps are retained.
+  files through exact EOF, start with a truthful sync sample, carry samples in every
+  fragment, contain completely framed access units, have a nonoverlapping representable
+  timeline, and carry a version-1 four-byte-length `hvcC` with VPS, SPS, and PPS. Valid
+  forward timeline gaps are retained.
 - Synthetic plans are checked before generation: at most 100,000 GOPs, 65,535 frames per
   GOP, 1,000,000 frames and 1 GiB of sample payload in total; durations and NAL units must
   be nonzero/representable. The constructors return diagnostics instead of panicking.
 
 ## Tests and measurements
 
-Unit tests cover strict `hvcC`, CRC/EOF/AU and timeline admission; RTP MTU, streaming
-fragmentation, rollover and interleaving boundaries; RTSP mount/session/channel/state and
-TEARDOWN behavior; grouped SDP parameter sets; every synthetic plan ceiling; the remote-bind
-opt-in; and, over loopback with shortened deadlines, the connection cap, partial and trickled
-requests closed at the pre-`PLAY` deadline, and a playing session kept by keepalives and
-closed once they stop.
+Unit tests cover strict `hvcC`, CRC/EOF/AU and timeline admission, a fragment without
+samples included; RTP MTU, streaming fragmentation, rollover, 32-bit clock wrap, and
+interleaving boundaries; RTSP head and `Content-Length` limits, mount/session/channel/state,
+and TEARDOWN behavior; grouped SDP parameter sets; every synthetic plan ceiling; the
+remote-bind opt-in and the exclusive delivery flags; per-packet, burst, and paced delivery
+and the drop interval, read from the player's queue; and, over loopback with shortened
+deadlines, the connection cap, partial and trickled requests and bare interleaved frames
+closed at the pre-`PLAY` deadline, a reply to a peer that stopped reading ending the
+connection, and a playing session kept by keepalives and closed once they stop.
 `tests/loopback.rs` serves a synthetic recording and receives it through the recorder's own
 RTSP client, checking bytes, sync flags, and timestamps. The fidelity of the replay against
 live cameras and the measurements it enabled are in `docs/research/12-ingest-cost.md`.

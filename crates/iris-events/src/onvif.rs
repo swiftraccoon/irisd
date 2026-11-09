@@ -9,25 +9,30 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use oxvif::{NotificationMessage, OnvifClient};
+use iris_core::event::{Event, EventKind, EventSource, EventState};
+use iris_core::id::CameraId;
+use iris_core::text::LogSafe;
+use iris_core::time::WallUs;
+use oxvif::soap::SoapError;
+use oxvif::transport::{Transport, TransportError};
+use oxvif::{NotificationMessage, OnvifClient, OnvifError, PullPointSubscription};
 use thiserror::Error;
 use tokio::time::{Instant, timeout};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use crate::backoff::Backoff;
-use crate::endpoint::{CameraEndpoint, EventSink};
+use crate::endpoint::CameraEndpoint;
+use crate::sink::EventSink;
 use crate::stats::EventStats;
 use crate::transport::SoapTransport;
-use iris_core::event::{Event, EventKind, EventSource, EventState};
-use iris_core::id::CameraId;
-use iris_core::time::WallUs;
 
 /// Subscription lifetime requested from the camera.
 const SUBSCRIPTION_LIFETIME: &str = "PT10M";
-/// Renew this long after creating or renewing (Home Assistant's cadence).
+/// Longest renewal delay, and the delay when the granted lease times are
+/// unusable (Home Assistant's cadence).
 const RENEW_EVERY: Duration = Duration::from_mins(8);
-/// Long-poll timeout sent in `PullMessages`. The `oxvif` HTTP transport caps every
+/// Long-poll timeout sent in `PullMessages`. The SOAP transport caps every
 /// request at 10 s, so a longer value fails on every quiet pull; cameras answer a 5 s
 /// pull in about 4 s.
 const PULL_TIMEOUT: &str = "PT5S";
@@ -39,36 +44,57 @@ const PULL_DEADLINE: Duration = Duration::from_secs(20);
 const PULL_COOLDOWN: Duration = Duration::from_millis(750);
 /// Minimum spacing between successful renewal attempts, including unusably tiny leases.
 const MIN_RENEW_DELAY: Duration = PULL_COOLDOWN;
-/// Bound on every single SOAP call other than the pull.
+/// Bound on every single SOAP call other than the pull and the unsubscribe.
 const CALL_DEADLINE: Duration = Duration::from_secs(20);
+/// Bound on the unsubscribe that releases a subscription when a session ends.
+const UNSUBSCRIBE_DEADLINE: Duration = Duration::from_secs(5);
 /// Minimum retry pause after rejected ONVIF credentials.
 const AUTH_FAILURE_PAUSE: Duration = Duration::from_secs(30);
 
+/// Why an ONVIF call or session failed.
+///
+/// `Display` may carry camera text (a SOAP fault's code and reason, an XML
+/// parser message); a log line takes it through
+/// [`LogSafe`].
 #[derive(Debug, Error)]
-enum SessionError {
+#[non_exhaustive]
+pub enum SessionError {
+    /// The camera refused or garbled a call.
     #[error("ONVIF call failed: {0}")]
-    Onvif(#[from] oxvif::OnvifError),
+    Onvif(#[from] OnvifError),
+    /// The camera's capabilities name no events service.
     #[error("camera advertises no events service")]
     NoEventsService,
+    /// A call exceeded its deadline.
     #[error("ONVIF call timed out")]
     Timeout,
+    /// The HTTP client could not be built.
     #[error("cannot build ONVIF HTTP client: {0}")]
     HttpClient(#[from] reqwest::Error),
+    /// The session's shutdown token was cancelled.
     #[error("ONVIF session cancelled")]
     Cancelled,
+    /// The endpoint's host is not a bare host name or IP address, so no URL
+    /// can be built for it ([`iris_core::config::is_valid_host`]).
+    #[error("camera host is not a bare host name or address")]
+    InvalidEndpoint,
 }
 
 impl SessionError {
+    /// Whether a call signed with the camera's measured clock offset should be
+    /// repeated with host time: only after a structured clock fault, and only
+    /// when `measured` differs from host time.
+    pub(crate) fn retries_with_host_time(&self, measured: i64) -> bool {
+        measured != 0 && self.is_clock_authentication_failure()
+    }
+
     fn is_authentication_failure(&self) -> bool {
         let Self::Onvif(error) = self else {
             return false;
         };
         match error {
-            oxvif::OnvifError::Transport(oxvif::transport::TransportError::HttpStatus {
-                status: 401,
-                ..
-            }) => true,
-            oxvif::OnvifError::Soap(oxvif::soap::SoapError::Fault {
+            OnvifError::Transport(TransportError::HttpStatus { status: 401, .. }) => true,
+            OnvifError::Soap(SoapError::Fault {
                 code,
                 reason,
                 subcode,
@@ -89,7 +115,7 @@ impl SessionError {
     }
 
     fn is_clock_authentication_failure(&self) -> bool {
-        let Self::Onvif(oxvif::OnvifError::Soap(oxvif::soap::SoapError::Fault {
+        let Self::Onvif(OnvifError::Soap(SoapError::Fault {
             code,
             reason,
             subcode,
@@ -125,9 +151,12 @@ fn is_clock_fault_marker(value: &str) -> bool {
         .filter(char::is_ascii_alphanumeric)
         .flat_map(char::to_lowercase)
         .collect();
+    // "time check" is the wording of the hardware fault recorded in
+    // `docs/research/11-multi-camera-results.md`.
     marker.contains("messageexpired")
         || marker.contains("invalidtimestamp")
         || marker.contains("clockskew")
+        || marker.contains("timecheck")
 }
 
 /// Runs a pull-point subscription for one camera until `shutdown` is cancelled.
@@ -150,7 +179,11 @@ pub async fn run_onvif_pullpoint(
         match &outcome {
             Ok(()) => info!(camera = %endpoint.camera, "ONVIF subscription ended; resubscribing"),
             Err(error) => {
-                warn!(camera = %endpoint.camera, %error, "ONVIF subscription failed; resubscribing");
+                warn!(
+                    camera = %endpoint.camera,
+                    error = %LogSafe(error),
+                    "ONVIF subscription failed; resubscribing"
+                );
             }
         }
         let Some(authentication_failure) = account_retry_cycle(&stats, &outcome) else {
@@ -194,13 +227,33 @@ async fn wait_for_retry(shutdown: &CancellationToken, delay: Duration) -> bool {
     }
 }
 
-fn should_retry_with_host_time(measured: i64, error: &SessionError) -> bool {
-    measured != 0 && error.is_clock_authentication_failure()
+/// The device-service client of `endpoint`, speaking through `transport`
+/// with the endpoint's credentials.
+pub(crate) fn device_client(
+    endpoint: &CameraEndpoint,
+    transport: Arc<dyn Transport>,
+) -> OnvifClient {
+    OnvifClient::new(format!("{}/onvif/device_service", endpoint.base_url()))
+        .with_transport(transport)
+        .with_credentials(&endpoint.username, &endpoint.password)
 }
 
-async fn bounded<T>(
+/// The camera's UTC offset in seconds, from `GetSystemDateAndTime`. The
+/// camera's clock may be hours off (DST bugs), and WS-Security tokens are
+/// signed with it.
+pub(crate) async fn measure_clock_offset(
     shutdown: &CancellationToken,
-    fut: impl Future<Output = Result<T, oxvif::OnvifError>>,
+    client: &OnvifClient,
+) -> Result<i64, SessionError> {
+    let date_time = bounded(shutdown, client.get_system_date_and_time()).await?;
+    Ok(date_time.utc_offset_secs())
+}
+
+/// Runs one SOAP call under the 20 s call deadline, ending early on
+/// `shutdown`.
+pub(crate) async fn bounded<T>(
+    shutdown: &CancellationToken,
+    fut: impl Future<Output = Result<T, OnvifError>>,
 ) -> Result<T, SessionError> {
     bounded_with_deadline(shutdown, CALL_DEADLINE, fut).await
 }
@@ -208,7 +261,7 @@ async fn bounded<T>(
 async fn bounded_with_deadline<T>(
     shutdown: &CancellationToken,
     deadline: Duration,
-    fut: impl Future<Output = Result<T, oxvif::OnvifError>>,
+    fut: impl Future<Output = Result<T, OnvifError>>,
 ) -> Result<T, SessionError> {
     tokio::select! {
         () = shutdown.cancelled() => Err(SessionError::Cancelled),
@@ -217,16 +270,6 @@ async fn bounded_with_deadline<T>(
             Err(_) => Err(SessionError::Timeout),
         }
     }
-}
-
-/// Finds the events service and creates a pull-point subscription signed by `client`.
-#[cfg(test)]
-async fn subscribe(
-    client: OnvifClient,
-    transport: &SoapTransport,
-    shutdown: &CancellationToken,
-) -> Result<(OnvifClient, oxvif::PullPointSubscription), SessionError> {
-    subscribe_with_deadline(client, transport, shutdown, CALL_DEADLINE).await
 }
 
 /// Finds the events service and creates a pull-point subscription signed by
@@ -242,7 +285,7 @@ async fn subscribe_with_deadline(
     transport: &SoapTransport,
     shutdown: &CancellationToken,
     deadline: Duration,
-) -> Result<(OnvifClient, oxvif::PullPointSubscription), SessionError> {
+) -> Result<(OnvifClient, PullPointSubscription), SessionError> {
     let capabilities = bounded_with_deadline(shutdown, deadline, client.get_capabilities()).await?;
     let events_url = capabilities
         .events
@@ -250,7 +293,7 @@ async fn subscribe_with_deadline(
         .ok_or(SessionError::NoEventsService)?;
     let events_url = transport
         .rebase_url(&events_url)
-        .map_err(oxvif::OnvifError::from)?;
+        .map_err(OnvifError::from)?;
     let mut subscription = bounded_with_deadline(
         shutdown,
         deadline,
@@ -263,7 +306,7 @@ async fn subscribe_with_deadline(
     .await?;
     subscription.reference_url = transport
         .rebase_url(&subscription.reference_url)
-        .map_err(oxvif::OnvifError::from)?
+        .map_err(OnvifError::from)?
         .to_string();
     Ok((client, subscription))
 }
@@ -274,14 +317,7 @@ async fn subscribe_with_clock_fallback(
     shutdown: &CancellationToken,
     measured: i64,
     deadline: Duration,
-) -> Result<
-    (
-        OnvifClient,
-        oxvif::PullPointSubscription,
-        Option<SessionError>,
-    ),
-    SessionError,
-> {
+) -> Result<(OnvifClient, PullPointSubscription, Option<SessionError>), SessionError> {
     match subscribe_with_deadline(
         client.clone().with_utc_offset(measured),
         transport,
@@ -291,7 +327,7 @@ async fn subscribe_with_clock_fallback(
     .await
     {
         Ok((client, subscription)) => Ok((client, subscription, None)),
-        Err(error) if should_retry_with_host_time(measured, &error) => {
+        Err(error) if error.retries_with_host_time(measured) => {
             let (client, subscription) =
                 subscribe_with_deadline(client.with_utc_offset(0), transport, shutdown, deadline)
                     .await?;
@@ -308,14 +344,9 @@ async fn session(
     shutdown: &CancellationToken,
     backoff: &mut Backoff,
 ) -> Result<(), SessionError> {
-    let device_url = format!("{}/onvif/device_service", endpoint.base_url());
     let transport = Arc::new(SoapTransport::new(endpoint)?);
-    let client = OnvifClient::new(device_url)
-        .with_transport(transport.clone())
-        .with_credentials(&endpoint.username, &endpoint.password);
-    // The camera's clock may be hours off (DST bugs); WS-Security needs its offset.
-    let date_time = bounded(shutdown, client.get_system_date_and_time()).await?;
-    let measured = date_time.utc_offset_secs();
+    let client = device_client(endpoint, transport.clone());
+    let measured = measure_clock_offset(shutdown, &client).await?;
     let (client, subscription, fallback_error) = subscribe_with_clock_fallback(
         client,
         transport.as_ref(),
@@ -329,7 +360,7 @@ async fn session(
         // against their true clock; host time then works.
         debug!(
             camera = %endpoint.camera,
-            %error,
+            error = %LogSafe(&error),
             measured,
             "subscribing with the camera's clock failed; retried with host time"
         );
@@ -377,12 +408,12 @@ async fn active_subscription(
     )
     .await;
     // Best effort: release the subscription so the camera does not keep it alive.
-    if let Err(error) = timeout(Duration::from_secs(5), client.unsubscribe(reference))
+    if let Err(error) = timeout(UNSUBSCRIBE_DEADLINE, client.unsubscribe(reference))
         .await
         .map_err(|_| SessionError::Timeout)
         .and_then(|r| r.map_err(SessionError::from))
     {
-        debug!(camera = %endpoint.camera, %error, "unsubscribe failed");
+        debug!(camera = %endpoint.camera, error = %LogSafe(&error), "unsubscribe failed");
     }
     stats.set_connected(false);
     result
@@ -428,7 +459,7 @@ async fn pull_loop(
         stats.record_message(now);
         for message in &messages {
             if let Some(event) = normalize_notification(&endpoint.camera, message, now) {
-                debug!(camera = %endpoint.camera, topic = %message.topic, "ONVIF event");
+                debug!(camera = %endpoint.camera, topic = %LogSafe(&message.topic), "ONVIF event");
                 stats.record_event(now);
                 sink.publish(event);
             }
@@ -483,7 +514,17 @@ fn renewal_delay(current_time: &str, termination_time: &str) -> Duration {
     )
 }
 
-/// Maps an ONVIF topic (with or without a namespace prefix) to a kind.
+/// Maps an ONVIF topic (with or without namespace prefixes) to a kind by its
+/// last segments; an unknown topic is kept as [`EventKind::Other`].
+///
+/// ```
+/// use iris_core::event::EventKind;
+/// use iris_events::onvif::kind_for_topic;
+///
+/// assert_eq!(kind_for_topic("tns1:VideoSource/MotionAlarm"), EventKind::Motion);
+/// assert_eq!(kind_for_topic("tns1:RuleEngine/LineDetector/Crossed"), EventKind::LineCross);
+/// assert_eq!(kind_for_topic("tns1:Vendor/Rule"), EventKind::Other("tns1:Vendor/Rule".to_owned()));
+/// ```
 #[must_use]
 pub fn kind_for_topic(topic: &str) -> EventKind {
     let segments: Vec<&str> = topic
@@ -646,7 +687,21 @@ pub fn normalize_notification(
     )
 }
 
-/// Parses `YYYY-MM-DDTHH:MM:SS[.fff](Z|±HH:MM)` into wall time.
+/// Parses an ISO 8601 date-time as cameras write it into wall time:
+/// `YYYY-MM-DD` and `HH:MM:SS` joined by `T` or a space, an optional fraction
+/// of any length (kept to microseconds), and a zone of `Z`, `z`, `±HH:MM` up to
+/// 14:00, or none, which is read as UTC. Surrounding whitespace is ignored.
+/// Years run from 1970 to 9999; a leap second, a longer text than 64 bytes, or
+/// a non-ASCII character is `None`.
+///
+/// ```
+/// use iris_core::time::WallUs;
+/// use iris_events::onvif::parse_utc;
+///
+/// assert_eq!(parse_utc("1970-01-01T00:00:01Z"), Some(WallUs::new(1_000_000)));
+/// assert_eq!(parse_utc("1970-01-01 01:00:00.5+01:00"), Some(WallUs::new(500_000)));
+/// assert_eq!(parse_utc("1970-01-01T00:00:60Z"), None);
+/// ```
 #[must_use]
 pub fn parse_utc(text: &str) -> Option<WallUs> {
     let text = text.trim();
@@ -756,6 +811,7 @@ mod tests {
     use tokio_rustls::rustls::pki_types::PrivatePkcs8KeyDer;
 
     use super::*;
+    use crate::loopback;
 
     struct Ignore;
 
@@ -763,7 +819,17 @@ mod tests {
         fn publish(&self, _: Event) {}
     }
 
-    #[derive(Clone, Copy)]
+    /// Finds the events service and creates a pull-point subscription signed
+    /// by `client`, under the production call deadline.
+    async fn subscribe(
+        client: OnvifClient,
+        transport: &SoapTransport,
+        shutdown: &CancellationToken,
+    ) -> Result<(OnvifClient, PullPointSubscription), SessionError> {
+        subscribe_with_deadline(client, transport, shutdown, CALL_DEADLINE).await
+    }
+
+    #[derive(Clone, Copy, Debug)]
     enum CancellationPoint {
         Pull,
         Cooldown,
@@ -834,13 +900,13 @@ mod tests {
     }
 
     #[async_trait::async_trait]
-    impl oxvif::transport::Transport for FallbackTransport {
+    impl Transport for FallbackTransport {
         async fn soap_post(
             &self,
             _url: &str,
             action: &str,
             _body: String,
-        ) -> Result<String, oxvif::transport::TransportError> {
+        ) -> Result<String, TransportError> {
             if action.contains("GetCapabilities") {
                 return Ok(r#"<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope" xmlns:tds="http://www.onvif.org/ver10/device/wsdl" xmlns:tt="http://www.onvif.org/ver10/schema"><s:Body><tds:GetCapabilitiesResponse><tds:Capabilities><tt:Events><tt:XAddr>http://127.0.0.1:8080/onvif/events</tt:XAddr></tt:Events></tds:Capabilities></tds:GetCapabilitiesResponse></s:Body></s:Envelope>"#.to_owned());
             }
@@ -855,14 +921,14 @@ mod tests {
                     FallbackMode::DetailMessageExpired => Ok(r#"<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope"><s:Body><s:Fault><s:Code><s:Value>s:Receiver</s:Value><s:Subcode><s:Value>ter:Action</s:Value></s:Subcode></s:Code><s:Reason><s:Text>Out of resources</s:Text></s:Reason><s:Detail><Text>MessageExpired</Text></s:Detail></s:Fault></s:Body></s:Envelope>"#.to_owned()),
                     FallbackMode::UnrelatedTimestamp => Ok(r#"<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope"><s:Body><s:Fault><s:Code><s:Value>s:Receiver</s:Value><s:Subcode><s:Value>ter:Action</s:Value></s:Subcode></s:Code><s:Reason><s:Text>Recording timestamp unavailable</s:Text></s:Reason></s:Fault></s:Body></s:Envelope>"#.to_owned()),
                     FallbackMode::Unauthorized => Err(
-                        oxvif::transport::TransportError::HttpStatus {
+                        TransportError::HttpStatus {
                             status: 401,
                             body: String::new(),
                         },
                     ),
                     FallbackMode::Parse => Ok("not XML".to_owned()),
                     FallbackMode::Transport => {
-                        Err(oxvif::transport::TransportError::EndpointPolicy)
+                        Err(TransportError::EndpointPolicy)
                     }
                     FallbackMode::LostCreateResponse => std::future::pending().await,
                 };
@@ -872,13 +938,13 @@ mod tests {
     }
 
     #[async_trait::async_trait]
-    impl oxvif::transport::Transport for SetupCancellationTransport {
+    impl Transport for SetupCancellationTransport {
         async fn soap_post(
             &self,
             _url: &str,
             action: &str,
             _body: String,
-        ) -> Result<String, oxvif::transport::TransportError> {
+        ) -> Result<String, TransportError> {
             let at_point = (matches!(self.point, SetupPoint::DateTime)
                 && action.contains("GetSystemDateAndTime"))
                 || (matches!(self.point, SetupPoint::Capabilities)
@@ -910,13 +976,13 @@ mod tests {
     }
 
     #[async_trait::async_trait]
-    impl oxvif::transport::Transport for AdvertisedUrlTransport {
+    impl Transport for AdvertisedUrlTransport {
         async fn soap_post(
             &self,
             url: &str,
             action: &str,
             _body: String,
-        ) -> Result<String, oxvif::transport::TransportError> {
+        ) -> Result<String, TransportError> {
             if action.contains("GetCapabilities") {
                 return Ok(format!(
                     r#"<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope" xmlns:tds="http://www.onvif.org/ver10/device/wsdl" xmlns:tt="http://www.onvif.org/ver10/schema"><s:Body><tds:GetCapabilitiesResponse><tds:Capabilities><tt:Events><tt:XAddr>{}</tt:XAddr></tt:Events></tds:Capabilities></tds:GetCapabilitiesResponse></s:Body></s:Envelope>"#,
@@ -939,13 +1005,13 @@ mod tests {
     }
 
     #[async_trait::async_trait]
-    impl oxvif::transport::Transport for CleanupTransport {
+    impl Transport for CleanupTransport {
         async fn soap_post(
             &self,
             _url: &str,
             action: &str,
             _body: String,
-        ) -> Result<String, oxvif::transport::TransportError> {
+        ) -> Result<String, TransportError> {
             const EMPTY_PULL: &str = r#"<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope"><s:Body><PullMessagesResponse/></s:Body></s:Envelope>"#;
             const RENEWED: &str = r#"<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope"><s:Body><RenewResponse><CurrentTime>2026-01-01T00:00:00Z</CurrentTime><TerminationTime>2026-01-01T00:10:00Z</TerminationTime></RenewResponse></s:Body></s:Envelope>"#;
             const UNSUBSCRIBED: &str = r#"<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope"><s:Body><UnsubscribeResponse/></s:Body></s:Envelope>"#;
@@ -972,13 +1038,13 @@ mod tests {
     }
 
     #[async_trait::async_trait]
-    impl oxvif::transport::Transport for TinyLeaseTransport {
+    impl Transport for TinyLeaseTransport {
         async fn soap_post(
             &self,
             _url: &str,
             action: &str,
             _body: String,
-        ) -> Result<String, oxvif::transport::TransportError> {
+        ) -> Result<String, TransportError> {
             if action.contains("PullMessagesRequest") {
                 self.pulls.fetch_add(1, Ordering::SeqCst);
                 tokio::time::sleep(Duration::from_secs(2)).await;
@@ -1131,15 +1197,22 @@ mod tests {
                     wait_for(|| transport.renews.load(Ordering::SeqCst) == 1).await;
                 }
             }
-            assert!(stats.connected());
+            assert!(stats.connected(), "{point:?}");
             shutdown.cancel();
             let result = timeout(Duration::from_secs(1), task)
                 .await
                 .expect("subscription cleanup completed")
                 .unwrap();
-            assert!(matches!(result, Ok(()) | Err(SessionError::Cancelled)));
-            assert!(!stats.connected());
-            assert_eq!(transport.unsubscribes.load(Ordering::SeqCst), 1);
+            assert!(
+                matches!(result, Ok(()) | Err(SessionError::Cancelled)),
+                "{point:?}: {result:?}"
+            );
+            assert!(!stats.connected(), "{point:?}");
+            assert_eq!(
+                transport.unsubscribes.load(Ordering::SeqCst),
+                1,
+                "{point:?}"
+            );
         }
     }
 
@@ -1327,7 +1400,10 @@ mod tests {
             let foreign_events = Arc::new(AdvertisedUrlTransport::new(rejected, same_reference));
             let client =
                 OnvifClient::new(endpoint.base_url()).with_transport(foreign_events.clone());
-            assert!(subscribe(client, &policy, &shutdown).await.is_err());
+            assert!(
+                subscribe(client, &policy, &shutdown).await.is_err(),
+                "{rejected}"
+            );
             assert_eq!(
                 foreign_events.creates.load(Ordering::SeqCst),
                 0,
@@ -1338,8 +1414,15 @@ mod tests {
             let foreign_reference = Arc::new(AdvertisedUrlTransport::new(same_events, &reference));
             let client =
                 OnvifClient::new(endpoint.base_url()).with_transport(foreign_reference.clone());
-            assert!(subscribe(client, &policy, &shutdown).await.is_err());
-            assert_eq!(foreign_reference.creates.load(Ordering::SeqCst), 1);
+            assert!(
+                subscribe(client, &policy, &shutdown).await.is_err(),
+                "{rejected}"
+            );
+            assert_eq!(
+                foreign_reference.creates.load(Ordering::SeqCst),
+                1,
+                "{rejected}"
+            );
         }
 
         for foreign in [
@@ -1362,90 +1445,6 @@ mod tests {
         }
     }
 
-    /// The canned reply of a loopback ONVIF camera to one SOAP action, given as
-    /// the request's lowercase `Content-Type` line.
-    fn camera_reply(action: &str, advertised: &str) -> String {
-        if action.contains("getsystemdateandtime") {
-            return r#"<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope" xmlns:tds="http://www.onvif.org/ver10/device/wsdl" xmlns:tt="http://www.onvif.org/ver10/schema"><s:Body><tds:GetSystemDateAndTimeResponse><tds:SystemDateAndTime><tt:UTCDateTime><tt:Time><tt:Hour>0</tt:Hour><tt:Minute>0</tt:Minute><tt:Second>0</tt:Second></tt:Time><tt:Date><tt:Year>2026</tt:Year><tt:Month>1</tt:Month><tt:Day>1</tt:Day></tt:Date></tt:UTCDateTime></tds:SystemDateAndTime></tds:GetSystemDateAndTimeResponse></s:Body></s:Envelope>"#.to_owned();
-        }
-        if action.contains("getcapabilities") {
-            return format!(
-                r#"<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope" xmlns:tds="http://www.onvif.org/ver10/device/wsdl" xmlns:tt="http://www.onvif.org/ver10/schema"><s:Body><tds:GetCapabilitiesResponse><tds:Capabilities><tt:Events><tt:XAddr>{advertised}/onvif/events</tt:XAddr></tt:Events></tds:Capabilities></tds:GetCapabilitiesResponse></s:Body></s:Envelope>"#
-            );
-        }
-        if action.contains("createpullpointsubscriptionrequest") {
-            return format!(
-                r#"<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope" xmlns:tev="http://www.onvif.org/ver10/events/wsdl" xmlns:wsa="http://www.w3.org/2005/08/addressing"><s:Body><tev:CreatePullPointSubscriptionResponse><tev:SubscriptionReference><wsa:Address>{advertised}/onvif/events/subscription</wsa:Address></tev:SubscriptionReference><tev:CurrentTime>2026-01-01T00:00:00Z</tev:CurrentTime><tev:TerminationTime>2026-01-01T00:10:00Z</tev:TerminationTime></tev:CreatePullPointSubscriptionResponse></s:Body></s:Envelope>"#
-            );
-        }
-        if action.contains("pullmessagesrequest") {
-            return r#"<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope"><s:Body><PullMessagesResponse/></s:Body></s:Envelope>"#.to_owned();
-        }
-        if action.contains("unsubscriberequest") {
-            return r#"<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope"><s:Body><UnsubscribeResponse/></s:Body></s:Envelope>"#.to_owned();
-        }
-        panic!("unexpected action {action}");
-    }
-
-    /// Serves one SOAP request per connection; reports `(path, action)` of each.
-    async fn loopback_camera(
-        listener: TcpListener,
-        advertised: String,
-        requests: tokio::sync::mpsc::UnboundedSender<(String, String)>,
-    ) {
-        loop {
-            let Ok((mut socket, _)) = listener.accept().await else {
-                return;
-            };
-            let mut request = Vec::new();
-            let mut chunk = [0_u8; 4096];
-            let mut complete = None;
-            while complete.is_none() {
-                match socket.read(&mut chunk).await {
-                    Ok(0) | Err(_) => break,
-                    Ok(read) => request.extend_from_slice(&chunk[..read]),
-                }
-                let Some(end) = request.windows(4).position(|window| window == b"\r\n\r\n") else {
-                    continue;
-                };
-                let head = String::from_utf8_lossy(&request[..end + 4]).to_ascii_lowercase();
-                let body_len: usize = head
-                    .lines()
-                    .find_map(|line| line.strip_prefix("content-length:"))
-                    .map_or(0, |value| value.trim().parse().unwrap_or(0));
-                if request.len() >= end + 4 + body_len {
-                    complete = Some(head);
-                }
-            }
-            // A connection that ends before a complete request is not a call.
-            let Some(head) = complete else {
-                continue;
-            };
-            let path = head
-                .split_whitespace()
-                .nth(1)
-                .unwrap_or_default()
-                .to_owned();
-            let action = head
-                .lines()
-                .find(|line| line.starts_with("content-type:"))
-                .unwrap_or_default()
-                .to_owned();
-            let reply = camera_reply(&action, &advertised);
-            let _ = requests.send((path, action));
-            socket
-                .write_all(
-                    format!(
-                        "HTTP/1.1 200 OK\r\nContent-Type: application/soap+xml\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}",
-                        reply.len()
-                    )
-                    .as_bytes(),
-                )
-                .await
-                .unwrap();
-        }
-    }
-
     /// Runs one session against a loopback camera configured as `host` that
     /// advertises `advertised` for its event services; returns every request
     /// it served.
@@ -1456,16 +1455,8 @@ mod tests {
         let camera = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = camera.local_addr().unwrap().port();
         let (requests_tx, mut requests) = tokio::sync::mpsc::unbounded_channel();
-        let camera_task = tokio::spawn(loopback_camera(camera, advertised(port), requests_tx));
-        let endpoint = CameraEndpoint {
-            camera: "cam1".parse().unwrap(),
-            host: host.to_owned(),
-            http_port: port,
-            https: false,
-            tls_verify: true,
-            username: "marker-user".to_owned(),
-            password: "marker-password".to_owned(),
-        };
+        let camera_task = tokio::spawn(loopback::camera(camera, advertised(port), requests_tx));
+        let endpoint = loopback::endpoint(host, port);
         let shutdown = CancellationToken::new();
         let session_shutdown = shutdown.clone();
         let session = tokio::spawn(async move {
@@ -1532,8 +1523,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_camera_configured_by_host_name_subscribes_through_advertised_addresses() {
-        let served = rebased_session("localhost", |port| format!("http://127.0.0.1:{port}")).await;
+    async fn a_camera_configured_by_host_name_is_served_at_that_host() {
+        let sink = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let sink_address = sink.local_addr().unwrap();
+        let served = rebased_session("localhost", |_| format!("http://{sink_address}")).await;
         assert!(
             served.iter().any(|(path, action)| path == "/onvif/events"
                 && action.contains("createpullpointsubscriptionrequest")),
@@ -1544,6 +1537,12 @@ mod tests {
                 .iter()
                 .any(|(_, action)| action.contains("unsubscriberequest")),
             "the subscription is released: {served:?}"
+        );
+        assert!(
+            timeout(Duration::from_millis(200), sink.accept())
+                .await
+                .is_err(),
+            "the advertised address received a request"
         );
     }
 
@@ -1846,7 +1845,25 @@ mod tests {
     }
 
     #[test]
-    fn derives_state_and_camera_time() {
+    fn a_notification_keeps_the_camera_time_beside_the_receipt_time() {
+        let camera = CameraId::try_new("cam1").unwrap();
+        let start = normalize_notification(
+            &camera,
+            &message(
+                "tns1:VideoSource/MotionAlarm",
+                &[("State", "true")],
+                "Changed",
+            ),
+            WallUs::new(1),
+        )
+        .unwrap();
+        assert_eq!(start.nvr_time, WallUs::new(1));
+        assert_eq!(start.camera_time, Some(WallUs::new(1_793_464_559_000_000)));
+        assert_eq!(start.source, EventSource::OnvifPullPoint);
+    }
+
+    #[test]
+    fn derives_state_from_the_topic_and_its_boolean_data() {
         let camera = CameraId::try_new("cam1").unwrap();
         let start = normalize_notification(
             &camera,
@@ -1862,8 +1879,6 @@ mod tests {
             (start.kind.clone(), start.state),
             (EventKind::Motion, EventState::Start)
         );
-        assert_eq!(start.camera_time, Some(WallUs::new(1_793_464_559_000_000)));
-        assert_eq!(start.source, EventSource::OnvifPullPoint);
         let stop = normalize_notification(
             &camera,
             &message(
@@ -1887,6 +1902,11 @@ mod tests {
             )
             .is_none()
         );
+    }
+
+    #[test]
+    fn a_notification_without_boolean_state_is_a_pulse_carrying_its_data() {
+        let camera = CameraId::try_new("cam1").unwrap();
         let pulse = normalize_notification(
             &camera,
             &message(
@@ -2206,26 +2226,23 @@ mod tests {
 
     #[test]
     fn authentication_and_clock_faults_are_classified_structurally() {
-        let http = SessionError::Onvif(oxvif::OnvifError::Transport(
-            oxvif::transport::TransportError::HttpStatus {
-                status: 401,
-                body: String::new(),
-            },
-        ));
+        let http = SessionError::Onvif(OnvifError::Transport(TransportError::HttpStatus {
+            status: 401,
+            body: String::new(),
+        }));
         assert!(http.is_authentication_failure());
         assert!(!http.is_clock_authentication_failure());
 
-        let unauthorized =
-            SessionError::Onvif(oxvif::OnvifError::Soap(oxvif::soap::SoapError::Fault {
-                code: "s:Sender".to_owned(),
-                reason: "Not Authorized".to_owned(),
-                subcode: Some("ter:NotAuthorized".to_owned()),
-                detail: None,
-            }));
+        let unauthorized = SessionError::Onvif(OnvifError::Soap(SoapError::Fault {
+            code: "s:Sender".to_owned(),
+            reason: "Not Authorized".to_owned(),
+            subcode: Some("ter:NotAuthorized".to_owned()),
+            detail: None,
+        }));
         assert!(unauthorized.is_authentication_failure());
         assert!(!unauthorized.is_clock_authentication_failure());
 
-        let expired = SessionError::Onvif(oxvif::OnvifError::Soap(oxvif::soap::SoapError::Fault {
+        let expired = SessionError::Onvif(OnvifError::Soap(SoapError::Fault {
             code: "s:Sender".to_owned(),
             reason: "Security timestamp expired".to_owned(),
             subcode: Some("wsse:MessageExpired".to_owned()),
@@ -2233,39 +2250,48 @@ mod tests {
         }));
         assert!(expired.is_authentication_failure());
         assert!(expired.is_clock_authentication_failure());
-        assert!(should_retry_with_host_time(3_600, &expired));
-        assert!(!should_retry_with_host_time(0, &expired));
+        assert!(expired.retries_with_host_time(3_600));
+        assert!(!expired.retries_with_host_time(0));
 
-        let unrelated =
-            SessionError::Onvif(oxvif::OnvifError::Soap(oxvif::soap::SoapError::Fault {
+        let time_check = SessionError::Onvif(OnvifError::Soap(SoapError::Fault {
+            code: "s:Sender".to_owned(),
+            reason: "Wsse authorized time check failed".to_owned(),
+            subcode: None,
+            detail: None,
+        }));
+        assert!(
+            time_check.is_clock_authentication_failure(),
+            "the hardware fault wording of 11 is a clock fault"
+        );
+        assert!(time_check.retries_with_host_time(3_600));
+
+        let unrelated = SessionError::Onvif(OnvifError::Soap(SoapError::Fault {
+            code: "s:Receiver".to_owned(),
+            reason: "Out of resources".to_owned(),
+            subcode: Some("ter:Action".to_owned()),
+            detail: None,
+        }));
+        assert!(!unrelated.is_authentication_failure());
+        assert!(!unrelated.is_clock_authentication_failure());
+        assert!(!unrelated.retries_with_host_time(3_600));
+
+        let unrelated_timestamp = SessionError::Onvif(OnvifError::Soap(SoapError::Fault {
+            code: "s:Receiver".to_owned(),
+            reason: "Recording timestamp unavailable".to_owned(),
+            subcode: Some("ter:Action".to_owned()),
+            detail: Some("created time field was omitted".to_owned()),
+        }));
+        assert!(!unrelated_timestamp.is_authentication_failure());
+        assert!(!unrelated_timestamp.is_clock_authentication_failure());
+        assert!(!unrelated_timestamp.retries_with_host_time(3_600));
+
+        for detail in ["InvalidTimestamp", "MessageExpired", "NotAuthorized"] {
+            let detail_only = SessionError::Onvif(OnvifError::Soap(SoapError::Fault {
                 code: "s:Receiver".to_owned(),
                 reason: "Out of resources".to_owned(),
                 subcode: Some("ter:Action".to_owned()),
-                detail: None,
+                detail: Some(detail.to_owned()),
             }));
-        assert!(!unrelated.is_authentication_failure());
-        assert!(!unrelated.is_clock_authentication_failure());
-        assert!(!should_retry_with_host_time(3_600, &unrelated));
-
-        let unrelated_timestamp =
-            SessionError::Onvif(oxvif::OnvifError::Soap(oxvif::soap::SoapError::Fault {
-                code: "s:Receiver".to_owned(),
-                reason: "Recording timestamp unavailable".to_owned(),
-                subcode: Some("ter:Action".to_owned()),
-                detail: Some("created time field was omitted".to_owned()),
-            }));
-        assert!(!unrelated_timestamp.is_authentication_failure());
-        assert!(!unrelated_timestamp.is_clock_authentication_failure());
-        assert!(!should_retry_with_host_time(3_600, &unrelated_timestamp));
-
-        for detail in ["InvalidTimestamp", "MessageExpired", "NotAuthorized"] {
-            let detail_only =
-                SessionError::Onvif(oxvif::OnvifError::Soap(oxvif::soap::SoapError::Fault {
-                    code: "s:Receiver".to_owned(),
-                    reason: "Out of resources".to_owned(),
-                    subcode: Some("ter:Action".to_owned()),
-                    detail: Some(detail.to_owned()),
-                }));
             assert!(
                 !detail_only.is_authentication_failure(),
                 "classified Fault Detail marker {detail} as authentication"
@@ -2275,22 +2301,42 @@ mod tests {
                 "classified Fault Detail marker {detail} as a clock fault"
             );
             assert!(
-                !should_retry_with_host_time(3_600, &detail_only),
+                !detail_only.retries_with_host_time(3_600),
                 "retried Fault Detail marker {detail} with host time"
             );
         }
 
-        assert!(!should_retry_with_host_time(3_600, &SessionError::Timeout));
-        let parse = SessionError::Onvif(oxvif::OnvifError::Soap(oxvif::soap::SoapError::XmlParse(
-            "marker".to_owned(),
-        )));
-        assert!(!should_retry_with_host_time(3_600, &parse));
+        assert!(!SessionError::Timeout.retries_with_host_time(3_600));
+        let parse = SessionError::Onvif(OnvifError::Soap(SoapError::XmlParse("marker".to_owned())));
+        assert!(!parse.retries_with_host_time(3_600));
+    }
 
+    #[test]
+    fn authentication_retries_wait_at_least_the_lockout_floor() {
         assert!(
             retry_delay(&mut Backoff::new("auth"), true) >= AUTH_FAILURE_PAUSE,
             "authentication retries must respect the lockout floor"
         );
         assert!(retry_delay(&mut Backoff::new("other"), false) < AUTH_FAILURE_PAUSE);
+    }
+
+    #[test]
+    fn a_logged_session_error_is_one_bounded_line() {
+        let hostile = format!("fault\n<0>forged{}", "x".repeat(2_048));
+        let error = SessionError::Onvif(OnvifError::Soap(SoapError::Fault {
+            code: "s:Sender".to_owned(),
+            reason: hostile,
+            subcode: None,
+            detail: None,
+        }));
+        let line = LogSafe(&error).to_string();
+        assert!(!line.contains('\n'), "{line}");
+        assert!(line.contains("fault\\n<0>forged"), "{line}");
+        assert!(
+            line.len() <= iris_core::text::MAX_LOGGED_CHARS && line.ends_with("..."),
+            "{}",
+            line.len()
+        );
     }
 
     #[tokio::test]

@@ -1,10 +1,17 @@
 //! The session description for one mount (RFC 4566, RFC 7798 §7.1).
 
+use std::fmt::Write as _;
+
+use iris_core::time::TIMESCALE;
+
+use crate::rtp::PAYLOAD_TYPE;
+
 /// Builds the SDP for a mount whose parameter sets are `sets` (VPS, SPS, PPS in
-/// any order; each is announced under its type).
+/// any order; each is announced under its type), announcing [`PAYLOAD_TYPE`] at
+/// the 90 kHz clock.
 #[must_use]
 pub fn describe(sets: &[Vec<u8>], frame_rate: f64) -> String {
-    let mut fmtp = String::from("a=fmtp:96");
+    let mut fmtp = format!("a=fmtp:{PAYLOAD_TYPE}");
     let mut grouped = [Vec::new(), Vec::new(), Vec::new()];
     for nal in sets {
         let Some(first) = nal.first() else {
@@ -24,11 +31,10 @@ pub fn describe(sets: &[Vec<u8>], frame_rate: f64) -> String {
         .zip(grouped)
         .filter(|(_, values)| !values.is_empty())
     {
-        fmtp.push(if first { ' ' } else { ';' });
+        let separator = if first { ' ' } else { ';' };
         first = false;
-        fmtp.push_str(key);
-        fmtp.push('=');
-        fmtp.push_str(&values.join(","));
+        write!(fmtp, "{separator}{key}={}", values.join(","))
+            .expect("writing to a String cannot fail");
     }
     format!(
         "v=0\r\n\
@@ -36,8 +42,8 @@ pub fn describe(sets: &[Vec<u8>], frame_rate: f64) -> String {
          s=iris-replay\r\n\
          t=0 0\r\n\
          a=control:*\r\n\
-         m=video 0 RTP/AVP 96\r\n\
-         a=rtpmap:96 H265/90000\r\n\
+         m=video 0 RTP/AVP {PAYLOAD_TYPE}\r\n\
+         a=rtpmap:{PAYLOAD_TYPE} H265/{TIMESCALE}\r\n\
          {fmtp}\r\n\
          a=framerate:{frame_rate:.3}\r\n\
          a=control:trackID=0\r\n"
@@ -45,8 +51,7 @@ pub fn describe(sets: &[Vec<u8>], frame_rate: f64) -> String {
 }
 
 /// Standard base64 with padding.
-#[must_use]
-pub fn base64(input: &[u8]) -> String {
+fn base64(input: &[u8]) -> String {
     const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
     for chunk in input.chunks(3) {

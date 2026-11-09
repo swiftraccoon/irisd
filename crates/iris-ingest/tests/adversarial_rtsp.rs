@@ -15,17 +15,22 @@ use iris_ingest::{
 };
 use iris_mp4::fragment::Fragment;
 use iris_replay::media::Media;
-use iris_replay::rtp::{Packetizer, interleave};
-use iris_replay::rtsp::{self, Parsed, Request};
+use iris_replay::rtp::{self, Packetizer, RtpTimestamp, Ssrc};
+use iris_replay::rtsp::{self, MountName, Parsed, Request};
 use iris_replay::sdp;
-use iris_replay::server::{Options as ReplayOptions, Server as ReplayServer};
-use iris_replay::synth::{self, Plan};
+use iris_replay::server::{Mounts, Options as ReplayOptions, Server as ReplayServer};
+use iris_replay::synth::{self, Plan, SliceKind};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
+/// Retina's production limit on one RTSP control message, head and body
+/// together; the crate keeps the constant private, so it is mirrored here.
 const CONTROL_MESSAGE_LIMIT: usize = 1024 * 1024;
+/// How much of an oversized access unit a peer may have sent before the
+/// depacketizer's 64 MiB bound ends the session: the bound plus 2 MiB of
+/// packets in flight.
 const OVERSIZED_AU_SEND_LIMIT: usize = 66 * 1024 * 1024;
 
 #[derive(Default)]
@@ -110,7 +115,8 @@ async fn serve_connection(
             && request.method == "DESCRIBE"
         {
             let head = format!(
-                "RTSP/1.0 200 OK\r\nCSeq: {}\r\nContent-Type: application/sdp\r\nContent-Length: {}\r\n\r\n",
+                "RTSP/1.0 200 OK\r\nCSeq: {}\r\nContent-Type: application/sdp\r\n\
+                 Content-Length: {}\r\n\r\n",
                 request.cseq,
                 CONTROL_MESSAGE_LIMIT + 1
             );
@@ -181,7 +187,7 @@ async fn next_request(socket: &mut TcpStream, input: &mut Vec<u8>) -> io::Result
 }
 
 fn response_for(request: &Request) -> Vec<u8> {
-    let session = ("Session", "regression;timeout=60".to_owned());
+    let session = ("Session", "regression;timeout=60");
     match request.method.as_str() {
         "DESCRIBE" => {
             let sets = [
@@ -195,10 +201,10 @@ fn response_for(request: &Request) -> Vec<u8> {
                 200,
                 "OK",
                 &[
-                    ("Content-Type", "application/sdp".to_owned()),
+                    ("Content-Type", "application/sdp"),
                     (
                         "Content-Base",
-                        format!("{}/", request.url.trim_end_matches('/')),
+                        &format!("{}/", request.url.trim_end_matches('/')),
                     ),
                 ],
                 body.as_bytes(),
@@ -212,7 +218,7 @@ fn response_for(request: &Request) -> Vec<u8> {
                 session,
                 (
                     "Transport",
-                    "RTP/AVP/TCP;unicast;interleaved=0-1;ssrc=12345678".to_owned(),
+                    "RTP/AVP/TCP;unicast;interleaved=0-1;ssrc=12345678",
                 ),
             ],
             b"",
@@ -225,7 +231,7 @@ fn response_for(request: &Request) -> Vec<u8> {
                 session,
                 (
                     "RTP-Info",
-                    format!("url={}/trackID=0;seq=1;rtptime=0", request.url),
+                    &format!("url={}/trackID=0;seq=1;rtptime=0", request.url),
                 ),
             ],
             b"",
@@ -239,21 +245,26 @@ async fn send_frames(
     count: usize,
     second_sync: Option<usize>,
 ) -> io::Result<()> {
-    let mut packetizer = Packetizer::new(0x1234_5678, 1);
+    let mut packetizer = Packetizer::new(Ssrc::new(0x1234_5678), 1);
     let mut wire = Vec::new();
-    let report = packetizer.sender_report(WallUs::now().to_ntp64(), 0);
-    interleave(&mut wire, 1, &report).expect("sender report fits interleaving");
+    let report = packetizer.sender_report(WallUs::now(), RtpTimestamp::new(0));
+    rtp::interleave(&mut wire, 1, &report).expect("sender report fits interleaving");
     socket.write_all(&wire).await?;
     for index in 0..count {
         let is_sync = index == 0 || second_sync == Some(index);
-        let nal = synth::slice(index as u64, is_sync, 200).expect("valid synthetic slice");
+        let kind = if is_sync {
+            SliceKind::Idr
+        } else {
+            SliceKind::Trail
+        };
+        let nal = synth::slice(index as u64, kind, 200).expect("valid synthetic slice");
         let nals = [nal.as_slice()];
         let packets = packetizer
-            .access_unit(&nals, (index as u32) * 3_000, 1_400)
+            .access_unit(&nals, RtpTimestamp::new((index as u32) * 3_000), 1_400)
             .expect("valid packetization");
         wire.clear();
         for packet in packets {
-            interleave(&mut wire, 0, &packet).expect("RTP packet fits interleaving");
+            rtp::interleave(&mut wire, 0, &packet).expect("RTP packet fits interleaving");
         }
         socket.write_all(&wire).await?;
     }
@@ -274,7 +285,7 @@ async fn send_oversized_server_header(socket: &mut TcpStream) -> io::Result<usiz
 }
 
 async fn send_oversized_access_unit(socket: &mut TcpStream) -> io::Result<usize> {
-    let mut packetizer = Packetizer::new(0x1234_5678, 1);
+    let mut packetizer = Packetizer::new(Ssrc::new(0x1234_5678), 1);
     let mut nal = vec![0x55; 60_000];
     nal[0] = 0x26;
     nal[1] = 0x01;
@@ -283,8 +294,8 @@ async fn send_oversized_access_unit(socket: &mut TcpStream) -> io::Result<usize>
     'send: while wire_bytes < OVERSIZED_AU_SEND_LIMIT {
         if packets_sent.is_multiple_of(128) {
             let mut wire = Vec::new();
-            let report = packetizer.sender_report(WallUs::now().to_ntp64(), 0);
-            interleave(&mut wire, 1, &report).expect("sender report fits interleaving");
+            let report = packetizer.sender_report(WallUs::now(), RtpTimestamp::new(0));
+            rtp::interleave(&mut wire, 1, &report).expect("sender report fits interleaving");
             if wire_bytes + wire.len() > OVERSIZED_AU_SEND_LIMIT {
                 break 'send;
             }
@@ -295,14 +306,14 @@ async fn send_oversized_access_unit(socket: &mut TcpStream) -> io::Result<usize>
         }
         let nals = [nal.as_slice()];
         let packet = packetizer
-            .access_unit(&nals, 0, 65_000)
+            .access_unit(&nals, RtpTimestamp::new(0), 65_000)
             .expect("valid bounded packetization")
             .next()
             .expect("one packet for one bounded NAL");
         let mut packet = packet;
         packet[1] &= 0x7f;
         let mut wire = Vec::with_capacity(packet.len() + 4);
-        interleave(&mut wire, 0, &packet).expect("RTP packet fits interleaving");
+        rtp::interleave(&mut wire, 0, &packet).expect("RTP packet fits interleaving");
         if wire_bytes + wire.len() > OVERSIZED_AU_SEND_LIMIT {
             break;
         }
@@ -428,7 +439,7 @@ async fn wall_placement_ignores_pause_and_catch_up_in_both_read_modes() {
                 )
                 .expect("synthetic media"),
             );
-            let mounts = [("cam".to_owned(), media)].into_iter().collect();
+            let mounts = Mounts::from([(MountName::try_new("cam").expect("mount name"), media)]);
             let server = ReplayServer::bind(
                 "127.0.0.1:0".parse().expect("loopback address"),
                 mounts,
@@ -483,8 +494,14 @@ async fn oversized_access_unit_reconnects_and_records_a_normal_session() {
 
             let sent = peer_state.fault_wire_bytes.load(Ordering::Relaxed);
             assert!(sent >= 64 * 1024 * 1024, "only {sent} bytes sent");
-            assert!(sent <= OVERSIZED_AU_SEND_LIMIT);
-            assert!(stats.sender_reports() >= 1);
+            assert!(
+                sent <= OVERSIZED_AU_SEND_LIMIT,
+                "{sent} bytes sent past the depacketizer bound"
+            );
+            assert!(
+                stats.sender_reports() >= 1,
+                "the normal session delivered no sender report"
+            );
             assert_eq!(stats.reconnects(), 1);
             assert_eq!(stats.frames(), 9);
             assert_eq!(sink.sample_count(), 9);
@@ -524,20 +541,25 @@ async fn oversized_control_messages_reconnect_and_preserve_pending_frames() {
                 peer.abort();
 
                 assert_eq!(stats.reconnects(), 1, "{action:?}, {read_interval:?}");
-                assert_eq!(sink.sample_count() as u64, stats.frames());
+                assert_eq!(
+                    sink.sample_count() as u64,
+                    stats.frames(),
+                    "{action:?}, {read_interval:?}: every frame reached the sink"
+                );
                 match action {
                     FirstConnection::OversizedDescribeBody => {
-                        assert_eq!(stats.frames(), 9);
+                        assert_eq!(stats.frames(), 9, "{read_interval:?}");
                         assert!(
                             peer_state.fault_wire_bytes.load(Ordering::Relaxed) < 1024,
-                            "the declared oversized body should not be sent"
+                            "{read_interval:?}: the declared oversized body should not be sent"
                         );
                     }
                     FirstConnection::OversizedPlayingHeader => {
-                        assert_eq!(stats.frames(), 17);
+                        assert_eq!(stats.frames(), 17, "{read_interval:?}");
                         assert_eq!(
                             peer_state.fault_wire_bytes.load(Ordering::Relaxed),
-                            CONTROL_MESSAGE_LIMIT
+                            CONTROL_MESSAGE_LIMIT,
+                            "{read_interval:?}"
                         );
                     }
                     _ => unreachable!(),
@@ -581,7 +603,7 @@ async fn replay_address(plan: Plan) -> (SocketAddr, JoinHandle<()>) {
         Media::from_bytes(synth::recording(plan).expect("valid synthetic recording"))
             .expect("synthetic rejection media"),
     );
-    let mounts = [("cam".to_owned(), media)].into_iter().collect();
+    let mounts = Mounts::from([(MountName::try_new("cam").expect("mount name"), media)]);
     let server = ReplayServer::bind(
         "127.0.0.1:0".parse().expect("loopback address"),
         mounts,
@@ -602,6 +624,7 @@ async fn rejection_case(
     plan: Plan,
     max_fragment: MediaTicks,
     reject: usize,
+    read_interval: Option<Duration>,
 ) -> (Vec<Attempt>, Arc<StreamStats>) {
     let (address, peer) = replay_address(plan).await;
     let sink = Arc::new(RejectCall {
@@ -614,7 +637,7 @@ async fn rejection_case(
         source(address),
         IngestOptions {
             max_fragment,
-            ..IngestOptions::default()
+            ..options(read_interval, Duration::from_secs(10))
         },
         Arc::clone(&sink) as Arc<dyn FragmentSink>,
         Arc::clone(&stats),
@@ -632,46 +655,66 @@ async fn rejection_case(
 
 #[tokio::test]
 async fn sink_rejection_resumes_only_at_an_independent_sync_run() {
-    tokio::time::timeout(Duration::from_secs(10), async {
-        let (attempts, stats) = rejection_case(
-            Plan {
-                gops: 3,
-                frames_per_gop: 30,
-                idr_len: 2_000,
-                trail_len: 200,
-                ..Plan::default()
-            },
-            MediaTicks::new(18_000),
-            2,
-        )
-        .await;
-        assert!(attempts[0].accepted && attempts[0].starts_sync);
-        assert!(!attempts[1].accepted && !attempts[1].starts_sync);
-        assert!(attempts[2].accepted);
-        assert!(attempts[2].starts_sync);
-        assert!(attempts[2].new_run);
-        assert_eq!(attempts[2].decode_time, 0);
-        assert_eq!(stats.dropped_sink(), 1);
-        assert_eq!(stats.gaps(), 1);
+    tokio::time::timeout(Duration::from_secs(20), async {
+        for read_interval in [None, Some(Duration::from_millis(20))] {
+            let (attempts, stats) = rejection_case(
+                Plan {
+                    gops: 3,
+                    frames_per_gop: 30,
+                    idr_len: 2_000,
+                    trail_len: 200,
+                    ..Plan::default()
+                },
+                MediaTicks::new(18_000),
+                2,
+                read_interval,
+            )
+            .await;
+            assert!(
+                attempts[0].accepted,
+                "{read_interval:?}: the first fragment is accepted"
+            );
+            assert!(
+                attempts[0].starts_sync,
+                "{read_interval:?}: it starts at sync"
+            );
+            assert!(
+                !attempts[1].accepted && !attempts[1].starts_sync,
+                "{read_interval:?}: the rejected fragment is a continuation"
+            );
+            assert!(attempts[2].accepted, "{read_interval:?}");
+            assert!(attempts[2].starts_sync, "{read_interval:?}");
+            assert!(attempts[2].new_run, "{read_interval:?}");
+            assert_eq!(attempts[2].decode_time, 0, "{read_interval:?}");
+            assert_eq!(stats.dropped_sink(), 1, "{read_interval:?}");
+            assert_eq!(stats.gaps(), 1, "{read_interval:?}");
 
-        let (attempts, stats) = rejection_case(
-            Plan {
-                gops: 4,
-                frames_per_gop: 10,
-                idr_len: 2_000,
-                trail_len: 200,
-                ..Plan::default()
-            },
-            MediaTicks::from_secs(2),
-            1,
-        )
-        .await;
-        assert!(!attempts[0].accepted && attempts[0].starts_sync);
-        assert!(attempts[1].accepted && attempts[1].starts_sync);
-        assert!(attempts[1].new_run);
-        assert_eq!(attempts[1].decode_time, 0);
-        assert_eq!(stats.dropped_sink(), 1);
-        assert_eq!(stats.gaps(), 1);
+            let (attempts, stats) = rejection_case(
+                Plan {
+                    gops: 4,
+                    frames_per_gop: 10,
+                    idr_len: 2_000,
+                    trail_len: 200,
+                    ..Plan::default()
+                },
+                MediaTicks::from_secs(2),
+                1,
+                read_interval,
+            )
+            .await;
+            assert!(
+                !attempts[0].accepted && attempts[0].starts_sync,
+                "{read_interval:?}: the first, sync fragment is rejected"
+            );
+            assert!(
+                attempts[1].accepted && attempts[1].starts_sync,
+                "{read_interval:?}: recording resumes at the next sync fragment"
+            );
+            assert!(attempts[1].new_run, "{read_interval:?}");
+            assert_eq!(attempts[1].decode_time, 0, "{read_interval:?}");
+            assert_eq!(stats.dropped_sink(), 1, "{read_interval:?}");
+            assert_eq!(stats.gaps(), 1, "{read_interval:?}");
+        }
     })
     .await
     .expect("sink-rejection regression stayed bounded");
@@ -805,8 +848,8 @@ fn describe_reply(cseq: u32, content_base: &str) -> Vec<u8> {
         200,
         "OK",
         &[
-            ("Content-Type", "application/sdp".to_owned()),
-            ("Content-Base", content_base.to_owned()),
+            ("Content-Type", "application/sdp"),
+            ("Content-Base", content_base),
         ],
         body.as_bytes(),
     )
@@ -818,10 +861,10 @@ fn setup_reply(cseq: u32, session: &str) -> Vec<u8> {
         200,
         "OK",
         &[
-            ("Session", session.to_owned()),
+            ("Session", session),
             (
                 "Transport",
-                "RTP/AVP/TCP;unicast;interleaved=0-1;ssrc=12345678".to_owned(),
+                "RTP/AVP/TCP;unicast;interleaved=0-1;ssrc=12345678",
             ),
         ],
         b"",
@@ -830,18 +873,23 @@ fn setup_reply(cseq: u32, session: &str) -> Vec<u8> {
 
 /// Eight frames of interleaved RTP after a sender report.
 fn frames_wire() -> Vec<u8> {
-    let mut packetizer = Packetizer::new(0x1234_5678, 1);
+    let mut packetizer = Packetizer::new(Ssrc::new(0x1234_5678), 1);
     let mut wire = Vec::new();
-    let report = packetizer.sender_report(WallUs::now().to_ntp64(), 0);
-    interleave(&mut wire, 1, &report).expect("sender report fits interleaving");
+    let report = packetizer.sender_report(WallUs::now(), RtpTimestamp::new(0));
+    rtp::interleave(&mut wire, 1, &report).expect("sender report fits interleaving");
     for index in 0..8u32 {
-        let nal = synth::slice(u64::from(index), index == 0, 200).expect("valid synthetic slice");
+        let kind = if index == 0 {
+            SliceKind::Idr
+        } else {
+            SliceKind::Trail
+        };
+        let nal = synth::slice(u64::from(index), kind, 200).expect("valid synthetic slice");
         let nals = [nal.as_slice()];
         for packet in packetizer
-            .access_unit(&nals, index * 3_000, 1_400)
+            .access_unit(&nals, RtpTimestamp::new(index * 3_000), 1_400)
             .expect("valid packetization")
         {
-            interleave(&mut wire, 0, &packet).expect("RTP packet fits interleaving");
+            rtp::interleave(&mut wire, 0, &packet).expect("RTP packet fits interleaving");
         }
     }
     wire
@@ -905,13 +953,7 @@ fn play_then_stall(
         let reply = match head.method.as_str() {
             "DESCRIBE" => describe_reply(head.cseq, &format!("rtsp://{address}/cam/")),
             "SETUP" => setup_reply(head.cseq, session),
-            _ => rtsp::response(
-                head.cseq,
-                200,
-                "OK",
-                &[("Session", session.to_owned())],
-                b"",
-            ),
+            _ => rtsp::response(head.cseq, 200, "OK", &[("Session", session)], b""),
         };
         stream.write_all(&reply)?;
         if head.method == "PLAY" {
@@ -948,7 +990,10 @@ fn closed_by_peer(stream: &mut std::net::TcpStream) -> bool {
     }
 }
 
-/// Records the longest pause between the ticks of a task on this runtime.
+/// Records the longest pause between the ticks of a task on this runtime. The
+/// monitor shares the session's only runtime thread, so a blocked thread
+/// shows as a gap; on a multi-thread runtime another worker would keep
+/// ticking, which is why the tests that use it run on `current_thread`.
 fn spawn_tick_gap_monitor() -> (Arc<AtomicU64>, JoinHandle<()>) {
     let longest = Arc::new(AtomicU64::new(0));
     let recorded = Arc::clone(&longest);
@@ -1016,12 +1061,12 @@ async fn stalled_camera_case(stall: Stall) {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "current_thread")]
 async fn keepalive_to_a_camera_that_stopped_reading_never_stalls_the_runtime() {
     stalled_camera_case(Stall::Keepalive).await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "current_thread")]
 async fn teardown_to_a_camera_that_stopped_reading_never_stalls_the_runtime() {
     stalled_camera_case(Stall::Teardown).await;
 }
@@ -1073,7 +1118,7 @@ fn spawn_advertising_camera(
                     head.cseq,
                     401,
                     "Unauthorized",
-                    &[("WWW-Authenticate", challenge.header().to_owned())],
+                    &[("WWW-Authenticate", challenge.header())],
                     b"",
                 ),
                 "DESCRIBE" => describe_reply(head.cseq, &format!("rtsp://{elsewhere}/elsewhere/")),
@@ -1087,7 +1132,7 @@ fn spawn_advertising_camera(
                             cseq,
                             401,
                             "Unauthorized",
-                            &[("WWW-Authenticate", challenge.header().to_owned())],
+                            &[("WWW-Authenticate", challenge.header())],
                             b"",
                         )
                     } else {

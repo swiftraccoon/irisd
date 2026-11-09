@@ -12,23 +12,31 @@
 //! # Modules
 //!
 //! - [`dahua`] — parsing and normalisation of CGI event parts.
-//! - [`onvif`] — topic mapping, notification normalisation, ISO 8601 parsing.
+//! - [`onvif`] — the pull-point session, topic mapping, notification
+//!   normalisation, ISO 8601 parsing.
+//! - [`media`] — Media service lookups: [`snapshot_url`] and [`stream_urls`],
+//!   with [`MediaUrlError`] naming what went wrong without camera text.
 //! - [`multipart`] — a bounded, incremental `multipart/x-mixed-replace` reader.
 //! - [`digest`] — HTTP digest authentication (RFC 7616, MD5).
-//! - [`CameraEndpoint`] — how to reach a camera's HTTP interface; the password
-//!   is redacted from `Debug`.
+//! - [`discovery`] — WS-Discovery of ONVIF cameras, bounded and sanitised, for
+//!   the Add camera flow.
+//! - [`CameraEndpoint`] — how to reach a camera's HTTP interface; its
+//!   credentials are redacted from `Debug`.
 //!
 //! # Invariants
 //!
 //! - [`EventSink::publish`] runs on the receive loop and must not block.
-//! - The ONVIF pull timeout stays under the 10 s that the HTTP transport
+//! - The ONVIF pull timeout stays under the 10 s that the SOAP transport
 //!   applies to every request, and subscriptions are renewed before they
 //!   expire from the lifetime the camera granted; WS-Security tokens fall back
 //!   to host time only for structured clock-authentication faults from cameras
 //!   that misreport UTC.
-//! - Camera-advertised ONVIF URLs stay on the configured origin. Authenticated
-//!   SOAP does not follow redirects and has byte and XML-structure limits.
-//! - Credentials never reach logs, URLs, or errors.
+//! - Camera-advertised ONVIF service URLs stay on the configured origin and
+//!   stream URLs on the configured host; every advertised URL is bounded in
+//!   length. Authenticated SOAP does not follow redirects or proxies and has
+//!   byte and XML-structure limits.
+//! - Credentials never reach logs, URLs, or errors, and camera text reaches a
+//!   log line only through [`iris_core::text::LogSafe`].
 //!
 //! # Example
 //!
@@ -47,14 +55,24 @@
 mod backoff;
 pub mod dahua;
 pub mod digest;
+pub mod discovery;
 mod endpoint;
 mod feed;
+#[cfg(test)]
+mod loopback;
+pub mod media;
 pub mod multipart;
 pub mod onvif;
+mod sink;
 mod stats;
+mod text;
 mod transport;
 
-pub use endpoint::{CameraEndpoint, EventSink};
+pub use discovery::{DiscoveredCamera, discover};
+pub use endpoint::CameraEndpoint;
 pub use feed::run_dahua_cgi;
+pub use media::{MediaUrlError, ProfileStream, snapshot_url, stream_urls};
 pub use onvif::run_onvif_pullpoint;
+pub use sink::EventSink;
 pub use stats::EventStats;
+pub use transport::MAX_ADVERTISED_URL_LEN;

@@ -1,16 +1,20 @@
-//! Snapshot proxy with HTTP digest authentication (RFC 7616, MD5).
+//! Snapshot proxy with HTTP digest authentication (RFC 7616, MD5): the Dahua
+//! CGI endpoint, or the URL a camera's ONVIF Media service names for its
+//! first profile, resolved on first use and kept for [`ONVIF_URL_TTL`].
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use axum::extract::{Path, State};
 use axum::http::header;
 use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
 use futures_util::StreamExt as _;
+use iris_core::config::ResolvedSnapshot;
 use iris_core::id::CameraId;
-use iris_core::time::WallUs;
+use iris_events::CameraEndpoint;
+use iris_events::digest::{self, DigestAuth};
+use url::Url;
 
 use crate::error::ApiError;
 use crate::state::{ApiState, SnapshotSource};
@@ -22,64 +26,155 @@ const MAX_SNAPSHOT_LEN: usize = 8 << 20;
 const JPEG_EOI_WINDOW: usize = 64 * 1024;
 const SNAPSHOT_PATH: &str = "/cgi-bin/snapshot.cgi?channel=1";
 const SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(5);
-
-static CNONCE_COUNTER: AtomicU64 = AtomicU64::new(0);
+/// How long a resolved ONVIF snapshot URL is reused before the Media service is
+/// asked again; a failed fetch forgets it at once.
+const ONVIF_URL_TTL: Duration = Duration::from_secs(3600);
 
 pub(crate) async fn snapshot(
     State(state): State<Arc<ApiState>>,
     Path(camera): Path<String>,
 ) -> Result<Response, ApiError> {
     let id = CameraId::try_new(&camera).map_err(|e| ApiError::BadRequest(e.to_string()))?;
-    let source = state.snapshot_sources.get(&id).ok_or(ApiError::NotFound)?;
+    let source = state
+        .snapshot_sources
+        .read()
+        .expect("snapshot registry")
+        .get(&id)
+        .cloned()
+        .ok_or(ApiError::NotFound)?;
     // One camera request at a time per camera; the guard also releases the
     // slot when the client goes away mid-request.
     let _in_flight = state.stats.admit_snapshot(&id)?;
-    let body = fetch_snapshot(source).await?;
+    let body = fetch_by_method(&id, &source, ONVIF_URL_TTL).await?;
     Ok(snapshot_response(body))
 }
 
-async fn fetch_snapshot(source: &SnapshotSource) -> Result<Bytes, ApiError> {
-    fetch_snapshot_with_timeout(source, SNAPSHOT_TIMEOUT).await
+/// Fetches by the camera's method: the Dahua CGI endpoint, or the URL the ONVIF
+/// Media service names, reused for `url_lifetime` and forgotten by a failed
+/// fetch so the next request resolves it again.
+async fn fetch_by_method(
+    id: &CameraId,
+    source: &SnapshotSource,
+    url_lifetime: Duration,
+) -> Result<Bytes, ApiError> {
+    match source.method {
+        ResolvedSnapshot::DahuaCgi => fetch_snapshot(id, source).await,
+        ResolvedSnapshot::Onvif => {
+            let url = onvif_snapshot_url(id, source, url_lifetime).await?;
+            let digest_uri = match url.query() {
+                Some(query) => format!("{}?{query}", url.path()),
+                None => url.path().to_owned(),
+            };
+            let fetched = fetch_snapshot_with_timeout(
+                id,
+                source,
+                url.as_str(),
+                &digest_uri,
+                SNAPSHOT_TIMEOUT,
+            )
+            .await;
+            if fetched.is_err() {
+                *source.resolved.lock().expect("snapshot url cache") = None;
+            }
+            fetched
+        }
+    }
 }
 
-async fn fetch_snapshot_with_timeout(
+/// The ONVIF snapshot URL of `source`: the cached one while it is younger than
+/// `lifetime` ([`ONVIF_URL_TTL`] in service), else resolved through the
+/// camera's Media service, with the failure's kind, never camera text, in the
+/// log.
+async fn onvif_snapshot_url(
+    id: &CameraId,
     source: &SnapshotSource,
+    lifetime: Duration,
+) -> Result<Url, ApiError> {
+    let cached = source.resolved.lock().expect("snapshot url cache").clone();
+    if let Some((url, resolved_at)) = cached
+        && resolved_at.elapsed() < lifetime
+    {
+        return Ok(url);
+    }
+    let endpoint = CameraEndpoint {
+        camera: id.clone(),
+        host: source.host.clone(),
+        http_port: source.port,
+        https: source.https,
+        tls_verify: source.tls_verify,
+        username: source.username.clone(),
+        password: source.password.clone(),
+    };
+    let url = iris_events::snapshot_url(&endpoint)
+        .await
+        .map_err(|error| {
+            tracing::debug!(
+                camera = %id,
+                failure = error.kind(),
+                "ONVIF snapshot URL could not be resolved"
+            );
+            ApiError::Upstream("snapshot URL could not be resolved".into())
+        })?;
+    *source.resolved.lock().expect("snapshot url cache") = Some((url.clone(), Instant::now()));
+    Ok(url)
+}
+
+/// The Dahua CGI snapshot of `source`.
+async fn fetch_snapshot(id: &CameraId, source: &SnapshotSource) -> Result<Bytes, ApiError> {
+    fetch_snapshot_with_timeout(
+        id,
+        source,
+        &snapshot_url(source),
+        SNAPSHOT_PATH,
+        SNAPSHOT_TIMEOUT,
+    )
+    .await
+}
+
+/// Fetches `url` from the camera with `source`'s credentials; `digest_uri` is
+/// the request target a digest challenge is answered for. The first `Digest`
+/// challenge irisd can answer (RFC 7616, MD5) among the `WWW-Authenticate`
+/// headers is used, as the event feed does.
+async fn fetch_snapshot_with_timeout(
+    id: &CameraId,
+    source: &SnapshotSource,
+    url: &str,
+    digest_uri: &str,
     timeout: Duration,
 ) -> Result<Bytes, ApiError> {
-    let url = snapshot_url(source);
     let client = reqwest::Client::builder()
         .danger_accept_invalid_certs(!source.tls_verify)
         .redirect(reqwest::redirect::Policy::none())
+        .no_proxy()
         .timeout(timeout)
         .build()
-        .map_err(|error| redacted_upstream_error(&error))?;
+        .map_err(|error| redacted_upstream_error(id, error))?;
     let first = client
-        .get(&url)
+        .get(url)
         .send()
         .await
-        .map_err(|error| redacted_upstream_error(&error))?;
+        .map_err(|error| redacted_upstream_error(id, error))?;
     let response = if first.status().as_u16() == 401 {
         let challenge = first
             .headers()
-            .get(header::WWW_AUTHENTICATE)
-            .and_then(|v| v.to_str().ok())
-            .ok_or_else(|| ApiError::Upstream("camera sent no digest challenge".into()))?;
-        let authorization = digest::authorization(
-            "GET",
-            SNAPSHOT_PATH,
-            &source.username,
-            &source.password,
-            challenge,
-            &cnonce(),
-            1,
-        )
-        .ok_or_else(|| ApiError::Upstream("unsupported digest challenge".into()))?;
+            .get_all(header::WWW_AUTHENTICATE)
+            .iter()
+            .filter_map(|value| value.to_str().ok())
+            .find_map(digest::parse_challenge)
+            .ok_or_else(|| {
+                ApiError::Upstream("camera sent no supported digest challenge".into())
+            })?;
+        let mut auth = DigestAuth::new(&source.username, &source.password);
+        auth.set_challenge(challenge);
+        let authorization = auth
+            .authorization("GET", digest_uri)
+            .expect("a challenge was set");
         client
-            .get(&url)
+            .get(url)
             .header(header::AUTHORIZATION, authorization)
             .send()
             .await
-            .map_err(|error| redacted_upstream_error(&error))?
+            .map_err(|error| redacted_upstream_error(id, error))?
     } else {
         first
     };
@@ -95,7 +190,7 @@ async fn fetch_snapshot_with_timeout(
     {
         return Err(ApiError::Upstream("snapshot too large".into()));
     }
-    let body = collect_snapshot(response).await?;
+    let body = collect_snapshot(id, response).await?;
     let Some(end) = jpeg_extent(&body) else {
         return Err(ApiError::Upstream("camera returned an invalid JPEG".into()));
     };
@@ -114,7 +209,7 @@ fn snapshot_response(body: Bytes) -> Response {
         .into_response()
 }
 
-async fn collect_snapshot(response: reqwest::Response) -> Result<Bytes, ApiError> {
+async fn collect_snapshot(id: &CameraId, response: reqwest::Response) -> Result<Bytes, ApiError> {
     let initial_capacity = response
         .content_length()
         .and_then(|len| usize::try_from(len).ok())
@@ -125,7 +220,7 @@ async fn collect_snapshot(response: reqwest::Response) -> Result<Bytes, ApiError
         .map_err(|_| ApiError::Upstream("snapshot allocation failed".into()))?;
     let mut chunks = response.bytes_stream();
     while let Some(chunk) = chunks.next().await {
-        let chunk = chunk.map_err(|error| redacted_upstream_error(&error))?;
+        let chunk = chunk.map_err(|error| redacted_upstream_error(id, error))?;
         let Some(next_len) = body.len().checked_add(chunk.len()) else {
             return Err(ApiError::Upstream("snapshot too large".into()));
         };
@@ -155,11 +250,12 @@ fn jpeg_extent(body: &[u8]) -> Option<usize> {
         .map(|position| window_start + position + 2)
 }
 
-fn redacted_upstream_error(error: &reqwest::Error) -> ApiError {
+/// Logs a camera request failure with its cause but without the camera URL,
+/// which carries the configured host, and answers a fixed body.
+fn redacted_upstream_error(id: &CameraId, error: reqwest::Error) -> ApiError {
     tracing::warn!(
-        timeout = error.is_timeout(),
-        connect = error.is_connect(),
-        status = ?error.status(),
+        camera = %id,
+        error = ?error.without_url(),
         "camera snapshot request failed"
     );
     ApiError::Upstream("snapshot request failed".into())
@@ -182,6 +278,7 @@ fn snapshot_url(source: &SnapshotSource) -> String {
 mod tests {
     use std::future::Future;
     use std::net::SocketAddr;
+    use std::sync::atomic::Ordering;
 
     use tokio::io::AsyncReadExt as _;
     use tokio::io::AsyncWriteExt as _;
@@ -191,14 +288,19 @@ mod tests {
     use super::*;
 
     fn source(address: SocketAddr) -> SnapshotSource {
-        SnapshotSource {
-            host: address.ip().to_string(),
-            port: address.port(),
-            https: false,
-            tls_verify: true,
-            username: String::new(),
-            password: String::new(),
-        }
+        SnapshotSource::new(
+            address.ip().to_string(),
+            address.port(),
+            false,
+            true,
+            String::new(),
+            String::new(),
+            ResolvedSnapshot::DahuaCgi,
+        )
+    }
+
+    fn cam1() -> CameraId {
+        CameraId::try_new("cam1").unwrap()
     }
 
     async fn read_request(socket: &mut TcpStream) {
@@ -254,6 +356,155 @@ mod tests {
         })
         .await;
         source
+    }
+
+    /// A loopback ONVIF camera: SOAP answers for the device and media calls,
+    /// every advertised URL on another host, and the snapshot at the rebased
+    /// path; `fail` makes the snapshot answer 500. Records every request line.
+    async fn onvif_fixture() -> (
+        SnapshotSource,
+        Arc<std::sync::Mutex<Vec<String>>>,
+        Arc<std::sync::atomic::AtomicBool>,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let fail = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        tokio::spawn({
+            let seen = Arc::clone(&seen);
+            let fail = Arc::clone(&fail);
+            async move {
+                loop {
+                    let Ok((mut socket, _)) = listener.accept().await else {
+                        return;
+                    };
+                    let Some(head) = read_head_and_body(&mut socket).await else {
+                        continue;
+                    };
+                    let first_line = head.lines().next().unwrap_or_default().to_owned();
+                    seen.lock().unwrap().push(first_line.clone());
+                    let (status, content_type, body) = if first_line.starts_with("GET ") {
+                        if fail.load(Ordering::Relaxed) {
+                            ("500 Internal Server Error", "text/plain", b"busy".to_vec())
+                        } else {
+                            ("200 OK", "image/jpeg", jpeg_with_len(64))
+                        }
+                    } else {
+                        let reply =
+                            soap_reply(&head.to_ascii_lowercase(), "http://203.0.113.9:8080");
+                        ("200 OK", "application/soap+xml", reply.into_bytes())
+                    };
+                    let headers = format!(
+                        "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = socket.write_all(headers.as_bytes()).await;
+                    let _ = socket.write_all(&body).await;
+                }
+            }
+        });
+        let mut source = source(address);
+        source.method = ResolvedSnapshot::Onvif;
+        (source, seen, fail)
+    }
+
+    /// Reads one request, head and body, and returns the head.
+    async fn read_head_and_body(socket: &mut TcpStream) -> Option<String> {
+        let mut request = Vec::new();
+        let mut chunk = [0_u8; 4096];
+        loop {
+            match socket.read(&mut chunk).await {
+                Ok(0) | Err(_) => return None,
+                Ok(read) => request.extend_from_slice(&chunk[..read]),
+            }
+            let Some(end) = request.windows(4).position(|window| window == b"\r\n\r\n") else {
+                continue;
+            };
+            let head = String::from_utf8_lossy(&request[..end + 4]).to_string();
+            let body_len: usize = head
+                .lines()
+                .find_map(|line| {
+                    line.to_ascii_lowercase()
+                        .strip_prefix("content-length:")
+                        .map(str::to_owned)
+                })
+                .map_or(0, |value| value.trim().parse().unwrap_or(0));
+            if request.len() >= end + 4 + body_len {
+                return Some(head);
+            }
+        }
+    }
+
+    fn soap_reply(head_lower: &str, advertised: &str) -> String {
+        const ENVELOPE: &str = r#"<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope" xmlns:tds="http://www.onvif.org/ver10/device/wsdl" xmlns:trt="http://www.onvif.org/ver10/media/wsdl" xmlns:tt="http://www.onvif.org/ver10/schema"><s:Body>"#;
+        let body = if head_lower.contains("getsystemdateandtime") {
+            "<tds:GetSystemDateAndTimeResponse><tds:SystemDateAndTime><tt:UTCDateTime><tt:Time><tt:Hour>0</tt:Hour><tt:Minute>0</tt:Minute><tt:Second>0</tt:Second></tt:Time><tt:Date><tt:Year>2026</tt:Year><tt:Month>1</tt:Month><tt:Day>1</tt:Day></tt:Date></tt:UTCDateTime></tds:SystemDateAndTime></tds:GetSystemDateAndTimeResponse>".to_owned()
+        } else if head_lower.contains("getcapabilities") {
+            format!(
+                "<tds:GetCapabilitiesResponse><tds:Capabilities><tt:Media><tt:XAddr>{advertised}/onvif/media</tt:XAddr></tt:Media></tds:Capabilities></tds:GetCapabilitiesResponse>"
+            )
+        } else if head_lower.contains("getprofiles") {
+            r#"<trt:GetProfilesResponse><trt:Profiles token="profile-1" fixed="true"><tt:Name>Main</tt:Name></trt:Profiles></trt:GetProfilesResponse>"#.to_owned()
+        } else if head_lower.contains("getsnapshoturi") {
+            format!(
+                "<trt:GetSnapshotUriResponse><trt:MediaUri><tt:Uri>{advertised}/snap.jpg?channel=1</tt:Uri><tt:InvalidAfterConnect>false</tt:InvalidAfterConnect><tt:InvalidAfterReboot>false</tt:InvalidAfterReboot><tt:Timeout>PT0S</tt:Timeout></trt:MediaUri></trt:GetSnapshotUriResponse>"
+            )
+        } else {
+            panic!("unexpected SOAP call: {head_lower}")
+        };
+        format!("{ENVELOPE}{body}</s:Body></s:Envelope>")
+    }
+
+    /// The ONVIF method asks the Media service once, fetches the snapshot at
+    /// the advertised path on the configured camera, reuses the URL, and
+    /// resolves again after a failed fetch.
+    #[tokio::test]
+    async fn onvif_snapshots_follow_the_media_service_and_cache_the_url() {
+        let (source, seen, fail) = onvif_fixture().await;
+        let id = CameraId::try_new("cam1").unwrap();
+        let body = tokio::time::timeout(
+            Duration::from_secs(10),
+            fetch_by_method(&id, &source, ONVIF_URL_TTL),
+        )
+        .await
+        .expect("the first snapshot completes")
+        .expect("the snapshot is served through the resolved URL");
+        assert_eq!(body.len(), 64);
+        {
+            let seen = seen.lock().unwrap();
+            assert_eq!(seen.len(), 5, "{seen:?}");
+            assert!(
+                seen[0].starts_with("POST /onvif/device_service "),
+                "{seen:?}"
+            );
+            assert!(seen[2].starts_with("POST /onvif/media "), "{seen:?}");
+            assert_eq!(seen[4], "GET /snap.jpg?channel=1 HTTP/1.1", "{seen:?}");
+        }
+        fetch_by_method(&id, &source, ONVIF_URL_TTL)
+            .await
+            .expect("the cached URL serves again");
+        assert_eq!(
+            seen.lock().unwrap().len(),
+            6,
+            "no media call for a cached URL"
+        );
+
+        fail.store(true, Ordering::Relaxed);
+        assert!(fetch_by_method(&id, &source, ONVIF_URL_TTL).await.is_err());
+        assert!(
+            source.resolved.lock().unwrap().is_none(),
+            "a failed fetch forgets the URL"
+        );
+        fail.store(false, Ordering::Relaxed);
+        fetch_by_method(&id, &source, ONVIF_URL_TTL)
+            .await
+            .expect("resolved again after the failure");
+        assert_eq!(
+            seen.lock().unwrap().len(),
+            7 + 5,
+            "{:?}",
+            seen.lock().unwrap()
+        );
     }
 
     fn jpeg_with_len(len: usize) -> Vec<u8> {
@@ -331,7 +582,9 @@ mod tests {
         let mut body = jpeg_with_len(64);
         body.extend_from_slice(b"\r\n\0\0");
         let source = serve_body(body, "image/jpeg").await;
-        let served = fetch_snapshot(&source).await.expect("padding is accepted");
+        let served = fetch_snapshot(&cam1(), &source)
+            .await
+            .expect("padding is accepted");
         assert_eq!(served.len(), 64);
         assert!(served.ends_with(&[0xff, 0xd9]));
     }
@@ -347,14 +600,15 @@ mod tests {
     fn snapshot_urls_bracket_ipv6_and_preserve_other_hosts() {
         for host in ["2001:db8::1", "192.0.2.7", "camera.example"] {
             for (https, scheme, port) in [(false, "http", 8080), (true, "https", 8443)] {
-                let source = SnapshotSource {
-                    host: host.into(),
+                let source = SnapshotSource::new(
+                    host.into(),
                     port,
                     https,
-                    tls_verify: true,
-                    username: String::new(),
-                    password: String::new(),
-                };
+                    true,
+                    String::new(),
+                    String::new(),
+                    ResolvedSnapshot::DahuaCgi,
+                );
                 let authority = if host.contains(':') {
                     format!("[{host}]")
                 } else {
@@ -374,7 +628,9 @@ mod tests {
     #[tokio::test]
     async fn accepts_exact_limit_and_sets_fixed_safe_headers() {
         let source = serve_body(jpeg_with_len(MAX_SNAPSHOT_LEN), "text/html").await;
-        let body = fetch_snapshot(&source).await.expect("exact limit succeeds");
+        let body = fetch_snapshot(&cam1(), &source)
+            .await
+            .expect("exact limit succeeds");
         assert_eq!(body.len(), MAX_SNAPSHOT_LEN);
 
         let response = snapshot_response(body);
@@ -400,7 +656,11 @@ mod tests {
         })
         .await;
         assert_eq!(
-            upstream_text(fetch_snapshot(&source).await.expect_err("must reject")),
+            upstream_text(
+                fetch_snapshot(&cam1(), &source)
+                    .await
+                    .expect_err("must reject")
+            ),
             "snapshot too large"
         );
         server.await.expect("server task");
@@ -429,7 +689,11 @@ mod tests {
         })
         .await;
         assert_eq!(
-            upstream_text(fetch_snapshot(&source).await.expect_err("must reject")),
+            upstream_text(
+                fetch_snapshot(&cam1(), &source)
+                    .await
+                    .expect_err("must reject")
+            ),
             "snapshot too large"
         );
         server.await.expect("server task");
@@ -462,8 +726,10 @@ mod tests {
                 task.await.expect("connection task");
             }
         });
+        let camera = cam1();
         let results =
-            futures_util::future::join_all((0..REQUESTS).map(|_| fetch_snapshot(&source))).await;
+            futures_util::future::join_all((0..REQUESTS).map(|_| fetch_snapshot(&camera, &source)))
+                .await;
         for result in results {
             assert_eq!(
                 upstream_text(result.expect_err("must reject")),
@@ -481,7 +747,11 @@ mod tests {
         )
         .await;
         assert_eq!(
-            upstream_text(fetch_snapshot(&source).await.expect_err("must reject")),
+            upstream_text(
+                fetch_snapshot(&cam1(), &source)
+                    .await
+                    .expect_err("must reject")
+            ),
             "camera returned an invalid JPEG"
         );
     }
@@ -497,7 +767,11 @@ mod tests {
                 .expect("write truncated response");
         })
         .await;
-        let text = upstream_text(fetch_snapshot(&source).await.expect_err("must reject"));
+        let text = upstream_text(
+            fetch_snapshot(&cam1(), &source)
+                .await
+                .expect_err("must reject"),
+        );
         assert_eq!(text, "snapshot request failed");
         assert!(!text.contains(&source.host));
         assert!(!text.contains(&source.port.to_string()));
@@ -519,9 +793,15 @@ mod tests {
         })
         .await;
         let text = upstream_text(
-            fetch_snapshot_with_timeout(&source, Duration::from_millis(50))
-                .await
-                .expect_err("slow body must time out"),
+            fetch_snapshot_with_timeout(
+                &cam1(),
+                &source,
+                &snapshot_url(&source),
+                SNAPSHOT_PATH,
+                Duration::from_millis(50),
+            )
+            .await
+            .expect_err("slow body must time out"),
         );
         assert_eq!(text, "snapshot request failed");
         server.abort();
@@ -541,7 +821,7 @@ mod tests {
         })
         .await;
         let cancelled =
-            tokio::time::timeout(Duration::from_millis(50), fetch_snapshot(&source)).await;
+            tokio::time::timeout(Duration::from_millis(50), fetch_snapshot(&cam1(), &source)).await;
         assert!(cancelled.is_err(), "caller deadline cancels the body read");
         server.abort();
     }
@@ -594,173 +874,12 @@ mod tests {
                     .is_ok()
             });
 
-            let error = fetch_snapshot(&source(source_address))
+            let error = fetch_snapshot(&cam1(), &source(source_address))
                 .await
                 .expect_err("redirect is not a snapshot response");
             assert_eq!(upstream_text(error), "camera returned 302 Found");
             assert!(!source_task.await.expect("redirect source task"), "{kind}");
             assert!(!target_task.await.expect("redirect target task"), "{kind}");
-        }
-    }
-}
-
-fn cnonce() -> String {
-    let n = CNONCE_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let micros = WallUs::now().get() as u64;
-    hex::encode((micros ^ n.rotate_left(32)).to_be_bytes())
-}
-
-/// HTTP digest (RFC 7616) with the MD5 algorithm, as IP cameras implement it.
-pub(crate) mod digest {
-    use std::fmt::Write as _;
-
-    use md5::{Digest as _, Md5};
-
-    /// The parts of a `WWW-Authenticate: Digest …` header irisd uses.
-    #[derive(Clone, Debug, PartialEq, Eq)]
-    pub(crate) struct Challenge {
-        pub(crate) realm: String,
-        pub(crate) nonce: String,
-        pub(crate) qop_auth: bool,
-        pub(crate) opaque: Option<String>,
-        pub(crate) algorithm: Option<String>,
-    }
-
-    /// Parses a digest challenge; `None` for other schemes or missing fields.
-    pub(crate) fn parse_challenge(header: &str) -> Option<Challenge> {
-        let rest = header.trim().strip_prefix("Digest")?.trim_start();
-        let mut realm = None;
-        let mut nonce = None;
-        let mut qop_auth = false;
-        let mut opaque = None;
-        let mut algorithm = None;
-        for (key, value) in parameters(rest) {
-            match key.to_ascii_lowercase().as_str() {
-                "realm" => realm = Some(value),
-                "nonce" => nonce = Some(value),
-                "qop" => qop_auth = value.split(',').any(|q| q.trim() == "auth"),
-                "opaque" => opaque = Some(value),
-                "algorithm" => algorithm = Some(value),
-                _ => {}
-            }
-        }
-        Some(Challenge {
-            realm: realm?,
-            nonce: nonce?,
-            qop_auth,
-            opaque,
-            algorithm,
-        })
-    }
-
-    /// Splits `key=value, key="quoted, value"` pairs.
-    fn parameters(input: &str) -> Vec<(String, String)> {
-        let mut out = Vec::new();
-        let mut rest = input;
-        while !rest.is_empty() {
-            let rest_trimmed = rest.trim_start_matches([' ', ',']);
-            let Some(eq) = rest_trimmed.find('=') else {
-                break;
-            };
-            let key = rest_trimmed[..eq].trim().to_owned();
-            let after = &rest_trimmed[eq + 1..];
-            let (value, remainder) = if let Some(quoted) = after.strip_prefix('"') {
-                match quoted.find('"') {
-                    Some(end) => (quoted[..end].to_owned(), &quoted[end + 1..]),
-                    None => (quoted.to_owned(), ""),
-                }
-            } else {
-                let end = after.find(',').unwrap_or(after.len());
-                (after[..end].trim().to_owned(), &after[end..])
-            };
-            out.push((key, value));
-            rest = remainder;
-        }
-        out
-    }
-
-    fn md5_hex(input: &str) -> String {
-        hex::encode(Md5::digest(input.as_bytes()))
-    }
-
-    /// Builds the `Authorization` header value for `method` on `uri`.
-    pub(crate) fn authorization(
-        method: &str,
-        uri: &str,
-        username: &str,
-        password: &str,
-        challenge_header: &str,
-        cnonce: &str,
-        nc: u32,
-    ) -> Option<String> {
-        let c = parse_challenge(challenge_header)?;
-        if c.algorithm
-            .as_deref()
-            .is_some_and(|a| !a.eq_ignore_ascii_case("MD5"))
-        {
-            return None;
-        }
-        let ha1 = md5_hex(&format!("{username}:{}:{password}", c.realm));
-        let ha2 = md5_hex(&format!("{method}:{uri}"));
-        let nc_hex = format!("{nc:08x}");
-        let response = if c.qop_auth {
-            md5_hex(&format!("{ha1}:{}:{nc_hex}:{cnonce}:auth:{ha2}", c.nonce))
-        } else {
-            md5_hex(&format!("{ha1}:{}:{ha2}", c.nonce))
-        };
-        let mut value = format!(
-            "Digest username=\"{username}\", realm=\"{}\", nonce=\"{}\", uri=\"{uri}\", response=\"{response}\"",
-            c.realm, c.nonce
-        );
-        if c.qop_auth {
-            let _ = write!(value, ", qop=auth, nc={nc_hex}, cnonce=\"{cnonce}\"");
-        }
-        if let Some(opaque) = &c.opaque {
-            let _ = write!(value, ", opaque=\"{opaque}\"");
-        }
-        if c.algorithm.is_some() {
-            value.push_str(", algorithm=MD5");
-        }
-        Some(value)
-    }
-
-    #[cfg(test)]
-    mod tests {
-        use super::*;
-
-        const RFC2617: &str = "Digest realm=\"testrealm@host.com\", qop=\"auth,auth-int\", nonce=\"dcd98b7102dd2f0e8b11d0f600bfb0c093\", opaque=\"5ccc069c403ebaf9f0171e9517f40e41\"";
-
-        #[test]
-        fn parses_quoted_and_bare_parameters() {
-            let c = parse_challenge(
-                "Digest realm=\"Login to X\", nonce=abc123, qop=auth, algorithm=MD5",
-            )
-            .unwrap();
-            assert_eq!(c.realm, "Login to X");
-            assert_eq!(c.nonce, "abc123");
-            assert!(c.qop_auth);
-            assert_eq!(c.algorithm.as_deref(), Some("MD5"));
-            assert!(parse_challenge("Basic realm=\"x\"").is_none());
-        }
-
-        #[test]
-        fn reproduces_the_rfc_2617_example() {
-            let header = authorization(
-                "GET",
-                "/dir/index.html",
-                "Mufasa",
-                "Circle Of Life",
-                RFC2617,
-                "0a4f113b",
-                1,
-            )
-            .unwrap();
-            assert!(
-                header.contains("response=\"6629fae49393a05397450978507c4ef1\""),
-                "{header}"
-            );
-            assert!(header.contains("qop=auth, nc=00000001, cnonce=\"0a4f113b\""));
-            assert!(header.contains("opaque=\"5ccc069c403ebaf9f0171e9517f40e41\""));
         }
     }
 }

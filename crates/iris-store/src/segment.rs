@@ -11,13 +11,16 @@ use std::time::{Duration, Instant};
 use iris_core::time::{MediaTicks, WallUs};
 use iris_mp4::fragment::{Fragment, FragmentHeader, encode_fragment};
 use iris_mp4::index::{IndexHeader, IndexRecord, IndexWriter};
-use rustix::fs::{AtFlags, Mode, OFlags};
+use rustix::fs::{AtFlags, Mode};
+use rustix::io::Errno;
+use tracing::warn;
 
+use crate::fs::ApprovedRoot;
 use crate::layout;
 use crate::observer::{SegmentProgress, SegmentSealed};
 
-/// Recordings and sidecars are readable and writable by their owner only,
-/// whatever the process umask.
+/// Recordings and sidecars are created readable and writable by their owner
+/// only; the umask can only narrow that further.
 const PRIVATE_FILE_MODE: u32 = 0o600;
 
 /// An open `.mp4` with its `.idx`, written strictly sequentially.
@@ -47,7 +50,7 @@ pub(crate) struct SegmentFile {
 impl SegmentFile {
     /// Creates the file (and its directories), writes the init segment, and
     /// reserves space ahead of it. When `path` exists, a numbered sibling is
-    /// used so that two runs starting in the same second never collide.
+    /// used so that two runs starting in the same microsecond never collide.
     pub(crate) fn create(
         path: &Path,
         init: &[u8],
@@ -83,7 +86,7 @@ impl SegmentFile {
     }
 
     pub(crate) fn create_beneath(
-        approved: &crate::fs::ApprovedRoot,
+        approved: &ApprovedRoot,
         root_directory: File,
         path: &Path,
         init: &[u8],
@@ -104,7 +107,7 @@ impl SegmentFile {
     }
 
     fn create_beneath_with(
-        approved: &crate::fs::ApprovedRoot,
+        approved: &ApprovedRoot,
         root_directory: File,
         path: &Path,
         init: &[u8],
@@ -184,10 +187,12 @@ impl SegmentFile {
                 guard.disarm();
                 Ok(segment)
             }
-            Err(error) => match guard.cleanup() {
-                Ok(()) => Err(error),
-                Err(cleanup) => Err(cleanup),
-            },
+            Err(error) => {
+                if let Err(cleanup) = guard.cleanup() {
+                    warn!(%error, %cleanup, "segment initialization failed and its rollback failed");
+                }
+                Err(error)
+            }
         }
     }
 
@@ -295,7 +300,7 @@ impl SegmentFile {
             return Err(error);
         }
         self.file.set_len(self.end)?;
-        self.file.sync_data()?;
+        self.file.sync_all()?;
         self.index.sync()?;
         self.sync_directory()?;
         Ok(SegmentSealed {
@@ -333,8 +338,12 @@ impl SegmentFile {
         }
         let remaining = self.allocated_end.saturating_sub(self.end);
         if remaining < self.preallocate_bytes / 4 {
-            crate::fs::preallocate(&self.file, self.allocated_end, self.preallocate_bytes)?;
-            self.allocated_end += self.preallocate_bytes;
+            // A fragment larger than the reservation leaves the write position past
+            // the reserved end; the next reservation starts at the position, not
+            // behind it.
+            let start = self.allocated_end.max(self.end);
+            crate::fs::preallocate(&self.file, start, self.preallocate_bytes)?;
+            self.allocated_end = start + self.preallocate_bytes;
         }
         Ok(())
     }
@@ -373,13 +382,9 @@ fn claim_unique_pair(
     before: &mut impl FnMut(CreateStep) -> io::Result<()>,
 ) -> io::Result<ClaimedPair> {
     let mut candidate = path.to_path_buf();
-    for n in 0..100u32 {
+    for n in 0..=layout::MAX_NUMBERED_SIBLING {
         if n > 0 {
-            let stem = path
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or("segment");
-            candidate = path.with_file_name(format!("{stem}-{n}.mp4"));
+            candidate = layout::numbered_segment_path(path, n);
         }
         before(CreateStep::MediaClaim)?;
         let file = match OpenOptions::new()
@@ -395,7 +400,9 @@ fn claim_unique_pair(
         let index_path = layout::index_path(&candidate);
         if let Err(error) = before(CreateStep::IndexClaim) {
             drop(file);
-            cleanup_paths(&candidate, None)?;
+            if let Err(cleanup) = cleanup_paths(&candidate, None) {
+                warn!(%error, %cleanup, "media claim rollback failed");
+            }
             return Err(error);
         }
         match OpenOptions::new()
@@ -419,7 +426,9 @@ fn claim_unique_pair(
             }
             Err(error) => {
                 drop(file);
-                cleanup_paths(&candidate, None)?;
+                if let Err(cleanup) = cleanup_paths(&candidate, None) {
+                    warn!(%error, %cleanup, "media claim rollback failed");
+                }
                 return Err(error);
             }
         }
@@ -439,40 +448,30 @@ fn claim_unique_pair_beneath(
     let directory = Arc::new(directory);
     let mut candidate = path.to_path_buf();
     let mut candidate_name = name;
-    let create_flags = OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL;
     let create_mode = Mode::RUSR | Mode::WUSR;
-    for n in 0..100u32 {
+    for n in 0..=layout::MAX_NUMBERED_SIBLING {
         if n > 0 {
-            let stem = path
-                .file_stem()
-                .and_then(|stem| stem.to_str())
-                .unwrap_or("segment");
-            candidate = path.with_file_name(format!("{stem}-{n}.mp4"));
+            candidate = layout::numbered_segment_path(path, n);
             candidate
                 .file_name()
                 .expect("numbered candidate has a basename")
                 .clone_into(&mut candidate_name);
         }
         before(CreateStep::MediaClaim)?;
-        let file = match crate::fs::open_file_beneath(
-            &directory,
-            &candidate_name,
-            create_flags,
-            create_mode,
-        ) {
+        let file = match crate::fs::create_file_beneath(&directory, &candidate_name, create_mode) {
             Ok(file) => file,
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
             Err(error) => return Err(error),
         };
-        let index_name = Path::new(&candidate_name)
-            .with_extension("idx")
-            .into_os_string();
+        let index_name = layout::index_path(Path::new(&candidate_name)).into_os_string();
         if let Err(error) = before(CreateStep::IndexClaim) {
             drop(file);
-            cleanup_beneath(&directory, &candidate_name, None)?;
+            if let Err(cleanup) = cleanup_beneath(&directory, &candidate_name, None) {
+                warn!(%error, %cleanup, "media claim rollback failed");
+            }
             return Err(error);
         }
-        match crate::fs::open_file_beneath(&directory, &index_name, create_flags, create_mode) {
+        match crate::fs::create_file_beneath(&directory, &index_name, create_mode) {
             Ok(index_file) => {
                 return Ok(ClaimedPair {
                     path: candidate.clone(),
@@ -492,7 +491,9 @@ fn claim_unique_pair_beneath(
             }
             Err(error) => {
                 drop(file);
-                cleanup_beneath(&directory, &candidate_name, None)?;
+                if let Err(cleanup) = cleanup_beneath(&directory, &candidate_name, None) {
+                    warn!(%error, %cleanup, "media claim rollback failed");
+                }
                 return Err(error);
             }
         }
@@ -566,8 +567,10 @@ impl CreationGuard {
 
 impl Drop for CreationGuard {
     fn drop(&mut self) {
-        if self.armed {
-            let _ = self.cleanup_target();
+        if self.armed
+            && let Err(error) = self.cleanup_target()
+        {
+            warn!(%error, "segment creation rollback failed");
         }
     }
 }
@@ -576,7 +579,7 @@ fn cleanup_beneath(directory: &File, media: &OsStr, index: Option<&OsStr>) -> io
     let mut first_error = None;
     for name in [Some(media), index].into_iter().flatten() {
         match rustix::fs::unlinkat(directory, name, AtFlags::empty()) {
-            Ok(()) | Err(rustix::io::Errno::NOENT) => {}
+            Ok(()) | Err(Errno::NOENT) => {}
             Err(error) => {
                 first_error.get_or_insert(io::Error::from(error));
             }
@@ -608,7 +611,6 @@ fn cleanup_paths(media: &Path, index: Option<&Path>) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use iris_core::id::{CameraId, StreamKey, StreamKind};
     use iris_core::time::WallUs;
 
     fn header() -> IndexHeader {
@@ -618,7 +620,7 @@ mod tests {
         }
     }
 
-    fn approved_root(directory: &tempfile::TempDir) -> (crate::fs::ApprovedRoot, PathBuf) {
+    fn approved_root(directory: &tempfile::TempDir) -> (ApprovedRoot, PathBuf) {
         let root = directory.path().join("root");
         let approved =
             crate::fs::admit_recording_root(&root, crate::fs::RootExpectation::Fresh).unwrap();
@@ -882,7 +884,8 @@ mod tests {
         let before = fs::metadata(&path).unwrap();
         let logical_blocks = before.len().div_ceil(512);
         if before.blocks() <= logical_blocks {
-            return; // filesystem does not expose KEEP_SIZE allocation accounting
+            eprintln!("skipping reservation release test: no KEEP_SIZE allocation accounting here");
+            return;
         }
         let report = crate::recover::recover_segment(&path).unwrap();
         assert!(!report.truncated, "the logical prefix was already complete");
@@ -934,9 +937,7 @@ mod tests {
             sample_entry: entry,
         };
         let written = segment.write_fragment_with(&fragment, 1, 0, |_| {
-            Err(io::Error::from_raw_os_error(
-                rustix::io::Errno::NOSPC.raw_os_error(),
-            ))
+            Err(io::Error::from_raw_os_error(Errno::NOSPC.raw_os_error()))
         });
         assert!(
             written.is_ok(),
@@ -961,13 +962,55 @@ mod tests {
     }
 
     #[test]
+    fn preallocation_stays_ahead_of_fragments_larger_than_the_reservation() {
+        use bytes::Bytes;
+        use iris_mp4::fragment::Sample;
+        use iris_mp4::init::{SampleEntry, build_init_segment};
+
+        let dir = tempfile::tempdir().unwrap();
+        let entry = Arc::new(SampleEntry::new(
+            Bytes::from_static(b"\0\0\0\x10hvc1\0\0\0\0\0\0\0\0"),
+            "hvc1".into(),
+            16,
+            16,
+        ));
+        let init = build_init_segment(&entry);
+        let mut segment = SegmentFile::create(
+            &dir.path().join("large.mp4"),
+            &init,
+            header(),
+            4_096,
+            Instant::now() + Duration::from_secs(30),
+        )
+        .unwrap();
+        let sample = Bytes::from(vec![0u8; 16_384]);
+        for sequence in 1..=3 {
+            let fragment = Fragment {
+                samples: vec![Sample {
+                    data: sample.clone(),
+                    duration: 3000,
+                    is_sync: true,
+                }],
+                decode_time: u64::from(sequence) * 3000,
+                wall: header().start_wall,
+                raw_rtp: 0,
+                new_run: sequence == 1,
+                sample_entry: Arc::clone(&entry),
+            };
+            segment.write_fragment(&fragment, sequence, 0).unwrap();
+            assert!(
+                segment.allocated_end > segment.end,
+                "fragment {sequence}: reservation ends at {} behind the write position {}",
+                segment.allocated_end,
+                segment.end
+            );
+        }
+        segment.seal().unwrap();
+    }
+
+    #[test]
     fn syncs_keep_their_phase_and_skip_clean_files() {
         let dir = tempfile::tempdir().unwrap();
-        let key = StreamKey {
-            camera: CameraId::try_new("cam1").unwrap(),
-            kind: StreamKind::Main,
-        };
-        let _ = key;
         let interval = Duration::from_secs(5);
         let phase = Duration::from_millis(1_250);
         let t0 = Instant::now();

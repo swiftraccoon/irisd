@@ -56,8 +56,9 @@ NoNewPrivileges=yes
 RestrictNamespaces=yes
 RestrictRealtime=yes
 # systemd's RestrictSUIDSGID filter rejects openat2, which irisd uses for
-# no-follow, beneath-root file resolution. NoNewPrivileges and the empty
-# capability set preserve the privilege boundary.
+# no-follow, beneath-root file resolution. Without it the daemon could mark a
+# file it owns set-user-ID; its writable paths are private to the service
+# account and group (packaging/README.md).
 RestrictSUIDSGID=no
 LockPersonality=yes
 MemoryDenyWriteExecute=yes
@@ -68,7 +69,9 @@ SystemCallFilter=~@privileged @resources
 CapabilityBoundingSet=
 # Landlock limits TCP ports, not addresses; peers are limited here. Only the
 # loopback is allowed until a drop-in adds the camera subnet, plus the API
-# clients' subnet when api.listen is a LAN address (packaging/README.md, step 5).
+# clients' subnet when api.listen is a LAN address, the DNS server when the
+# resolver is not on the loopback, and multicast for camera discovery when
+# provisioning is enabled (packaging/README.md, step 5).
 # Allow lists from drop-ins are merged with this one, for example:
 #   [Service]
 #   IPAddressAllow=192.0.2.0/24

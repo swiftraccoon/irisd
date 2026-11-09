@@ -1,11 +1,12 @@
 [package]
 name = "iris-tools"
-description = "Operations and research tools for irisd: log summaries, the soak sampler and report, the replay benchmark, camera probes, and signed commits"
 version.workspace = true
 edition.workspace = true
-rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Operations and research tools for irisd: log summaries, the soak sampler and report, the replay benchmark, camera probes, and signed commits"
 
 [[bin]]
 name = "iris-tools"
@@ -15,7 +16,11 @@ path = "src/main.rs"
 anyhow = { workspace = true }
 base64 = "0.22"
 clap = { workspace = true }
+getrandom = { workspace = true }
 hex = { workspace = true }
+iris-core = { workspace = true }
+iris-h265 = { workspace = true }
+iris-tls = { workspace = true }
 md-5 = { workspace = true }
 reqwest = { workspace = true }
 rustix = { workspace = true, features = ["fs", "param", "process"] }
@@ -26,6 +31,7 @@ tokio = { workspace = true, features = ["rt-multi-thread", "process"] }
 toml = { workspace = true }
 
 [dev-dependencies]
+iris-replay = { workspace = true }
 tempfile = { workspace = true }
 
 [lints]

@@ -204,7 +204,8 @@ Code=TimeChange;action=Pulse;index=0;data={
 ```
 
 `Content-Length:` has no space after the colon and blank lines between parts vary; parse
-defensively. Times in `data` are camera-local (values above altered). `NTPAdjustTime` and `TimeChange` pulses arrive every minute (NTP period 1 min).
+defensively. Times in `data` are camera-local (values above altered). `NTPAdjustTime` and
+`TimeChange` pulses arrive every minute (NTP period 1 min).
 `eventManager.cgi?action=getEventIndexes&code=VideoMotion` returns `Error: No Events` when idle.
 
 A 15-minute capture of the same feed (heartbeat 30 s) around midday caught real activity:
@@ -230,6 +231,14 @@ ONVIF `GetEventProperties` lists 23 topics, including `tns1:VideoSource/MotionAl
 The ONVIF metadata RTP track (`vnd.onvif.metadata`, trackID=4) SETUPs fine but delivered 0
 packets in 90 s and again 0 packets in 15 min that included four motion episodes.
 
+ONVIF over HTTPS: a unit of this platform with HTTPS enabled advertises every ONVIF service with an
+`https` address, in WS-Discovery and in `GetCapabilities` alike, yet its port 443 answers an ONVIF
+request inside the TLS session with plaintext HTTP, so clients see a TLS record error (OpenSSL
+"wrong version number", rustls "InvalidContentType") after sending the request, while a plain `GET`
+of its web interface over the same port works and port 80 answers the same ONVIF requests correctly.
+Its CGI over HTTPS is unaffected. Units without HTTPS enabled keep port 443 closed (measured
+2026-11-08).
+
 ## 8. Storage arithmetic at measured rates
 
 | Stream | Mbps | GB/day/camera | GB/day for 6 cameras |
@@ -245,7 +254,8 @@ audio adds 11 %; AAC at 64 kbps adds 0.7 GB/day/camera.
 ## 9. Implications for irisd
 
 1. `hvc1` packaging is straightforward: single-slice pictures, IDR-only random access,
-   stable in-band parameter sets (hash them per IDR; a change seals the file).
+   stable in-band parameter sets (the writer compares each fragment's sample entry with the
+   open file's; a change seals the file).
 2. A fragment per GOP is 2 MB at 4K every 2 s. Container overhead is negligible in every
    format, so the storage decision is about crash safety, zero-copy serving, and tool
    compatibility, not bytes.
@@ -254,39 +264,47 @@ audio adds 11 %; AAC at 64 kbps adds 0.7 GB/day/camera.
    the stream). The clock is accurate (+2 ppm) but the declared 30 fps is 0.6 % off the
    delivered ≈ 29.8 fps, so the regulariser must measure the rate rather than trust the
    declaration, and a fragment cap equal to the nominal GOP length needs slack.
-8. GOP length is not a constant: the camera forces IDRs when its own clip recording starts.
-4. Camera wall clocks are untrustworthy (ONVIF UTC off by 1 h). Use NVR receipt time; use
+4. GOP length is not a constant: the camera forces IDRs when its own clip recording starts.
+5. Camera wall clocks are untrustworthy (ONVIF UTC off by 1 h). Use NVR receipt time; use
    SRs only as a cross-check.
-5. Audio must be switched to AAC on the camera before recording; L16 costs 1 Mbps and HLS
-   cannot play it.
-6. Event ingestion can start with the CGI feed; ONVIF PullPoint and the metadata track exist
+6. irisd sets up only the video track (04 R7). An audio path would need AAC: L16 costs
+   1 Mbps and HLS cannot play it.
+7. Event ingestion can start with the CGI feed; ONVIF PullPoint and the metadata track exist
    on this firmware for the vendor-neutral path.
-7. The camera uplink behaves like 100 Mbps (a 650 KB IDR takes ≈ 50 ms to arrive). Six such
+8. The camera uplink behaves like 100 Mbps (a 650 KB IDR takes ≈ 50 ms to arrive). Six such
    cameras need a gigabit NVR uplink, nothing more.
+9. ONVIF endpoints of an HTTPS-enabled unit are addressed over HTTP (§7): irisd never downgrades
+   an endpoint on its own, so a lookup or pull-point subscription that names the HTTPS port fails
+   and is made again with `https = false`.
 
 ## 10. Open validation items
 
-- Motion is validated on the CGI feed (§7). Still open: ONVIF PullPoint delivery of the same
+- Motion is validated on the CGI feed (§7). Open: ONVIF PullPoint delivery of the same
   episodes, whether enabling an IVS rule makes the metadata track emit, and event-to-video
   latency (timestamp the feed lines against the video wall clock).
-- Change the main-stream resolution via CGI while recording to observe in-band parameter-set
-  changes and whether the RTSP session survives.
+- An in-band parameter-set change while recording, when an operator changes the main-stream
+  resolution: whether the RTSP session survives (irisd never changes camera settings).
 - Stall the TCP reader deliberately to measure how long the camera tolerates backpressure
   before dropping the session (sizes the writer queue).
-- Find the maximum number of concurrent RTSP sessions the camera serves (clients must go
-  through irisd regardless).
-- Verify AAC packetisation (`MPEG4-GENERIC` AU headers) after switching main-stream audio.
+- Not measured: the maximum number of concurrent RTSP sessions. `AGENTS.md` rule 6 caps tests
+  at three sessions per camera, and §5b shows a second session already stops the sub stream on
+  this family.
+- AAC packetisation (`MPEG4-GENERIC` AU headers) on a stream that carries AAC, such as the
+  third stream.
 
 ## 11. Reproduction
 
 ```sh
-CAM=<camera-address>; CRED='user:password'
-# identity, encoder, detection, NTP
-curl -s --digest -u "$CRED" "http://$CAM/cgi-bin/magicBox.cgi?action=getSystemInfo"
-curl -s --digest -u "$CRED" "http://$CAM/cgi-bin/configManager.cgi?action=getConfig&name=Encode"
-curl -s --digest -u "$CRED" "http://$CAM/cgi-bin/configManager.cgi?action=getConfig&name=MotionDetect"
-# stream parameters and packet-level GOP analysis
-ffprobe -rtsp_transport tcp -i "rtsp://$CRED@$CAM:554/cam/realmonitor?channel=1&subtype=0&unicast=true&proto=Onvif" -show_streams -of json
+CAM=<camera-address>
+# identity, encoder, detection, NTP; curl prompts for the password, which stays out of shell
+# history and process listings
+curl -s --digest -u user "http://$CAM/cgi-bin/magicBox.cgi?action=getSystemInfo"
+curl -s --digest -u user "http://$CAM/cgi-bin/configManager.cgi?action=getConfig&name=Encode"
+curl -s --digest -u user "http://$CAM/cgi-bin/configManager.cgi?action=getConfig&name=MotionDetect"
+# stream parameters and packet-level GOP analysis; ffmpeg's tools take the credentials only
+# inside the URL ("rtsp://..." below) and print it, so prefer iris-tools rtsp-probe, further
+# down, which reads the password from the environment
+ffprobe -rtsp_transport tcp -i "rtsp://..." -show_streams -of json
 ffprobe -v verbose -rtsp_transport tcp -i "rtsp://..." 2>&1 | grep -E '^(m=|a=)'          # SDP
 ffprobe -v error -rtsp_transport tcp -i "rtsp://..." -select_streams v:0 \
   -show_entries packet=pts,dts,size,flags -of csv=p=0 -read_intervals '%+#450'
@@ -301,5 +319,5 @@ iris-tools rtsp-probe --password-env CAMERA_PASSWORD $CAM user 90 0 probe/meta.x
 iris-tools onvif-call --password-env CAMERA_PASSWORD user http://$CAM/onvif/event_service \
   '<GetEventProperties xmlns="http://www.onvif.org/ver10/events/wsdl"/>' 60000
 # Dahua event feed
-curl -s -g --digest -u "$CRED" "http://$CAM/cgi-bin/eventManager.cgi?action=attach&codes=[All]&heartbeat=5"
+curl -s -g --digest -u user "http://$CAM/cgi-bin/eventManager.cgi?action=attach&codes=[All]&heartbeat=5"
 ```

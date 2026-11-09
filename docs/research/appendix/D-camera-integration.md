@@ -1,70 +1,278 @@
-# Appendix D — Camera-layer research notes (unedited, 2026-10-31)
+# Appendix D — Camera-layer research notes (2026-10-31)
+
+Edited on 2026-11-09: camera model numbers quoted from changelogs and forums are described by
+their class.
 
 Research notes produced by the camera-integration thread. Tags: **[P]** verified-primary
-(RFC/spec/source read), **[S]** secondary, **[I]** inferred. Summarised in
-`../05-ingest-events.md`; several open questions were answered by the probe in `../01-camera-probe.md`.
+(RFC/spec/source read), **[S]** secondary, **[I]** inferred. Summarised in `../05-ingest-events.md`;
+several open questions were answered by the probe in `../01-camera-probe.md`.
 
 ### 1. RTSP/RTP ingest for H.265
 
-1. **RFC 7798 defines three payload structures you must handle: single NAL (types 0–47, 2-byte NAL header as-is), Aggregation Packet (type 48: PayloadHdr + repeated 16-bit NALU size + NALU) and Fragmentation Unit (type 49: PayloadHdr + FU header S|E|FuType + payload).** FUs must be consecutive seq numbers; S and E both set is forbidden; on a lost FU "discard all following FUs" of that NAL. Marker bit = last packet of the access unit; 90 kHz clock; non-VCL NALs (VPS/SPS/PPS/SEI) carry the picture's timestamp. https://www.rfc-editor.org/rfc/rfc7798 §4.1, §4.4.1–4.4.3 [P]
-2. **DONL/DOND fields exist only when `sprop-max-don-diff > 0`; for a single stream where transmission order = decoding order it MUST be 0 and DONL MUST NOT be present; the de-packetization buffer is then zero bytes and NALs go straight through in arrival order.** Cameras use SRST without DON. Dahua's SDP (retina fixture `src/client/testdata/dahua_describe_h265_pcma.txt`) carries only `profile-id=1;sprop-sps;sprop-pps;sprop-vps`, no DON parameters. RFC 7798 §4.4, §6, §7.1 [P]
-3. **`sprop-vps/sps/pps` are base64 NALs in `a=fmtp`; in-band copies may update them, and ONVIF requires in-band SPS/PPS "if these have been changed during the transmission".** Store parameter sets with each segment and re-check on every IRAP. RFC 7798 §7.2.4; ONVIF Streaming Spec 26.06 §5.1.3 (https://www.onvif.org/specs/stream/ONVIF-Streaming-Spec.pdf) [P]
-4. **AU boundaries: use marker bit, fall back to timestamp change; RFC's informative rule is "next VCL NAL has high-order bit of first byte after NAL header = 1" (`first_slice_segment_in_pic_flag`) with only types 32–35, 39, 41–44, 48–55 in between.** A zero-copy depacketizer can stream NALs to disk as they arrive (length-prefixed) and only needs AU detection for the index entry (timestamp, IRAP flag, byte range). RFC 7798 §4.1 [P]; streaming-vs-buffering trade-off [I]
-5. **retina 0.4.21 (released 2026-10-04; crates.io) implements H.265 in `src/codec/h265.rs` (1773 lines) + `h265/nal.rs` (VPS/SPS/PPS parsing).** State machine New/PreMark/Loss/PostMark; AU finalized on marker (only if last NAL `can_end_au`, i.e. not VPS/SPS/PPS/RSV41-44/UNSPEC48-55 — exactly the RFC list) or on timestamp change; tolerates "bogus mid-AU timestamp change after parameter sets". AP(48) and FU(49) supported; source comment: "only tx-mode SRST is supported, there is no DONL field to decode" (no check of `sprop-max-don-diff`). Loss mid-AU → rest of AU discarded, reported via `VideoFrame::loss()`. Since 0.4.20 reads into a ring buffer (benchmark 2.1→4.6 GiB/s). https://github.com/scottlamb/retina [P]
-6. **retina's `is_random_access_point()` in 0.4.21 only marks IDR; unreleased main treats all IRAP (CRA/BLA) as RAPs — matters because `ParameterSetInsertion::EachKeyFrame` never fired on CRA streams (issue #132).** Exposed API: `VideoFrame{timestamp(), is_random_access_point(), has_new_parameters(), loss(), start_ctx()/end_ctx() (receive wall-clock + Instant since 0.4.18), data()/into_data()}`, `FrameFormat` (Annex B or length-prefixed; parameter-set insertion EachKeyFrame/OnChange), `Stream::parameters()` → `VideoParameters` (VPS/SPS/PPS, coded + display dims). CHANGELOG, `src/codec/mod.rs` [P]
-7. **retina policy knobs:** `Transport` default `Tcp` (UDP "experimental": no reorder buffer, out-of-order dropped); `ReceiverReportPolicy` default Never; `TeardownPolicy` Auto/Always/Never; `InitialTimestampPolicy` Default (= Require for multi-stream, Ignore single)/Require/Ignore/Permissive; `InitialSequenceNumberPolicy` default IgnoreSuspiciousValues; `UnknownRtcpSsrcPolicy` default DropPackets; `enforce_timestamps_with_max_jump_secs` (off by default — computed timestamps may go backwards otherwise). Keepalive: OPTIONS first, then GET_PARAMETER > SET_PARAMETER > OPTIONS, every `min(timeout,60)/2` s; Session timeout defaults to 60 if absent; a keepalive unanswered for one interval fails the session. **No data-inactivity timeout** — caller must wrap `stream.next()` in `tokio::time::timeout`. `src/client/mod.rs`, `src/client/parse.rs` [P]
-8. **Documented camera workarounds (CHANGELOG):** Dahua NVR writes `ssrc` decimal in `RTP-Info` but hex in `Transport` (0.4.21, now ignored); Rubetek 16-bit/garbage ssrc; Tapo answers SET_PARAMETER with 400 (hence GET_PARAMETER preference); Hikvision whitespace in ssrc; Laureii trailing `;` in RTP-Info; empty FU fragments; FU NAL-type change mid-AU; Reolink `pps_scaling_list_data`; Tenda SPS; TrailN (type 0) single-NAL bug; Anjvision schemeless `Content-Base`; Ivel MARK bit on SEI; buggy live555 TEARDOWN; Hikvision DS-2CD2032-I `seq=0`, Tapo `seq=1`. [P]
-9. **Backchannel and metadata: README says backchannel unchecked, but current source has `SessionOptions::backchannel` (sends `Require: www.onvif.org/ver20/backchannel`, `StreamDirection::Sending`), and ONVIF metadata (`vnd.onvif.metadata`, `src/codec/onvif.rs`, `MessageFrame`) is supported.** README is stale. [P]
-10. **TCP interleaved is the recording default everywhere: retina `Transport::default()=Tcp`; Moonfire uses that default (`server/src/streamer.rs`, per-stream `rtsp_transport` override); go2rtc `Transport ""|"tcp"` → `RTP/AVP/TCP;unicast;interleaved`, UDP opt-in (`pkg/rtsp/client.go`); Frigate `preset-rtsp-generic` = `-rtsp_transport tcp -timeout 10000000 -use_wallclock_as_timestamps 1`, `preset-rtsp-udp` only "when the camera only supports UDP" (`frigate/ffmpeg_presets.py`).** ONVIF requires devices to support RTP/UDP and "should" support RTP/RTSP/TCP (Streaming §5.1.1). [P] Rationale: on a LAN TCP gives zero loss and kernel retransmit; head-of-line blocking only adds latency, irrelevant for recording; the real failure mode is backpressure — if the NVR stalls, the camera's socket buffer fills and it drops the session, so reconnect logic matters more than transport. UDP would surface loss as `loss()` gaps with no reorder buffer. CPU difference is negligible at 6 streams. [I]
-11. **Keepalive/timeout rules:** RFC 2326 §12.37 `Session: id;timeout=N` (default 60); bodyless GET_PARAMETER "may be used to test liveness" (§10.8). RFC 7826 §10.5: SET_PARAMETER recommended, GET_PARAMETER OK, OPTIONS "bigger responses"; timeouts < 30 s not recommended. ONVIF Streaming §5.2.2.2: "any RTSP request other than TEARDOWN" and any RTCP RR is a keepalive; GET/SET_PARAMETER are optional (Table 2). Dahua returns `Session: ...;timeout=60` (retina fixture `dahua_setup.txt`). go2rtc sends OPTIONS every `timeout−5` s (25 s default) with a 5 s read timeout (`pkg/rtsp/conn.go`). Moonfire sleeps 1 s and retries after any streamer error. [P]
-12. **Dahua sends RTCP Sender Reports; ONVIF mandates them ("A device shall support RTCP Sender Report for media synchronization", Streaming §5.1.2.2.1).** A capture from an HDBW3841R-ZS-S2 shows SRs with a sane NTP timestamp but sender packet/octet count 0. https://discourse.gstreamer.org/t/rtcp-sender-reports-fail-sanity-checks-dahua-type-camera/4597 [S]. retina exposes SRs (`PacketItem::Rtcp` → `SenderReportRef::{ntp_timestamp, rtp_timestamp}`; `NtpTimestamp ⇄ SystemTime` on main). [P]
-13. **`proto=Onvif` / `unicast=true`: no official definition found.** Evidence: retina's captured DESCRIBE for `...&unicast=true&proto=Onvif` (`dahua_describe_h264_aac_onvif.txt`) returns video + AAC (`MPEG4-GENERIC/48000`) + `m=application ... vnd.onvif.metadata/90000` (trackID=4), whereas the plain `/cam/realmonitor?channel=1&subtype=2` capture returns video + `PCMA/8000` only; go2rtc docs say the ONVIF form is "preferred for two-way audio" on Dahua doorbells; `proto=Dahua3&unicast=false` appears in a multicast SETUP (FFmpeg trac #5970). Inference: `proto` selects the server-side profile (ONVIF media profile incl. metadata/backchannel vs. Dahua private), `unicast=false` requests multicast. [S/I] Audio: G.711a and AAC both appear in-session; retina depacketizes both. Multicast is enabled via `configManager` `Multicast.*` tables (forum) — pointless for one consumer per camera. [S]
+1. **RFC 7798 defines three payload structures you must handle: single NAL (types 0–47, 2-byte NAL
+   header as-is), Aggregation Packet (type 48: PayloadHdr + repeated 16-bit NALU size + NALU) and
+   Fragmentation Unit (type 49: PayloadHdr + FU header S|E|FuType + payload).** FUs must be
+   consecutive seq numbers; S and E both set is forbidden; on a lost FU "discard all following FUs"
+   of that NAL. Marker bit = last packet of the access unit; 90 kHz clock; non-VCL NALs
+   (VPS/SPS/PPS/SEI) carry the picture's timestamp. https://www.rfc-editor.org/rfc/rfc7798 §4.1,
+   §4.4.1–4.4.3 [P]
+2. **DONL/DOND fields exist only when `sprop-max-don-diff > 0`; for a single stream where
+   transmission order = decoding order it MUST be 0 and DONL MUST NOT be present; the
+   de-packetization buffer is then zero bytes and NALs go straight through in arrival order.**
+   Cameras use SRST without DON. Dahua's SDP (retina fixture
+   `src/client/testdata/dahua_describe_h265_pcma.txt`) carries only
+   `profile-id=1;sprop-sps;sprop-pps;sprop-vps`, no DON parameters. RFC 7798 §4.4, §6, §7.1 [P]
+3. **`sprop-vps/sps/pps` are base64 NALs in `a=fmtp`; in-band copies may update them, and ONVIF
+   requires in-band SPS/PPS "if these have been changed during the transmission".** Store parameter
+   sets with each segment and re-check on every IRAP. RFC 7798 §7.2.4; ONVIF Streaming Spec 26.06
+   §5.1.3 (https://www.onvif.org/specs/stream/ONVIF-Streaming-Spec.pdf) [P]
+4. **AU boundaries: use marker bit, fall back to timestamp change; RFC's informative rule is "next
+   VCL NAL has high-order bit of first byte after NAL header = 1"
+   (`first_slice_segment_in_pic_flag`) with only types 32–35, 39, 41–44, 48–55 in between.** A
+   zero-copy depacketizer can stream NALs to disk as they arrive (length-prefixed) and only needs AU
+   detection for the index entry (timestamp, IRAP flag, byte range). RFC 7798 §4.1 [P];
+   streaming-vs-buffering trade-off [I]
+5. **retina 0.4.21 (released 2026-10-04; crates.io) implements H.265 in `src/codec/h265.rs` (1773
+   lines) + `h265/nal.rs` (VPS/SPS/PPS parsing).** State machine New/PreMark/Loss/PostMark; AU
+   finalized on marker (only if last NAL `can_end_au`, i.e. not VPS/SPS/PPS/RSV41-44/UNSPEC48-55 —
+   exactly the RFC list) or on timestamp change; tolerates "bogus mid-AU timestamp change after
+   parameter sets". AP(48) and FU(49) supported; source comment: "only tx-mode SRST is supported,
+   there is no DONL field to decode" (no check of `sprop-max-don-diff`). Loss mid-AU → rest of AU
+   discarded, reported via `VideoFrame::loss()`. Since 0.4.20 reads into a ring buffer (benchmark
+   2.1→4.6 GiB/s). https://github.com/scottlamb/retina [P]
+6. **retina's `is_random_access_point()` in 0.4.21 only marks IDR; unreleased main treats all IRAP
+   (CRA/BLA) as RAPs — matters because `ParameterSetInsertion::EachKeyFrame` never fired on CRA
+   streams (issue #132).** Exposed API: `VideoFrame{timestamp(), is_random_access_point(),
+   has_new_parameters(), loss(), start_ctx()/end_ctx() (receive wall-clock + Instant since 0.4.18),
+   data()/into_data()}`, `FrameFormat` (Annex B or length-prefixed; parameter-set insertion
+   EachKeyFrame/OnChange), `Stream::parameters()` → `VideoParameters` (VPS/SPS/PPS, coded +
+   display dims). CHANGELOG, `src/codec/mod.rs` [P]
+7. **retina policy knobs:** `Transport` default `Tcp` (UDP "experimental": no reorder buffer,
+   out-of-order dropped); `ReceiverReportPolicy` default Never; `TeardownPolicy` Auto/Always/Never;
+   `InitialTimestampPolicy` Default (= Require for multi-stream, Ignore
+   single)/Require/Ignore/Permissive; `InitialSequenceNumberPolicy` default IgnoreSuspiciousValues;
+   `UnknownRtcpSsrcPolicy` default DropPackets; `enforce_timestamps_with_max_jump_secs` (off by
+   default — computed timestamps may go backwards otherwise). Keepalive: OPTIONS first, then
+   GET_PARAMETER > SET_PARAMETER > OPTIONS, every `min(timeout,60)/2` s; Session timeout defaults to
+   60 if absent; a keepalive unanswered for one interval fails the session. **No data-inactivity
+   timeout** — caller must wrap `stream.next()` in `tokio::time::timeout`. `src/client/mod.rs`,
+   `src/client/parse.rs` [P]
+8. **Documented camera workarounds (CHANGELOG):** Dahua NVR writes `ssrc` decimal in `RTP-Info` but
+   hex in `Transport` (0.4.21, now ignored); Rubetek 16-bit/garbage ssrc; Tapo answers SET_PARAMETER
+   with 400 (hence GET_PARAMETER preference); Hikvision whitespace in ssrc; Laureii trailing `;` in
+   RTP-Info; empty FU fragments; FU NAL-type change mid-AU; Reolink `pps_scaling_list_data`; Tenda
+   SPS; TrailN (type 0) single-NAL bug; Anjvision schemeless `Content-Base`; Ivel MARK bit on SEI;
+   buggy live555 TEARDOWN; a Hikvision IPC `seq=0`, Tapo `seq=1`. [P]
+9. **Backchannel and metadata: README says backchannel unchecked, but current source has
+   `SessionOptions::backchannel` (sends `Require: www.onvif.org/ver20/backchannel`,
+   `StreamDirection::Sending`), and ONVIF metadata (`vnd.onvif.metadata`, `src/codec/onvif.rs`,
+   `MessageFrame`) is supported.** README is stale. [P]
+10. **TCP interleaved is the recording default everywhere: retina `Transport::default()=Tcp`;
+    Moonfire uses that default (`server/src/streamer.rs`, per-stream `rtsp_transport` override);
+    go2rtc `Transport ""|"tcp"` → `RTP/AVP/TCP;unicast;interleaved`, UDP opt-in
+    (`pkg/rtsp/client.go`); Frigate `preset-rtsp-generic` = `-rtsp_transport tcp -timeout 10000000
+    -use_wallclock_as_timestamps 1`, `preset-rtsp-udp` only "when the camera only supports UDP"
+    (`frigate/ffmpeg_presets.py`).** ONVIF requires devices to support RTP/UDP and "should" support
+    RTP/RTSP/TCP (Streaming §5.1.1). [P] Rationale: on a LAN TCP gives zero loss and kernel
+    retransmit; head-of-line blocking only adds latency, irrelevant for recording; the real failure
+    mode is backpressure — if the NVR stalls, the camera's socket buffer fills and it drops the
+    session, so reconnect logic matters more than transport. UDP would surface loss as `loss()` gaps
+    with no reorder buffer. CPU difference is negligible at 6 streams. [I]
+11. **Keepalive/timeout rules:** RFC 2326 §12.37 `Session: id;timeout=N` (default 60); bodyless
+    GET_PARAMETER "may be used to test liveness" (§10.8). RFC 7826 §10.5: SET_PARAMETER
+    recommended, GET_PARAMETER OK, OPTIONS "bigger responses"; timeouts < 30 s not recommended.
+    ONVIF Streaming §5.2.2.2: "any RTSP request other than TEARDOWN" and any RTCP RR is a
+    keepalive; GET/SET_PARAMETER are optional (Table 2). Dahua returns `Session: ...;timeout=60`
+    (retina fixture `dahua_setup.txt`). go2rtc sends OPTIONS every `timeout−5` s (25 s default)
+    with a 5 s read timeout (`pkg/rtsp/conn.go`). Moonfire sleeps 1 s and retries after any streamer
+    error. [P]
+12. **Dahua sends RTCP Sender Reports; ONVIF mandates them ("A device shall support RTCP Sender
+    Report for media synchronization", Streaming §5.1.2.2.1).** A capture from a Dahua 4K dome
+    shows SRs with a sane NTP timestamp but sender packet/octet count 0.
+    https://discourse.gstreamer.org/t/rtcp-sender-reports-fail-sanity-checks-dahua-type-camera/4597
+    [S]. retina exposes SRs (`PacketItem::Rtcp` → `SenderReportRef::{ntp_timestamp,
+    rtp_timestamp}`; `NtpTimestamp ⇄ SystemTime` on main). [P]
+13. **`proto=Onvif` / `unicast=true`: no official definition found.** Evidence: retina's captured
+    DESCRIBE for `...&unicast=true&proto=Onvif` (`dahua_describe_h264_aac_onvif.txt`) returns video
+    + AAC (`MPEG4-GENERIC/48000`) + `m=application ... vnd.onvif.metadata/90000` (trackID=4),
+    whereas the plain `/cam/realmonitor?channel=1&subtype=2` capture returns video + `PCMA/8000`
+    only; go2rtc docs say the ONVIF form is "preferred for two-way audio" on Dahua doorbells;
+    `proto=Dahua3&unicast=false` appears in a multicast SETUP (FFmpeg trac #5970). Inference:
+    `proto` selects the server-side profile (ONVIF media profile incl. metadata/backchannel vs.
+    Dahua private), `unicast=false` requests multicast. [S/I] Audio: G.711a and AAC both appear
+    in-session; retina depacketizes both. Multicast is enabled via `configManager` `Multicast.*`
+    tables (forum) — pointless for one consumer per camera. [S]
 
 ### 2. ONVIF
 
-1. **Discovery: ONVIF Core 26.06 §7 — device implements WS-Discovery Target Service; `<d:Types>` must include `tds:Device`; scopes `onvif://www.onvif.org/<path>`; ProbeMatch must carry `<d:XAddrs>` (device service URL).** Multicast 239.255.255.250:3702 (onvif-rs `MULTI_PORT = 3702`). https://www.onvif.org/specs/core/ONVIF-Core-Specification.pdf [P]
-2. **Profile T v1.0 mandates GetProfiles, GetStreamUri, GetVideoEncoderConfigurations (Media2), GetSystemDateAndTime, H.264 or H.265 streaming, `tns1:VideoSource/MotionAlarm` and a tampering event (`tns1:VideoSource/GlobalSceneChange/ImagingService`); MaxPullPoints ≥ 2.** GetSnapshotUri is Media1 (Profile S). Media2 `GovLength` is the GOP field. ONVIF_Profile_T_Specification_v1-0.pdf §7.17, §7.20, §8.6 [P]
-3. **PullPoint (Core §9.1): device "shall implement the Real Time Pull-Point Notification Interface"; `CreatePullPointSubscription{Filter (TopicExpression dialect `.../ConcreteSet`), InitialTerminationTime (absolute or relative), SubscriptionPolicy tev:ChangedOnly}`; keepalive is implicit — after each PullMessages response the subscription stays alive ≥ the request Timeout; `PullMessages{Timeout (≥ 1 min supported), MessageLimit}` returns immediately when messages are waiting, otherwise blocks until Timeout then returns zero messages; `Renew` ≥ 1 min; `Unsubscribe`; `SetSynchronizationPoint` re-emits properties as `PropertyOperation="Initialized"`; property messages carry Initialized/Changed/Deleted; CurrentTime/TerminationTime in UTC 'Z'.** [P]
-4. **Topic names (consolidated from `onvif_parsers` 2.5.0, the library Home Assistant now uses):** `tns1:VideoSource/MotionAlarm` (State), `tns1:RuleEngine/CellMotionDetector/Motion` (IsMotion), `tns1:RuleEngine/MotionRegionDetector/Motion`, `tns1:RuleEngine/FieldDetector/ObjectsInside` (IsInside), `tns1:RuleEngine/LineDetector/Crossed` (ObjectId), `tns1:RuleEngine/TamperDetector/Tamper`, `tns1:VideoSource/GlobalSceneChange/*`, `tns1:AudioAnalytics/Audio/DetectedSound`, `tns1:Device/Trigger/DigitalInput`, `tns1:RuleEngine/ObjectDetection/Object`, plus vendor ones (`MyRuleDetector/*` Reolink, `TPSmartEvent` Tapo). A Dahua HDW2431 log shows `CellMotionDetector/Motion IsMotion=true` followed by `VideoSource/MotionAlarm`. Dahua IVS topic names were not verified — enumerate with `GetEventProperties`. https://pypi.org/project/onvif_parsers/ [P for list; S for Dahua]
-5. **Auth: WS-UsernameToken PasswordDigest = Base64(SHA1(nonce ‖ created ‖ password)); Core §5.9.5 "server shall reject any Username Token not using both nonce and creation timestamps"** → clock skew breaks auth; onvif-rs applies a measured `time_gap` (`onvif/src/soap/auth/username_token.rs`), HA warns when |camera−host| ≥ 5 s (`components/onvif/device.py`). PullMessages endpoints on some cameras want HTTP Digest instead (onvif-rs event example sets `AuthType::Digest` for the subscription URL). [P]
-6. **Dahua quirks (forum, could not fetch — ipcamtalk returns 403):** creating a PullPoint subscription can silently enable motion detection; TerminationTime advances ~10× the PullMessages duration; messages missing `Data` crash naive parsers (openHAB). HA's battle-tested constants: subscription 10 min, Renew every 8 min, PullMessages Timeout 60 s / MessageLimit 100, 0.75 s cooldown between pulls, 60 s restart after error. `hacore/homeassistant/components/onvif/event_manager.py` [P]; forum items [S]
-7. **Crates:** `lumeohq/onvif-rs` — git-only (`onvif` 0.1.0 in Cargo; the crates.io `onvif 0.0.0`, 2026-03-21, is an unrelated placeholder), last commits 2026-08-12 (clippy/deps), reqwest 0.13 + yaserde 0.7 + git-pinned xsd-parser-rs; has WS-Discovery, UsernameToken, Digest, devicemgmt/media/media2/event/analytics/ptz; event ops = create_pull_point_subscription, pull_messages, seek, set_synchronization_point, get_event_properties — `unsubscribe` commented out, no `renew`. `oxvif` 0.17.0 (2026-09-14, 9k downloads, https://github.com/smiti1642/oxvif): device/media1/media2/ptz/imaging/events (pull-point, renew, unsubscribe), recording/search/replay, WS-Discovery; WS-Security + HTTP Digest; reqwest 0.13 + diqwest + quick-xml 0.42; tokio; analytics rules not implemented. `onvif-cam-rs` 0.2.1 (2023-09-09) stale. `dahua-camera-onvif` 0.3.1 (2026-08-05, 132 downloads) not evaluated. **Recommend oxvif**, with a hand-rolled fallback (reqwest + quick-xml, ~8 operations) if it misbehaves on Dahua. [P]
+1. **Discovery: ONVIF Core 26.06 §7 — device implements WS-Discovery Target Service; `<d:Types>`
+   must include `tds:Device`; scopes `onvif://www.onvif.org/<path>`; ProbeMatch must carry
+   `<d:XAddrs>` (device service URL).** Multicast 239.255.255.250:3702 (onvif-rs `MULTI_PORT =
+   3702`). https://www.onvif.org/specs/core/ONVIF-Core-Specification.pdf [P]
+2. **Profile T v1.0 mandates GetProfiles, GetStreamUri, GetVideoEncoderConfigurations (Media2),
+   GetSystemDateAndTime, H.264 or H.265 streaming, `tns1:VideoSource/MotionAlarm` and a tampering
+   event (`tns1:VideoSource/GlobalSceneChange/ImagingService`); MaxPullPoints ≥ 2.**
+   GetSnapshotUri is Media1 (Profile S). Media2 `GovLength` is the GOP field.
+   ONVIF_Profile_T_Specification_v1-0.pdf §7.17, §7.20, §8.6 [P]
+3. **PullPoint (Core §9.1): device "shall implement the Real Time Pull-Point Notification
+   Interface"; `CreatePullPointSubscription{Filter (TopicExpression dialect `.../ConcreteSet`),
+   InitialTerminationTime (absolute or relative), SubscriptionPolicy tev:ChangedOnly}`; keepalive is
+   implicit — after each PullMessages response the subscription stays alive ≥ the request
+   Timeout; `PullMessages{Timeout (≥ 1 min supported), MessageLimit}` returns immediately when
+   messages are waiting, otherwise blocks until Timeout then returns zero messages; `Renew` ≥ 1
+   min; `Unsubscribe`; `SetSynchronizationPoint` re-emits properties as
+   `PropertyOperation="Initialized"`; property messages carry Initialized/Changed/Deleted;
+   CurrentTime/TerminationTime in UTC 'Z'.** [P]
+4. **Topic names (consolidated from `onvif_parsers` 2.5.0, the library Home Assistant now uses):**
+   `tns1:VideoSource/MotionAlarm` (State), `tns1:RuleEngine/CellMotionDetector/Motion` (IsMotion),
+   `tns1:RuleEngine/MotionRegionDetector/Motion`, `tns1:RuleEngine/FieldDetector/ObjectsInside`
+   (IsInside), `tns1:RuleEngine/LineDetector/Crossed` (ObjectId),
+   `tns1:RuleEngine/TamperDetector/Tamper`, `tns1:VideoSource/GlobalSceneChange/*`,
+   `tns1:AudioAnalytics/Audio/DetectedSound`, `tns1:Device/Trigger/DigitalInput`,
+   `tns1:RuleEngine/ObjectDetection/Object`, plus vendor ones (`MyRuleDetector/*` Reolink,
+   `TPSmartEvent` Tapo). A Dahua turret's log shows `CellMotionDetector/Motion IsMotion=true`
+   followed by `VideoSource/MotionAlarm`. Dahua IVS topic names were not verified — enumerate with
+   `GetEventProperties`. https://pypi.org/project/onvif_parsers/ [P for list; S for Dahua]
+5. **Auth: WS-UsernameToken PasswordDigest = Base64(SHA1(nonce ‖ created ‖ password)); Core
+   §5.9.5 "server shall reject any Username Token not using both nonce and creation timestamps"**
+   → clock skew breaks auth; onvif-rs applies a measured `time_gap`
+   (`onvif/src/soap/auth/username_token.rs`), HA warns when |camera−host| ≥ 5 s
+   (`components/onvif/device.py`). PullMessages endpoints on some cameras want HTTP Digest instead
+   (onvif-rs event example sets `AuthType::Digest` for the subscription URL). [P]
+6. **Dahua quirks (forum, could not fetch — ipcamtalk returns 403):** creating a PullPoint
+   subscription can silently enable motion detection; TerminationTime advances ~10× the
+   PullMessages duration; messages missing `Data` crash naive parsers (openHAB). HA's battle-tested
+   constants: subscription 10 min, Renew every 8 min, PullMessages Timeout 60 s / MessageLimit 100,
+   0.75 s cooldown between pulls, 60 s restart after error.
+   `hacore/homeassistant/components/onvif/event_manager.py` [P]; forum items [S]
+7. **Crates:** `lumeohq/onvif-rs` — git-only (`onvif` 0.1.0 in Cargo; the crates.io `onvif 0.0.0`,
+   2026-03-21, is an unrelated placeholder), last commits 2026-08-12 (clippy/deps), reqwest 0.13 +
+   yaserde 0.7 + git-pinned xsd-parser-rs; has WS-Discovery, UsernameToken, Digest,
+   devicemgmt/media/media2/event/analytics/ptz; event ops = create_pull_point_subscription,
+   pull_messages, seek, set_synchronization_point, get_event_properties — `unsubscribe` commented
+   out, no `renew`. `oxvif` 0.17.0 (2026-09-14, 9k downloads, https://github.com/smiti1642/oxvif):
+   device/media1/media2/ptz/imaging/events (pull-point, renew, unsubscribe),
+   recording/search/replay, WS-Discovery; WS-Security + HTTP Digest; reqwest 0.13 + diqwest +
+   quick-xml 0.42; tokio; analytics rules not implemented. `onvif-cam-rs` 0.2.1 (2023-09-09) stale.
+   `dahua-camera-onvif` 0.3.1 (2026-08-05, 132 downloads) not evaluated. **Recommend oxvif**, with a
+   hand-rolled fallback (reqwest + quick-xml, ~8 operations) if it misbehaves on Dahua. [P]
 
 ### 3. Dahua HTTP CGI API
 
-1. **Event feed: `GET /cgi-bin/eventManager.cgi?action=attach&codes=[All]&heartbeat=5` → `Content-Type: multipart/x-mixed-replace; boundary=myboundary`; each part `--myboundary\r\nContent-Type: text/plain\r\nContent-Length: N\r\n\r\nCode=VideoMotion;action=Start;index=0[;data={JSON}]`; heartbeat "integer, range [1,60], unit second… the heartbeat message are 'Heartbeat'" (API text quoted in the HA Dahua client); heartbeat part is 9 bytes, and on a DH-SD42A212TN-HNI it lacks the blank line (parser bug #995).** Read the boundary from Content-Type. Codes seen: VideoMotion, VideoMotionInfo (action=State), VideoLoss, VideoBlind, AlarmLocal, CrossLineDetection, CrossRegionDetection, LeftDetection, TakenAwayDetection, VideoAbnormalDetection, FaceDetection, AudioMutation, AudioAnomaly, VideoUnFocus, WanderDetection, RioterDetection, ParkingDetection, MoveDetection, MDResult, HeatImagingTemper, NewFile, SmartMotionHuman/SmartMotionVehicle (HA also derives these from CrossLine/CrossRegion `data.ObjectType`). https://github.com/rroller/dahua (`custom_components/dahua/client.py`, issues #166/#296), ipcmanview `pkg/dahuacgi/event.go` [S]
-2. **Reliability vs ONVIF PullPoint:** push with built-in heartbeat (stall detection = 2×heartbeat), carries IVS object metadata, one connection per camera; but proprietary and firmware-dependent — some firmware 404s all of `/cgi-bin/` (HA falls back to RPC2 polling), long `codes=` lists get HTTP 400/500 (use `[All]` and filter locally), digest MD5 must stay enabled ("Compatibility" auth mode), and repeated bad logins lock out the source IP. python-amcrest uses the same URL without heartbeat (read timeout `None`) and parses `Content-length:` + 2 bytes then `key=value;` regex with JSON `data`. https://github.com/tchellomello/python-amcrest (`src/amcrest/event.py`) [S]
-3. **Encode config: `configManager.cgi?action=getConfig&name=Encode` returns `table.Encode[ch].MainFormat[i].Video.{Compression,BitRate,BitRateControl,FPS,GOP,resolution,...}` and `ExtraFormat[i]` for sub-streams (i: 0 regular, 1 motion, 2 alarm); set with `action=setConfig&Encode[0].MainFormat[0].Video.GOP=30`.** `Video.Profile` and the Smart Codec key were not confirmed — diff `getConfig` before/after toggling in the UI. Also `encode.cgi?action=getCaps|getConfigCaps`. python-amcrest `utils.py`, https://pkg.go.dev/code.jhot.me/jhot/hats/pkg/amcrest constants [S] *(Probe note: cam1 exposes `Video.Profile=Main` and `SmartEncode[0].Enable`.)*
-4. **Snapshot/time/NTP: `snapshot.cgi?channel=1` (JPEG); `global.cgi?action=getCurrentTime` → `result=YYYY-MM-DD HH:MM:SS` (locale-independent), `setCurrentTime&time=...`; NTP table `table.NTP.{Enable,Address,Port,UpdatePeriod,TimeZone}` (NVRs add `NTP.ServerList[n]`).** Auth is HTTP Digest (MD5), Basic on old firmware; no documented rate limit, but every request re-challenges, so reuse the digest nonce across requests (HA does this to cut device log spam). [S]
-5. **RPC2 (JSON-RPC, reverse-engineered, no official spec): `POST /RPC2_Login` `global.login` two-step (first call returns session/realm/random, second sends hashed password, `clientType:"Web3.0"`), then `/RPC2` with `session`; `global.keepAlive` (ipcmanview asks 300 s; HA uses the device-stated interval −5 s, 60 s fallback); `configManager.getConfig`, `global.getCurrentTime`, `magicBox.getSoftwareVersion`.** Use only as fallback. https://github.com/ItsNotGoodName/ipcmanview (`pkg/dahuarpc`), rroller client [S]
+1. **Event feed: `GET /cgi-bin/eventManager.cgi?action=attach&codes=[All]&heartbeat=5` →
+   `Content-Type: multipart/x-mixed-replace; boundary=myboundary`; each part
+   `--myboundary\r\nContent-Type: text/plain\r\nContent-Length:
+   N\r\n\r\nCode=VideoMotion;action=Start;index=0[;data={JSON}]`; heartbeat "integer, range [1,60],
+   unit second… the heartbeat message are 'Heartbeat'" (API text quoted in the HA Dahua client);
+   heartbeat part is 9 bytes, and on a Dahua PTZ it lacks the blank line (parser bug
+   #995).** Read the boundary from Content-Type. Codes seen: VideoMotion, VideoMotionInfo
+   (action=State), VideoLoss, VideoBlind, AlarmLocal, CrossLineDetection, CrossRegionDetection,
+   LeftDetection, TakenAwayDetection, VideoAbnormalDetection, FaceDetection, AudioMutation,
+   AudioAnomaly, VideoUnFocus, WanderDetection, RioterDetection, ParkingDetection, MoveDetection,
+   MDResult, HeatImagingTemper, NewFile, SmartMotionHuman/SmartMotionVehicle (HA also derives these
+   from CrossLine/CrossRegion `data.ObjectType`). https://github.com/rroller/dahua
+   (`custom_components/dahua/client.py`, issues #166/#296), ipcmanview `pkg/dahuacgi/event.go` [S]
+2. **Reliability vs ONVIF PullPoint:** push with built-in heartbeat (stall detection =
+   2×heartbeat), carries IVS object metadata, one connection per camera; but proprietary and
+   firmware-dependent — some firmware 404s all of `/cgi-bin/` (HA falls back to RPC2 polling),
+   long `codes=` lists get HTTP 400/500 (use `[All]` and filter locally), digest MD5 must stay
+   enabled ("Compatibility" auth mode), and repeated bad logins lock out the source IP.
+   python-amcrest uses the same URL without heartbeat (read timeout `None`) and parses
+   `Content-length:` + 2 bytes then `key=value;` regex with JSON `data`.
+   https://github.com/tchellomello/python-amcrest (`src/amcrest/event.py`) [S]
+3. **Encode config: `configManager.cgi?action=getConfig&name=Encode` returns
+   `table.Encode[ch].MainFormat[i].Video.{Compression,BitRate,BitRateControl,FPS,GOP,resolution,...}`
+   and `ExtraFormat[i]` for sub-streams (i: 0 regular, 1 motion, 2 alarm); set with
+   `action=setConfig&Encode[0].MainFormat[0].Video.GOP=30`.** `Video.Profile` and the Smart Codec
+   key were not confirmed — diff `getConfig` before/after toggling in the UI. Also
+   `encode.cgi?action=getCaps|getConfigCaps`. python-amcrest `utils.py`,
+   https://pkg.go.dev/code.jhot.me/jhot/hats/pkg/amcrest constants [S] *(Probe note: cam1 exposes
+   `Video.Profile=Main` and `SmartEncode[0].Enable`.)*
+4. **Snapshot/time/NTP: `snapshot.cgi?channel=1` (JPEG); `global.cgi?action=getCurrentTime` →
+   `result=YYYY-MM-DD HH:MM:SS` (locale-independent), `setCurrentTime&time=...`; NTP table
+   `table.NTP.{Enable,Address,Port,UpdatePeriod,TimeZone}` (NVRs add `NTP.ServerList[n]`).** Auth is
+   HTTP Digest (MD5), Basic on old firmware; no documented rate limit, but every request
+   re-challenges, so reuse the digest nonce across requests (HA does this to cut device log spam).
+   [S]
+5. **RPC2 (JSON-RPC, reverse-engineered, no official spec): `POST /RPC2_Login` `global.login`
+   two-step (first call returns session/realm/random, second sends hashed password,
+   `clientType:"Web3.0"`), then `/RPC2` with `session`; `global.keepAlive` (ipcmanview asks 300 s;
+   HA uses the device-stated interval −5 s, 60 s fallback); `configManager.getConfig`,
+   `global.getCurrentTime`, `magicBox.getSoftwareVersion`.** Use only as fallback.
+   https://github.com/ItsNotGoodName/ipcmanview (`pkg/dahuarpc`), rroller client [S]
 
 ### 4. Smart codec / long GOP
 
-1. **Dahua Smart H.265+ = scene-adaptive encoding, dynamic GOP ("an I-frame is inserted only when a change such as motion interrupts the scene"), dynamic ROI, flexible multi-frame reference, region-aware noise reduction; vendor claims up to 70% vs H.265.** https://www.securityinfowatch.com/video-surveillance/product/12327175/… , Dahua datasheets [S, vendor]
-2. **Hikvision H.265+ = background-model predictive encoding (background as long-term reference), noise suppression, long-term bitrate control; vendor claims ~32% of H.265 bitrate.** hikvision.com H.265+ page/white paper (via search summary; PDF unreachable) [S, vendor]
-3. **Consequences: GOP becomes very long and irregular; the I-frame interval setting disappears in the UI when enabled; segment boundaries (must start at an IRAP) and seek granularity stretch to tens of seconds, thumbnails require decoding from a distant IRAP, event-clip starts and reconnects lose up to a GOP, and long-term references mean a mid-GOP cut is undecodable.** Blue Iris/SecuritySpy both tell users to disable "+" modes (ipcamtalk, bensoftware forums). [S/I]
-4. **Recommended camera settings: Smart Codec off; GOP = 1×–2× fps (Dahua auto-sets 2×; Blue Iris recommends 1×); CBR (or VBR with a max) for predictable storage; Main profile; these encoders emit P-only streams (no B-frames), so decode order = output order and `sprop-max-don-diff=0` holds.** [S/I]
+1. **Dahua Smart H.265+ = scene-adaptive encoding, dynamic GOP ("an I-frame is inserted only when a
+   change such as motion interrupts the scene"), dynamic ROI, flexible multi-frame reference,
+   region-aware noise reduction; vendor claims up to 70% vs H.265.**
+   https://www.securityinfowatch.com/video-surveillance/product/12327175/… , Dahua datasheets [S,
+   vendor]
+2. **Hikvision H.265+ = background-model predictive encoding (background as long-term reference),
+   noise suppression, long-term bitrate control; vendor claims ~32% of H.265 bitrate.**
+   hikvision.com H.265+ page/white paper (via search summary; PDF unreachable) [S, vendor]
+3. **Consequences: GOP becomes very long and irregular; the I-frame interval setting disappears in
+   the UI when enabled; segment boundaries (must start at an IRAP) and seek granularity stretch to
+   tens of seconds, thumbnails require decoding from a distant IRAP, event-clip starts and
+   reconnects lose up to a GOP, and long-term references mean a mid-GOP cut is undecodable.** Blue
+   Iris/SecuritySpy both tell users to disable "+" modes (ipcamtalk, bensoftware forums). [S/I]
+4. **Recommended camera settings: Smart Codec off; GOP = 1×–2× fps (Dahua auto-sets 2×; Blue
+   Iris recommends 1×); CBR (or VBR with a max) for predictable storage; Main profile; these
+   encoders emit P-only streams (no B-frames), so decode order = output order and
+   `sprop-max-don-diff=0` holds.** [S/I]
 
 ### 5. Clock sync
 
-1. **Video timing should never depend on camera clocks: Moonfire stamps every frame with NVR wall time at receipt and uses RTP deltas for duration; the writer reconciles media vs wall duration per recording.** `moonfire-nvr/server/src/streamer.rs`, `server/db/writer.rs` [P]
-2. **Camera clocks matter only for event correlation and RTCP-SR NTP mapping; check offset with ONVIF `GetSystemDateAndTime` (HA warns at ≥ 5 s) or `global.cgi?action=getCurrentTime`, and apply the measured offset to event times.** [P/S]
-3. **Drift without NTP is anecdotal only: ~1.5 min/month (~3 s/day) reported, worse cases from DST mis-handling (1 h jumps).** No vendor spec found. ipcamtalk threads [S] *(Probe: cam1's ONVIF UTC is exactly 1 h off even with NTP.)*
-4. **Run chrony on the NVR, serve the LAN, point each camera at it via the NTP table (`UpdatePeriod`, forums cite 10 min); disable DST on cameras, prefer UTC.** Users report Dahua cameras sync fine to an NVR/NAS NTP server (IPVM, ipcamtalk). [S]
+1. **Video timing should never depend on camera clocks: Moonfire stamps every frame with NVR wall
+   time at receipt and uses RTP deltas for duration; the writer reconciles media vs wall duration
+   per recording.** `moonfire-nvr/server/src/streamer.rs`, `server/db/writer.rs` [P]
+2. **Camera clocks matter only for event correlation and RTCP-SR NTP mapping; check offset with
+   ONVIF `GetSystemDateAndTime` (HA warns at ≥ 5 s) or `global.cgi?action=getCurrentTime`, and
+   apply the measured offset to event times.** [P/S]
+3. **Drift without NTP is anecdotal only: ~1.5 min/month (~3 s/day) reported, worse cases from DST
+   mis-handling (1 h jumps).** No vendor spec found. ipcamtalk threads [S] *(Probe: cam1's ONVIF UTC
+   is exactly 1 h off even with NTP.)*
+4. **Run chrony on the NVR, serve the LAN, point each camera at it via the NTP table
+   (`UpdatePeriod`, forums cite 10 min); disable DST on cameras, prefer UTC.** Users report Dahua
+   cameras sync fine to an NVR/NAS NTP server (IPVM, ipcamtalk). [S]
 
 ### Recommended ingest and event design for irisd (as proposed by this thread)
 
-- **Ingest:** `retina = "0.4.21"` (pin a git rev on main if CRA/BLA RAP detection is needed), `Transport::Tcp`, `FrameFormat` length-prefixed (or Annex B) with `ParameterSetInsertion::OnChange`, `enforce_timestamps_with_max_jump_secs(10)`, `ReceiverReportPolicy::Never` (TCP), `TeardownPolicy::Auto`. One tokio task per stream; wrap `next()` in a 10 s `timeout`; also fail if a keepalive goes unanswered. On any error: reconnect with 1 s → ×2 → 30 s cap, ±20% jitter, resume recording at the next `is_random_access_point()`. Segment on IRAP every ~10 s (Frigate uses 10 s segments). Use `start_ctx()` wall time for timestamps; log SR NTP vs local offset.
-- **URLs:** main `subtype=0`, sub `subtype=1`; add `unicast=true&proto=Onvif` only when the metadata track or backchannel is wanted; keep credentials out of the URL (Moonfire rule).
-- **Camera settings via CGI at setup:** H.265, Smart Codec off, GOP = fps (or 2×), CBR, Main profile, NTP → irisd host.
-- **Events (priority):** (1) `eventManager.cgi?action=attach&codes=[All]&heartbeat=5` with digest auth, reconnect if no part within 15 s; (2) ONVIF PullPoint via oxvif 0.17 (Timeout 60 s, MessageLimit 100, Renew every 8 min of a 10 min subscription) when CGI is 404/forbidden; (3) RPC2 polling only as last resort. Normalize into one event schema keyed by camera, code/topic, action, ObjectType, camera time + measured offset.
-- **ONVIF crate:** oxvif 0.17.0 for discovery, GetProfiles/GetStreamUri/GetSnapshotUri/GetSystemDateAndTime/events; keep a thin reqwest + quick-xml escape hatch.
+- **Ingest:** `retina = "0.4.21"` (pin a git rev on main if CRA/BLA RAP detection is needed),
+  `Transport::Tcp`, `FrameFormat` length-prefixed (or Annex B) with
+  `ParameterSetInsertion::OnChange`, `enforce_timestamps_with_max_jump_secs(10)`,
+  `ReceiverReportPolicy::Never` (TCP), `TeardownPolicy::Auto`. One tokio task per stream; wrap
+  `next()` in a 10 s `timeout`; also fail if a keepalive goes unanswered. On any error: reconnect
+  with 1 s → ×2 → 30 s cap, ±20% jitter, resume recording at the next
+  `is_random_access_point()`. Segment on IRAP every ~10 s (Frigate uses 10 s segments). Use
+  `start_ctx()` wall time for timestamps; log SR NTP vs local offset.
+- **URLs:** main `subtype=0`, sub `subtype=1`; add `unicast=true&proto=Onvif` only when the metadata
+  track or backchannel is wanted; keep credentials out of the URL (Moonfire rule).
+- **Camera settings via CGI at setup:** H.265, Smart Codec off, GOP = fps (or 2×), CBR, Main
+  profile, NTP → irisd host.
+- **Events (priority):** (1) `eventManager.cgi?action=attach&codes=[All]&heartbeat=5` with digest
+  auth, reconnect if no part within 15 s; (2) ONVIF PullPoint via oxvif 0.17 (Timeout 60 s,
+  MessageLimit 100, Renew every 8 min of a 10 min subscription) when CGI is 404/forbidden; (3) RPC2
+  polling only as last resort. Normalize into one event schema keyed by camera, code/topic, action,
+  ObjectType, camera time + measured offset.
+- **ONVIF crate:** oxvif 0.17.0 for discovery,
+  GetProfiles/GetStreamUri/GetSnapshotUri/GetSystemDateAndTime/events; keep a thin reqwest +
+  quick-xml escape hatch.
 
 ### Open questions
 
-1. Exact Dahua CGI key for Smart Codec and `Video.Profile`; whether `BitRateControl` values are `CBR`/`VBR` on current firmware (verify with `getConfig` diff). *(cam1: `SmartEncode[0].Enable`, `Video.Profile=Main`, `BitRateControl=CBR`.)*
-2. Official meaning of `proto=Onvif`/`unicast=true` (Dahua HTTP API PDF v2.76/v3.x not accessible; Scribd copy of v1.67 unverified).
-3. Whether the 6 cameras' firmware honors `heartbeat=`, serves IVS codes, and which ONVIF `tns1:RuleEngine/*` topics they emit (`GetEventProperties`). *(cam1: heartbeat honoured; 23 topics listed in 01.)*
-4. Dahua RTCP SR interval and NTP accuracy on these models; whether Dahua ever sends `sprop-max-don-diff`/AP packets (retina ignores DON). *(cam1: SR every 5 s, NTP within 100 ms, no DON, no AP.)*
-5. oxvif behaviour against Dahua PullPoint (Renew semantics, Digest on subscription URL) — needs a hardware test.
-6. Backpressure behaviour: how long Dahua tolerates a stalled TCP reader before dropping the session (sizing of write buffers / disk stalls).
+1. Exact Dahua CGI key for Smart Codec and `Video.Profile`; whether `BitRateControl` values are
+   `CBR`/`VBR` on current firmware (verify with `getConfig` diff). *(cam1: `SmartEncode[0].Enable`,
+   `Video.Profile=Main`, `BitRateControl=CBR`.)*
+2. Official meaning of `proto=Onvif`/`unicast=true` (Dahua HTTP API PDF v2.76/v3.x not accessible;
+   Scribd copy of v1.67 unverified).
+3. Whether the 6 cameras' firmware honors `heartbeat=`, serves IVS codes, and which ONVIF
+   `tns1:RuleEngine/*` topics they emit (`GetEventProperties`). *(cam1: heartbeat honoured; 23
+   topics listed in 01.)*
+4. Dahua RTCP SR interval and NTP accuracy on these models; whether Dahua ever sends
+   `sprop-max-don-diff`/AP packets (retina ignores DON). *(cam1: SR every 5 s, NTP within 100 ms, no
+   DON, no AP.)*
+5. oxvif behaviour against Dahua PullPoint (Renew semantics, Digest on subscription URL) — needs a
+   hardware test.
+6. Backpressure behaviour: how long Dahua tolerates a stalled TCP reader before dropping the session
+   (sizing of write buffers / disk stalls).

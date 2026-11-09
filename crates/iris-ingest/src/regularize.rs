@@ -5,8 +5,9 @@
 //! frames, and bunches frames by up to 100 ms, while its clock as a whole runs
 //! within a few ppm of the NVR. Using those deltas verbatim makes players
 //! stutter. The regulariser assigns each frame the nominal duration, keeps a
-//! slow lock on the camera's long-term timeline, and only when the camera
-//! truly pauses or drops frames does it honour the gap exactly ("snap").
+//! slow lock on the camera's long-term timeline, renders camera-dropped frames
+//! as frame-long holds, and snaps to the camera's timeline only when the
+//! remaining error exceeds the tolerance.
 
 use std::collections::VecDeque;
 
@@ -31,11 +32,12 @@ const WARMUP_FRAGMENTS: usize = 16;
 /// is re-timed, because a hold at every GOP boundary would stutter on playback.
 const OVERRIDE_RATIO: f64 = 0.01;
 /// Per-fragment correction limit, in parts per thousand of the fragment's
-/// nominal duration. One percent absorbs a dropped frame (the probed camera
-/// loses one frame in about 170) or a 30 ms IDR timestamp step within the next
-/// fragment, which keeps the assigned timeline locked to the camera's without
-/// ever accumulating a snap-sized error, while a 1 % rate change over two
-/// seconds is invisible to a viewer.
+/// nominal duration. One percent (20 ms over a 2 s fragment at 30 fps) absorbs
+/// sub-frame jitter and backward timestamp steps over one or two fragments,
+/// which keeps the assigned timeline locked to the camera's without ever
+/// accumulating a snap-sized error, while a 1 % rate change over two seconds
+/// is invisible to a viewer. Leads of [`HOLE_THRESHOLD_PER_MILLE`] of a frame
+/// or more are rendered as holds instead.
 const MAX_CORRECTION_PER_MILLE: i64 = 10;
 /// Smallest change of the measured nominal, in ticks, that moves the nominal in
 /// use (hysteresis against one-tick wobble as the window fills).
@@ -50,6 +52,14 @@ const HOLE_THRESHOLD_PER_MILLE: i64 = 600;
 const HOLE_RATIO_OVERRIDE: f64 = 0.05;
 /// Consecutive snaps after which the rate estimate restarts.
 const RESTART_AFTER_SNAPS: u32 = 3;
+/// Fragments whose average frame span deviates from the nominal by more than
+/// this ratio are left out of the rate estimate.
+const ESTIMATE_OUTLIER_RATIO: f64 = 0.2;
+/// Fallback nominal duration (30 fps) when nothing better is known.
+pub(crate) const FALLBACK_NOMINAL: u32 = 3000;
+/// How far the assigned timeline may drift from the camera's before a
+/// fragment snaps to it; the sessions pass it to [`Regularizer::new`].
+pub(crate) const SNAP_TOLERANCE: MediaTicks = MediaTicks::from_millis(500);
 
 /// One measured fragment.
 #[derive(Clone, Copy, Debug)]
@@ -61,8 +71,6 @@ struct Window {
     /// Frames in the fragment.
     frames: u32,
 }
-/// Fallback nominal duration (30 fps) when nothing better is known.
-const FALLBACK_NOMINAL: u32 = 3000;
 
 /// Durations assigned to one fragment.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -179,7 +187,9 @@ impl Regularizer {
     }
 
     /// Assigns durations to the frames with timestamps `raw` (unwrapped 90 kHz
-    /// ticks) given the first timestamp of the following fragment.
+    /// ticks) given the first timestamp of the following fragment. The
+    /// estimator state moves with every call, so the result must be used.
+    #[must_use]
     pub fn assign(&mut self, raw: &[i64], next_raw: i64) -> Assignment {
         let n = raw.len();
         if n == 0 {
@@ -306,14 +316,15 @@ impl Regularizer {
     }
 
     /// Folds a regular (not snapped) fragment into the rate estimate, ignoring
-    /// fragments whose average deviates more than 20 % from the nominal.
+    /// fragments whose average deviates more than [`ESTIMATE_OUTLIER_RATIO`]
+    /// from the nominal.
     fn update_estimate(&mut self, span: i64, hold: i64, n: usize) {
         if span <= 0 {
             return;
         }
         if let Some(nominal) = self.nominal() {
             let cadence = (span - hold) as f64 / n as f64;
-            if (cadence - f64::from(nominal)).abs() / f64::from(nominal) > 0.2 {
+            if (cadence - f64::from(nominal)).abs() / f64::from(nominal) > ESTIMATE_OUTLIER_RATIO {
                 return;
             }
         }
@@ -593,7 +604,7 @@ mod tests {
         for _ in 0..HISTORY_LEN {
             let raw: Vec<i64> = (0..60).map(|index| start + index * 3000).collect();
             start += 180_000;
-            r.assign(&raw, start);
+            let _ = r.assign(&raw, start);
         }
         assert_eq!(r.history.len(), HISTORY_LEN);
 
@@ -626,6 +637,101 @@ mod tests {
     fn empty_input_is_harmless() {
         let mut r = Regularizer::new(TimestampMode::Regularize, None, tolerance());
         assert_eq!(r.assign(&[], 10).durations, Vec::<u32>::new());
+    }
+
+    /// A small deterministic generator (xorshift64*) for the property tests.
+    struct Rng(u64);
+
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x >> 12;
+            x ^= x << 25;
+            x ^= x >> 27;
+            self.0 = x;
+            x.wrapping_mul(0x2545_f491_4f6c_dd1d)
+        }
+
+        fn below(&mut self, n: u64) -> u64 {
+            self.next() % n
+        }
+    }
+
+    /// A camera-like timeline: frames of the nominal duration with ±30 %
+    /// jitter, repeated timestamps, and occasional dropped frames.
+    fn generated_timeline(
+        rng: &mut Rng,
+        nominal: i64,
+        frames: usize,
+        start: i64,
+    ) -> (Vec<i64>, i64) {
+        let mut raw = Vec::with_capacity(frames);
+        let mut t = start;
+        for _ in 0..frames {
+            raw.push(t);
+            t += match rng.below(20) {
+                0 => 0,
+                1 => 2 * nominal,
+                _ => nominal * (70 + rng.below(61) as i64) / 100,
+            };
+        }
+        (raw, t)
+    }
+
+    #[test]
+    fn generated_timelines_keep_every_duration_positive_and_the_error_bounded() {
+        let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
+        for case in 0..200 {
+            let nominal = [3000i64, 3600, 1500, 6000][case % 4];
+            let mut r =
+                Regularizer::new(TimestampMode::Regularize, Some(nominal as u32), tolerance());
+            let mut start = 1_000_000i64;
+            for fragment in 0..40 {
+                let frames = 1 + rng.below(90) as usize;
+                let (raw, next) = generated_timeline(&mut rng, nominal, frames, start);
+                let a = r.assign(&raw, next);
+                assert_eq!(a.durations.len(), frames, "case {case} fragment {fragment}");
+                assert!(
+                    a.durations.iter().all(|&d| d >= 1),
+                    "case {case} fragment {fragment}: {a:?}"
+                );
+                let span = next - raw[0];
+                let total: i64 = a.durations.iter().map(|&d| i64::from(d)).sum();
+                if a.snapped {
+                    if span >= frames as i64 {
+                        assert_eq!(
+                            total, span,
+                            "case {case} fragment {fragment}: a snap covers the span"
+                        );
+                    }
+                } else {
+                    assert!(
+                        r.error_ticks().abs() <= tolerance().get(),
+                        "case {case} fragment {fragment}: error {} after a fragment that did not snap",
+                        r.error_ticks()
+                    );
+                }
+                start = next;
+            }
+        }
+    }
+
+    #[test]
+    fn passthrough_reproduces_generated_deltas_with_a_floor_of_one() {
+        let mut rng = Rng(0x5851_f42d_4c95_7f2d);
+        for case in 0..100 {
+            let mut r = Regularizer::new(TimestampMode::Passthrough, Some(3000), tolerance());
+            let frames = 1 + rng.below(60) as usize;
+            let (raw, next) = generated_timeline(&mut rng, 3000, frames, 500_000);
+            let a = r.assign(&raw, next);
+            let expected: Vec<u32> = raw
+                .iter()
+                .zip(raw.iter().skip(1).chain(std::iter::once(&next)))
+                .map(|(a, b)| u32::try_from((b - a).max(1)).unwrap_or(u32::MAX))
+                .collect();
+            assert_eq!(a.durations, expected, "case {case}");
+            assert!(!a.snapped);
+        }
     }
 
     #[test]

@@ -37,7 +37,7 @@ pub struct CpuSplit {
 /// The command name in field 2 may contain spaces and parentheses, so fields
 /// are counted from the last `)`: the field after it is 3 (`state`), `utime`
 /// is field 14 and `stime` field 15.
-pub fn parse_stat_times(line: &str) -> Option<CpuTimes> {
+fn parse_stat_times(line: &str) -> Option<CpuTimes> {
     let after = &line[line.rfind(')')? + 1..];
     let mut fields = after.split_ascii_whitespace();
     let user: u64 = fields.nth(11)?.parse().ok()?;
@@ -46,12 +46,12 @@ pub fn parse_stat_times(line: &str) -> Option<CpuTimes> {
 }
 
 /// Parses `VmRSS` (kibibytes) from `/proc/<pid>/status` text.
-pub fn parse_vmrss_kib(status: &str) -> Option<u64> {
+fn parse_vmrss_kib(status: &str) -> Option<u64> {
     status_field(status, "VmRSS:")
 }
 
 /// Parses `Threads` from `/proc/<pid>/status` text.
-pub fn parse_threads(status: &str) -> Option<u64> {
+fn parse_threads(status: &str) -> Option<u64> {
     status_field(status, "Threads:")
 }
 
@@ -64,14 +64,9 @@ fn status_field(status: &str, name: &str) -> Option<u64> {
 }
 
 /// Reads this process's user and system CPU time in clock ticks.
-pub fn cpu_times() -> io::Result<CpuTimes> {
+fn cpu_times() -> io::Result<CpuTimes> {
     let stat = fs::read_to_string("/proc/self/stat")?;
     parse_stat_times(&stat).ok_or_else(|| io::Error::other("cannot parse /proc/self/stat"))
-}
-
-/// Reads this process's CPU time in clock ticks.
-pub fn cpu_ticks() -> io::Result<u64> {
-    cpu_times().map(CpuTimes::total)
 }
 
 /// Reads this process's resident set size in bytes.
@@ -106,8 +101,12 @@ pub struct CpuMeter {
 }
 
 impl CpuMeter {
-    /// Starts measuring from now.
-    pub fn new() -> io::Result<Self> {
+    /// Starts measuring from the moment of the call.
+    ///
+    /// # Errors
+    ///
+    /// Fails when `/proc/self/stat` cannot be read or parsed.
+    pub fn try_new() -> io::Result<Self> {
         let times = cpu_times()?;
         let now = Instant::now();
         Ok(Self {
@@ -121,6 +120,10 @@ impl CpuMeter {
 
     /// Percent of one core used since the previous call (or since creation),
     /// split into user and system time.
+    ///
+    /// # Errors
+    ///
+    /// Fails when `/proc/self/stat` cannot be read or parsed.
     pub fn sample(&mut self) -> io::Result<CpuSplit> {
         let times = cpu_times()?;
         let now = Instant::now();
@@ -148,8 +151,12 @@ impl CpuMeter {
     }
 
     /// Percent of one core used since the meter was created.
+    ///
+    /// # Errors
+    ///
+    /// Fails when `/proc/self/stat` cannot be read or parsed.
     pub fn mean(&self) -> io::Result<f64> {
-        let ticks = cpu_ticks()?;
+        let ticks = cpu_times()?.total();
         Ok(percent(
             ticks.saturating_sub(self.start.total()),
             self.start_at.elapsed().as_secs_f64(),
@@ -172,7 +179,8 @@ mod tests {
 
     #[test]
     fn parses_stat_with_spaces_in_command_name() {
-        let line = "12345 (irisd (test) daemon) S 1 12345 12345 0 -1 4194560 1000 0 0 0 150 25 0 0 20 0 1 0 100 1000000 500 18446744073709551615";
+        let line = "12345 (irisd (test) daemon) S 1 12345 12345 0 -1 4194560 1000 0 0 0 150 25 0 0 \
+                    20 0 1 0 100 1000000 500 18446744073709551615";
         assert_eq!(
             parse_stat_times(line),
             Some(CpuTimes {
@@ -201,6 +209,10 @@ mod tests {
     #[test]
     fn counts_own_descriptors() {
         assert!(fd_count().unwrap() >= 3);
+    }
+
+    #[test]
+    fn counts_own_threads() {
         assert!(threads().unwrap() >= 1);
     }
 }

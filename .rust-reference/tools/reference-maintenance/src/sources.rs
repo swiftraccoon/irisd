@@ -70,6 +70,18 @@ pub fn all() -> BTreeMap<String, Source> {
     ]
     .map(String::from)
     .into();
+    // The specification text and its notices; the site generators, themes, and
+    // their package manifests are not reference material.
+    sources
+        .get_mut("conventional-commits")
+        .expect("Conventional Commits is included above")
+        .selection = ["content/v1.0.0", "LICENSE", "README.md"]
+        .map(String::from)
+        .into();
+    sources
+        .get_mut("semver")
+        .expect("SemVer is included above")
+        .selection = ["spec", "README.md"].map(String::from).into();
     sources.insert(
         "google-timeless-documentation".into(),
         Source {

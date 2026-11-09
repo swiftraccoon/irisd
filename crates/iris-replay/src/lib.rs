@@ -17,7 +17,8 @@
 //! - [`rtsp`] — request parsing and responses.
 //! - [`sdp`] — the session description.
 //! - [`server`] — [`Server`](server::Server) and the delivery [`Options`](server::Options):
-//!   per-packet writes, pacing, bursts, dropped packets, stalls.
+//!   per-packet writes, pacing, or bursts ([`Delivery`](server::Delivery)), dropped packets,
+//!   stalls.
 //! - [`synth`] — fallible [`recording`](synth::recording) construction from a
 //!   bounded [`Plan`](synth::Plan).
 //!
@@ -29,10 +30,10 @@
 //!
 //! let bytes = synth::recording(Plan { gops: 2, frames_per_gop: 3, ..Plan::default() })?;
 //! let media = Media::from_bytes(bytes)?;
-//! assert_eq!(media.frames.len(), 6);
-//! assert!(media.frames[0].is_sync && !media.frames[1].is_sync);
-//! assert_eq!(media.parameter_sets.len(), 3);
-//! # Ok::<(), anyhow::Error>(())
+//! assert_eq!(media.frames().len(), 6);
+//! assert!(media.frames()[0].is_sync && !media.frames()[1].is_sync);
+//! assert_eq!(media.parameter_sets().len(), 3);
+//! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 
 pub mod media;

@@ -6,6 +6,7 @@ use anyhow::Context;
 use gst::prelude::*;
 use gtk::gdk;
 use gtk::glib;
+use tracing::warn;
 
 /// Pipeline for one keyframe: the bytes go in through `appsrc`, the one
 /// decoded frame comes out of `appsink` as packed RGB.
@@ -18,28 +19,42 @@ const MAX_THUMBNAIL_DIMENSION: u32 = 4096;
 /// Largest packed RGB frame copied out of the decoder.
 const MAX_THUMBNAIL_RGB_BYTES: usize = 64 << 20;
 
-/// One decoded frame.
+/// One decoded frame: each side between 1 and [`MAX_THUMBNAIL_DIMENSION`]
+/// pixels, rows of `stride` bytes, at most [`MAX_THUMBNAIL_RGB_BYTES`]. Only
+/// [`decode`] builds one, so the bounds hold for every image.
 #[derive(Clone, Debug)]
 pub struct Image {
-    /// Width in pixels.
-    pub width: u32,
-    /// Height in pixels.
-    pub height: u32,
-    /// Bytes per row.
-    pub stride: usize,
-    /// Packed RGB rows.
-    pub rgb: Vec<u8>,
+    width: u32,
+    height: u32,
+    stride: usize,
+    rgb: Vec<u8>,
 }
 
 impl Image {
-    /// The frame as a GTK texture; main loop only.
-    pub fn texture(&self) -> gdk::Texture {
-        let bytes = glib::Bytes::from(&self.rgb);
+    /// A black image of `width` by `height` pixels, for tests.
+    #[cfg(test)]
+    pub(crate) fn black(width: u32, height: u32) -> Self {
+        let stride = usize::try_from(width).unwrap() * 3;
+        let rgb_len = validated_rgb_len(width, height, stride, usize::MAX).unwrap();
+        Self {
+            width,
+            height,
+            stride,
+            rgb: vec![0; rgb_len],
+        }
+    }
+
+    /// The frame as a GTK texture, moving its bytes rather than copying them;
+    /// main loop only.
+    pub fn into_texture(self) -> gdk::Texture {
+        let side = |pixels: u32| {
+            i32::try_from(pixels).expect("decode bounds each side to MAX_THUMBNAIL_DIMENSION")
+        };
         gdk::MemoryTexture::new(
-            i32::try_from(self.width).unwrap_or(i32::MAX),
-            i32::try_from(self.height).unwrap_or(i32::MAX),
+            side(self.width),
+            side(self.height),
             gdk::MemoryFormat::R8g8b8,
-            &bytes,
+            &glib::Bytes::from_owned(self.rgb),
             self.stride,
         )
         .upcast()
@@ -61,10 +76,11 @@ pub fn decode(keyframe: Vec<u8>) -> anyhow::Result<Image> {
         .by_name("sink")
         .and_then(|e| e.downcast::<gst_app::AppSink>().ok())
         .context("appsink missing")?;
-    pipeline
-        .set_state(gst::State::Playing)
-        .context("starting the thumbnail pipeline")?;
+    // Every outcome, a failed start included, ends with the pipeline in NULL.
     let result = (|| {
+        pipeline
+            .set_state(gst::State::Playing)
+            .context("starting the thumbnail pipeline")?;
         src.push_buffer(gst::Buffer::from_slice(keyframe))
             .map_err(|flow| anyhow::anyhow!("appsrc rejected the keyframe: {flow:?}"))?;
         src.end_of_stream()
@@ -85,10 +101,14 @@ pub fn decode(keyframe: Vec<u8>) -> anyhow::Result<Image> {
             rgb: map.as_slice()[..rgb_len].to_vec(),
         })
     })();
-    let _ = pipeline.set_state(gst::State::Null);
+    if let Err(error) = pipeline.set_state(gst::State::Null) {
+        warn!(%error, "cannot stop the thumbnail pipeline");
+    }
     result
 }
 
+/// The bytes of a packed RGB frame of `width` by `height` with rows of `stride`
+/// bytes, refused outside the thumbnail bounds or beyond `mapped_len`.
 fn validated_rgb_len(
     width: u32,
     height: u32,
@@ -120,32 +140,54 @@ fn validated_rgb_len(
 mod tests {
     use super::*;
 
+    /// The stride at which the largest frame fills the byte bound exactly.
+    fn exact_stride() -> usize {
+        MAX_THUMBNAIL_RGB_BYTES / usize::try_from(MAX_THUMBNAIL_DIMENSION).unwrap()
+    }
+
     #[test]
-    fn validates_thumbnail_geometry_and_rgb_budget() {
+    fn a_packed_frame_is_its_rows_times_its_stride() {
         assert_eq!(validated_rgb_len(1, 1, 3, 3).unwrap(), 3);
+    }
+
+    #[test]
+    fn sides_outside_one_to_the_dimension_bound_are_refused() {
         assert!(validated_rgb_len(0, 1, 3, 3).is_err());
         assert!(validated_rgb_len(1, 0, 3, 3).is_err());
         assert!(validated_rgb_len(MAX_THUMBNAIL_DIMENSION + 1, 1, 3, 3).is_err());
-        assert!(validated_rgb_len(2, 1, 5, 6).is_err());
-        assert!(validated_rgb_len(2, 2, 6, 11).is_err());
+    }
 
-        let exact_stride =
-            MAX_THUMBNAIL_RGB_BYTES / usize::try_from(MAX_THUMBNAIL_DIMENSION).unwrap();
+    #[test]
+    fn a_stride_shorter_than_a_row_is_refused() {
+        assert!(validated_rgb_len(2, 1, 5, 6).is_err());
+    }
+
+    #[test]
+    fn a_truncated_buffer_is_refused() {
+        assert!(validated_rgb_len(2, 2, 6, 11).is_err());
+    }
+
+    #[test]
+    fn the_largest_frame_fits_the_byte_bound_exactly() {
         assert_eq!(
             validated_rgb_len(
                 MAX_THUMBNAIL_DIMENSION,
                 MAX_THUMBNAIL_DIMENSION,
-                exact_stride,
+                exact_stride(),
                 MAX_THUMBNAIL_RGB_BYTES,
             )
             .unwrap(),
             MAX_THUMBNAIL_RGB_BYTES
         );
+    }
+
+    #[test]
+    fn a_frame_beyond_the_byte_bound_is_refused() {
         assert!(
             validated_rgb_len(
                 MAX_THUMBNAIL_DIMENSION,
                 MAX_THUMBNAIL_DIMENSION,
-                exact_stride + 1,
+                exact_stride() + 1,
                 MAX_THUMBNAIL_RGB_BYTES + MAX_THUMBNAIL_DIMENSION as usize,
             )
             .is_err()

@@ -1,14 +1,15 @@
 //! Inbound limits shared by the live and event WebSocket endpoints.
 //!
-//! Both endpoints only send. Clients may answer pings and close, but a data
-//! message, one larger than [`INBOUND_LIMIT_BYTES`], or any other protocol
-//! failure ends the session with close code 1008 (policy violation).
+//! Both endpoints only send. Clients may send pings, pongs, and a close
+//! (tungstenite answers pings), but a data message, one larger than
+//! [`INBOUND_LIMIT_BYTES`], or any other protocol failure ends the session
+//! with close code 1008 (policy violation).
 
 use axum::extract::ws::{CloseFrame, Message, WebSocketUpgrade, close_code};
 
 /// Inbound message, frame, and read-buffer limit. Control frames carry at most
 /// 125 bytes (RFC 6455 §5.5), and clients send no data messages.
-pub(crate) const INBOUND_LIMIT_BYTES: usize = 4 * 1024;
+const INBOUND_LIMIT_BYTES: usize = 4 * 1024;
 /// Write-buffer target before a flush, tungstenite's default.
 const WRITE_BUFFER_BYTES: usize = 128 * 1024;
 /// Largest WebSocket frame header (RFC 6455 §5.2).

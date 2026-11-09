@@ -7,18 +7,29 @@ Scope: this crate only. Read the root `AGENTS.md` first.
 - The route table in `lib.rs` is the API surface fixed by `docs/research/07-architecture.md §5`
   and `docs/design/phase2-interfaces.md`; adding or renaming a route updates both.
 - Every route under `/api` except `/api/health` goes through `auth::require_token`;
-  `/metrics` does too unless `ApiState::public_metrics` is set. Media capabilities never
-  authorize `/metrics`. Tokens are compared in constant time.
+  `/metrics` does too unless `ApiState::public_metrics` is set. Media capabilities authorize
+  only the paths playlists issue them for (recording files and the LL-HLS init, segment, and
+  part resources), never playlists, the live WebSocket, or `/metrics`; they are signed with
+  `ApiState::capability_secret`, never derived from a token, and rolling expiries are rounded
+  down to the minute so reloads mint identical URIs. Tokens are compared in constant time.
+- The provisioning routes exist only with `ApiState::control` (HTTP 403 without it), validate
+  the camera with `CameraConfig::validate` before the daemon sees it, relay through
+  `CameraControl` with a 20 s deadline, and are never authorized by a media capability
+  (`require_token` admits capabilities for `GET` and `HEAD` only). Protected routes take at
+  most 64 KiB of request body. `ApiState::active_cameras` and `snapshot_sources` are behind
+  `RwLock`s because the daemon edits them as cameras come and go.
 - `server.rs` serves HTTP/1.1 only, takes a connection slot before each `accept` (the slot
   lives in the connection's stream, so upgraded WebSockets keep it), applies the 10 s
   request-head deadline through hyper's timer, and fails a write that makes no progress for
   the write-stall deadline. Shutdown drains in-flight responses through hyper's graceful
   shutdown and waits for every connection task.
 - Playlist and export semantics follow `docs/research/04-storage-format.md §10`: byte ranges
-  into recording files, three fragments per media segment, `EXT-X-MAP` per file,
+  into recording files, a media segment running from a sync fragment to the first sync
+  fragment after its third fragment (continuations always join it), `EXT-X-MAP` per file,
   discontinuities at run boundaries. The server never decodes or re-muxes.
 - Responses never contain server paths or credentials; `SegmentDto` is the only shape a
-  segment takes on the wire.
+  segment takes on the wire, and `ProvisionError::Store` and `Lifecycle` details are logged,
+  never returned.
 - Snapshot sources carry bare hosts; the snapshot URL builder brackets IPv6 authorities.
 - Snapshot fetches never follow redirects, stream through the 8 MiB limit, require `FF D8 FF`
   at the start and an `FF D9` within the last 64 KiB, serve through the final `FF D9`, run one
@@ -79,8 +90,14 @@ Scope: this crate only. Read the root `AGENTS.md` first.
 - Metrics catalog aggregates refresh at most once per second under one cache-owned single-flight
   that survives requesting-scrape cancellation and uses the last snapshot on refresh failure.
   API uptime uses `started_monotonic`.
-- LL-HLS timestamp resets resume at sync with a discontinuity. Each GOP carries its
-  discontinuity sequence so removing playlist entries preserves the epoch.
+- LL-HLS follows the vendored HLS draft (`docs/standards/ietf/`): the target duration and the
+  part target are pinned per feeder and never change, complete segments stay until three
+  target durations follow them (at most 12), a blocking reload waits three target durations,
+  and a GOP past the pinned target is cut with a discontinuity. Timestamp resets, lag, and
+  budget breaches end the open segment and resume at sync with a discontinuity; a new sample
+  entry starts the window over. Each GOP carries its discontinuity sequence so removing
+  playlist entries preserves the epoch. Changing a tag or window rule needs the draft's section
+  in the comment and `docs/research/04-storage-format.md §10` updated.
 
 ## Where things are
 
@@ -91,20 +108,30 @@ Scope: this crate only. Read the root `AGENTS.md` first.
 - `state.rs` — `ApiState`, `LiveRegistry`, `SnapshotSource`, `ApiStats`.
 - `auth.rs` — bearer-token middleware, request auth context, and exact-path media-capability
   issuer/verifier.
-- `query.rs` — `from`/`to` parsing, defaults, and bounds.
+- `query.rs` — declares and re-exports the time-range query modules.
+- `query/range.rs` — `from`/`to` parsing, defaults, and bounds.
 - `query/time.rs` — allocation-free timestamp parser, included by the `api_time` fuzz target.
 - `cameras.rs`, `segments.rs`, `events.rs`, `health.rs`, `metrics.rs` — the JSON and text
   endpoints.
+- `segments/range.rs` — the allocation-free `Range` header parser, included by the `api_range`
+  fuzz target.
 - `hls.rs` — VOD playlist construction from sidecar indexes.
 - `llhls.rs` — the low-latency live playlist: the per-stream feeder over the live ring, part
   cutting, playlist rendering, blocking reload, the segment and part responses.
-- `media_admission.rs` — shared permit ownership across detached media work and response bodies.
-  The two media classes, the WebSocket caps, and snapshot single-flight live in `ApiStats`.
+- `media_admission.rs` — shared permit ownership across detached media work and response bodies
+  (`attach` binds a permit to response bytes). The two media classes, the WebSocket caps, and
+  snapshot single-flight live in `ApiStats`.
 - `keyframe.rs` — the keyframe resource: one sync sample re-encoded behind the init
   segment, found through `hls::load_fragments` within two minutes before `t`.
 - `export.rs` — streamed export of a range.
 - `live.rs` — WebSocket live session over a `LiveRing`.
-- `snapshot.rs` — digest-authenticated snapshot proxy.
+- `snapshot.rs` — digest-authenticated snapshot proxy, using `iris_events::digest` (the fuzzed
+  parser) and the first supported `WWW-Authenticate` challenge.
+- `provision.rs` — `POST /api/cameras` and `DELETE /api/cameras/{camera}` with the daemon
+  control contract (`CameraControl`, `ControlRequest`, `ProvisionError`).
+- `onvif.rs` — `GET /api/onvif/devices` and `POST /api/onvif/streams`, relayed through the same
+  control (403 without it, root token only); the daemon owns the sockets, the port policy, and
+  the lookup limit, and the handlers validate the host and bound `wait_ms` first.
 - `error.rs` — `ApiError` and its HTTP mapping.
 
 ## How to verify a change

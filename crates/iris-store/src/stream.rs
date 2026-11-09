@@ -1,5 +1,6 @@
 //! Per-stream rotation policy on top of [`SegmentFile`].
 
+use std::fmt;
 use std::io;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -33,7 +34,9 @@ const FRAGMENT_SOFT_LIMIT: usize = MAX_PERSISTED_INDEX_RECORDS - 4_096;
 pub(crate) enum Written {
     /// Appended; the record describes it.
     Record(IndexRecord),
-    /// Dropped because no file was open and the fragment did not start with a sync sample.
+    /// Dropped: the fragment needs a fresh file (none open, a new run, new
+    /// parameter sets, or a full file) and does not start with a sync sample,
+    /// so no file can take it.
     Dropped,
 }
 
@@ -61,8 +64,8 @@ pub(crate) struct StreamWriter {
     approved_root: Option<ApprovedRoot>,
 }
 
-impl std::fmt::Debug for StreamWriter {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Debug for StreamWriter {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("StreamWriter")
             .field("key", &self.key)
             .field("run_id", &self.run_id)
@@ -100,7 +103,9 @@ impl StreamWriter {
         }
     }
 
-    /// Appends `fragment`, opening or rotating the file first when needed.
+    /// Appends `fragment`, opening or rotating the file first when needed. A
+    /// fragment that needs a fresh file but does not start with a sync sample
+    /// is returned as [`Written::Dropped`] rather than opening a file mid-GOP.
     pub(crate) fn write(&mut self, fragment: &Fragment) -> io::Result<Written> {
         let starts_sync = fragment.starts_with_sync();
         // The first file of a stream starts run 1: nothing continuous precedes it.
@@ -129,18 +134,34 @@ impl StreamWriter {
                 self.pending_new_run = true;
                 if !self.dropping_at_limit {
                     self.dropping_at_limit = true;
-                    warn!(stream = %self.key, fragments = self.fragment_limit,
-                        "open file reached the sidecar record limit; dropping fragments until a sync sample");
+                    warn!(
+                        stream = %self.key,
+                        fragments = self.fragment_limit,
+                        "open file reached the sidecar record limit; dropping until a sync sample"
+                    );
                 }
             } else {
-                self.pending_new_run = new_run;
-                warn!(stream = %self.key, "dropping fragment: no open file and not a sync sample");
+                // The dropped fragment leaves a recording gap, so the next file
+                // starts a new run.
+                self.pending_new_run = true;
+                let reason = if self.current.is_none() {
+                    "no open file"
+                } else if new_run {
+                    "new run"
+                } else {
+                    "new parameter sets"
+                };
+                warn!(
+                    stream = %self.key,
+                    reason,
+                    "dropping fragment: it does not start with a sync sample"
+                );
             }
             return Ok(Written::Dropped);
         }
         let limit_reached = self.current.as_ref().is_some_and(|segment| {
             segment.bytes_written() >= self.policy.rotate_bytes
-                || segment.opened_at().elapsed() >= Duration::from_secs(self.policy.rotate_secs)
+                || segment.opened_at().elapsed() >= self.policy.rotate_age
                 || fragment_count(segment) >= self.fragment_soft_limit
         });
         let rotate = must_start_file || (limit_reached && starts_sync);
@@ -173,7 +194,10 @@ impl StreamWriter {
             });
         }
         self.sequence += 1;
-        let segment = self.current.as_mut().expect("rotate opens a file");
+        let segment = self
+            .current
+            .as_mut()
+            .expect("a file is open: rotate opened one or must_start_file found one");
         let record = segment.write_fragment(fragment, self.sequence, flags)?;
         Ok(Written::Record(record))
     }
@@ -188,7 +212,12 @@ impl StreamWriter {
         after_root_verification: impl FnOnce() -> io::Result<()>,
     ) -> io::Result<()> {
         if let Some(segment) = self.current.take() {
-            info!(stream = %self.key, path = %segment.path().display(), bytes = segment.bytes_written(), "sealing");
+            info!(
+                stream = %self.key,
+                path = %segment.path().display(),
+                bytes = segment.bytes_written(),
+                "sealing"
+            );
             self.observer.segment_sealed(segment.seal()?);
         }
         let init = build_init_segment(&fragment.sample_entry);
@@ -234,7 +263,8 @@ impl StreamWriter {
         Ok(())
     }
 
-    /// Syncs the open file if its interval elapsed, reporting progress.
+    /// Syncs the open file if its interval elapsed, reporting progress. Returns
+    /// `Ok(true)` only when it synced.
     pub(crate) fn maybe_sync(&mut self, now: Instant, interval: Duration) -> io::Result<bool> {
         let Some(segment) = self.current.as_mut() else {
             return Ok(false);
@@ -260,7 +290,11 @@ impl StreamWriter {
     pub(crate) fn abandon(&mut self) {
         self.mark_discontinuity();
         if let Some(segment) = self.current.take() {
-            warn!(stream = %self.key, path = %segment.path().display(), "abandoning file after error");
+            warn!(
+                stream = %self.key,
+                path = %segment.path().display(),
+                "abandoning file after error"
+            );
         }
     }
 
@@ -272,20 +306,6 @@ impl StreamWriter {
     /// Number of files this stream has opened.
     pub(crate) fn files_opened(&self) -> u64 {
         self.files_opened
-    }
-
-    #[cfg(test)]
-    fn sync_deadline(&self) -> Instant {
-        self.current
-            .as_ref()
-            .map_or(self.next_sync, SegmentFile::next_sync)
-    }
-
-    #[cfg(test)]
-    fn with_fragment_limits(mut self, soft: usize, hard: usize) -> Self {
-        self.fragment_soft_limit = soft;
-        self.fragment_limit = hard;
-        self
     }
 }
 
@@ -300,9 +320,37 @@ mod tests {
     use iris_core::id::{CameraId, StreamKind};
     use iris_core::time::WallUs;
     use iris_mp4::fragment::Sample;
+    use iris_mp4::index::{MAX_PERSISTED_INDEX_RECORDS, read_index_bounded};
     use iris_mp4::init::SampleEntry;
 
     use crate::observer::NoopObserver;
+
+    /// Whether a test fragment starts a run.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Run {
+        New,
+        Continues,
+    }
+
+    /// Whether a test fragment starts with a sync sample.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Start {
+        Sync,
+        Continuation,
+    }
+
+    fn sync_deadline(writer: &StreamWriter) -> Instant {
+        writer
+            .current
+            .as_ref()
+            .map_or(writer.next_sync, SegmentFile::next_sync)
+    }
+
+    fn with_fragment_limits(mut writer: StreamWriter, soft: usize, hard: usize) -> StreamWriter {
+        writer.fragment_soft_limit = soft;
+        writer.fragment_limit = hard;
+        writer
+    }
 
     fn key() -> StreamKey {
         StreamKey {
@@ -311,7 +359,7 @@ mod tests {
         }
     }
 
-    fn fragment(index: u64, new_run: bool) -> Fragment {
+    fn fragment(index: u64, run: Run) -> Fragment {
         Fragment {
             samples: vec![Sample {
                 data: Bytes::from_static(&[0, 0, 0, 2, 0x26, 1]),
@@ -321,7 +369,7 @@ mod tests {
             decode_time: index * 3_000,
             wall: WallUs::new(1_700_000_000_000_000 + i64::try_from(index).unwrap()),
             raw_rtp: 0,
-            new_run,
+            new_run: run == Run::New,
             sample_entry: Arc::new(SampleEntry::new(
                 Bytes::from_static(b"\0\0\0\x10hvc1\0\0\0\0\0\0\0\0"),
                 "hvc1".into(),
@@ -339,7 +387,7 @@ mod tests {
                 sync_interval: Duration::from_secs(5),
                 preallocate_bytes: 0,
                 rotate_bytes: u64::MAX,
-                rotate_secs: u64::MAX,
+                rotate_age: Duration::MAX,
             },
             Arc::new(NoopObserver),
             phase,
@@ -351,12 +399,12 @@ mod tests {
         Arc::new(SampleEntry::new(Bytes::from(bytes), "hvc1".into(), 16, 16))
     }
 
-    fn fragment_with(index: u64, sync: bool, entry: &Arc<SampleEntry>) -> Fragment {
+    fn fragment_with(index: u64, start: Start, entry: &Arc<SampleEntry>) -> Fragment {
         Fragment {
             samples: vec![Sample {
                 data: Bytes::from_static(&[0, 0, 0, 2, 0x26, 1]),
                 duration: 3_000,
-                is_sync: sync,
+                is_sync: start == Start::Sync,
             }],
             decode_time: index * 3_000,
             wall: WallUs::new(1_700_000_000_000_000 + i64::try_from(index).unwrap()),
@@ -389,7 +437,7 @@ mod tests {
         found.sort();
         found
             .iter()
-            .map(|path| iris_mp4::index::read_index(path).unwrap())
+            .map(|path| read_index_bounded(path, MAX_PERSISTED_INDEX_RECORDS).unwrap())
             .collect()
     }
 
@@ -434,22 +482,67 @@ mod tests {
     }
 
     #[test]
+    fn a_parameter_change_dropped_mid_gop_starts_a_new_run_at_the_next_sync() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut writer = writer(dir.path().to_path_buf(), Duration::ZERO);
+        let first = sample_entry(vec![1; 16]);
+        let second = sample_entry(vec![2; 16]);
+        record(
+            &writer
+                .write(&fragment_with(0, Start::Sync, &first))
+                .unwrap(),
+        );
+        assert!(matches!(
+            writer
+                .write(&fragment_with(1, Start::Continuation, &second))
+                .unwrap(),
+            Written::Dropped
+        ));
+        let resumed = record(
+            &writer
+                .write(&fragment_with(2, Start::Sync, &second))
+                .unwrap(),
+        );
+        assert_ne!(
+            resumed.flags & FLAG_DISCONTINUITY_BEFORE,
+            0,
+            "the dropped fragment left a gap, so the next file starts a run"
+        );
+        assert_eq!(writer.run_id, 2);
+        writer.close().unwrap();
+    }
+
+    #[test]
     fn a_full_file_drops_dependents_and_starts_a_new_run_at_the_next_sync() {
         let dir = tempfile::tempdir().unwrap();
         let mut writer =
-            writer(dir.path().to_path_buf(), Duration::ZERO).with_fragment_limits(10, 3);
-        let entry = fragment(0, false).sample_entry;
-        record(&writer.write(&fragment_with(0, true, &entry)).unwrap());
+            with_fragment_limits(writer(dir.path().to_path_buf(), Duration::ZERO), 10, 3);
+        let entry = fragment(0, Run::Continues).sample_entry;
+        record(
+            &writer
+                .write(&fragment_with(0, Start::Sync, &entry))
+                .unwrap(),
+        );
         for index in 1..3 {
-            record(&writer.write(&fragment_with(index, false, &entry)).unwrap());
+            record(
+                &writer
+                    .write(&fragment_with(index, Start::Continuation, &entry))
+                    .unwrap(),
+            );
         }
         for index in 3..5 {
             assert!(matches!(
-                writer.write(&fragment_with(index, false, &entry)).unwrap(),
+                writer
+                    .write(&fragment_with(index, Start::Continuation, &entry))
+                    .unwrap(),
                 Written::Dropped
             ));
         }
-        let first_of_next = record(&writer.write(&fragment_with(5, true, &entry)).unwrap());
+        let first_of_next = record(
+            &writer
+                .write(&fragment_with(5, Start::Sync, &entry))
+                .unwrap(),
+        );
         assert_ne!(first_of_next.flags & FLAG_DISCONTINUITY_BEFORE, 0);
         assert_eq!(writer.files_opened(), 2);
         writer.close().unwrap();
@@ -468,17 +561,33 @@ mod tests {
     fn the_soft_fragment_limit_rotates_at_the_next_sync_fragment() {
         let dir = tempfile::tempdir().unwrap();
         let mut writer =
-            writer(dir.path().to_path_buf(), Duration::ZERO).with_fragment_limits(2, 10);
-        let entry = fragment(0, false).sample_entry;
-        record(&writer.write(&fragment_with(0, true, &entry)).unwrap());
-        record(&writer.write(&fragment_with(1, false, &entry)).unwrap());
-        record(&writer.write(&fragment_with(2, false, &entry)).unwrap());
+            with_fragment_limits(writer(dir.path().to_path_buf(), Duration::ZERO), 2, 10);
+        let entry = fragment(0, Run::Continues).sample_entry;
+        record(
+            &writer
+                .write(&fragment_with(0, Start::Sync, &entry))
+                .unwrap(),
+        );
+        record(
+            &writer
+                .write(&fragment_with(1, Start::Continuation, &entry))
+                .unwrap(),
+        );
+        record(
+            &writer
+                .write(&fragment_with(2, Start::Continuation, &entry))
+                .unwrap(),
+        );
         assert_eq!(
             writer.files_opened(),
             1,
             "rotation waits for a sync fragment"
         );
-        let rotated = record(&writer.write(&fragment_with(3, true, &entry)).unwrap());
+        let rotated = record(
+            &writer
+                .write(&fragment_with(3, Start::Sync, &entry))
+                .unwrap(),
+        );
         assert_eq!(rotated.flags & FLAG_DISCONTINUITY_BEFORE, 0);
         assert_eq!(writer.files_opened(), 2);
         writer.close().unwrap();
@@ -505,9 +614,21 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let mut writer = writer(dir.path().to_path_buf(), Duration::ZERO);
-        record(&writer.write(&fragment_with(0, true, &first)).unwrap());
-        record(&writer.write(&fragment_with(1, false, &first)).unwrap());
-        let changed = record(&writer.write(&fragment_with(2, true, &second)).unwrap());
+        record(
+            &writer
+                .write(&fragment_with(0, Start::Sync, &first))
+                .unwrap(),
+        );
+        record(
+            &writer
+                .write(&fragment_with(1, Start::Continuation, &first))
+                .unwrap(),
+        );
+        let changed = record(
+            &writer
+                .write(&fragment_with(2, Start::Sync, &second))
+                .unwrap(),
+        );
         assert_ne!(changed.flags & FLAG_NEW_PARAMETERS, 0);
         assert_eq!(writer.files_opened(), 2);
         writer.close().unwrap();
@@ -520,8 +641,12 @@ mod tests {
         assert!(!Arc::ptr_eq(&first, &copy));
         let dir = tempfile::tempdir().unwrap();
         let mut writer = writer(dir.path().to_path_buf(), Duration::ZERO);
-        record(&writer.write(&fragment_with(0, true, &first)).unwrap());
-        let same = record(&writer.write(&fragment_with(1, true, &copy)).unwrap());
+        record(
+            &writer
+                .write(&fragment_with(0, Start::Sync, &first))
+                .unwrap(),
+        );
+        let same = record(&writer.write(&fragment_with(1, Start::Sync, &copy)).unwrap());
         assert_eq!(same.flags & FLAG_NEW_PARAMETERS, 0);
         assert_eq!(writer.files_opened(), 1);
         writer.close().unwrap();
@@ -532,25 +657,25 @@ mod tests {
         for phase in [Duration::ZERO, Duration::from_millis(1_250)] {
             let dir = tempfile::tempdir().unwrap();
             let mut writer = writer(dir.path().to_path_buf(), phase);
-            let initial = writer.sync_deadline();
-            writer.write(&fragment(0, false)).unwrap();
-            assert_eq!(writer.sync_deadline(), initial);
+            let initial = sync_deadline(&writer);
+            writer.write(&fragment(0, Run::Continues)).unwrap();
+            assert_eq!(sync_deadline(&writer), initial);
 
             let interval = Duration::from_secs(5);
             assert!(writer.maybe_sync(initial, interval).unwrap());
             let advanced = initial + interval;
-            assert_eq!(writer.sync_deadline(), advanced);
+            assert_eq!(sync_deadline(&writer), advanced);
 
-            writer.write(&fragment(1, true)).unwrap();
-            assert_eq!(writer.sync_deadline(), advanced);
+            writer.write(&fragment(1, Run::New)).unwrap();
+            assert_eq!(sync_deadline(&writer), advanced);
             assert!(writer.maybe_sync(advanced, interval).unwrap());
-            assert_eq!(writer.sync_deadline(), advanced + interval);
+            assert_eq!(sync_deadline(&writer), advanced + interval);
             assert!(!writer.maybe_sync(advanced + interval, interval).unwrap());
-            assert_eq!(writer.sync_deadline(), advanced + 2 * interval);
+            assert_eq!(sync_deadline(&writer), advanced + 2 * interval);
 
             let late = advanced + 10 * interval;
             assert!(!writer.maybe_sync(late, interval).unwrap());
-            assert_eq!(writer.sync_deadline(), late);
+            assert_eq!(sync_deadline(&writer), late);
             writer.close().unwrap();
         }
     }
@@ -569,13 +694,13 @@ mod tests {
                 sync_interval: Duration::from_secs(5),
                 preallocate_bytes: 0,
                 rotate_bytes: u64::MAX,
-                rotate_secs: u64::MAX,
+                rotate_age: Duration::MAX,
             },
             Arc::new(NoopObserver),
             Duration::ZERO,
             Some(approved),
         );
-        let fragment = fragment(0, false);
+        let fragment = fragment(0, Run::Continues);
         let replacement_path = layout::segment_path(&root, &key(), fragment.wall);
         let original_path = displaced.join(replacement_path.strip_prefix(&root).unwrap());
 
@@ -624,13 +749,13 @@ mod tests {
                 sync_interval: Duration::from_secs(5),
                 preallocate_bytes: 0,
                 rotate_bytes: u64::MAX,
-                rotate_secs: u64::MAX,
+                rotate_age: Duration::MAX,
             },
             Arc::new(NoopObserver),
             Duration::ZERO,
             Some(approved),
         );
-        let fragment = fragment(0, false);
+        let fragment = fragment(0, Run::Continues);
         let requested = layout::segment_path(&root, &key(), fragment.wall);
         std::fs::create_dir(&victim).unwrap();
         std::fs::write(victim.join("sentinel"), b"victim bytes").unwrap();
@@ -665,13 +790,13 @@ mod tests {
                 sync_interval: Duration::from_secs(5),
                 preallocate_bytes: 0,
                 rotate_bytes: u64::MAX,
-                rotate_secs: u64::MAX,
+                rotate_age: Duration::MAX,
             },
             Arc::new(NoopObserver),
             Duration::ZERO,
             Some(approved),
         );
-        let fragment = fragment(0, false);
+        let fragment = fragment(0, Run::Continues);
         let path = layout::segment_path(&root, &key(), fragment.wall);
 
         assert!(matches!(

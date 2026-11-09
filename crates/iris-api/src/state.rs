@@ -6,8 +6,8 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
-use bytes::Bytes;
 use iris_catalog::{CatalogError, CatalogHandle, CatalogStats};
+use iris_core::config::ResolvedSnapshot;
 use iris_core::config::{DEFAULT_API_BOUNDED_MEDIA, DEFAULT_API_STREAMING_MEDIA};
 use iris_core::event::Event;
 use iris_core::id::{CameraId, StreamKey};
@@ -16,16 +16,19 @@ use iris_ingest::{LiveRing, StreamStats};
 use iris_store::ApprovedRoot;
 use tokio::sync::{Mutex, Notify, OwnedSemaphorePermit, Semaphore, broadcast};
 use tokio_util::sync::CancellationToken;
+use url::Url;
 
+use crate::auth::CapabilitySecret;
 use crate::error::ApiError;
 use crate::media_admission::{self, MediaPermit};
+use crate::provision::CameraControl;
 
 /// Live WebSocket sessions admitted process-wide.
-pub(crate) const MAX_LIVE_SOCKETS: usize = 64;
+const MAX_LIVE_SOCKETS: usize = 64;
 /// Live WebSocket sessions admitted for one stream.
 pub(crate) const MAX_LIVE_SOCKETS_PER_STREAM: usize = 16;
 /// Event WebSocket sessions admitted process-wide.
-pub(crate) const MAX_EVENT_SOCKETS: usize = 32;
+const MAX_EVENT_SOCKETS: usize = 32;
 /// Catalog aggregate refresh interval shared by all public metrics scrapes.
 const CATALOG_STATS_REFRESH: Duration = Duration::from_secs(1);
 
@@ -51,9 +54,12 @@ impl MediaClass {
 }
 
 /// Everything the handlers need, shared by every request: the catalog, the
-/// live rings, the event channel, the accepted tokens, the approved recording
-/// roots, snapshot sources, counters, and the shutdown token that ends
-/// long-lived WebSocket sessions.
+/// live rings, the event channel, the accepted tokens and the capability
+/// secret, the approved recording roots, the public-metrics switch, the
+/// running cameras and their snapshot sources, the daemon's camera control,
+/// counters, and the shutdown token that ends long-lived WebSocket sessions.
+/// The daemon assembles it once at startup; the fields are its assembly
+/// record.
 pub struct ApiState {
     /// Recording and event catalog.
     pub catalog: CatalogHandle,
@@ -63,15 +69,23 @@ pub struct ApiState {
     pub events: broadcast::Sender<Arc<Event>>,
     /// Accepted bearer tokens; empty disables authentication.
     pub tokens: Vec<String>,
+    /// Signs media capabilities; see [`CapabilitySecret`].
+    pub capability_secret: CapabilitySecret,
     /// Recording roots admitted at startup. Media is read only through a descriptor opened
     /// beneath the root that owns a row's path; a row outside every root returns HTTP 404.
     pub recording_roots: Vec<ApprovedRoot>,
     /// Serve `/metrics` without authentication. When false it requires a root bearer token.
     pub public_metrics: bool,
-    /// Where to fetch snapshots for each camera.
-    pub snapshot_sources: HashMap<CameraId, SnapshotSource>,
-    /// Cameras in the running configuration, separate from historical catalog rows.
-    pub active_cameras: HashMap<CameraId, ActiveCamera>,
+    /// Where to fetch snapshots for each camera; provisioning adds and removes entries.
+    pub snapshot_sources: RwLock<HashMap<CameraId, SnapshotSource>>,
+    /// Cameras in the running configuration, separate from historical catalog
+    /// rows; provisioning adds and removes entries.
+    pub active_cameras: RwLock<HashMap<CameraId, ActiveCamera>>,
+    /// The daemon's camera control while `[provisioning]` is enabled;
+    /// `POST /api/cameras`, `DELETE /api/cameras/{camera}`, `GET
+    /// /api/onvif/devices`, and `POST /api/onvif/streams` send their
+    /// requests through it and answer HTTP 403 without it.
+    pub control: Option<CameraControl>,
     /// Request and client counters.
     pub stats: Arc<ApiStats>,
     /// Wall time when the server started, retained for diagnostic context.
@@ -88,8 +102,21 @@ impl fmt::Debug for ApiState {
             .field("tokens", &self.tokens.len())
             .field("recording_roots", &self.recording_roots.len())
             .field("public_metrics", &self.public_metrics)
-            .field("snapshot_sources", &self.snapshot_sources.len())
-            .field("active_cameras", &self.active_cameras.len())
+            .field(
+                "snapshot_sources",
+                &self
+                    .snapshot_sources
+                    .read()
+                    .map_or(0, |sources| sources.len()),
+            )
+            .field(
+                "active_cameras",
+                &self
+                    .active_cameras
+                    .read()
+                    .map_or(0, |cameras| cameras.len()),
+            )
+            .field("control", &self.control.is_some())
             .field("started", &self.started)
             .finish_non_exhaustive()
     }
@@ -104,9 +131,14 @@ pub struct ActiveCamera {
     pub name: String,
     /// Optional configured vendor hint.
     pub vendor: Option<String>,
+    /// Added through the API rather than the configuration file, so the API
+    /// may remove it.
+    pub provisioned: bool,
 }
 
-/// A camera's HTTP endpoint for `snapshot.cgi`.
+/// A camera's HTTP endpoint for snapshots: the Dahua CGI path, or the URL its
+/// ONVIF Media service names, resolved on first use and kept for an hour.
+/// Built with [`SnapshotSource::new`]; clones share the resolved URL.
 #[derive(Clone)]
 pub struct SnapshotSource {
     /// Host name or address.
@@ -121,6 +153,37 @@ pub struct SnapshotSource {
     pub username: String,
     /// Digest-auth password.
     pub password: String,
+    /// Where the snapshot comes from.
+    pub method: ResolvedSnapshot,
+    /// The ONVIF snapshot URL and when it was resolved, shared by every clone
+    /// of the source; `None` until the first request or after a failed fetch.
+    pub(crate) resolved: Arc<std::sync::Mutex<Option<(Url, Instant)>>>,
+}
+
+impl SnapshotSource {
+    /// A source whose ONVIF URL, if its method needs one, is resolved on the
+    /// first request.
+    #[must_use]
+    pub fn new(
+        host: String,
+        port: u16,
+        https: bool,
+        tls_verify: bool,
+        username: String,
+        password: String,
+        method: ResolvedSnapshot,
+    ) -> Self {
+        Self {
+            host,
+            port,
+            https,
+            tls_verify,
+            username,
+            password,
+            method,
+            resolved: Arc::default(),
+        }
+    }
 }
 
 impl fmt::Debug for SnapshotSource {
@@ -128,7 +191,8 @@ impl fmt::Debug for SnapshotSource {
         f.debug_struct("SnapshotSource")
             .field("host", &self.host)
             .field("port", &self.port)
-            .field("username", &self.username)
+            .field("username", &"<redacted>")
+            .field("method", &self.method)
             .finish_non_exhaustive()
     }
 }
@@ -161,7 +225,7 @@ impl Default for ApiStats {
     /// Counters with the configuration's default media admission classes:
     /// [`DEFAULT_API_STREAMING_MEDIA`] streaming and [`DEFAULT_API_BOUNDED_MEDIA`] bounded slots.
     fn default() -> Self {
-        Self::with_media_limits(DEFAULT_API_STREAMING_MEDIA, DEFAULT_API_BOUNDED_MEDIA)
+        Self::new_with_media_limits(DEFAULT_API_STREAMING_MEDIA, DEFAULT_API_BOUNDED_MEDIA)
     }
 }
 
@@ -170,7 +234,7 @@ impl ApiStats {
     /// bounded responses at once (`[api] max_streaming_media` and `max_bounded_media`).
     /// Each class has at least one slot.
     #[must_use]
-    pub fn with_media_limits(streaming: usize, bounded: usize) -> Self {
+    pub fn new_with_media_limits(streaming: usize, bounded: usize) -> Self {
         Self {
             requests: AtomicU64::new(0),
             live_clients: AtomicU64::new(0),
@@ -201,13 +265,13 @@ impl ApiStats {
         self.requests.load(Ordering::Relaxed)
     }
 
-    /// Live WebSocket clients connected now.
+    /// Connected live WebSocket clients.
     #[must_use]
     pub fn live_clients(&self) -> u64 {
         self.live_clients.load(Ordering::Relaxed)
     }
 
-    /// Event WebSocket clients connected now.
+    /// Connected event WebSocket clients.
     #[must_use]
     pub fn event_clients(&self) -> u64 {
         self.event_clients.load(Ordering::Relaxed)
@@ -401,6 +465,7 @@ impl ApiStats {
 
 /// The single in-flight snapshot request of one camera.
 #[derive(Debug)]
+#[must_use = "dropping the guard releases the camera's snapshot slot"]
 pub(crate) struct SnapshotGuard {
     stats: Arc<ApiStats>,
     camera: CameraId,
@@ -416,28 +481,7 @@ impl Drop for SnapshotGuard {
     }
 }
 
-/// Attaches one media-admission permit to response bytes. Clones of the
-/// returned `Bytes` share the same owner, so admission is not released until
-/// the transport has dropped the final response buffer.
-pub(crate) fn admitted_media_bytes(bytes: Bytes, permit: Arc<OwnedSemaphorePermit>) -> Bytes {
-    Bytes::from_owner(AdmittedMediaBytes {
-        bytes,
-        _permit: permit,
-    })
-}
-
-struct AdmittedMediaBytes {
-    bytes: Bytes,
-    _permit: Arc<OwnedSemaphorePermit>,
-}
-
-impl AsRef<[u8]> for AdmittedMediaBytes {
-    fn as_ref(&self) -> &[u8] {
-        &self.bytes
-    }
-}
-
-#[derive(Debug)]
+#[derive(Debug, Default)]
 struct CatalogStatsCache {
     value: Option<CatalogStats>,
     refreshed: Option<Instant>,
@@ -445,19 +489,14 @@ struct CatalogStatsCache {
     refresh_completed: Arc<Notify>,
 }
 
-impl Default for CatalogStatsCache {
-    fn default() -> Self {
-        Self {
-            value: None,
-            refreshed: None,
-            refreshing: false,
-            refresh_completed: Arc::new(Notify::new()),
-        }
-    }
-}
-
 /// Live rings by stream key. The daemon inserts one ring per stream as
 /// recording starts; the live endpoint looks a stream up by camera and kind.
+///
+/// # Panics
+///
+/// A method panics when a registry lock is poisoned, which takes a panic in
+/// another caller holding it for writing; the release profile aborts at that
+/// panic instead (`panic = "abort"`).
 #[derive(Debug, Default)]
 pub struct LiveRegistry {
     rings: RwLock<HashMap<StreamKey, LiveRing>>,
@@ -474,6 +513,10 @@ impl LiveRegistry {
     }
 
     /// Registers (or replaces) the ring for a stream.
+    ///
+    /// # Panics
+    ///
+    /// When a registry lock is poisoned (see [`LiveRegistry`]).
     pub fn insert(&self, key: StreamKey, ring: LiveRing) {
         self.external_viewers
             .write()
@@ -491,7 +534,34 @@ impl LiveRegistry {
         &self.hls
     }
 
+    /// Forgets every stream of `camera`: its rings, statistics, viewer counts,
+    /// and live playlist states. Live sockets on those streams end when their
+    /// ring stops; the camera's recordings stay reachable through the catalog.
+    ///
+    /// # Panics
+    ///
+    /// When a registry lock is poisoned (see [`LiveRegistry`]).
+    pub fn remove_camera(&self, camera: &CameraId) {
+        self.rings
+            .write()
+            .expect("live registry lock")
+            .retain(|key, _| key.camera != *camera);
+        self.stats
+            .write()
+            .expect("live registry lock")
+            .retain(|key, _| key.camera != *camera);
+        self.external_viewers
+            .write()
+            .expect("live registry lock")
+            .retain(|key, _| key.camera != *camera);
+        self.hls.remove_camera(camera);
+    }
+
     /// Registers the statistics of a stream, which the camera detail reports.
+    ///
+    /// # Panics
+    ///
+    /// When a registry lock is poisoned (see [`LiveRegistry`]).
     pub fn insert_stats(&self, key: StreamKey, stats: Arc<StreamStats>) {
         self.stats
             .write()
@@ -500,6 +570,10 @@ impl LiveRegistry {
     }
 
     /// The statistics of every registered stream of `camera`, by kind.
+    ///
+    /// # Panics
+    ///
+    /// When a registry lock is poisoned (see [`LiveRegistry`]).
     #[must_use]
     pub fn camera_stats(&self, camera: &CameraId) -> Vec<(StreamKey, Arc<StreamStats>)> {
         let mut out: Vec<(StreamKey, Arc<StreamStats>)> = self
@@ -515,6 +589,10 @@ impl LiveRegistry {
     }
 
     /// Returns the ring for a stream, if registered.
+    ///
+    /// # Panics
+    ///
+    /// When a registry lock is poisoned (see [`LiveRegistry`]).
     #[must_use]
     pub fn get(&self, key: &StreamKey) -> Option<LiveRing> {
         self.rings
@@ -525,6 +603,10 @@ impl LiveRegistry {
     }
 
     /// The registered streams.
+    ///
+    /// # Panics
+    ///
+    /// When a registry lock is poisoned (see [`LiveRegistry`]).
     #[must_use]
     pub fn keys(&self) -> Vec<StreamKey> {
         self.rings
@@ -537,6 +619,7 @@ impl LiveRegistry {
 
     /// Tracks one external live-WebSocket viewer until the returned guard drops,
     /// or returns `None` when the stream already has `limit` viewers.
+    #[must_use]
     pub(crate) fn try_track_external_viewer(
         &self,
         key: &StreamKey,
@@ -603,6 +686,22 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_source_debug_omits_the_credentials() {
+        let source = SnapshotSource::new(
+            "192.0.2.7".into(),
+            80,
+            false,
+            true,
+            "synthetic-user".into(),
+            "synthetic-password".into(),
+            ResolvedSnapshot::DahuaCgi,
+        );
+        let rendered = format!("{source:?}");
+        assert!(rendered.contains("192.0.2.7"), "{rendered}");
+        assert!(!rendered.contains("synthetic"), "{rendered}");
+    }
+
+    #[test]
     fn external_viewer_guard_counts_only_its_lifetime() {
         let registry = LiveRegistry::new();
         let key = key();
@@ -623,7 +722,7 @@ mod tests {
 
     #[test]
     fn media_classes_are_independent_process_wide_and_fallible() {
-        let stats = ApiStats::with_media_limits(2, 3);
+        let stats = ApiStats::new_with_media_limits(2, 3);
         let streaming: Vec<_> = (0..2)
             .map(|_| {
                 stats
@@ -658,29 +757,6 @@ mod tests {
             .collect();
         assert!(stats.try_media(MediaClass::Bounded).is_none());
         drop((streaming, bounded));
-    }
-
-    #[test]
-    fn admitted_bytes_hold_the_permit_across_clones() {
-        let stats = ApiStats::with_media_limits(2, 1);
-        let guarded = admitted_media_bytes(
-            Bytes::from_static(b"media"),
-            Arc::new(
-                stats
-                    .try_media(MediaClass::Streaming)
-                    .expect("first permit"),
-            ),
-        );
-        let remaining = stats
-            .try_media(MediaClass::Streaming)
-            .expect("remaining permit");
-        assert!(stats.try_media(MediaClass::Streaming).is_none());
-        let clone = guarded.clone();
-        drop(guarded);
-        assert!(stats.try_media(MediaClass::Streaming).is_none());
-        drop(clone);
-        assert!(stats.try_media(MediaClass::Streaming).is_some());
-        drop(remaining);
     }
 
     #[test]

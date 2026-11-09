@@ -54,7 +54,7 @@ writes, pacing, and the deliberate post-stall catch-up burst used by the measure
 
 Instead of reading a socket as soon as a packet arrives, each session drains what is
 readable without arming a wake-up, then sleeps until the next tick of a clock shared by
-every stream (05 §2). One read then covers an interval's worth of packets and all streams
+every stream (05 §1). One read then covers an interval's worth of packets and all streams
 are read in the same wake-up.
 
 | Sessions | Mbit/s | Read interval | CPU % (user / system) | % per Mbit/s | Change |
@@ -155,6 +155,11 @@ unwinder stopped at an inlined frame):
 | `readv` | 640 /s | one read plus one `EAGAIN` per stream per tick | 700 /s |
 | all | 6,420 /s | | 930 /s |
 
+Checked on 2026-11-09: the three "Before" rows sum to 6,925 /s, more than the 6,420 /s total,
+and a read plus an `EAGAIN` per stream per tick would be about 1,400 /s for 14 streams at 50
+ticks a second, not 640. No perf output is kept with the record, so it cannot settle which
+figure is wrong; the "After" column is consistent with its total.
+
 The two changes, in `iris-ingest` and the vendored retina:
 
 - **One ticker for all streams** (`iris_ingest::ReadTicker`): a single timer task wakes
@@ -193,16 +198,36 @@ With the detached socket the `readv` count first doubled, since a detached read 
 brought it to one per stream per tick, 930 system calls a second in all for fourteen
 streams against 6,420 before this section.
 
+### One clock read per socket read (2026-11-08)
+
+retina stamped every decoded message with the wall and monotonic clock; with a read
+delivering many packets, that was two clock reads per packet. The vendored copy takes
+both once per socket read and stamps every message decoded from those bytes with them.
+Within one read the difference was microseconds, and with timer-driven reads the stamp
+already marked the read rather than the arrival, so the time model is unchanged. Measured
+with the same harness (14 replayed cameras at 143 Mbit/s payload, 20 ms reads, 32 KiB
+low-water mark, two runs each, the six fuzz targets running niced in the background):
+
+| Build | CPU % (user / system) | % per Mbit/s | Wake-ups /s |
+|---|---|---|---|
+| before, two runs | 3.58 (1.69 / 1.89), 3.51 (1.71 / 1.80) | 0.0250, 0.0245 | 66, 69 |
+| one stamp per read, two runs | 3.56 (1.65 / 1.91), 3.42 (1.51 / 1.91) | 0.0249, 0.0238 | 68, 66 |
+
+User time fell by about 0.1 percentage points of a core, the size the §5 sample share
+predicted; the totals sit within the run-to-run spread of 0.1. The figures above are
+higher than §6's because this replay carries 143 rather than 132 Mbit/s and the daemon
+of this round bounds and escapes every camera-supplied diagnostic; compare rows within a
+table, not across sections.
+
 ## 7. What remains
 
-The measured figure is 0.021 % per Mbit/s at 132 Mbit/s against the 07 §7 budget of
-0.036 %. What is left, in order:
+The measured figure is 0.024 % per Mbit/s at 143 Mbit/s against the 07 §7 budget of
+0.036 %. What is left:
 
-1. Clock reads (2 % of samples in §5): retina stamps every packet with wall and monotonic
-   time.
-2. Upstream the retina changes (the low-water mark, the detached socket, the short-read
-   stop) so the vendored copy can go.
-3. The remaining 930 system calls a second are 700 reads, 110 `epoll_wait` returns (the
+1. Upstream the retina changes (the low-water mark, the detached socket, the short-read
+   stop, the one stamp per read, the bounded fields and diagnostics) so the vendored copy
+   can go.
+2. The remaining 930 system calls a second are 700 reads, 110 `epoll_wait` returns (the
    ticker, the writer and catalog replies, the API), and the rest bookkeeping; the
    kernel's TCP copy is the floor.
 

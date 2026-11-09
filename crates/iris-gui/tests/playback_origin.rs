@@ -14,7 +14,7 @@ use axum::Router;
 use axum::extract::{OriginalUri, Query, State};
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use axum::routing::get;
+use axum::routing;
 
 /// How the fixture's playlist leaves the daemon's contract.
 #[derive(Clone, Copy, Debug)]
@@ -44,7 +44,7 @@ async fn api(
     if path == "/api/cameras" {
         return (
             [(header::CONTENT_TYPE, "application/json")],
-            r#"[{"id":"fixture","name":"Fixture"}]"#,
+            r#"[{"id":"fixture","name":"Fixture","provisioned":false}]"#,
         )
             .into_response();
     }
@@ -68,22 +68,24 @@ async fn api(
             Mode::FileScheme => "file:///nonexistent/".to_owned(),
             Mode::KeyTag => "/media/".to_owned(),
         };
-        let mut playlist = String::from(
-            "#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-TARGETDURATION:2\n#EXT-X-PLAYLIST-TYPE:VOD\n#EXT-X-MEDIA-SEQUENCE:0\n",
-        );
+        let mut playlist = String::from(concat!(
+            "#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-TARGETDURATION:2\n",
+            "#EXT-X-PLAYLIST-TYPE:VOD\n#EXT-X-MEDIA-SEQUENCE:0\n",
+        ));
         writeln!(playlist, "#EXT-X-MAP:URI=\"{prefix}init.mp4\"").unwrap();
         if let Mode::KeyTag = api.mode {
             writeln!(
                 playlist,
-                "#EXT-X-KEY:METHOD=AES-128,URI=\"http://{}/key.bin\",IV=0x00000000000000000000000000000000",
-                api.other
+                "#EXT-X-KEY:METHOD=AES-128,URI=\"http://{}/key.bin\",IV=0x{:032x}",
+                api.other, 0
             )
             .unwrap();
         }
         for i in 0..3 {
             writeln!(
                 playlist,
-                "#IRIS-FRAGMENT:WALL-US={},DURATION-TICKS=180000\n#EXTINF:2.00000,\n{prefix}test{i}.m4s",
+                "#IRIS-FRAGMENT:WALL-US={},DURATION-TICKS=180000\n\
+                 #EXTINF:2.00000,\n{prefix}test{i}.m4s",
                 wall_start + i * 2_000_000
             )
             .unwrap();
@@ -116,7 +118,9 @@ fn run(mode: Mode, expected: &str) {
         async move {
             axum::serve(
                 other_listener,
-                Router::new().fallback(get(other)).with_state(fetched),
+                Router::new()
+                    .fallback(routing::get(other))
+                    .with_state(fetched),
             )
             .await
             .unwrap();
@@ -136,9 +140,12 @@ fn run(mode: Mode, expected: &str) {
     let server = runtime.spawn({
         let state = Arc::clone(&api_state);
         async move {
-            axum::serve(listener, Router::new().fallback(get(api)).with_state(state))
-                .await
-                .unwrap();
+            axum::serve(
+                listener,
+                Router::new().fallback(routing::get(api)).with_state(state),
+            )
+            .await
+            .unwrap();
         }
     });
     let output = Command::new("timeout")

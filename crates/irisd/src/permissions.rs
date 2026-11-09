@@ -1,14 +1,15 @@
 //! Startup permission checks for the files that hold the daemon's secrets and
-//! state: the configuration file, the state directory, and the catalog's
-//! database, write-ahead log, and shared-memory files.
+//! state: the configuration file, the state directory, and the state files in
+//! it (the catalog's database, write-ahead log, and shared-memory files, the
+//! media-capability key, and the store of cameras the API added).
 //!
-//! SQLite gives a new write-ahead log and shared-memory file the database
-//! file's mode, so a catalog once created readable by other users stays that
-//! way across restarts even under a restrictive umask. The daemon therefore
-//! checks the state directory and the catalog files before SQLite opens them:
-//! each must belong to the service account, the catalog files must be regular
-//! files with one link, and group or other permissions are removed with a
-//! warning. A wrong owner, type, or link count fails startup.
+//! SQLite gives a write-ahead log or shared-memory file it creates the
+//! database file's mode, so a catalog once created readable by other users
+//! stays that way across restarts even under a restrictive umask. The daemon
+//! therefore checks the state directory and the state files before SQLite
+//! opens them: each must belong to the service account, the files must be
+//! regular files with one link, and group or other permissions are removed
+//! with a warning. A wrong owner, type, or link count fails startup.
 
 use std::fs::{File, Permissions};
 use std::io;
@@ -23,10 +24,22 @@ use rustix::io::Errno;
 pub const CATALOG_FILE: &str = "irisd.db";
 /// SQLite's companions of the catalog database.
 const CATALOG_COMPANIONS: [&str; 2] = ["irisd.db-wal", "irisd.db-shm"];
+/// File name of the media-capability signing secret inside the state directory.
+pub const CAPABILITY_KEY_FILE: &str = "capability.key";
+/// File name of the store of cameras the API added, inside the state directory.
+pub const PROVISIONED_CAMERAS_FILE: &str = "cameras.toml";
 /// Mode of the state directory: the service account only.
 const PRIVATE_DIRECTORY: u32 = 0o700;
-/// Mode of a catalog file: read and write for the service account only.
+/// Mode of a state file (catalog, capability key, camera store): read and
+/// write for the service account only.
 const PRIVATE_FILE: u32 = 0o600;
+/// Flags of every state-file open: never through a final symbolic link, never
+/// blocking on a FIFO or device, never acquiring a controlling terminal.
+const STATE_FILE_FLAGS: OFlags = OFlags::RDONLY
+    .union(OFlags::NOFOLLOW)
+    .union(OFlags::NONBLOCK)
+    .union(OFlags::NOCTTY)
+    .union(OFlags::CLOEXEC);
 
 /// One permission change made by [`secure_state_directory`].
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -39,15 +52,22 @@ pub struct ModeRepair {
     pub new_mode: u32,
 }
 
-/// Checks the state directory and the catalog files in it before the catalog
+/// Checks the state directory and the state files in it before the catalog
 /// opens, and returns the modes it tightened.
 ///
-/// The directory is opened without following a final symbolic link and must be
-/// owned by the effective user; group or other bits are removed (mode 0700).
-/// Each of `irisd.db`, `irisd.db-wal`, and `irisd.db-shm` that exists is opened
-/// without following a symbolic link or blocking on a special file, must be a
-/// regular file with one link owned by the effective user, and gets mode 0600
-/// when group or other bits are set.
+/// The directory is opened without following a final symbolic link and must
+/// be owned by the effective user; group or other bits are removed (mode
+/// 0700). Each of `irisd.db`, `irisd.db-wal`, `irisd.db-shm`,
+/// `capability.key`, and `cameras.toml` that exists is opened relative to
+/// that directory without following a symbolic link or blocking on a special
+/// file, must be a regular file with one link owned by the effective user,
+/// and gets mode 0600 when group or other bits are set.
+///
+/// # Errors
+///
+/// Fails when the directory or a file cannot be opened or inspected, is a
+/// symbolic link, a special file, or has several links, or belongs to
+/// another account.
 pub fn secure_state_directory(dir: &Path) -> anyhow::Result<Vec<ModeRepair>> {
     secure_state_directory_for(dir, rustix::process::geteuid().as_raw())
 }
@@ -69,18 +89,16 @@ fn secure_state_directory_for(dir: &Path, owner: u32) -> anyhow::Result<Vec<Mode
     let mut repairs = Vec::new();
     check_owner(&directory, dir, owner)?;
     tighten(&directory, dir, PRIVATE_DIRECTORY, &mut repairs)?;
-    for name in std::iter::once(CATALOG_FILE).chain(CATALOG_COMPANIONS) {
+    for name in std::iter::once(CATALOG_FILE)
+        .chain(CATALOG_COMPANIONS)
+        .chain([CAPABILITY_KEY_FILE, PROVISIONED_CAMERAS_FILE])
+    {
         let path = dir.join(name);
-        let file = match rustix::fs::openat(
-            &directory,
-            name,
-            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::NOCTTY | OFlags::CLOEXEC,
-            Mode::empty(),
-        ) {
+        let file = match rustix::fs::openat(&directory, name, STATE_FILE_FLAGS, Mode::empty()) {
             Ok(file) => File::from(file),
             Err(Errno::NOENT) => continue,
             Err(Errno::LOOP) => bail!(
-                "{} is a symbolic link; the catalog must be a regular file in the state directory",
+                "{} is a symbolic link; state files must be regular files in the state directory",
                 path.display()
             ),
             Err(error) => {
@@ -89,23 +107,53 @@ fn secure_state_directory_for(dir: &Path, owner: u32) -> anyhow::Result<Vec<Mode
                 });
             }
         };
-        let metadata = file
-            .metadata()
-            .with_context(|| format!("reading the status of {}", path.display()))?;
-        if !metadata.file_type().is_file() {
-            bail!("{} is not a regular file", path.display());
-        }
-        if metadata.nlink() != 1 {
-            bail!(
-                "{} has {} hard links; the catalog must not be reachable through another name",
-                path.display(),
-                metadata.nlink()
-            );
-        }
+        require_regular_with_one_link(&file, &path)?;
         check_owner(&file, &path, owner)?;
         tighten(&file, &path, PRIVATE_FILE, &mut repairs)?;
     }
     Ok(repairs)
+}
+
+/// Opens the state file at `path` for reading without following a symbolic
+/// link or blocking on a special file; `None` when nothing exists there. The
+/// file must be a regular file with one link.
+///
+/// # Errors
+///
+/// Fails when the path is a symbolic link, is not a regular file, is
+/// reachable through another name, or cannot be opened or inspected.
+pub fn open_private_file(path: &Path) -> anyhow::Result<Option<File>> {
+    let file = match rustix::fs::open(path, STATE_FILE_FLAGS, Mode::empty()) {
+        Ok(file) => File::from(file),
+        Err(Errno::NOENT) => return Ok(None),
+        Err(Errno::LOOP) => bail!(
+            "{} is a symbolic link; state files must be regular files in the state directory",
+            path.display()
+        ),
+        Err(error) => {
+            return Err(io::Error::from(error))
+                .with_context(|| format!("opening {}", path.display()));
+        }
+    };
+    require_regular_with_one_link(&file, path)?;
+    Ok(Some(file))
+}
+
+fn require_regular_with_one_link(file: &File, path: &Path) -> anyhow::Result<()> {
+    let metadata = file
+        .metadata()
+        .with_context(|| format!("reading the status of {}", path.display()))?;
+    if !metadata.file_type().is_file() {
+        bail!("{} is not a regular file", path.display());
+    }
+    if metadata.nlink() != 1 {
+        bail!(
+            "{} has {} hard links; a state file must not be reachable through another name",
+            path.display(),
+            metadata.nlink()
+        );
+    }
+    Ok(())
 }
 
 fn check_owner(file: &File, path: &Path, owner: u32) -> anyhow::Result<()> {
@@ -148,21 +196,42 @@ fn tighten(
     Ok(())
 }
 
-/// Permission bits of the configuration file when users other than the
-/// daemon's account or group can read or write it; `None` when it is private
-/// or its status cannot be read.
+/// A user and group id pair.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Account {
+    uid: u32,
+    gid: u32,
+}
+
+/// Permission bits of the configuration file when a user other than root or
+/// the daemon's account can read or write it; `None` when it is private or
+/// its status cannot be read.
 ///
 /// The file holds camera passwords and API tokens. Group access is accepted
-/// only for the daemon's own group, which matches the packaged layout
-/// (mode 0640, owner root, group irisd).
+/// only for the daemon's own group, and owner access only for root or the
+/// daemon's account, which matches the packaged layout (mode 0640, owner
+/// root, group irisd).
 pub fn exposed_configuration(path: &Path) -> Option<u32> {
     let metadata = std::fs::metadata(path).ok()?;
     let mode = metadata.mode() & 0o7777;
-    configuration_exposed(mode, metadata.gid(), rustix::process::getegid().as_raw()).then_some(mode)
+    let owner = Account {
+        uid: metadata.uid(),
+        gid: metadata.gid(),
+    };
+    let daemon = Account {
+        uid: rustix::process::geteuid().as_raw(),
+        gid: rustix::process::getegid().as_raw(),
+    };
+    configuration_exposed(mode, owner, daemon).then_some(mode)
 }
 
-fn configuration_exposed(mode: u32, file_group: u32, daemon_group: u32) -> bool {
-    mode & 0o006 != 0 || (mode & 0o060 != 0 && file_group != daemon_group)
+/// Whether `mode` lets a user other than root or the daemon read or write the
+/// file: other bits, group bits for a group other than the daemon's, or owner
+/// bits for an owner who is neither root nor the daemon.
+fn configuration_exposed(mode: u32, owner: Account, daemon: Account) -> bool {
+    mode & 0o006 != 0
+        || (mode & 0o060 != 0 && owner.gid != daemon.gid)
+        || (mode & 0o600 != 0 && owner.uid != 0 && owner.uid != daemon.uid)
 }
 
 #[cfg(test)]
@@ -181,13 +250,28 @@ mod tests {
         rustix::process::geteuid().as_raw()
     }
 
-    /// A state directory holding the three catalog files, all shared.
+    fn mkfifo(path: &Path) {
+        rustix::fs::mknodat(
+            rustix::fs::CWD,
+            path,
+            rustix::fs::FileType::Fifo,
+            Mode::from_raw_mode(0o600),
+            0,
+        )
+        .unwrap();
+    }
+
+    /// A state directory holding the catalog files, the capability key, and
+    /// the camera store, all readable by other users.
     fn shared_state() -> (tempfile::TempDir, PathBuf) {
         let dir = tempfile::tempdir().unwrap();
         let state = dir.path().join("state");
         std::fs::create_dir(&state).unwrap();
         set_mode(&state, 0o755);
-        for name in std::iter::once(CATALOG_FILE).chain(CATALOG_COMPANIONS) {
+        for name in std::iter::once(CATALOG_FILE)
+            .chain(CATALOG_COMPANIONS)
+            .chain([CAPABILITY_KEY_FILE, PROVISIONED_CAMERAS_FILE])
+        {
             let path = state.join(name);
             std::fs::write(&path, b"catalog bytes").unwrap();
             set_mode(&path, 0o644);
@@ -196,10 +280,10 @@ mod tests {
     }
 
     #[test]
-    fn a_shared_state_directory_and_catalog_are_restricted_to_the_owner() {
+    fn a_shared_state_directory_and_its_files_are_restricted_to_the_owner() {
         let (_dir, state) = shared_state();
         let repairs = secure_state_directory_for(&state, euid()).unwrap();
-        assert_eq!(repairs.len(), 4, "{repairs:?}");
+        assert_eq!(repairs.len(), 6, "{repairs:?}");
         assert_eq!(
             repairs[0],
             ModeRepair {
@@ -209,7 +293,10 @@ mod tests {
             }
         );
         assert_eq!(mode(&state), 0o700);
-        for name in std::iter::once(CATALOG_FILE).chain(CATALOG_COMPANIONS) {
+        for name in std::iter::once(CATALOG_FILE)
+            .chain(CATALOG_COMPANIONS)
+            .chain([CAPABILITY_KEY_FILE, PROVISIONED_CAMERAS_FILE])
+        {
             let path = state.join(name);
             assert_eq!(mode(&path), 0o600, "{}", path.display());
             assert_eq!(std::fs::read(&path).unwrap(), b"catalog bytes");
@@ -299,14 +386,7 @@ mod tests {
         let (_dir, state) = shared_state();
         let database = state.join(CATALOG_FILE);
         std::fs::remove_file(&database).unwrap();
-        rustix::fs::mknodat(
-            rustix::fs::CWD,
-            &database,
-            rustix::fs::FileType::Fifo,
-            Mode::from_raw_mode(0o600),
-            0,
-        )
-        .unwrap();
+        mkfifo(&database);
         let checked = state.clone();
         let (result_tx, result_rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
@@ -331,18 +411,90 @@ mod tests {
     }
 
     #[test]
-    fn configuration_access_beyond_the_daemon_account_and_group_is_reported() {
+    fn open_private_file_returns_none_for_an_absent_path() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(
+            open_private_file(&dir.path().join("absent"))
+                .unwrap()
+                .is_none()
+        );
+        std::fs::write(dir.path().join("present"), b"x").unwrap();
+        assert!(
+            open_private_file(&dir.path().join("present"))
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn open_private_file_refuses_a_symbolic_link() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("target"), b"x").unwrap();
+        std::os::unix::fs::symlink(dir.path().join("target"), dir.path().join("link")).unwrap();
+        let error = open_private_file(&dir.path().join("link")).unwrap_err();
+        assert!(error.to_string().contains("symbolic link"), "{error:#}");
+    }
+
+    #[test]
+    fn open_private_file_refuses_a_hard_linked_file() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("file"), b"x").unwrap();
+        std::fs::hard_link(dir.path().join("file"), dir.path().join("alias")).unwrap();
+        let error = open_private_file(&dir.path().join("file")).unwrap_err();
+        assert!(error.to_string().contains("hard links"), "{error:#}");
+    }
+
+    #[test]
+    fn open_private_file_does_not_block_on_a_fifo() {
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = dir.path().join("fifo");
+        mkfifo(&fifo);
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = result_tx.send(open_private_file(&fifo).map(|file| file.is_some()));
+        });
+        let error = result_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("the open must not block on a FIFO")
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("not a regular file"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn configuration_access_beyond_root_and_the_daemon_account_and_group_is_reported() {
+        let daemon = Account { uid: 10, gid: 10 };
+        let same = Account { uid: 10, gid: 10 };
+        let root_in_group = Account { uid: 0, gid: 10 };
         for mode in [0o600, 0o400, 0o640, 0o440] {
-            assert!(!configuration_exposed(mode, 10, 10), "{mode:o}");
+            assert!(!configuration_exposed(mode, same, daemon), "{mode:o}");
+            assert!(
+                !configuration_exposed(mode, root_in_group, daemon),
+                "{mode:o}"
+            );
         }
         for mode in [0o644, 0o604, 0o602, 0o666] {
-            assert!(configuration_exposed(mode, 10, 10), "{mode:o}");
+            assert!(configuration_exposed(mode, same, daemon), "{mode:o}");
         }
         assert!(
-            configuration_exposed(0o640, 10, 11),
+            configuration_exposed(0o640, Account { uid: 10, gid: 11 }, daemon),
             "another group can read it"
         );
-        assert!(!configuration_exposed(0o600, 10, 11));
+        assert!(!configuration_exposed(
+            0o600,
+            Account { uid: 10, gid: 11 },
+            daemon
+        ));
+        assert!(
+            configuration_exposed(0o640, Account { uid: 11, gid: 10 }, daemon),
+            "another account owns it and can read it"
+        );
+        assert!(
+            !configuration_exposed(0o040, Account { uid: 11, gid: 10 }, daemon),
+            "an owner without owner bits exposes nothing"
+        );
 
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("irisd.toml");

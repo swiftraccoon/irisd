@@ -1,6 +1,6 @@
 //! Shared identifiers, time units, event types, configuration, and metrics for irisd.
 //!
-//! Every crate in the workspace speaks in these types so that a wall-clock
+//! The recorder's crates speak in these types so that a wall-clock
 //! microsecond is never confused with a 90 kHz media tick, and a camera id is
 //! never confused with a stream key.
 //!
@@ -15,15 +15,19 @@
 //!   clock, with its [`event::EventSource`], [`event::EventKind`], and
 //!   [`event::EventState`].
 //! - [`config`]: [`config::Config`], the TOML configuration and its defaults.
-//! - [`metrics`]: [`metrics::Histogram`] and [`metrics::Peak`], one atomic per
-//!   sample, for the statistics lines.
+//! - [`metrics`]: [`metrics::Histogram`] and [`metrics::Peak`], lock-free atomic
+//!   counters for the statistics lines.
+//! - [`text`]: [`text::LogSafe`], peer-controlled text as one bounded, escaped
+//!   log line.
+//! - [`nonce`]: [`nonce::client_nonce`], a random digest client nonce.
 //!
 //! # Invariants
 //!
 //! Media time is 90 kHz everywhere, so one millisecond is exactly 90 ticks.
 //! [`time::WallUs`] places, searches, and expires recordings; camera clocks are
 //! recorded for diagnostics only. NTP64 conversions round trip exactly to the
-//! microsecond, which the `prft` box depends on.
+//! microsecond from 1970 through 2104 (both NTP eras), which the `prft` box
+//! depends on.
 //!
 //! ```
 //! use iris_core::time::{MediaTicks, TIMESCALE, WallUs};
@@ -40,4 +44,6 @@ pub mod config;
 pub mod event;
 pub mod id;
 pub mod metrics;
+pub mod nonce;
+pub mod text;
 pub mod time;

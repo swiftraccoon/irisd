@@ -60,9 +60,9 @@ fn semantic_rfc3339(raw: &str) -> Option<i64> {
     if bytes.get(pos) == Some(&b'.') {
         pos += 1;
         let start = pos;
-        while bytes.get(pos).is_some_and(u8::is_ascii_digit) {
+        while let Some(&digit) = bytes.get(pos).filter(|byte| byte.is_ascii_digit()) {
             if pos - start < 6 {
-                micros = micros * 10 + i64::from(bytes[pos] - b'0');
+                micros = micros * 10 + i64::from(digit - b'0');
             }
             pos += 1;
         }

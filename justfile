@@ -12,8 +12,13 @@ fmt:
 # Verify formatting, lints (warnings are errors), docs, tests, and the vendored crates' tests.
 check: fmt-check clippy test doc vendor-test
 
+# Lint the fuzz targets with the pinned nightly; `just fuzz-build` builds them.
+fuzz-clippy:
+    cd fuzz && cargo clippy --locked --bins -- -D warnings
+
 fmt-check:
     cargo fmt --all -- --check
+    cargo fmt --manifest-path fuzz/Cargo.toml --all -- --check
 
 clippy:
     cargo clippy --workspace --all-targets --locked -- -D warnings
@@ -45,6 +50,12 @@ audit:
 # Build every fuzz target with the nightly toolchain pinned in fuzz/rust-toolchain.toml.
 fuzz-build:
     cd fuzz && cargo fuzz build
+
+# Type-check every crate but the GUI (which needs a GTK sysroot) for 64-bit ARM. Needs
+# `rustup target add aarch64-unknown-linux-gnu` and a C cross compiler named by
+# CC_aarch64_unknown_linux_gnu; CFLAGS_aarch64_unknown_linux_gnu may add a --sysroot.
+cross-check target="aarch64-unknown-linux-gnu":
+    cargo clippy --workspace --exclude iris-gui --all-targets --locked --target {{target}} -- -D warnings
 
 # Release build of the daemon.
 build:

@@ -19,7 +19,7 @@ use iris_core::id::{CameraId, StreamKey, StreamKind};
 use iris_core::time::WallUs;
 use iris_ingest::{LiveFrame, LiveRing};
 use iris_mp4::fragment::{Fragment, Sample};
-use iris_mp4::index::read_index;
+use iris_mp4::index::{MAX_PERSISTED_INDEX_RECORDS, read_index_bounded};
 use iris_mp4::init::SampleEntry;
 use iris_store::{ApprovedRoot, RootExpectation, StoragePolicy, WriterHandle};
 use tokio::sync::broadcast;
@@ -139,7 +139,7 @@ async fn record_segments_with_rotation(
             sync_interval: Duration::from_secs(5),
             preallocate_bytes: 1 << 20,
             rotate_bytes,
-            rotate_secs: 3600,
+            rotate_age: Duration::from_secs(3600),
         },
         16,
     )
@@ -153,7 +153,11 @@ async fn record_segments_with_rotation(
         .unwrap();
     let files = find_mp4s(root);
     for path in &files {
-        let (header, records) = read_index(&iris_store::layout::index_path(path)).unwrap();
+        let (header, records) = read_index_bounded(
+            &iris_store::layout::index_path(path),
+            MAX_PERSISTED_INDEX_RECORDS,
+        )
+        .unwrap();
         catalog.notify(Change::SegmentOpened {
             key: key(),
             path: path.to_owned(),
@@ -192,7 +196,7 @@ async fn populate(dir: &Path, catalog: &CatalogHandle) -> (PathBuf, u32, u64) {
             sync_interval: Duration::from_millis(20),
             preallocate_bytes: 1 << 20,
             rotate_bytes: 1 << 30,
-            rotate_secs: 3600,
+            rotate_age: Duration::from_secs(3600),
         },
         16,
     )
@@ -205,7 +209,11 @@ async fn populate(dir: &Path, catalog: &CatalogHandle) -> (PathBuf, u32, u64) {
         .unwrap()
         .unwrap();
     let path = find_mp4(root);
-    let (header, records) = read_index(&iris_store::layout::index_path(&path)).unwrap();
+    let (header, records) = read_index_bounded(
+        &iris_store::layout::index_path(&path),
+        MAX_PERSISTED_INDEX_RECORDS,
+    )
+    .unwrap();
     assert_eq!(records.len(), 3);
     let total: u64 = records.iter().map(|r| u64::from(r.len)).sum();
     let len = u64::from(header.init_len) + total;
@@ -227,7 +235,8 @@ async fn populate(dir: &Path, catalog: &CatalogHandle) -> (PathBuf, u32, u64) {
         wall_end: last.wall.offset(2_000_000),
         media_end: last.decode_time + u64::from(last.duration),
     });
-    tokio::time::sleep(Duration::from_millis(400)).await;
+    // A query flushes all preceding catalog changes before returning.
+    catalog.total_bytes().await.unwrap();
     (path, header.init_len, len)
 }
 
@@ -248,10 +257,12 @@ fn state_with_cameras(
         live: Arc::new(LiveRegistry::new()),
         events,
         tokens,
+        capability_secret: iris_api::CapabilitySecret::new([1; 32]),
         recording_roots: vec![recording_root(dir)],
         public_metrics: false,
-        snapshot_sources: HashMap::new(),
-        active_cameras,
+        snapshot_sources: std::sync::RwLock::new(HashMap::new()),
+        active_cameras: std::sync::RwLock::new(active_cameras),
+        control: None,
         stats: Arc::new(ApiStats::default()),
         started: WallUs::now(),
         started_monotonic: Instant::now(),
@@ -787,7 +798,10 @@ async fn lists_segments_and_builds_a_byte_range_playlist() {
         .lines()
         .find(|line| line.starts_with(&map_prefix))
         .unwrap();
-    assert!(!map_line.contains("token=t"));
+    assert!(
+        !map_line.contains("token=t"),
+        "root token leaked in {map_line}"
+    );
     let media_uri = map_line
         .strip_prefix("#EXT-X-MAP:URI=\"")
         .and_then(|line| line.split_once('\"'))
@@ -1183,7 +1197,11 @@ async fn clipped_continuations_keep_sync_preroll_in_vod_metadata_and_export() {
         vec![fragment(0, &entry), continuation],
     )
     .await;
-    let (_, records) = read_index(&iris_store::layout::index_path(&paths[0])).unwrap();
+    let (_, records) = read_index_bounded(
+        &iris_store::layout::index_path(&paths[0]),
+        MAX_PERSISTED_INDEX_RECORDS,
+    )
+    .unwrap();
     let app = router(state(dir.path(), catalog.clone(), vec![]));
     let range = format!(
         "from={}&to={}",
@@ -1355,7 +1373,11 @@ async fn exports_reject_codec_changes_when_adopted_files_have_unknown_hashes() {
     original.shutdown();
     let adopted = CatalogHandle::open(&dir.path().join("adopted.db")).unwrap();
     for path in files {
-        let (header, records) = read_index(&iris_store::layout::index_path(&path)).unwrap();
+        let (header, records) = read_index_bounded(
+            &iris_store::layout::index_path(&path),
+            MAX_PERSISTED_INDEX_RECORDS,
+        )
+        .unwrap();
         let last = records.last().unwrap();
         adopted
             .adopt_segment(iris_catalog::NewSegment {
@@ -1438,7 +1460,7 @@ async fn the_keyframe_resource_is_one_sync_sample_behind_the_init_segment() {
 }
 
 #[tokio::test]
-async fn implicit_newest_keyframes_are_not_cached() {
+async fn keyframes_at_or_near_the_present_are_not_cached() {
     let dir = tempfile::tempdir().unwrap();
     let catalog = CatalogHandle::open(&dir.path().join("c.db")).unwrap();
     let entry = entry();
@@ -1450,9 +1472,28 @@ async fn implicit_newest_keyframes_are_not_cached() {
     let newest = get(&app, "/api/streams/cam1/main/keyframe".into(), None).await;
     assert_eq!(newest.status(), StatusCode::OK);
     assert_eq!(newest.headers()[header::CACHE_CONTROL], "private, no-store");
-    let historical = get(
+    // An explicit time within the mutable horizon names a sample that later
+    // fragments may still replace.
+    let recent = get(
         &app,
         format!("/api/streams/cam1/main/keyframe?t={at}"),
+        None,
+    )
+    .await;
+    assert_eq!(recent.status(), StatusCode::OK);
+    assert_eq!(recent.headers()[header::CACHE_CONTROL], "private, no-store");
+    catalog.shutdown();
+}
+
+#[tokio::test]
+async fn historical_keyframes_may_cache_privately() {
+    let dir = tempfile::tempdir().unwrap();
+    let catalog = CatalogHandle::open(&dir.path().join("c.db")).unwrap();
+    record_segments(dir.path(), &catalog, vec![fragment(0, &entry())]).await;
+    let app = router(state(dir.path(), catalog.clone(), Vec::new()));
+    let historical = get(
+        &app,
+        format!("/api/streams/cam1/main/keyframe?t={}", wall(0).get()),
         None,
     )
     .await;
@@ -1504,7 +1545,11 @@ async fn keyframe_rejects_corrupt_payload_and_false_sidecar_sync() {
     let corrupt_dir = tempfile::tempdir().unwrap();
     let corrupt_catalog = CatalogHandle::open(&corrupt_dir.path().join("c.db")).unwrap();
     let (path, _, _) = populate(corrupt_dir.path(), &corrupt_catalog).await;
-    let (_, records) = read_index(&iris_store::layout::index_path(&path)).unwrap();
+    let (_, records) = read_index_bounded(
+        &iris_store::layout::index_path(&path),
+        MAX_PERSISTED_INDEX_RECORDS,
+    )
+    .unwrap();
     let record = records[1];
     let mut media = std::fs::OpenOptions::new()
         .read(true)
@@ -1563,8 +1608,12 @@ async fn keyframe_rejects_corrupt_payload_and_false_sidecar_sync() {
         .write(true)
         .open(index_path)
         .unwrap();
-    // Header + first record + flags byte in the second record.
-    index.seek(SeekFrom::Start(64 + 40 + 34)).unwrap();
+    // The flags byte of the second record: header, first record, 34 bytes in.
+    index
+        .seek(SeekFrom::Start(
+            (iris_mp4::index::HEADER_LEN + iris_mp4::index::RECORD_LEN + 34) as u64,
+        ))
+        .unwrap();
     index
         .write_all(&[iris_mp4::index::FLAG_STARTS_WITH_SYNC])
         .unwrap();
@@ -1596,7 +1645,8 @@ fn live_frame(entry: &Arc<SampleEntry>, index: u64, is_sync: bool) -> Arc<LiveFr
     })
 }
 
-/// A router with one live ring, fed `frames` frames after the feeder started.
+/// A router with one live ring fed 80 frames, a sync frame every 30th, once
+/// the feeder has subscribed.
 async fn live_setup() -> (
     axum::Router,
     LiveRing,
@@ -1619,7 +1669,13 @@ async fn live_setup() -> (
         let app = app.clone();
         async move { get(&app, "/api/streams/cam1/main/hls/live.m3u8".into(), None).await }
     });
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while ring.subscriber_count() == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the feeder subscribed");
     for i in 0..80u64 {
         ring.publish(live_frame(&entry, i, i % 30 == 0));
     }
@@ -1832,17 +1888,18 @@ async fn snapshots_are_single_flight_per_camera() {
     let mut state = state(dir.path(), catalog.clone(), vec![]);
     Arc::get_mut(&mut state)
         .expect("sole state owner")
-        .snapshot_sources = HashMap::from([(
+        .snapshot_sources = std::sync::RwLock::new(HashMap::from([(
         key().camera,
-        SnapshotSource {
-            host: address.ip().to_string(),
-            port: address.port(),
-            https: false,
-            tls_verify: true,
-            username: String::new(),
-            password: String::new(),
-        },
-    )]);
+        SnapshotSource::new(
+            address.ip().to_string(),
+            address.port(),
+            false,
+            true,
+            String::new(),
+            String::new(),
+            iris_core::config::ResolvedSnapshot::DahuaCgi,
+        ),
+    )]));
     let counters = Arc::clone(&state.stats);
     let app = router(state);
     let first = tokio::spawn({
@@ -1909,6 +1966,33 @@ async fn the_live_playlist_blocks_until_the_requested_part_and_rejects_bad_direc
     assert_eq!(bad.status(), StatusCode::BAD_REQUEST);
     let far = get(&app, format!("{base}/live.m3u8?_HLS_msn=9"), None).await;
     assert_eq!(far.status(), StatusCode::BAD_REQUEST);
+    // Six parts of 0.5 s are the advance part limit; part 50 is far beyond it.
+    let far_part = get(
+        &app,
+        format!("{base}/live.m3u8?_HLS_msn=2&_HLS_part=50"),
+        None,
+    )
+    .await;
+    assert_eq!(far_part.status(), StatusCode::BAD_REQUEST);
+    catalog.shutdown();
+}
+
+/// A blocking reload the feeder cannot satisfy answers 503 after three
+/// target durations (draft-pantos-hls-rfc8216bis §6.2.5.2).
+#[tokio::test(start_paused = true)]
+async fn a_blocking_reload_that_cannot_advance_answers_503() {
+    let (app, _ring, _entry, catalog, _dir) = live_setup().await;
+    let text = settled_playlist(&app).await;
+    assert!(text.contains("#EXT-X-TARGETDURATION:2\n"), "{text}");
+    let started = tokio::time::Instant::now();
+    let response = get(
+        &app,
+        "/api/streams/cam1/main/hls/live.m3u8?_HLS_msn=3".into(),
+        None,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(started.elapsed(), Duration::from_secs(6));
     catalog.shutdown();
 }
 
@@ -1976,6 +2060,7 @@ async fn camera_detail_reports_stream_health() {
                 id: camera_id,
                 name: "front".into(),
                 vendor: Some("test".into()),
+                provisioned: false,
             },
         )]),
     );
@@ -2021,6 +2106,7 @@ async fn active_camera_surface_excludes_removed_history_without_deleting_recordi
                 id: active,
                 name: "active".into(),
                 vendor: Some("test".into()),
+                provisioned: false,
             },
         )]),
     );
@@ -2100,10 +2186,73 @@ async fn retaining_an_event_sets_and_clears_its_time() {
             .await
             .contains("\"retain_until_us\":null")
     );
-    let bad = app
+    catalog.shutdown();
+}
+
+/// Builds a retain request for `uri` with `body` and no `Content-Type`.
+fn retain_request(uri: &str, body: &'static str) -> Request<Body> {
+    Request::post(uri).body(Body::from(body)).unwrap()
+}
+
+#[tokio::test]
+async fn a_retain_body_without_a_content_type_still_sets_the_mark() {
+    let dir = tempfile::tempdir().unwrap();
+    let catalog = CatalogHandle::open(&dir.path().join("c.db")).unwrap();
+    let id = catalog
+        .insert_event(&Event {
+            camera: CameraId::try_new("cam1").unwrap(),
+            source: EventSource::DahuaCgi,
+            kind: EventKind::Motion,
+            state: EventState::Pulse,
+            nvr_time: wall(1),
+            camera_time: None,
+            data: None,
+        })
+        .await
+        .unwrap();
+    let app = router(state(dir.path(), catalog.clone(), vec![]));
+    let uri = format!("/api/events/{}/retain", id.0);
+    let set = app
         .clone()
+        .oneshot(retain_request(
+            &uri,
+            "{\"until\": \"2030-01-01T00:00:00Z\"}",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(set.status(), StatusCode::OK);
+    assert!(
+        body_string(set)
+            .await
+            .contains("\"retain_until_us\":1893456000000000")
+    );
+    let unknown_field = app
+        .clone()
+        .oneshot(retain_request(&uri, "{\"until_us\": 1}"))
+        .await
+        .unwrap();
+    assert_eq!(unknown_field.status(), StatusCode::BAD_REQUEST);
+    let still_set = get(
+        &app,
+        format!("/api/events?from={}&to={}", wall(0).get(), wall(3).get()),
+        None,
+    )
+    .await;
+    assert!(
+        body_string(still_set).await.contains("1893456000000000"),
+        "a refused body changes nothing"
+    );
+    catalog.shutdown();
+}
+
+#[tokio::test]
+async fn retain_rejects_an_unparseable_time() {
+    let dir = tempfile::tempdir().unwrap();
+    let catalog = CatalogHandle::open(&dir.path().join("c.db")).unwrap();
+    let app = router(state(dir.path(), catalog.clone(), vec![]));
+    let bad = app
         .oneshot(
-            Request::post(&uri)
+            Request::post("/api/events/1/retain")
                 .header(header::CONTENT_TYPE, "application/json")
                 .body(Body::from("{\"until\": \"yesterday\"}"))
                 .unwrap(),
@@ -2111,12 +2260,16 @@ async fn retaining_an_event_sets_and_clears_its_time() {
         .await
         .unwrap();
     assert_eq!(bad.status(), StatusCode::BAD_REQUEST);
+    catalog.shutdown();
+}
+
+#[tokio::test]
+async fn retaining_an_unknown_event_is_not_found() {
+    let dir = tempfile::tempdir().unwrap();
+    let catalog = CatalogHandle::open(&dir.path().join("c.db")).unwrap();
+    let app = router(state(dir.path(), catalog.clone(), vec![]));
     let missing = app
-        .oneshot(
-            Request::post("/api/events/999/retain")
-                .body(Body::empty())
-                .unwrap(),
-        )
+        .oneshot(retain_request("/api/events/999/retain", ""))
         .await
         .unwrap();
     assert_eq!(missing.status(), StatusCode::NOT_FOUND);

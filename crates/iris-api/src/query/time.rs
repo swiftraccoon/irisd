@@ -125,6 +125,21 @@ mod tests {
     use super::*;
 
     #[test]
+    fn parses_micros_and_rfc3339() {
+        assert_eq!(
+            parse_time("1793466000000000"),
+            Some(WallUs::new(1_793_466_000_000_000))
+        );
+        let t = parse_time("2026-10-31T17:00:00Z").unwrap();
+        assert_eq!(t.to_string(), "2026-10-31T17:00:00.000000Z");
+        let t = parse_time("2026-10-31T13:00:00.25-04:00").unwrap();
+        assert_eq!(t.to_string(), "2026-10-31T17:00:00.250000Z");
+        assert_eq!(parse_time("1970-01-01T00:00:00Z"), Some(WallUs::new(0)));
+        assert!(parse_time("2026-13-01T00:00:00Z").is_none());
+        assert!(parse_time("yesterday").is_none());
+    }
+
+    #[test]
     fn rejects_multibyte_characters_at_numeric_boundaries() {
         for raw in [
             "2026-01-01T00:00:0éZ",

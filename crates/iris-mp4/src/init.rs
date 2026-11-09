@@ -9,8 +9,12 @@ use iris_core::time::TIMESCALE;
 /// The track id used for video in every irisd file.
 pub const VIDEO_TRACK_ID: u32 = 1;
 
-/// A codec configuration: the complete `hvc1`/`avc1` sample entry box plus
-/// the facts playlists and clients need.
+/// Movie timescale written to `mvhd` by [`build_init_segment`]: edit-list
+/// durations are expressed in it (milliseconds).
+pub const MOVIE_TIMESCALE: u32 = 1000;
+
+/// A codec configuration: the complete `hvc1` sample entry box plus the facts
+/// playlists and clients need.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SampleEntry {
     /// The serialized sample entry box, parameter sets included (`hvcC`).
@@ -21,7 +25,10 @@ pub struct SampleEntry {
     pub width: u16,
     /// Display height in pixels.
     pub height: u16,
-    /// CRC-32C of `bytes`; identifies a parameter-set epoch.
+    /// CRC-32C of `bytes` when built with [`SampleEntry::new`]: a hint for a
+    /// parameter-set epoch, not an identity. The store and the catalog
+    /// compare entries by bytes, and the catalog keys them by hash and bytes
+    /// together, so two entries with one hash stay distinct.
     pub hash: u32,
 }
 
@@ -76,7 +83,7 @@ fn write_mvhd(w: &mut BoxWriter) {
     let mvhd = w.begin_full(b"mvhd", 1, 0);
     w.u64(0); // creation_time
     w.u64(0); // modification_time
-    w.u32(1000); // timescale
+    w.u32(MOVIE_TIMESCALE);
     w.u64(0); // duration (unknown; fragmented)
     w.i32(0x0001_0000); // rate 1.0
     w.i16(0x0100); // volume 1.0

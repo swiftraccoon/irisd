@@ -1,10 +1,14 @@
-//! The SQLite connection and every statement run against it. Used only from
-//! the catalog thread.
+//! The SQLite connection and every statement run against it. Used by the
+//! catalog thread, and by the synchronous root registry before that thread
+//! starts.
 
+use std::cmp::Reverse;
 use std::collections::HashMap;
-use std::mem::size_of;
+use std::fmt;
+use std::fs::{DirBuilder, OpenOptions};
+use std::io::ErrorKind;
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
 use rusqlite::{
@@ -14,22 +18,20 @@ use tracing::warn;
 
 use crate::types::{
     CameraRow, CatalogError, CatalogStats, Change, DeleteMarkResult, EventCursor, EventId,
-    EventProtection, EventProtectionCursor, EventRow, NewSegment, RetentionPage, SegmentId,
-    SegmentRow, TimeRange,
+    EventRow, NewSegment, RetentionPage, SampleEntryId, SegmentCursor, SegmentId, SegmentRow,
+    StartupRow, TimeRange,
 };
 use iris_core::event::{Event, EventKind, EventSource, EventState};
-use iris_core::id::{CameraId, StreamKey, StreamKind};
+use iris_core::id::{CameraId, RootIdentity, StreamKey, StreamKind};
 use iris_core::time::WallUs;
 use iris_mp4::init::SampleEntry;
 
-const SCHEMA_VERSION: i64 = 9;
+const SCHEMA_VERSION: i64 = 10;
 
 /// Largest number of event rows one listing materializes.
 const MAX_EVENT_READ_ROWS: usize = 10_000;
 /// Largest aggregate of owned event strings one listing materializes.
 const MAX_EVENT_READ_BYTES: usize = 8 * 1024 * 1024;
-/// Largest minimal retained-event page.
-const MAX_PROTECTION_PAGE_ROWS: usize = 512;
 /// Event rows retained in the state database before oldest inactive rows are pruned.
 const MAX_EVENT_ROWS: u64 = 2_000_000;
 /// Logical bytes retained across event strings before oldest inactive rows are pruned.
@@ -47,17 +49,20 @@ const EVENT_PRUNE_BATCH: usize = 1_000;
 /// Maximum segment rows held by one startup-reconciliation page.
 const RECONCILE_PAGE_ROWS: usize = 512;
 
-/// How long after its last durable progress an unsealed segment still extends
-/// toward the present in range listings ([`crate::CatalogHandle::segments_limited`]).
+/// The default of how long after its last durable progress an unsealed segment
+/// still extends toward the present in range listings
+/// ([`crate::CatalogHandle::segments_limited`]).
 ///
 /// The writer reports progress after each sync (every five seconds by default)
-/// and a fragment spans at most two seconds by default, so thirty seconds covers
-/// two sync intervals, one fragment, and catalog batching with margin. An open
-/// row whose progress stops for longer (a camera outage, a file the writer
-/// abandoned, or a row startup recovery could not reach) ends this long after
-/// its last progress, so it drops out of later windows instead of claiming to
-/// cover them. Catalog overload that starves progress for longer than the grace
-/// also hides a growing row until its next progress.
+/// and a fragment spans at most two and a half seconds by default, so thirty
+/// seconds covers two sync intervals, one fragment, and catalog batching with
+/// margin. A deployment with longer intervals opens the catalog with
+/// [`crate::CatalogHandle::open_with_grace`] and a grace derived from them. An
+/// open row whose progress stops for longer (a camera outage, a file the
+/// writer abandoned, or a row startup recovery could not reach) ends this long
+/// after its last progress, so it drops out of later windows instead of
+/// claiming to cover them. Catalog overload that starves progress for longer
+/// than the grace also hides a growing row until its next progress.
 pub const OPEN_SEGMENT_GRACE: Duration = Duration::from_secs(30);
 
 const SCHEMA_V1: &str = "
@@ -220,6 +225,28 @@ CREATE TABLE recording_root_state (
 );
 ";
 
+/// Version 10: sample entries are unique by CRC-32C and bytes together, so two
+/// entries whose CRCs collide keep their own rows and metadata, and the unknown
+/// placeholder (CRC 0, no bytes) never merges with a real entry. The table is
+/// rebuilt with its ids, so `segment.sample_entry_id` stays valid; the rebuild
+/// drops a referenced table, which needs foreign-key enforcement off, so the
+/// migration checks the keys itself before it commits.
+const SCHEMA_V10: &str = "
+CREATE TABLE sample_entry_v10 (
+    id     INTEGER PRIMARY KEY,
+    hash   INTEGER NOT NULL,
+    codecs TEXT NOT NULL,
+    width  INTEGER NOT NULL,
+    height INTEGER NOT NULL,
+    config BLOB NOT NULL,
+    UNIQUE(hash, config)
+);
+INSERT INTO sample_entry_v10 (id, hash, codecs, width, height, config)
+    SELECT id, hash, codecs, width, height, config FROM sample_entry;
+DROP TABLE sample_entry;
+ALTER TABLE sample_entry_v10 RENAME TO sample_entry;
+";
+
 #[derive(Clone, Copy)]
 struct EventLimits {
     rows: u64,
@@ -236,21 +263,35 @@ pub(crate) struct ApplyOutcome {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CatalogRootExpectation {
     /// Durable identity registered by a previous successful start.
-    Known(String),
-    /// Pre-identity catalog rows belong to this root; an operator marker is required.
+    Known(RootIdentity),
+    /// No identity is registered for this root, and the catalog predates root
+    /// identities or holds rows beneath the root; an operator marker is
+    /// required.
     LegacyOwned,
     /// No catalog state belongs to this root, so it may be initialized.
     Fresh,
 }
 
 /// Synchronous catalog preflight used before Landlock and before any thread is
-/// spawned. It migrates and reads only the recording-root registry/state.
+/// spawned. It migrates the schema, reads the recording-root registry, and
+/// pages through the segment rows to find the roots that own rows.
 pub struct CatalogRootRegistry {
     db: Db,
 }
 
+impl fmt::Debug for CatalogRootRegistry {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CatalogRootRegistry")
+            .finish_non_exhaustive()
+    }
+}
+
 impl CatalogRootRegistry {
     /// Opens and migrates the catalog without spawning a worker thread.
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`crate::CatalogHandle::open`].
     pub fn open(path: &Path) -> Result<Self, CatalogError> {
         Ok(Self {
             db: Db::open(path)?,
@@ -260,6 +301,13 @@ impl CatalogRootRegistry {
     /// Resolves catalog expectations in input order using bounded segment
     /// pages. `page_complete` runs after every page so startup can extend its
     /// external deadline even before the async catalog thread exists.
+    ///
+    /// # Errors
+    ///
+    /// [`CatalogError::Corrupt`] for a registered identity that is not 32
+    /// lowercase hexadecimal characters or a row that fails checked decoding,
+    /// [`CatalogError::NonUtf8Path`] for a configured root that is not UTF-8,
+    /// and [`CatalogError::Sqlite`] for a statement failure.
     pub fn expectations_with_progress(
         &mut self,
         roots: &[PathBuf],
@@ -277,7 +325,46 @@ const EVENT_LIMITS: EventLimits = EventLimits {
 
 const SEGMENT_COLUMNS: &str = "s.id, s.camera_id, s.kind, s.path, s.run_seq, s.discontinuity, \
      s.wall_start_us, s.wall_end_us, s.media_start, s.media_end, s.init_len, s.durable_len, \
-     s.fragments, s.bytes, s.sealed, s.deleting, e.codecs, e.width, e.height, e.hash";
+     s.fragments, s.bytes, s.sealed, s.deleting, e.codecs, e.width, e.height, e.hash, e.id";
+
+/// Index of a column a query appends after [`SEGMENT_COLUMNS`] (the root or
+/// the protection result); [`segment_row`] reads the 21 columns before it.
+const APPENDED_COLUMN: usize = 21;
+
+/// The tables [`SEGMENT_COLUMNS`] read from.
+const SEGMENT_FROM: &str = "FROM segment s JOIN sample_entry e ON e.id = s.sample_entry_id";
+
+/// `NOT EXISTS (...)`: no active retained event of the same camera overlaps
+/// the segment aliased `segment`, widened by the `margin` parameter on both
+/// sides, where "active" means a deadline after the `now` parameter. Every
+/// statement that decides protection uses this one predicate.
+fn protection_predicate(segment: &str, now: &str, margin: &str) -> String {
+    format!(
+        "NOT EXISTS ( \
+           SELECT 1 FROM event protected \
+           WHERE protected.camera_id = {segment}.camera_id \
+             AND protected.retain_until_us > {now} \
+             AND protected.nvr_time_us > {segment}.wall_start_us - {margin} \
+             AND protected.nvr_time_us < {segment}.wall_end_us + {margin} \
+         )"
+    )
+}
+
+/// The atomic deletion mark: a sealed, ordinary row that the protection
+/// predicate admits, optionally only at the persisted `:root`.
+fn mark_sql(root_bound: bool) -> String {
+    let root_clause = if root_bound {
+        "AND candidate.root = :root "
+    } else {
+        ""
+    };
+    format!(
+        "UPDATE segment AS candidate SET deleting = 1 \
+         WHERE candidate.id = :id AND candidate.sealed = 1 \
+           AND candidate.deleting = 0 {root_clause}AND {}",
+        protection_predicate("candidate", ":now", ":margin")
+    )
+}
 
 const EVENT_COLUMNS: &str = "id, camera_id, source, kind, kind_other, state, nvr_time_us, \
      camera_time_us, data, retain_until_us";
@@ -317,20 +404,6 @@ fn event_query_lower_bound(from: WallUs, after: Option<EventCursor>) -> i64 {
     after.map_or(from.get(), |cursor| from.get().max(cursor.time.get()))
 }
 
-fn event_protection_query_sql(seek_after: bool) -> &'static str {
-    if seek_after {
-        "SELECT id, camera_id, nvr_time_us, retain_until_us FROM event \
-         WHERE retain_until_us = ?2 AND id > ?3 \
-         UNION ALL \
-         SELECT id, camera_id, nvr_time_us, retain_until_us FROM event \
-         WHERE retain_until_us > ?2 \
-         ORDER BY retain_until_us, id LIMIT ?4"
-    } else {
-        "SELECT id, camera_id, nvr_time_us, retain_until_us FROM event \
-         WHERE retain_until_us > ?1 ORDER BY retain_until_us, id LIMIT ?4"
-    }
-}
-
 fn retention_candidate_query_sql(root: bool, after: bool) -> String {
     let root_clause = if root { "AND s.root = ?1" } else { "" };
     let candidates = if after {
@@ -351,17 +424,12 @@ fn retention_candidate_query_sql(root: bool, after: bool) -> String {
              ORDER BY s.wall_start_us, s.id LIMIT ?6"
         )
     };
+    let unprotected = protection_predicate("s", "?4", "?5");
     format!(
         "WITH candidates(id, wall_start_us) AS MATERIALIZED ( \
            {candidates} \
          ) \
-         SELECT {SEGMENT_COLUMNS}, NOT EXISTS ( \
-             SELECT 1 FROM event protected \
-             WHERE protected.camera_id = s.camera_id \
-               AND protected.retain_until_us > ?4 \
-               AND protected.nvr_time_us > s.wall_start_us - ?5 \
-               AND protected.nvr_time_us < s.wall_end_us + ?5 \
-           ) \
+         SELECT {SEGMENT_COLUMNS}, {unprotected} \
          FROM candidates c \
          JOIN segment s ON s.id = c.id \
          JOIN sample_entry e ON e.id = s.sample_entry_id \
@@ -387,17 +455,12 @@ fn expired_candidate_query_sql(after: bool) -> String {
            AND s.sealed = 1 AND s.deleting = 0 AND s.wall_start_us < ?3 \
          ORDER BY s.wall_start_us, s.id LIMIT ?8"
     };
+    let unprotected = protection_predicate("s", "?6", "?7");
     format!(
         "WITH candidates(id, wall_start_us) AS MATERIALIZED ( \
            {candidates} \
          ) \
-         SELECT {SEGMENT_COLUMNS}, (s.wall_end_us < ?3 AND NOT EXISTS ( \
-             SELECT 1 FROM event protected \
-             WHERE protected.camera_id = s.camera_id \
-               AND protected.retain_until_us > ?6 \
-               AND protected.nvr_time_us > s.wall_start_us - ?7 \
-               AND protected.nvr_time_us < s.wall_end_us + ?7 \
-           )) \
+         SELECT {SEGMENT_COLUMNS}, (s.wall_end_us < ?3 AND {unprotected}) \
          FROM candidates c \
          JOIN segment s ON s.id = c.id \
          JOIN sample_entry e ON e.id = s.sample_entry_id \
@@ -435,27 +498,42 @@ pub struct Db {
     conn: Connection,
     path: PathBuf,
     roots: Vec<PathBuf>,
+    open_segment_grace: Duration,
     event_maintenance_cursor: Option<EventCursor>,
 }
 
 impl Db {
+    /// Opens (creating if needed) and migrates the database at `path` with the
+    /// default [`OPEN_SEGMENT_GRACE`].
+    pub fn open(path: &Path) -> Result<Self, CatalogError> {
+        Self::open_with_grace(path, OPEN_SEGMENT_GRACE)
+    }
+
     /// Opens (creating if needed) and migrates the database at `path`.
     ///
     /// Missing parent directories are created with mode 0700 and a missing
     /// database file with mode 0600, whatever the process umask. SQLite gives
     /// the write-ahead log and shared-memory files the database file's mode, so
-    /// a fresh catalog stays readable by its owner only.
-    pub fn open(path: &Path) -> Result<Self, CatalogError> {
+    /// a fresh catalog stays readable by its owner only. `open_segment_grace`
+    /// is how far an unsealed row extends past its last progress in range
+    /// listings.
+    pub fn open_with_grace(
+        path: &Path,
+        open_segment_grace: Duration,
+    ) -> Result<Self, CatalogError> {
         if let Some(parent) = path.parent()
             && !parent.as_os_str().is_empty()
         {
-            std::fs::DirBuilder::new()
+            DirBuilder::new()
                 .recursive(true)
                 .mode(0o700)
                 .create(parent)?;
         }
         create_private_database(path)?;
         let conn = Connection::open(path)?;
+        // A connection setting, not a persistent pragma: set before the first
+        // read so it covers an exclusive lock held by another connection.
+        conn.busy_timeout(Duration::from_secs(5))?;
         // The daemon's filesystem sandbox intentionally admits only configured
         // state and recording roots. Keep SQLite's transient sorter and
         // materialized-query state inside the process instead of relying on an
@@ -468,21 +546,34 @@ impl Db {
                 supported: SCHEMA_VERSION,
             });
         }
-        conn.busy_timeout(Duration::from_secs(5))?;
         if version >= 1 {
-            validate_segment_booleans(&conn, version >= 3)?;
+            // `deleting` exists from version 3 on and arrives with a default
+            // of zero, so a migrated column never needs a second check.
+            validate_segment_booleans(&conn, /* validate_deleting */ version >= 3)?;
         }
-        conn.pragma_update(None, "journal_mode", "WAL")?;
+        // `PRAGMA journal_mode` keeps the previous mode when WAL cannot be
+        // enabled and reports the result; the durability statements of this
+        // crate hold only in WAL mode.
+        let mode: String =
+            conn.pragma_update_and_check(None, "journal_mode", "WAL", |row| row.get(0))?;
+        if !mode.eq_ignore_ascii_case("wal") {
+            return Err(CatalogError::JournalMode(mode));
+        }
         conn.pragma_update(None, "synchronous", "NORMAL")?;
-        conn.pragma_update(None, "foreign_keys", "ON")?;
         let mut db = Self {
             conn,
             path: path.to_path_buf(),
             roots: Vec::new(),
+            open_segment_grace,
             event_maintenance_cursor: None,
         };
+        // The bundled SQLite enforces foreign keys by default. A migration that
+        // rebuilds a referenced table needs them off (the rebuild drops the old
+        // table) and checks the keys itself before it commits; enforcement is
+        // back on for everything after.
+        db.conn.pragma_update(None, "foreign_keys", "OFF")?;
         db.migrate(version)?;
-        validate_segment_booleans(&db.conn, true)?;
+        db.conn.pragma_update(None, "foreign_keys", "ON")?;
         Ok(db)
     }
 
@@ -535,6 +626,10 @@ impl Db {
                     params![i64::from(version != 0)],
                 )?;
             }
+            if version < 10 {
+                tx.execute_batch(SCHEMA_V10)?;
+                check_foreign_keys(&tx)?;
+            }
             tx.execute("DELETE FROM schema_version", [])?;
             tx.execute(
                 "INSERT INTO schema_version (version) VALUES (?1)",
@@ -545,36 +640,27 @@ impl Db {
         Ok(())
     }
 
-    /// Durably registers one admitted recording-root identity.
+    /// Durably binds one configured root `path` to its `identity`.
+    /// Registering the same pair again changes nothing.
     pub fn register_recording_root(
         &mut self,
         path: &Path,
-        identity: &str,
+        identity: RootIdentity,
     ) -> Result<(), CatalogError> {
-        if identity.len() != 32
-            || !identity
-                .bytes()
-                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-        {
-            return Err(corrupt(
-                "recording-root identity is not 32 lowercase hexadecimal characters",
-            ));
-        }
-        let path = path_text(path);
+        let path = path_text(path)?;
+        let identity = identity.to_string();
         self.with_full_synchronous(|connection| {
             let transaction = write_transaction(connection)?;
             let existing = transaction
                 .query_row(
                     "SELECT identity FROM recording_root WHERE path = ?1",
-                    params![&path],
+                    params![path],
                     |row| row.get::<_, String>(0),
                 )
                 .optional()?;
             if let Some(existing) = existing {
                 if existing != identity {
-                    return Err(corrupt(
-                        "configured recording root has a different catalog identity",
-                    ));
+                    return Err(CatalogError::RootIdentityMismatch(PathBuf::from(path)));
                 }
                 transaction.commit()?;
                 return Ok(());
@@ -586,10 +672,8 @@ impl Db {
                     |row| row.get::<_, String>(0),
                 )
                 .optional()?;
-            if existing_path.is_some_and(|existing| existing != path) {
-                return Err(corrupt(
-                    "two configured paths claim one recording-root identity",
-                ));
+            if let Some(existing) = existing_path.filter(|existing| existing != path) {
+                return Err(CatalogError::RootIdentityInUse(PathBuf::from(existing)));
             }
             transaction.execute(
                 "INSERT INTO recording_root(path, identity) VALUES (?1, ?2)",
@@ -605,17 +689,22 @@ impl Db {
     /// SQL string prefix.
     pub fn configure_video_roots(&mut self, roots: &[PathBuf]) -> Result<(), CatalogError> {
         let mut roots = roots.to_vec();
-        roots.sort_by_key(|root| std::cmp::Reverse(root.components().count()));
+        roots.sort_by_key(|root| (Reverse(root.components().count()), root.clone()));
         roots.dedup();
-        let mut cursor = None;
+        let mut cursor: Option<i64> = None;
         loop {
             let assignments = {
-                let mut statement = self.conn.prepare(
-                    "SELECT id, path FROM segment WHERE root IS NULL \
-                     AND (?1 IS NULL OR id > ?1) \
-                     ORDER BY id LIMIT ?2",
-                )?;
-                statement
+                // Two statements rather than `?1 IS NULL OR id > ?1`: the OR
+                // form cannot use the rowid index, so every page would scan
+                // from the first row.
+                let sql = if cursor.is_some() {
+                    "SELECT id, path FROM segment WHERE root IS NULL AND id > ?1 \
+                     ORDER BY id LIMIT ?2"
+                } else {
+                    "SELECT id, path FROM segment WHERE root IS NULL ORDER BY id LIMIT ?2"
+                };
+                let mut statement = self.conn.prepare_cached(sql)?;
+                let rows = statement
                     .query_map(
                         params![
                             cursor,
@@ -624,13 +713,16 @@ impl Db {
                         |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
                     )?
                     .collect::<Result<Vec<_>, _>>()
-                    .map_err(row_error)?
-                    .into_iter()
+                    .map_err(row_error)?;
+                rows.into_iter()
                     .map(|(id, path)| {
-                        let root = root_for_path(&roots, Path::new(&path)).map(path_text);
-                        (id, root)
+                        let root = root_for_path(&roots, Path::new(&path))
+                            .map(path_text)
+                            .transpose()?
+                            .map(str::to_owned);
+                        Ok((id, root))
                     })
-                    .collect::<Vec<_>>()
+                    .collect::<Result<Vec<_>, CatalogError>>()?
             };
             if assignments.is_empty() {
                 break;
@@ -658,41 +750,53 @@ impl Db {
         roots: &[PathBuf],
         mut page_complete: impl FnMut(),
     ) -> Result<Vec<CatalogRootExpectation>, CatalogError> {
-        let pre_identity_catalog = self.conn.query_row(
-            "SELECT pre_identity_catalog FROM recording_root_state WHERE singleton = 1",
-            [],
-            |row| row.get::<_, bool>(0),
-        )?;
+        let pre_identity_catalog = self
+            .conn
+            .query_row(
+                "SELECT pre_identity_catalog FROM recording_root_state WHERE singleton = 1",
+                [],
+                |row| row.get::<_, bool>(0),
+            )
+            .map_err(row_error)?;
+        let root_texts = roots
+            .iter()
+            .map(|root| path_text(root))
+            .collect::<Result<Vec<_>, _>>()?;
         let mut expectations = Vec::with_capacity(roots.len());
-        for root in roots {
+        for root in &root_texts {
             let identity = self
                 .conn
                 .query_row(
                     "SELECT identity FROM recording_root WHERE path = ?1",
-                    params![path_text(root)],
+                    params![root],
                     |row| row.get::<_, String>(0),
                 )
-                .optional()?;
-            expectations.push(identity.map_or_else(
-                || {
-                    if pre_identity_catalog {
-                        CatalogRootExpectation::LegacyOwned
-                    } else {
-                        CatalogRootExpectation::Fresh
-                    }
-                },
-                CatalogRootExpectation::Known,
-            ));
+                .optional()
+                .map_err(row_error)?;
+            let expectation = match identity {
+                Some(identity) => {
+                    CatalogRootExpectation::Known(identity.parse::<RootIdentity>().map_err(
+                        |_| corrupt("recording_root.identity is not a recording-root identity"),
+                    )?)
+                }
+                None if pre_identity_catalog => CatalogRootExpectation::LegacyOwned,
+                None => CatalogRootExpectation::Fresh,
+            };
+            expectations.push(expectation);
         }
 
         let mut owned = vec![false; roots.len()];
-        let mut cursor = None;
+        let mut cursor: Option<i64> = None;
         loop {
             let rows = {
-                let mut statement = self.conn.prepare(
-                    "SELECT id, path, root FROM segment \
-                     WHERE (?1 IS NULL OR id > ?1) ORDER BY id LIMIT ?2",
-                )?;
+                // Two statements rather than `?1 IS NULL OR id > ?1`, so each
+                // page is a rowid seek instead of a scan from the first row.
+                let sql = if cursor.is_some() {
+                    "SELECT id, path, root FROM segment WHERE id > ?1 ORDER BY id LIMIT ?2"
+                } else {
+                    "SELECT id, path, root FROM segment ORDER BY id LIMIT ?2"
+                };
+                let mut statement = self.conn.prepare_cached(sql)?;
                 statement
                     .query_map(
                         params![
@@ -717,7 +821,7 @@ impl Db {
                 cursor = Some(*id);
                 if let Some(index) = assigned_root
                     .as_deref()
-                    .and_then(|assigned| roots.iter().position(|root| path_text(root) == assigned))
+                    .and_then(|assigned| root_texts.iter().position(|root| *root == assigned))
                 {
                     owned[index] = true;
                 }
@@ -740,7 +844,7 @@ impl Db {
 
     /// Applies a batch of changes in one transaction.
     pub fn apply(&mut self, changes: &[Change]) -> Result<ApplyOutcome, CatalogError> {
-        let roots = self.roots.clone();
+        let roots = &self.roots;
         let tx = write_transaction(&mut self.conn)?;
         let now = WallUs::now();
         let mut event_work = EVENT_PRUNE_BATCH;
@@ -748,53 +852,50 @@ impl Db {
         let mut committed_events = Vec::new();
         for change in changes {
             match change {
-                Change::SegmentOpened { .. } => apply_segment_opened(&tx, &roots, change)?,
+                Change::SegmentOpened {
+                    key,
+                    path,
+                    run_seq,
+                    discontinuity,
+                    wall_start,
+                    media_start,
+                    init_len,
+                    sample_entry,
+                } => apply_segment_opened(
+                    &tx,
+                    roots,
+                    OpenedSegment {
+                        key,
+                        path,
+                        run_seq: *run_seq,
+                        discontinuity: *discontinuity,
+                        wall_start: *wall_start,
+                        media_start: *media_start,
+                        init_len: *init_len,
+                        sample_entry,
+                    },
+                )?,
                 Change::SegmentProgress {
                     path,
                     durable_len,
                     fragments,
                     wall_end,
                     media_end,
-                } => {
-                    let updated = tx.execute(
-                        "UPDATE segment SET durable_len = :durable, fragments = :fragments, \
-                         wall_end_us = :wall_end, media_end = :media_end, \
-                         bytes = MAX(bytes, :durable) WHERE path = :path AND deleting = 0",
-                        named_params! {
-                            ":durable": as_i64(*durable_len),
-                            ":fragments": i64::from(*fragments),
-                            ":wall_end": wall_end.get(),
-                            ":media_end": as_i64(*media_end),
-                            ":path": path_text(path),
-                        },
-                    )?;
-                    if updated == 0 {
-                        warn!(path = %path.display(), "progress for a segment the catalog does not know");
-                    }
-                }
+                } => apply_segment_progress(
+                    &tx,
+                    path,
+                    *durable_len,
+                    *fragments,
+                    *wall_end,
+                    *media_end,
+                )?,
                 Change::SegmentSealed {
                     path,
                     len,
                     fragments,
                     wall_end,
                     media_end,
-                } => {
-                    let updated = tx.execute(
-                        "UPDATE segment SET sealed = 1, bytes = :len, durable_len = :len, \
-                         fragments = :fragments, wall_end_us = :wall_end, media_end = :media_end \
-                         WHERE path = :path AND deleting = 0",
-                        named_params! {
-                            ":len": as_i64(*len),
-                            ":fragments": i64::from(*fragments),
-                            ":wall_end": wall_end.get(),
-                            ":media_end": as_i64(*media_end),
-                            ":path": path_text(path),
-                        },
-                    )?;
-                    if updated == 0 {
-                        warn!(path = %path.display(), "seal for a segment the catalog does not know");
-                    }
-                }
+                } => apply_segment_sealed(&tx, path, *len, *fragments, *wall_end, *media_end)?,
                 Change::Event(event) => {
                     if try_insert_event(&tx, event, now, EVENT_LIMITS, &mut event_work)?.is_none() {
                         rejected_events += 1;
@@ -824,11 +925,13 @@ impl Db {
         name: &str,
         vendor: Option<&str>,
     ) -> Result<(), CatalogError> {
-        self.conn.execute(
+        let tx = write_transaction(&mut self.conn)?;
+        tx.execute(
             "INSERT INTO camera (id, name, vendor) VALUES (?1, ?2, ?3) \
              ON CONFLICT(id) DO UPDATE SET name = excluded.name, vendor = excluded.vendor",
             params![id.as_str(), name, vendor],
         )?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -856,9 +959,9 @@ impl Db {
             .collect()
     }
 
-    /// Segments of a stream overlapping `range`, by start time. An unsealed
-    /// segment is listed only once it has a durable fragment, and it extends to
-    /// the earlier of now and [`OPEN_SEGMENT_GRACE`] past its last progress.
+    /// Every segment of a stream overlapping `range`, by start time, for the
+    /// tests of this module; serving callers use [`Db::segments_limited`].
+    #[cfg(test)]
     pub fn segments(
         &mut self,
         key: &StreamKey,
@@ -867,8 +970,10 @@ impl Db {
         self.segments_limited(key, range, usize::MAX)
     }
 
-    /// Segments of a stream overlapping `range`, capped before rows are
-    /// materialized. Unsealed rows follow the rule of [`Db::segments`].
+    /// At most `limit` segments of a stream overlapping `range`, by start time
+    /// and id, capped before rows are materialized. An unsealed segment is
+    /// listed only once it has a durable fragment, and it extends to the
+    /// earlier of now and the open-segment grace past its last progress.
     pub fn segments_limited(
         &mut self,
         key: &StreamKey,
@@ -879,17 +984,17 @@ impl Db {
         // An open row without a durable fragment has nothing to serve, and one
         // whose progress stopped must not claim later windows.
         let sql = format!(
-            "SELECT {SEGMENT_COLUMNS} FROM segment s JOIN sample_entry e ON e.id = s.sample_entry_id \
+            "SELECT {SEGMENT_COLUMNS} {SEGMENT_FROM} \
              WHERE s.deleting = 0 AND s.camera_id = :camera AND s.kind = :kind \
              AND s.wall_start_us < :to \
              AND (s.sealed = 1 OR s.fragments > 0) \
              AND (CASE WHEN s.sealed = 0 THEN MIN(:now, s.wall_end_us + :grace) \
                   ELSE s.wall_end_us END) > :from \
-             ORDER BY s.wall_start_us LIMIT :limit"
+             ORDER BY s.wall_start_us, s.id LIMIT :limit"
         );
         let mut stmt = self.conn.prepare_cached(&sql)?;
         let limit = i64::try_from(limit).unwrap_or(i64::MAX);
-        let grace = i64::try_from(OPEN_SEGMENT_GRACE.as_micros()).unwrap_or(i64::MAX);
+        let grace = i64::try_from(self.open_segment_grace.as_micros()).unwrap_or(i64::MAX);
         let rows = stmt
             .query_map(
                 named_params! {
@@ -908,12 +1013,10 @@ impl Db {
         rows.into_iter().map(decode_segment).collect()
     }
 
-    /// One segment by id.
+    /// One segment by id; `None` for an unknown id and for a row in deletion
+    /// intent.
     pub fn segment(&mut self, id: SegmentId) -> Result<Option<SegmentRow>, CatalogError> {
-        let sql = format!(
-            "SELECT {SEGMENT_COLUMNS} FROM segment s JOIN sample_entry e ON e.id = s.sample_entry_id \
-             WHERE s.id = ?1"
-        );
+        let sql = format!("SELECT {SEGMENT_COLUMNS} {SEGMENT_FROM} WHERE s.id = ?1");
         let row = self
             .conn
             .query_row(&sql, params![id.0], segment_row)
@@ -928,15 +1031,13 @@ impl Db {
         decode_segment(row).map(Some)
     }
 
-    /// One segment by path.
+    /// One segment by path; `None` for an unknown path and for a row in
+    /// deletion intent.
     pub fn segment_by_path(&mut self, path: &Path) -> Result<Option<SegmentRow>, CatalogError> {
-        let sql = format!(
-            "SELECT {SEGMENT_COLUMNS} FROM segment s JOIN sample_entry e ON e.id = s.sample_entry_id \
-             WHERE s.path = ?1"
-        );
+        let sql = format!("SELECT {SEGMENT_COLUMNS} {SEGMENT_FROM} WHERE s.path = ?1");
         let row = self
             .conn
-            .query_row(&sql, params![path_text(path)], segment_row)
+            .query_row(&sql, params![path_text(path)?], segment_row)
             .optional()
             .map_err(row_error)?;
         let Some(row) = row else {
@@ -953,10 +1054,10 @@ impl Db {
         self.conn
             .query_row(
                 "SELECT EXISTS(SELECT 1 FROM segment WHERE path = ?1)",
-                params![path_text(path)],
+                params![path_text(path)?],
                 |row| row.get(0),
             )
-            .map_err(Into::into)
+            .map_err(row_error)
     }
 
     /// Persisted recording-root spelling for one segment.
@@ -969,14 +1070,16 @@ impl Db {
             )
             .optional()
             .map(|root| root.flatten().map(PathBuf::from))
-            .map_err(Into::into)
+            .map_err(row_error)
     }
 
-    /// Unsealed segments, by start time.
+    /// Every unsealed segment, by start time; test support, the daemon pages
+    /// with [`Db::writing_segments_page`].
+    #[cfg(any(test, feature = "test-support"))]
     pub fn writing_segments(&mut self) -> Result<Vec<SegmentRow>, CatalogError> {
         let sql = format!(
-            "SELECT {SEGMENT_COLUMNS} FROM segment s JOIN sample_entry e ON e.id = s.sample_entry_id \
-             WHERE s.sealed = 0 AND s.deleting = 0 ORDER BY s.wall_start_us"
+            "SELECT {SEGMENT_COLUMNS} {SEGMENT_FROM} \
+             WHERE s.sealed = 0 AND s.deleting = 0 ORDER BY s.wall_start_us, s.id"
         );
         let mut stmt = self.conn.prepare_cached(&sql)?;
         let rows = stmt
@@ -986,37 +1089,64 @@ impl Db {
         rows.into_iter().map(decode_segment).collect()
     }
 
-    /// One stable bounded page of open segments ordered by `(wall_start, id)`.
+    /// One stable bounded page of open segments after the exclusive cursor,
+    /// ordered by `(wall_start, id)`; `limit` is clamped to 1 to 512. Open
+    /// rows are few (one per recording stream), so the page scans the table
+    /// rather than carrying an index for them.
     pub fn writing_segments_page(
         &mut self,
-        after: Option<(WallUs, SegmentId)>,
+        after: Option<SegmentCursor>,
         limit: usize,
-    ) -> Result<Vec<(SegmentRow, Option<PathBuf>)>, CatalogError> {
+    ) -> Result<Vec<StartupRow>, CatalogError> {
         let sql = format!(
-            "SELECT {SEGMENT_COLUMNS}, s.root FROM segment s JOIN sample_entry e ON e.id = s.sample_entry_id \
+            "SELECT {SEGMENT_COLUMNS}, s.root {SEGMENT_FROM} \
              WHERE s.sealed = 0 AND s.deleting = 0 AND \
                (?1 IS NULL OR s.wall_start_us > ?1 OR (s.wall_start_us = ?1 AND s.id > ?2)) \
              ORDER BY s.wall_start_us, s.id LIMIT ?3"
         );
-        let (time, id) = after.map_or((None, None), |(time, id)| (Some(time.get()), Some(id.0)));
+        self.startup_page(&sql, after, limit)
+    }
+
+    /// Runs one startup page statement with the cursor and limit parameters.
+    fn startup_page(
+        &mut self,
+        sql: &str,
+        after: Option<SegmentCursor>,
+        limit: usize,
+    ) -> Result<Vec<StartupRow>, CatalogError> {
+        let (time, id) = after.map_or((None, None), |cursor| {
+            (Some(cursor.wall_start.get()), Some(cursor.id.0))
+        });
         let limit = limit.clamp(1, RECONCILE_PAGE_ROWS);
-        let mut statement = self.conn.prepare_cached(&sql)?;
+        let mut statement = self.conn.prepare_cached(sql)?;
         let rows = statement
             .query_map(
                 params![time, id, i64::try_from(limit).unwrap_or(i64::MAX)],
-                |row| Ok((segment_row(row)?, row.get::<_, Option<String>>(20)?)),
+                |row| {
+                    Ok((
+                        segment_row(row)?,
+                        row.get::<_, Option<String>>(APPENDED_COLUMN)?,
+                    ))
+                },
             )?
             .collect::<Result<Vec<_>, _>>()
             .map_err(row_error)?;
         rows.into_iter()
-            .map(|(row, root)| Ok((decode_segment(row)?, root.map(PathBuf::from))))
+            .map(|(row, root)| {
+                Ok(StartupRow {
+                    row: decode_segment(row)?,
+                    root: root.map(PathBuf::from),
+                })
+            })
             .collect()
     }
 
-    /// The oldest sealed segments, by start time.
+    /// The oldest sealed segments by start time, ignoring protection and
+    /// roots; test support, retention uses [`Db::retention_candidates`].
+    #[cfg(any(test, feature = "test-support"))]
     pub fn oldest_sealed(&mut self, limit: usize) -> Result<Vec<SegmentRow>, CatalogError> {
         let sql = format!(
-            "SELECT {SEGMENT_COLUMNS} FROM segment s JOIN sample_entry e ON e.id = s.sample_entry_id \
+            "SELECT {SEGMENT_COLUMNS} {SEGMENT_FROM} \
              WHERE s.sealed = 1 AND s.deleting = 0 \
              ORDER BY s.wall_start_us, s.id LIMIT ?1"
         );
@@ -1032,9 +1162,9 @@ impl Db {
     /// The sealed segment of `key` that ends last.
     pub fn newest_sealed(&mut self, key: &StreamKey) -> Result<Option<SegmentRow>, CatalogError> {
         let sql = format!(
-            "SELECT {SEGMENT_COLUMNS} FROM segment s JOIN sample_entry e ON e.id = s.sample_entry_id \
+            "SELECT {SEGMENT_COLUMNS} {SEGMENT_FROM} \
              WHERE s.camera_id = ?1 AND s.kind = ?2 AND s.sealed = 1 AND s.deleting = 0 \
-             ORDER BY s.wall_end_us DESC LIMIT 1"
+             ORDER BY s.wall_end_us DESC, s.id DESC LIMIT 1"
         );
         let row = self
             .conn
@@ -1067,24 +1197,35 @@ impl Db {
         checked_u64(total, "segment byte total")
     }
 
-    /// Deletes a segment row.
+    /// Deletes a row in deletion intent once its files are gone. A row that
+    /// left deletion intent in the meantime (a writer reopened the path and
+    /// `SegmentOpened` reset it) is kept.
     pub fn delete_segment(&mut self, id: SegmentId) -> Result<(), CatalogError> {
-        self.conn
-            .execute("DELETE FROM segment WHERE id = ?1", params![id.0])?;
+        let tx = write_transaction(&mut self.conn)?;
+        tx.execute(
+            "DELETE FROM segment WHERE id = ?1 AND deleting = 1",
+            params![id.0],
+        )?;
+        tx.commit()?;
         Ok(())
     }
 
-    /// Durably marks a sealed segment for deletion before its files are
-    /// removed.
-    pub fn mark_deleting(&mut self, id: SegmentId) -> Result<(), CatalogError> {
+    /// Durably marks a sealed segment for deletion without the protection
+    /// check; test support for exercising deletion intents.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn mark_deleting(&mut self, id: SegmentId) -> Result<DeleteMarkResult, CatalogError> {
         self.with_full_synchronous(|conn| {
             let tx = write_transaction(conn)?;
-            tx.execute(
-                "UPDATE segment SET deleting = 1 WHERE id = ?1 AND sealed = 1",
+            let changed = tx.execute(
+                "UPDATE segment SET deleting = 1 WHERE id = ?1 AND sealed = 1 AND deleting = 0",
                 params![id.0],
             )?;
             tx.commit()?;
-            Ok(())
+            Ok(if changed == 1 {
+                DeleteMarkResult::Marked
+            } else {
+                DeleteMarkResult::NotFound
+            })
         })
     }
 
@@ -1122,22 +1263,13 @@ impl Db {
     ) -> Result<DeleteMarkResult, CatalogError> {
         self.with_full_synchronous(|conn| {
             let tx = write_transaction(conn)?;
-            let changed = tx.execute(
-                "UPDATE segment AS candidate SET deleting = 1 \
-                 WHERE candidate.id = :id AND candidate.sealed = 1 \
-                   AND candidate.deleting = 0 AND NOT EXISTS ( \
-                     SELECT 1 FROM event AS protected \
-                     WHERE protected.camera_id = candidate.camera_id \
-                       AND protected.retain_until_us > :now \
-                       AND protected.nvr_time_us > candidate.wall_start_us - :margin \
-                       AND protected.nvr_time_us < candidate.wall_end_us + :margin \
-                   )",
-                named_params! {
+            let changed = tx
+                .prepare_cached(&mark_sql(false))?
+                .execute(named_params! {
                     ":id": id.0,
                     ":now": now.get(),
                     ":margin": margin_us,
-                },
-            )?;
+                })?;
             let result = if changed == 1 {
                 DeleteMarkResult::Marked
             } else {
@@ -1167,33 +1299,22 @@ impl Db {
         now: WallUs,
         margin_us: i64,
     ) -> Result<DeleteMarkResult, CatalogError> {
-        let expected_root = path_text(expected_root);
+        let expected_root = path_text(expected_root)?;
         self.with_full_synchronous(|conn| {
             let tx = write_transaction(conn)?;
-            let changed = tx.execute(
-                "UPDATE segment AS candidate SET deleting = 1 \
-                 WHERE candidate.id = :id AND candidate.sealed = 1 \
-                   AND candidate.deleting = 0 AND candidate.root = :root AND NOT EXISTS ( \
-                     SELECT 1 FROM event AS protected \
-                     WHERE protected.camera_id = candidate.camera_id \
-                       AND protected.retain_until_us > :now \
-                       AND protected.nvr_time_us > candidate.wall_start_us - :margin \
-                       AND protected.nvr_time_us < candidate.wall_end_us + :margin \
-                   )",
-                named_params! {
-                    ":id": id.0,
-                    ":root": &expected_root,
-                    ":now": now.get(),
-                    ":margin": margin_us,
-                },
-            )?;
+            let changed = tx.prepare_cached(&mark_sql(true))?.execute(named_params! {
+                ":id": id.0,
+                ":root": expected_root,
+                ":now": now.get(),
+                ":margin": margin_us,
+            })?;
             let result = if changed == 1 {
                 DeleteMarkResult::Marked
             } else {
                 let exists: bool = tx.query_row(
                     "SELECT EXISTS(SELECT 1 FROM segment \
                      WHERE id = ?1 AND root = ?2 AND sealed = 1 AND deleting = 0)",
-                    params![id.0, &expected_root],
+                    params![id.0, expected_root],
                     |row| row.get(0),
                 )?;
                 if exists {
@@ -1227,10 +1348,12 @@ impl Db {
         }
     }
 
-    /// Segments whose durable deletion intent still needs to be completed.
+    /// Every segment in deletion intent, by start time; test support, the
+    /// daemon pages with [`Db::deleting_segments_page`].
+    #[cfg(any(test, feature = "test-support"))]
     pub fn deleting_segments(&mut self) -> Result<Vec<SegmentRow>, CatalogError> {
         let sql = format!(
-            "SELECT {SEGMENT_COLUMNS} FROM segment s JOIN sample_entry e ON e.id = s.sample_entry_id \
+            "SELECT {SEGMENT_COLUMNS} {SEGMENT_FROM} \
              WHERE s.deleting != 0 ORDER BY s.wall_start_us, s.id"
         );
         let mut stmt = self.conn.prepare_cached(&sql)?;
@@ -1241,31 +1364,21 @@ impl Db {
         rows.into_iter().map(decode_segment).collect()
     }
 
-    /// One stable bounded page of deletion intents ordered by `(wall_start, id)`.
+    /// One stable bounded page of deletion intents after the exclusive cursor,
+    /// ordered by `(wall_start, id)`; `limit` is clamped to 1 to 512. Rows in
+    /// deletion intent are few, so the page scans the table.
     pub fn deleting_segments_page(
         &mut self,
-        after: Option<(WallUs, SegmentId)>,
+        after: Option<SegmentCursor>,
         limit: usize,
-    ) -> Result<Vec<(SegmentRow, Option<PathBuf>)>, CatalogError> {
+    ) -> Result<Vec<StartupRow>, CatalogError> {
         let sql = format!(
-            "SELECT {SEGMENT_COLUMNS}, s.root FROM segment s JOIN sample_entry e ON e.id = s.sample_entry_id \
+            "SELECT {SEGMENT_COLUMNS}, s.root {SEGMENT_FROM} \
              WHERE s.deleting != 0 AND \
                (?1 IS NULL OR s.wall_start_us > ?1 OR (s.wall_start_us = ?1 AND s.id > ?2)) \
              ORDER BY s.wall_start_us, s.id LIMIT ?3"
         );
-        let (time, id) = after.map_or((None, None), |(time, id)| (Some(time.get()), Some(id.0)));
-        let limit = limit.clamp(1, RECONCILE_PAGE_ROWS);
-        let mut statement = self.conn.prepare_cached(&sql)?;
-        let rows = statement
-            .query_map(
-                params![time, id, i64::try_from(limit).unwrap_or(i64::MAX)],
-                |row| Ok((segment_row(row)?, row.get::<_, Option<String>>(20)?)),
-            )?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(row_error)?;
-        rows.into_iter()
-            .map(|(row, root)| Ok((decode_segment(row)?, root.map(PathBuf::from))))
-            .collect()
+        self.startup_page(&sql, after, limit)
     }
 
     /// Marks a segment sealed with its final lengths.
@@ -1277,32 +1390,41 @@ impl Db {
         wall_end: WallUs,
         media_end: u64,
     ) -> Result<(), CatalogError> {
-        let updated = self.conn.execute(
-            "UPDATE segment SET sealed = 1, bytes = :len, durable_len = :len, fragments = :fragments, \
-             wall_end_us = :wall_end, media_end = :media_end WHERE path = :path",
+        let tx = write_transaction(&mut self.conn)?;
+        let updated = tx.execute(
+            "UPDATE segment SET sealed = 1, bytes = :len, durable_len = :len, \
+             fragments = :fragments, wall_end_us = :wall_end, media_end = :media_end \
+             WHERE path = :path",
             named_params! {
                 ":len": as_i64(len),
                 ":fragments": i64::from(fragments),
                 ":wall_end": wall_end.get(),
                 ":media_end": as_i64(media_end),
-                ":path": path_text(path),
+                ":path": path_text(path)?,
             },
         )?;
         if updated == 0 {
             return Err(CatalogError::NotFound(path.to_path_buf()));
         }
+        tx.commit()?;
         Ok(())
     }
 
-    /// Inserts a sealed segment found on disk.
+    /// Inserts a sealed segment found on disk: an upsert by path that replaces
+    /// a row the path already has and clears its deletion intent.
     pub fn adopt_segment(&mut self, row: &NewSegment) -> Result<SegmentId, CatalogError> {
+        let path = path_text(&row.path)?;
+        let root = root_for_path(&self.roots, &row.path)
+            .map(path_text)
+            .transpose()?;
         let tx = write_transaction(&mut self.conn)?;
         let entry_id = upsert_sample_entry(&tx, row.sample_entry.as_deref())?;
         tx.execute(
-            "INSERT INTO segment (camera_id, kind, path, root, run_seq, discontinuity, wall_start_us, \
-             wall_end_us, media_start, media_end, init_len, durable_len, fragments, bytes, sealed, \
-             sample_entry_id) VALUES (:camera, :kind, :path, :root, :run_seq, :disc, :wall_start, \
-             :wall_end, :media_start, :media_end, :init_len, :len, :fragments, :len, 1, :entry) \
+            "INSERT INTO segment (camera_id, kind, path, root, run_seq, discontinuity, \
+             wall_start_us, wall_end_us, media_start, media_end, init_len, durable_len, \
+             fragments, bytes, sealed, sample_entry_id) \
+             VALUES (:camera, :kind, :path, :root, :run_seq, :disc, :wall_start, :wall_end, \
+             :media_start, :media_end, :init_len, :len, :fragments, :len, 1, :entry) \
              ON CONFLICT(path) DO UPDATE SET run_seq = excluded.run_seq, \
              discontinuity = excluded.discontinuity, wall_start_us = excluded.wall_start_us, \
              wall_end_us = excluded.wall_end_us, media_start = excluded.media_start, \
@@ -1313,8 +1435,8 @@ impl Db {
             named_params! {
                 ":camera": row.key.camera.as_str(),
                 ":kind": row.key.kind.as_str(),
-                ":path": path_text(&row.path),
-                ":root": root_for_path(&self.roots, &row.path).map(path_text),
+                ":path": path,
+                ":root": root,
                 ":run_seq": as_i64(row.run_seq),
                 ":disc": row.discontinuity,
                 ":wall_start": row.wall_start.get(),
@@ -1329,7 +1451,7 @@ impl Db {
         )?;
         let id: i64 = tx.query_row(
             "SELECT id FROM segment WHERE path = ?1",
-            params![path_text(&row.path)],
+            params![path],
             |r| r.get(0),
         )?;
         tx.commit()?;
@@ -1380,49 +1502,15 @@ impl Db {
         Ok(result)
     }
 
-    /// Minimal active event-protection rows after an optional stable cursor.
-    pub fn event_protections(
-        &mut self,
-        now: WallUs,
-        after: Option<EventProtectionCursor>,
-        limit: usize,
-    ) -> Result<Vec<EventProtection>, CatalogError> {
-        let seek_after = after.is_some_and(|cursor| cursor.retain_until > now);
-        let sql = event_protection_query_sql(seek_after);
-        let mut stmt = self.conn.prepare_cached(sql)?;
-        let limit = i64::try_from(limit.min(MAX_PROTECTION_PAGE_ROWS)).unwrap_or(i64::MAX);
-        let mut rows = stmt.query(params![
-            now.get(),
-            after.map(|cursor| cursor.retain_until.get()),
-            after.map(|cursor| cursor.id.0),
-            limit,
-        ])?;
-        let mut result = Vec::with_capacity(usize::try_from(limit).unwrap_or(0));
-        while let Some(row) = rows.next()? {
-            let id = checked_id(row.get(0).map_err(row_error)?, "event.id")?;
-            let camera_text: String = row.get(1).map_err(row_error)?;
-            let camera = CameraId::try_new(&camera_text)
-                .map_err(|_| corrupt("event.camera_id is not a valid camera identifier"))?;
-            let retain_until: Option<i64> = row.get(3).map_err(row_error)?;
-            let Some(retain_until) = retain_until else {
-                return Err(corrupt("active event protection has no retention time"));
-            };
-            result.push(EventProtection {
-                id: EventId(id),
-                camera,
-                time: WallUs::new(row.get(2).map_err(row_error)?),
-                retain_until: WallUs::new(retain_until),
-            });
-        }
-        Ok(result)
-    }
-
     /// Sets (or clears, with `None`) the time until which an event's footage
     /// is kept, and returns the event.
     ///
     /// # Errors
     ///
-    /// Returns [`CatalogError::UnknownEvent`] when no event has that id.
+    /// [`CatalogError::UnknownEvent`] when no event has that id;
+    /// [`CatalogError::EventRetentionLimit`] when a mark that becomes active
+    /// would exceed 100,000 active marks or 128 MiB of their logical bytes;
+    /// [`CatalogError::Corrupt`] for malformed accounting.
     pub fn retain_event(
         &mut self,
         id: EventId,
@@ -1438,7 +1526,7 @@ impl Db {
             .optional()
             .map_err(row_error)?;
         let Some((storage_bytes, previous_until)) = stored else {
-            return Err(CatalogError::UnknownEvent(id.0));
+            return Err(CatalogError::UnknownEvent(id));
         };
         let now = WallUs::now().get();
         if until.is_some_and(|value| value.get() > now)
@@ -1480,90 +1568,31 @@ impl Db {
         Ok(row)
     }
 
-    /// Events whose retention time is after `now`, oldest first.
-    pub fn retained_events(&mut self, now: WallUs) -> Result<Vec<EventRow>, CatalogError> {
-        let sql = format!(
-            "SELECT {EVENT_COLUMNS} FROM event \
-             WHERE retain_until_us > ?1 ORDER BY nvr_time_us, id LIMIT ?2"
-        );
-        let mut stmt = self.conn.prepare_cached(&sql)?;
-        let mut rows = stmt.query(params![now.get(), MAX_EVENT_READ_ROWS as i64])?;
-        let mut result = Vec::new();
-        let mut bytes = 0usize;
-        while let Some(row) = rows.next()? {
-            let event = decode_event(event_row(row).map_err(row_error)?)?;
-            let row_bytes = event_owned_bytes(&event);
-            if row_bytes > MAX_EVENT_READ_BYTES {
-                return Err(CatalogError::EventReadTooLarge {
-                    bytes: row_bytes,
-                    max_bytes: MAX_EVENT_READ_BYTES,
-                });
-            }
-            let Some(next_bytes) = bytes.checked_add(row_bytes) else {
-                break;
-            };
-            if next_bytes > MAX_EVENT_READ_BYTES {
-                break;
-            }
-            bytes = next_bytes;
-            result.push(event);
-        }
-        Ok(result)
-    }
-
-    /// The oldest sealed segments after the `(start time, id)` cursor, at most `limit`.
-    pub fn oldest_sealed_after(
-        &mut self,
-        after: (WallUs, SegmentId),
-        limit: usize,
-    ) -> Result<Vec<SegmentRow>, CatalogError> {
-        let sql = format!(
-            "WITH candidates(id, wall_start_us) AS MATERIALIZED ( \
-               SELECT s.id, s.wall_start_us FROM segment s \
-               WHERE s.sealed = 1 AND s.deleting = 0 \
-                 AND s.wall_start_us = ?1 AND s.id > ?2 \
-               UNION ALL \
-               SELECT s.id, s.wall_start_us FROM segment s \
-               WHERE s.sealed = 1 AND s.deleting = 0 AND s.wall_start_us > ?1 \
-               ORDER BY wall_start_us, id LIMIT ?3 \
-             ) \
-             SELECT {SEGMENT_COLUMNS} FROM candidates c \
-             JOIN segment s ON s.id = c.id JOIN sample_entry e ON e.id = s.sample_entry_id \
-             ORDER BY s.wall_start_us, s.id LIMIT ?3"
-        );
-        let mut stmt = self.conn.prepare_cached(&sql)?;
-        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
-        let rows = stmt
-            .query_map(params![after.0.get(), after.1.0, limit], segment_row)?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(row_error)?;
-        rows.into_iter().map(decode_segment).collect()
-    }
-
     /// Root-aware retention page with raw indexed scan progress after an
     /// optional stable cursor.
     pub fn retention_candidates(
         &mut self,
         root: Option<&Path>,
-        after: Option<(WallUs, SegmentId)>,
+        after: Option<SegmentCursor>,
         now: WallUs,
         margin_us: i64,
         limit: usize,
     ) -> Result<RetentionPage, CatalogError> {
+        let root = root.map(path_text).transpose()?;
         let sql = retention_candidate_query_sql(root.is_some(), after.is_some());
         let mut stmt = self.conn.prepare_cached(&sql)?;
         let limit = i64::try_from(limit).unwrap_or(i64::MAX);
         let rows = stmt
             .query_map(
                 params![
-                    root.map(path_text),
-                    after.map(|cursor| cursor.0.get()),
-                    after.map(|cursor| cursor.1.0),
+                    root,
+                    after.map(|cursor| cursor.wall_start.get()),
+                    after.map(|cursor| cursor.id.0),
                     now.get(),
                     margin_us,
                     limit,
                 ],
-                |row| Ok((segment_row(row)?, row.get::<_, i64>(20)?)),
+                |row| Ok((segment_row(row)?, row.get::<_, i64>(APPENDED_COLUMN)?)),
             )?
             .collect::<Result<Vec<_>, _>>()
             .map_err(row_error)?;
@@ -1576,7 +1605,7 @@ impl Db {
         &mut self,
         key: &StreamKey,
         cutoff: WallUs,
-        after: Option<(WallUs, SegmentId)>,
+        after: Option<SegmentCursor>,
         now: WallUs,
         margin_us: i64,
         limit: usize,
@@ -1590,13 +1619,13 @@ impl Db {
                     key.camera.as_str(),
                     key.kind.as_str(),
                     cutoff.get(),
-                    after.map(|cursor| cursor.0.get()),
-                    after.map(|cursor| cursor.1.0),
+                    after.map(|cursor| cursor.wall_start.get()),
+                    after.map(|cursor| cursor.id.0),
                     now.get(),
                     margin_us,
                     limit,
                 ],
-                |row| Ok((segment_row(row)?, row.get::<_, i64>(20)?)),
+                |row| Ok((segment_row(row)?, row.get::<_, i64>(APPENDED_COLUMN)?)),
             )?
             .collect::<Result<Vec<_>, _>>()
             .map_err(row_error)?;
@@ -1616,7 +1645,13 @@ impl Db {
     /// recording-horizon rule.
     pub fn maintain_events(&mut self, now: WallUs) -> Result<(), CatalogError> {
         let tx = write_transaction(&mut self.conn)?;
-        let next = maintain_events_tx(&tx, now, true, EVENT_LIMITS, self.event_maintenance_cursor)?;
+        let next = maintain_events_tx(
+            &tx,
+            now,
+            /* recording_horizon */ true,
+            EVENT_LIMITS,
+            self.event_maintenance_cursor,
+        )?;
         tx.commit()?;
         self.event_maintenance_cursor = next;
         Ok(())
@@ -1689,12 +1724,89 @@ impl Db {
     }
 }
 
+/// Records durable progress of an open file; a path the catalog does not
+/// know, or one in deletion intent, is logged and skipped.
+fn apply_segment_progress(
+    tx: &Transaction<'_>,
+    path: &Path,
+    durable_len: u64,
+    fragments: u32,
+    wall_end: WallUs,
+    media_end: u64,
+) -> Result<(), CatalogError> {
+    let updated = tx.execute(
+        "UPDATE segment SET durable_len = :durable, fragments = :fragments, \
+         wall_end_us = :wall_end, media_end = :media_end, \
+         bytes = MAX(bytes, :durable) WHERE path = :path AND deleting = 0",
+        named_params! {
+            ":durable": as_i64(durable_len),
+            ":fragments": i64::from(fragments),
+            ":wall_end": wall_end.get(),
+            ":media_end": as_i64(media_end),
+            ":path": path_text(path)?,
+        },
+    )?;
+    if updated == 0 {
+        warn!(
+            path = %path.display(),
+            "progress for a segment the catalog does not know"
+        );
+    }
+    Ok(())
+}
+
+/// Seals an open file with its final lengths; a path the catalog does not
+/// know, or one in deletion intent, is logged and skipped.
+fn apply_segment_sealed(
+    tx: &Transaction<'_>,
+    path: &Path,
+    len: u64,
+    fragments: u32,
+    wall_end: WallUs,
+    media_end: u64,
+) -> Result<(), CatalogError> {
+    let updated = tx.execute(
+        "UPDATE segment SET sealed = 1, bytes = :len, durable_len = :len, \
+         fragments = :fragments, wall_end_us = :wall_end, media_end = :media_end \
+         WHERE path = :path AND deleting = 0",
+        named_params! {
+            ":len": as_i64(len),
+            ":fragments": i64::from(fragments),
+            ":wall_end": wall_end.get(),
+            ":media_end": as_i64(media_end),
+            ":path": path_text(path)?,
+        },
+    )?;
+    if updated == 0 {
+        warn!(
+            path = %path.display(),
+            "seal for a segment the catalog does not know"
+        );
+    }
+    Ok(())
+}
+
+/// The fields of a [`Change::SegmentOpened`], borrowed from the batch.
+#[derive(Clone, Copy)]
+struct OpenedSegment<'a> {
+    key: &'a StreamKey,
+    path: &'a Path,
+    run_seq: u64,
+    discontinuity: bool,
+    wall_start: WallUs,
+    media_start: u64,
+    init_len: u32,
+    sample_entry: &'a SampleEntry,
+}
+
+/// Inserts the row of an opened file, or resets the row its path already has
+/// (fragments, seal, and deletion intent cleared).
 fn apply_segment_opened(
     tx: &Transaction<'_>,
     roots: &[PathBuf],
-    change: &Change,
+    opened: OpenedSegment<'_>,
 ) -> Result<(), CatalogError> {
-    let Change::SegmentOpened {
+    let OpenedSegment {
         key,
         path,
         run_seq,
@@ -1703,10 +1815,8 @@ fn apply_segment_opened(
         media_start,
         init_len,
         sample_entry,
-    } = change
-    else {
-        unreachable!("caller selects only SegmentOpened");
-    };
+    } = opened;
+    let root = root_for_path(roots, path).map(path_text).transpose()?;
     let entry_id = upsert_sample_entry(tx, Some(sample_entry))?;
     tx.execute(
         "INSERT INTO segment (camera_id, kind, path, root, run_seq, discontinuity, \
@@ -1724,13 +1834,13 @@ fn apply_segment_opened(
         named_params! {
             ":camera": key.camera.as_str(),
             ":kind": key.kind.as_str(),
-            ":path": path_text(path),
-            ":root": root_for_path(roots, path).map(path_text),
-            ":run_seq": as_i64(*run_seq),
-            ":disc": *discontinuity,
+            ":path": path_text(path)?,
+            ":root": root,
+            ":run_seq": as_i64(run_seq),
+            ":disc": discontinuity,
             ":wall": wall_start.get(),
-            ":media": as_i64(*media_start),
-            ":init_len": i64::from(*init_len),
+            ":media": as_i64(media_start),
+            ":init_len": i64::from(init_len),
             ":entry": entry_id,
         },
     )?;
@@ -1753,35 +1863,35 @@ fn upsert_sample_entry(
     };
     tx.execute(
         "INSERT INTO sample_entry (hash, codecs, width, height, config) VALUES (?1, ?2, ?3, ?4, ?5) \
-         ON CONFLICT(hash) DO NOTHING",
+         ON CONFLICT(hash, config) DO NOTHING",
         params![hash, codecs, width, height, config],
     )?;
     let id: i64 = tx.query_row(
-        "SELECT id FROM sample_entry WHERE hash = ?1",
-        params![hash],
+        "SELECT id FROM sample_entry WHERE hash = ?1 AND config = ?2",
+        params![hash, config],
         |r| r.get(0),
     )?;
     Ok(id)
 }
 
+/// Inserts one event that [`Event::bounded`] has already bounded.
 fn insert_event_row(tx: &Transaction<'_>, event: &Event) -> Result<EventId, CatalogError> {
-    let bounded = event.clone().bounded();
-    let (kind, kind_other) = kind_storage(&bounded.kind);
-    let storage_bytes = i64::try_from(event_storage_bytes(&bounded))
-        .map_err(|_| corrupt("event storage size does not fit SQLite"))?;
+    let (kind, kind_other) = kind_storage(&event.kind);
+    let storage_bytes = i64::try_from(event_storage_bytes(event))
+        .expect("a bounded event is far below i64::MAX bytes");
     tx.execute(
         "INSERT INTO event (camera_id, source, kind, kind_other, state, nvr_time_us, \
          camera_time_us, data, storage_bytes) \
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
         params![
-            bounded.camera.as_str(),
-            source_name(bounded.source),
+            event.camera.as_str(),
+            event.source.as_str(),
             kind,
             kind_other,
-            state_name(bounded.state),
-            bounded.nvr_time.get(),
-            bounded.camera_time.map(WallUs::get),
-            bounded.data,
+            event.state.as_str(),
+            event.nvr_time.get(),
+            event.camera_time.map(WallUs::get),
+            event.data,
             storage_bytes,
         ],
     )?;
@@ -1797,7 +1907,7 @@ fn try_insert_event(
 ) -> Result<Option<EventId>, CatalogError> {
     let event = event.clone().bounded();
     let incoming_bytes = u64::try_from(event_storage_bytes(&event))
-        .map_err(|_| corrupt("event storage size does not fit SQLite"))?;
+        .expect("a bounded event is far below u64::MAX bytes");
     if limits.rows == 0 || incoming_bytes > limits.bytes {
         return Ok(None);
     }
@@ -2021,15 +2131,15 @@ fn event_owned_bytes(row: &EventRow) -> usize {
 fn event_storage_bytes(event: &Event) -> usize {
     let kind_bytes = match &event.kind {
         EventKind::Other(code) => "other".len().saturating_add(code.len()),
-        kind => serde_name(kind).len(),
+        kind => kind.name().len(),
     };
     event
         .camera
         .as_str()
         .len()
-        .saturating_add(source_name(event.source).len())
+        .saturating_add(event.source.as_str().len())
         .saturating_add(kind_bytes)
-        .saturating_add(state_name(event.state).len())
+        .saturating_add(event.state.as_str().len())
         .saturating_add(event.data.as_ref().map_or(0, String::len))
 }
 
@@ -2045,7 +2155,7 @@ fn root_index_for_path(roots: &[PathBuf], path: &Path) -> Option<usize> {
             let relative = path.strip_prefix(root).ok()?;
             relative
                 .components()
-                .all(|component| matches!(component, std::path::Component::Normal(_)))
+                .all(|component| matches!(component, Component::Normal(_)))
                 .then_some((index, root.components().count()))
         })
         .max_by_key(|(_, depth)| *depth)
@@ -2080,6 +2190,7 @@ struct PersistedSegment {
     width: i64,
     height: i64,
     sample_entry_hash: i64,
+    sample_entry_id: i64,
 }
 
 /// Reads raw SQLite values. Semantic conversion happens outside rusqlite's
@@ -2106,6 +2217,7 @@ fn segment_row(row: &Row<'_>) -> rusqlite::Result<PersistedSegment> {
         width: row.get(17)?,
         height: row.get(18)?,
         sample_entry_hash: row.get(19)?,
+        sample_entry_id: row.get(20)?,
     })
 }
 
@@ -2140,6 +2252,7 @@ fn decode_segment(row: PersistedSegment) -> Result<SegmentRow, CatalogError> {
         width: checked_u16(row.width, "sample_entry.width")?,
         height: checked_u16(row.height, "sample_entry.height")?,
         sample_entry_hash: checked_u32(row.sample_entry_hash, "sample_entry.hash")?,
+        sample_entry_id: SampleEntryId(checked_id(row.sample_entry_id, "segment.sample_entry_id")?),
     })
 }
 
@@ -2151,7 +2264,7 @@ fn decode_retention_page(
     let mut next = None;
     for (row, unprotected) in rows {
         let row = decode_segment(row)?;
-        next = Some((row.wall_start, row.id));
+        next = Some(SegmentCursor::from(&row));
         if checked_bool(unprotected, "retention protection result")? {
             result.push(row);
         }
@@ -2209,8 +2322,11 @@ fn decode_event(row: PersistedEvent) -> Result<EventRow, CatalogError> {
     })
 }
 
-fn path_text(path: &Path) -> String {
-    path.to_string_lossy().into_owned()
+/// The text a path is stored as. The path columns hold text, and a lossy
+/// conversion would merge distinct non-UTF-8 paths, so such a path is refused.
+fn path_text(path: &Path) -> Result<&str, CatalogError> {
+    path.to_str()
+        .ok_or_else(|| CatalogError::NonUtf8Path(path.to_path_buf()))
 }
 
 fn as_i64(v: u64) -> i64 {
@@ -2245,28 +2361,22 @@ fn checked_bool(value: i64, field: &str) -> Result<bool, CatalogError> {
     }
 }
 
-/// The serde name of a source (`dahua_cgi`, …).
-fn source_name(source: EventSource) -> String {
-    serde_name(&source)
-}
-
 fn source_from_name(name: &str) -> Result<EventSource, CatalogError> {
-    serde_from_name(name).ok_or_else(|| corrupt("event.source is not a known event source"))
-}
-
-fn state_name(state: EventState) -> String {
-    serde_name(&state)
+    name.parse()
+        .map_err(|_| corrupt("event.source is not a known event source"))
 }
 
 fn state_from_name(name: &str) -> Result<EventState, CatalogError> {
-    serde_from_name(name).ok_or_else(|| corrupt("event.state is not a known event state"))
+    name.parse()
+        .map_err(|_| corrupt("event.state is not a known event state"))
 }
 
-/// The persisted kind discriminator and optional vendor-specific value.
-fn kind_storage(kind: &EventKind) -> (String, Option<&str>) {
+/// The persisted kind discriminator and optional vendor-specific value: a
+/// built-in kind's name, or `other` with the vendor code beside it.
+fn kind_storage(kind: &EventKind) -> (&str, Option<&str>) {
     match kind {
-        EventKind::Other(code) => ("other".to_owned(), Some(code)),
-        other => (serde_name(other), None),
+        EventKind::Other(code) => ("other", Some(code)),
+        other => (other.name(), None),
     }
 }
 
@@ -2281,46 +2391,43 @@ fn kind_from_storage(name: &str, other: Option<String>) -> Result<EventKind, Cat
             "event.kind_other is present for a built-in event kind",
         ));
     }
-    serde_from_name(name).ok_or_else(|| corrupt("event.kind is not a known event kind"))
-}
-
-fn serde_name<T: serde::Serialize>(value: &T) -> String {
-    match serde_json::to_value(value) {
-        Ok(serde_json::Value::String(s)) => s,
-        _ => "unknown".to_owned(),
-    }
-}
-
-fn serde_from_name<T: serde::de::DeserializeOwned>(name: &str) -> Option<T> {
-    serde_json::from_value(serde_json::Value::String(name.to_owned())).ok()
+    name.parse()
+        .map_err(|_| corrupt("event.kind is not a known event kind"))
 }
 
 fn corrupt(detail: &str) -> CatalogError {
     CatalogError::Corrupt(detail.to_owned())
 }
 
+/// Turns a value that does not decode as its column's type into a corruption
+/// report that names the column.
 fn row_error(error: rusqlite::Error) -> CatalogError {
     match error {
-        rusqlite::Error::FromSqlConversionFailure(..)
-        | rusqlite::Error::IntegralValueOutOfRange(..)
-        | rusqlite::Error::InvalidColumnType(..) => {
-            corrupt("a row contains a value with the wrong SQLite type")
+        rusqlite::Error::FromSqlConversionFailure(index, ty, source) => corrupt(&format!(
+            "column {index} holds a {ty} value that does not convert: {source}"
+        )),
+        rusqlite::Error::IntegralValueOutOfRange(index, value) => {
+            corrupt(&format!("column {index} holds {value}, outside its range"))
+        }
+        rusqlite::Error::InvalidColumnType(index, name, ty) => {
+            corrupt(&format!("column {name} ({index}) holds a {ty} value"))
         }
         other => CatalogError::Sqlite(other),
     }
 }
 
 /// Creates an empty owner-only database file when none exists; SQLite opens an
-/// empty file as a new database. An existing entry is left for SQLite to open.
+/// empty file as a new database. A file already at the path is left for SQLite
+/// to open.
 fn create_private_database(path: &Path) -> std::io::Result<()> {
-    match std::fs::OpenOptions::new()
+    match OpenOptions::new()
         .write(true)
         .create_new(true)
         .mode(0o600)
         .open(path)
     {
         Ok(_) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+        Err(error) if error.kind() == ErrorKind::AlreadyExists => Ok(()),
         Err(error) => Err(error),
     }
 }
@@ -2338,7 +2445,23 @@ fn write_transaction(conn: &mut Connection) -> rusqlite::Result<Transaction<'_>>
     conn.transaction_with_behavior(TransactionBehavior::Immediate)
 }
 
-/// Reads an existing schema version without changing persistent SQLite pragmas.
+/// Fails when any row references a missing parent; run after a migration that
+/// rebuilt a referenced table with foreign-key enforcement off.
+fn check_foreign_keys(tx: &Transaction<'_>) -> Result<(), CatalogError> {
+    let violations: i64 =
+        tx.query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+            row.get(0)
+        })?;
+    if violations == 0 {
+        Ok(())
+    } else {
+        Err(corrupt(&format!(
+            "{violations} rows reference a missing parent after migration"
+        )))
+    }
+}
+
+/// Reads the stored schema version without changing persistent SQLite pragmas.
 fn stored_schema_version(conn: &Connection) -> Result<i64, CatalogError> {
     let has_version: bool = conn.query_row(
         "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'schema_version'",
@@ -2364,36 +2487,31 @@ fn stored_schema_version(conn: &Connection) -> Result<i64, CatalogError> {
     Ok(*version)
 }
 
+/// Rejects a `segment` table whose `sealed` (and, when the column exists,
+/// `deleting`) values are not integer booleans, in one scan of the table.
 fn validate_segment_booleans(
     conn: &Connection,
     validate_deleting: bool,
 ) -> Result<(), CatalogError> {
-    let invalid_sealed: i64 = conn
+    let deleting_clause = if validate_deleting {
+        ", EXISTS(SELECT 1 FROM segment \
+           WHERE typeof(deleting) != 'integer' OR deleting NOT IN (0, 1))"
+    } else {
+        ", 0"
+    };
+    let (invalid_sealed, invalid_deleting): (i64, i64) = conn
         .query_row(
-            "SELECT EXISTS( \
-               SELECT 1 FROM segment \
-               WHERE typeof(sealed) != 'integer' OR sealed NOT IN (0, 1) \
-             )",
+            &format!(
+                "SELECT EXISTS(SELECT 1 FROM segment \
+                   WHERE typeof(sealed) != 'integer' OR sealed NOT IN (0, 1)){deleting_clause}"
+            ),
             [],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .map_err(row_error)?;
     if invalid_sealed != 0 {
         return Err(corrupt("segment.sealed is not an integer boolean"));
     }
-    if !validate_deleting {
-        return Ok(());
-    }
-    let invalid_deleting: i64 = conn
-        .query_row(
-            "SELECT EXISTS( \
-               SELECT 1 FROM segment \
-               WHERE typeof(deleting) != 'integer' OR deleting NOT IN (0, 1) \
-             )",
-            [],
-            |row| row.get(0),
-        )
-        .map_err(row_error)?;
     if invalid_deleting != 0 {
         return Err(corrupt("segment.deleting is not an integer boolean"));
     }
@@ -2403,6 +2521,7 @@ fn validate_segment_booleans(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
 
     fn segment(path: PathBuf) -> NewSegment {
         NewSegment {
@@ -2436,6 +2555,40 @@ mod tests {
         .unwrap();
     }
 
+    fn cursor(wall_start: i64, id: i64) -> SegmentCursor {
+        SegmentCursor {
+            wall_start: WallUs::new(wall_start),
+            id: SegmentId(id),
+        }
+    }
+
+    /// The `(type, name, table, sql)` rows of `sqlite_master`, sorted.
+    fn schema_rows(conn: &Connection) -> Vec<(String, String, String, Option<String>)> {
+        let mut rows = conn
+            .prepare("SELECT type, name, tbl_name, sql FROM sqlite_master")
+            .unwrap()
+            .query_map([], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        rows.sort();
+        rows
+    }
+
+    /// The `EXPLAIN QUERY PLAN` detail lines of `sql`, joined; the statement's
+    /// parameters stay unbound, which the planner treats as unknown values.
+    fn explain(conn: &Connection, sql: &str) -> String {
+        let mut statement = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+        let mut rows = statement.raw_query();
+        let mut details = Vec::new();
+        while let Some(row) = rows.next().unwrap() {
+            details.push(row.get::<_, String>(3).unwrap());
+        }
+        details.join("; ")
+    }
+
     fn statement_steps(conn: &Connection, sql: &str) -> i32 {
         conn.prepare_cached(sql)
             .unwrap()
@@ -2450,7 +2603,7 @@ mod tests {
 
     /// A version-1 database gains both later lifecycle columns on open.
     #[test]
-    fn a_version_one_database_migrates_to_current() {
+    fn a_version_one_database_migrates_to_the_supported_version() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("v1.db");
         {
@@ -2459,7 +2612,7 @@ mod tests {
             conn.execute("INSERT INTO schema_version (version) VALUES (1)", [])
                 .unwrap();
         }
-        let mut db = Db::open(&path).unwrap();
+        let db = Db::open(&path).unwrap();
         let version: i64 = db
             .conn
             .query_row("SELECT MAX(version) FROM schema_version", [], |r| r.get(0))
@@ -2477,7 +2630,6 @@ mod tests {
             columns.iter().any(|c| c == "retain_until_us"),
             "{columns:?}"
         );
-        assert_eq!(db.retained_events(WallUs::new(0)).unwrap().len(), 0);
         let segment_columns: Vec<String> = db
             .conn
             .prepare("PRAGMA table_info(segment)")
@@ -2487,6 +2639,196 @@ mod tests {
             .collect::<Result<_, _>>()
             .unwrap();
         assert!(segment_columns.iter().any(|column| column == "deleting"));
+    }
+
+    fn stream_range() -> (StreamKey, TimeRange) {
+        (
+            StreamKey {
+                camera: CameraId::try_new("cam1").unwrap(),
+                kind: StreamKind::Main,
+            },
+            TimeRange {
+                from: WallUs::new(0),
+                to: WallUs::new(10_000_000),
+            },
+        )
+    }
+
+    fn segment_at(path: &str, second: i64, entry: Option<Arc<SampleEntry>>) -> NewSegment {
+        let mut row = segment(PathBuf::from(path));
+        row.wall_start = WallUs::new(second * 1_000_000);
+        row.wall_end = WallUs::new((second + 1) * 1_000_000);
+        row.sample_entry = entry;
+        row
+    }
+
+    fn entry(bytes: &'static [u8], codecs: &str, width: u16) -> SampleEntry {
+        SampleEntry::new(
+            bytes::Bytes::from_static(bytes),
+            codecs.to_owned(),
+            width,
+            480,
+        )
+    }
+
+    /// Sample entries whose CRC-32C collide are different entries: each keeps
+    /// its row and metadata, and byte-identical entries share one row.
+    #[test]
+    fn colliding_sample_entries_keep_their_own_rows_and_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = Db::open(&dir.path().join("collide.db")).unwrap();
+        let first = Arc::new(entry(b"first entry", "hvc1.1.6.L120.B0", 1920));
+        let mut forged = entry(b"other entry", "hvc1.1.6.L153.B0", 3840);
+        forged.hash = first.hash;
+        let forged = Arc::new(forged);
+        let (key, range) = stream_range();
+        let one = db
+            .adopt_segment(&segment_at(
+                "/video/cam1/main/one.mp4",
+                1,
+                Some(first.clone()),
+            ))
+            .unwrap();
+        let two = db
+            .adopt_segment(&segment_at("/video/cam1/main/two.mp4", 3, Some(forged)))
+            .unwrap();
+        let three = db
+            .adopt_segment(&segment_at("/video/cam1/main/three.mp4", 5, Some(first)))
+            .unwrap();
+        let rows = db.segments(&key, range).unwrap();
+        let row = |id: SegmentId| rows.iter().find(|row| row.id == id).unwrap();
+        assert_eq!(row(one).sample_entry_hash, row(two).sample_entry_hash);
+        assert_ne!(row(one).sample_entry_id, row(two).sample_entry_id);
+        assert_eq!(row(one).codecs, "hvc1.1.6.L120.B0");
+        assert_eq!(row(one).width, 1920);
+        assert_eq!(row(two).codecs, "hvc1.1.6.L153.B0");
+        assert_eq!(row(two).width, 3840);
+        assert_eq!(row(three).sample_entry_id, row(one).sample_entry_id);
+        let entries: i64 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM sample_entry", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(entries, 2);
+    }
+
+    /// A real entry whose CRC-32C is zero never merges with the placeholder for
+    /// an unknown entry.
+    #[test]
+    fn a_crc_zero_sample_entry_stays_distinct_from_unknown() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = Db::open(&dir.path().join("zero.db")).unwrap();
+        let mut zero = entry(b"zero hash entry", "hvc1.1.6.L93.B0", 640);
+        zero.hash = 0;
+        let (key, range) = stream_range();
+        let known = db
+            .adopt_segment(&segment_at(
+                "/video/cam1/main/known.mp4",
+                1,
+                Some(Arc::new(zero)),
+            ))
+            .unwrap();
+        let unknown = db
+            .adopt_segment(&segment_at("/video/cam1/main/unknown.mp4", 3, None))
+            .unwrap();
+        let rows = db.segments(&key, range).unwrap();
+        let row = |id: SegmentId| rows.iter().find(|row| row.id == id).unwrap();
+        assert_eq!(row(known).sample_entry_hash, 0);
+        assert_eq!(row(unknown).sample_entry_hash, 0);
+        assert_ne!(row(known).sample_entry_id, row(unknown).sample_entry_id);
+        assert_eq!(row(known).codecs, "hvc1.1.6.L93.B0");
+        assert_eq!(row(unknown).codecs, "unknown");
+    }
+
+    /// The v9 to v10 rebuild keeps every sample entry id, so segments still
+    /// point at their entries, and enforcement is back on afterwards.
+    #[test]
+    fn a_version_nine_database_rebuilds_sample_entries_with_their_ids() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v9.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            for schema in [
+                SCHEMA_V1, SCHEMA_V2, SCHEMA_V3, SCHEMA_V4, SCHEMA_V5, SCHEMA_V6, SCHEMA_V7,
+                SCHEMA_V8, SCHEMA_V9,
+            ] {
+                conn.execute_batch(schema).unwrap();
+            }
+            conn.execute(
+                "INSERT INTO recording_root_state(singleton, pre_identity_catalog) VALUES (1, 0)",
+                [],
+            )
+            .unwrap();
+            conn.execute("INSERT INTO schema_version (version) VALUES (9)", [])
+                .unwrap();
+            conn.execute(
+                "INSERT INTO sample_entry (id, hash, codecs, width, height, config) VALUES \
+                 (5, 77, 'hvc1', 640, 480, x'0102'), (9, 0, 'unknown', 0, 0, x'')",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO segment (camera_id, kind, path, run_seq, discontinuity, \
+                 wall_start_us, wall_end_us, media_start, media_end, init_len, durable_len, \
+                 fragments, bytes, sealed, sample_entry_id) VALUES \
+                 ('cam1', 'main', '/video/cam1/main/a.mp4', 1, 1, 1000000, 2000000, 0, 90000, \
+                 700, 12345, 3, 12345, 1, 5), \
+                 ('cam1', 'main', '/video/cam1/main/b.mp4', 1, 1, 3000000, 4000000, 0, 90000, \
+                 700, 12345, 3, 12345, 1, 9)",
+                [],
+            )
+            .unwrap();
+        }
+        let mut db = Db::open(&path).unwrap();
+        let version: i64 = db
+            .conn
+            .query_row("SELECT MAX(version) FROM schema_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+        let violations: i64 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(violations, 0);
+        let enforced: i64 = db
+            .conn
+            .query_row("PRAGMA foreign_keys", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(enforced, 1, "enforcement is back on after the rebuild");
+        let (key, range) = stream_range();
+        let rows = db.segments(&key, range).unwrap();
+        let by_path = |name: &str| {
+            rows.iter()
+                .find(|row| row.path.ends_with(name))
+                .unwrap()
+                .sample_entry_id
+        };
+        assert_eq!(by_path("a.mp4"), SampleEntryId(5));
+        assert_eq!(by_path("b.mp4"), SampleEntryId(9));
+        db.conn
+            .execute(
+                "INSERT INTO sample_entry (hash, codecs, width, height, config) \
+                 VALUES (77, 'hvc1', 1280, 720, x'0304')",
+                [],
+            )
+            .expect("the same CRC with other bytes is another entry");
+        assert!(
+            db.conn
+                .execute(
+                    "INSERT INTO sample_entry (hash, codecs, width, height, config) \
+                     VALUES (77, 'hvc1', 1280, 720, x'0102')",
+                    [],
+                )
+                .is_err(),
+            "the same CRC and bytes are one entry"
+        );
+        assert!(
+            db.conn
+                .execute("DELETE FROM sample_entry WHERE id = 5", [])
+                .is_err(),
+            "a referenced entry cannot be deleted once enforcement is on"
+        );
     }
 
     #[test]
@@ -2532,11 +2874,10 @@ mod tests {
         );
     }
 
-    #[test]
-    fn reconciliation_pages_are_bounded_stable_and_exactly_once_across_equal_times() {
+    /// 600 open rows that share one start time under `/video`.
+    fn six_hundred_open_rows(name: &str) -> (tempfile::TempDir, Db) {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("reconciliation.db");
-        let mut db = Db::open(&path).unwrap();
+        let db = Db::open(&dir.path().join(name)).unwrap();
         db.conn
             .execute_batch(
                 "INSERT INTO sample_entry(id, hash, codecs, width, height, config) \
@@ -2552,7 +2893,31 @@ mod tests {
                    FROM seq;",
             )
             .unwrap();
+        (dir, db)
+    }
 
+    /// Every row id of the pages `next_page` yields, following the cursor.
+    fn paged_ids(
+        mut next_page: impl FnMut(Option<SegmentCursor>) -> Vec<StartupRow>,
+        page_size: usize,
+    ) -> Vec<SegmentId> {
+        let mut ids = Vec::new();
+        let mut cursor = None;
+        loop {
+            let page = next_page(cursor);
+            assert!(page.len() <= page_size, "a page of {}", page.len());
+            let Some(last) = page.last() else {
+                break;
+            };
+            cursor = Some(SegmentCursor::from(&last.row));
+            ids.extend(page.iter().map(|entry| entry.row.id));
+        }
+        ids
+    }
+
+    #[test]
+    fn root_expectations_page_through_every_row_in_512_row_pages() {
+        let (_dir, mut db) = six_hundred_open_rows("expectations.db");
         let roots = [PathBuf::from("/video")];
         let mut registry_pages = 0usize;
         assert_eq!(
@@ -2561,36 +2926,309 @@ mod tests {
             [CatalogRootExpectation::LegacyOwned]
         );
         assert_eq!(registry_pages, 2, "600 rows require two 512-row pages");
+    }
 
-        let mut writing_ids = Vec::new();
-        let mut cursor = None;
-        loop {
-            let page = db.writing_segments_page(cursor, 31).unwrap();
-            assert!(page.len() <= 31);
-            let Some((last, _)) = page.last() else {
-                break;
-            };
-            cursor = Some((last.wall_start, last.id));
-            writing_ids.extend(page.into_iter().map(|(row, _)| row.id));
-        }
-        assert_eq!(writing_ids.len(), 600);
-        assert!(writing_ids.windows(2).all(|ids| ids[0] < ids[1]));
+    #[test]
+    fn writing_pages_are_bounded_stable_and_exactly_once_across_equal_times() {
+        let (_dir, mut db) = six_hundred_open_rows("writing-pages.db");
+        let ids = paged_ids(|cursor| db.writing_segments_page(cursor, 31).unwrap(), 31);
+        assert_eq!(ids.len(), 600);
+        assert!(ids.windows(2).all(|ids| ids[0] < ids[1]), "{ids:?}");
+    }
 
+    #[test]
+    fn deleting_pages_visit_the_same_rows_as_writing_pages_once_marked() {
+        let (_dir, mut db) = six_hundred_open_rows("deleting-pages.db");
+        let writing_ids = paged_ids(|cursor| db.writing_segments_page(cursor, 31).unwrap(), 31);
         db.conn
             .execute("UPDATE segment SET deleting = 1", [])
             .unwrap();
-        let mut deleting_ids = Vec::new();
-        let mut cursor = None;
-        loop {
-            let page = db.deleting_segments_page(cursor, 29).unwrap();
-            assert!(page.len() <= 29);
-            let Some((last, _)) = page.last() else {
-                break;
-            };
-            cursor = Some((last.wall_start, last.id));
-            deleting_ids.extend(page.into_iter().map(|(row, _)| row.id));
-        }
+        let deleting_ids = paged_ids(|cursor| db.deleting_segments_page(cursor, 29).unwrap(), 29);
         assert_eq!(deleting_ids, writing_ids);
+    }
+
+    #[test]
+    fn id_paged_startup_scans_seek_by_rowid() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("id-pages.db")).unwrap();
+        for sql in [
+            "SELECT id, path, root FROM segment WHERE id > ?1 ORDER BY id LIMIT ?2",
+            "SELECT id, path FROM segment WHERE root IS NULL AND id > ?1 ORDER BY id LIMIT ?2",
+        ] {
+            let plan = explain(&db.conn, sql);
+            assert!(plan.contains("rowid>?"), "{sql}: {plan}");
+        }
+    }
+
+    #[test]
+    fn open_runs_in_wal_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("wal.db")).unwrap();
+        let mode: String = db
+            .conn
+            .pragma_query_value(None, "journal_mode", |row| row.get(0))
+            .unwrap();
+        assert_eq!(mode, "wal");
+    }
+
+    #[test]
+    fn the_v4_built_in_kind_list_names_every_built_in_event_kind() {
+        for kind in &EventKind::BUILT_IN {
+            let quoted = format!("'{}'", kind.name());
+            assert!(
+                SCHEMA_V4.contains(&quoted),
+                "{quoted} missing from SCHEMA_V4"
+            );
+        }
+        assert_eq!(
+            SCHEMA_V4.matches('\'').count(),
+            2 * (EventKind::BUILT_IN.len() + 1)
+        );
+    }
+
+    /// The schema constants in migration order.
+    const SCHEMAS: [&str; 10] = [
+        SCHEMA_V1, SCHEMA_V2, SCHEMA_V3, SCHEMA_V4, SCHEMA_V5, SCHEMA_V6, SCHEMA_V7, SCHEMA_V8,
+        SCHEMA_V9, SCHEMA_V10,
+    ];
+
+    /// Creates a database at schema `version` holding a camera, a sample
+    /// entry, a sealed and an open segment, and a built-in and a vendor event
+    /// with data, inserted as that version stored them.
+    fn database_at_version(path: &Path, version: usize) {
+        let conn = Connection::open(path).unwrap();
+        for schema in &SCHEMAS[..version] {
+            conn.execute_batch(schema).unwrap();
+        }
+        if version >= 9 {
+            conn.execute(
+                "INSERT INTO recording_root_state(singleton, pre_identity_catalog) VALUES (1, 0)",
+                [],
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "INSERT INTO schema_version (version) VALUES (?1)",
+            params![i64::try_from(version).unwrap()],
+        )
+        .unwrap();
+        conn.execute_batch(
+            "INSERT INTO camera (id, name, vendor) VALUES ('cam1', 'front', NULL); \
+             INSERT INTO sample_entry (id, hash, codecs, width, height, config) \
+               VALUES (1, 7, 'hvc1.1.6.L120.B0', 640, 480, x'0102'); \
+             INSERT INTO segment (camera_id, kind, path, run_seq, discontinuity, \
+               wall_start_us, wall_end_us, media_start, media_end, init_len, durable_len, \
+               fragments, bytes, sealed, sample_entry_id) VALUES \
+               ('cam1', 'main', '/video/cam1/main/a.mp4', 1, 1, 1000000, 2000000, 0, 90000, \
+                700, 12345, 3, 12345, 1, 1), \
+               ('cam1', 'main', '/video/cam1/main/b.mp4', 1, 0, 3000000, 3000000, 90000, \
+                90000, 700, 700, 0, 700, 0, 1);",
+        )
+        .unwrap();
+        let storage_bytes = "length(CAST(?1 AS BLOB)) + length(CAST(?2 AS BLOB)) \
+                             + length(CAST(?3 AS BLOB)) + length(CAST(COALESCE(?4, '') AS BLOB)) \
+                             + length(CAST(?5 AS BLOB)) + length(CAST(COALESCE(?7, '') AS BLOB))";
+        for (kind, kind_other, data) in [
+            ("motion", None, Some("{\"region\":[0]}")),
+            if version >= 4 {
+                ("other", Some("Vendor/温度"), None)
+            } else {
+                ("Vendor/温度", None, None)
+            },
+        ] {
+            let (columns, values) = match version {
+                0..=3 => (
+                    "camera_id, source, kind, state, nvr_time_us, data",
+                    "?1, ?2, ?3, ?5, ?6, ?7".to_owned(),
+                ),
+                4..=5 => (
+                    "camera_id, source, kind, kind_other, state, nvr_time_us, data",
+                    "?1, ?2, ?3, ?4, ?5, ?6, ?7".to_owned(),
+                ),
+                _ => (
+                    "camera_id, source, kind, kind_other, state, nvr_time_us, data, storage_bytes",
+                    format!("?1, ?2, ?3, ?4, ?5, ?6, ?7, {storage_bytes}"),
+                ),
+            };
+            conn.execute(
+                &format!("INSERT INTO event ({columns}) VALUES ({values})"),
+                params![
+                    "cam1",
+                    "dahua_cgi",
+                    kind,
+                    kind_other,
+                    "pulse",
+                    1_500_000,
+                    data
+                ],
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn every_starting_version_migrates_to_the_same_schema_and_accounting() {
+        let dir = tempfile::tempdir().unwrap();
+        let fresh = Db::open(&dir.path().join("fresh.db")).unwrap();
+        let expected_schema = schema_rows(&fresh.conn);
+        drop(fresh);
+        for version in 1..=9 {
+            let path = dir.path().join(format!("v{version}.db"));
+            database_at_version(&path, version);
+            let mut db = Db::open(&path).unwrap();
+            assert_eq!(
+                schema_rows(&db.conn),
+                expected_schema,
+                "schema after migrating from version {version}"
+            );
+            assert_eq!(
+                stored_schema_version(&db.conn).unwrap(),
+                SCHEMA_VERSION,
+                "from version {version}"
+            );
+            let events = db
+                .events(
+                    None,
+                    TimeRange {
+                        from: WallUs::new(0),
+                        to: WallUs::new(i64::MAX),
+                    },
+                    None,
+                    10,
+                )
+                .unwrap();
+            assert_eq!(
+                events
+                    .iter()
+                    .map(|row| row.event.kind.clone())
+                    .collect::<Vec<_>>(),
+                [EventKind::Motion, EventKind::Other("Vendor/温度".into())],
+                "events after migrating from version {version}"
+            );
+            let (rows, bytes): (i64, i64) = db
+                .conn
+                .query_row(EVENT_STATE_SQL, [], |row| Ok((row.get(0)?, row.get(1)?)))
+                .unwrap();
+            let expected_bytes: usize = events
+                .iter()
+                .map(|row| event_storage_bytes(&row.event))
+                .sum();
+            assert_eq!(
+                (rows, bytes),
+                (2, i64::try_from(expected_bytes).unwrap()),
+                "event accounting after migrating from version {version}"
+            );
+            let (key, range) = stream_range();
+            let segments = db.segments(&key, range).unwrap();
+            assert_eq!(
+                segments.len(),
+                1,
+                "the open row has no fragment: {segments:?}"
+            );
+            assert!(segments[0].sealed);
+            assert_eq!(segments[0].codecs, "hvc1.1.6.L120.B0");
+            assert_eq!(db.writing_segments().unwrap().len(), 1);
+        }
+    }
+
+    #[test]
+    fn configure_video_roots_assigns_the_deepest_root_and_keeps_assigned_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = Db::open(&dir.path().join("roots.db")).unwrap();
+        for path in [
+            "/video/cam1/main/a.mp4",
+            "/video/nested/cam1/main/b.mp4",
+            "/video2/cam1/main/c.mp4",
+            "/elsewhere/d.mp4",
+        ] {
+            db.adopt_segment(&segment(PathBuf::from(path))).unwrap();
+        }
+        db.configure_video_roots(&[
+            PathBuf::from("/video"),
+            PathBuf::from("/video/nested"),
+            PathBuf::from("/video"),
+        ])
+        .unwrap();
+        let mut root_of = |path: &str| {
+            let id = db.segment_by_path(Path::new(path)).unwrap().unwrap().id;
+            db.segment_root(id).unwrap()
+        };
+        assert_eq!(
+            root_of("/video/cam1/main/a.mp4"),
+            Some(PathBuf::from("/video"))
+        );
+        assert_eq!(
+            root_of("/video/nested/cam1/main/b.mp4"),
+            Some(PathBuf::from("/video/nested")),
+            "the deepest root wins"
+        );
+        assert_eq!(
+            root_of("/video2/cam1/main/c.mp4"),
+            None,
+            "a textual prefix is not a parent directory"
+        );
+        assert_eq!(root_of("/elsewhere/d.mp4"), None);
+
+        db.configure_video_roots(&[PathBuf::from("/video/cam1")])
+            .unwrap();
+        let id = db
+            .segment_by_path(Path::new("/video/cam1/main/a.mp4"))
+            .unwrap()
+            .unwrap()
+            .id;
+        assert_eq!(
+            db.segment_root(id).unwrap(),
+            Some(PathBuf::from("/video")),
+            "a non-null root is never rewritten"
+        );
+    }
+
+    #[test]
+    fn root_bound_marks_refuse_other_roots_and_honour_protection() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = Db::open(&dir.path().join("root-marks.db")).unwrap();
+        db.configure_video_roots(&[PathBuf::from("/video")])
+            .unwrap();
+        let id = db
+            .adopt_segment(&segment(PathBuf::from("/video/cam1/main/a.mp4")))
+            .unwrap();
+        let now = WallUs::new(10);
+        assert_eq!(
+            db.mark_deleting_if_unprotected_at_root(id, Path::new("/other"), now, 0)
+                .unwrap(),
+            DeleteMarkResult::NotFound,
+            "another root never marks the row"
+        );
+        let event_id = db
+            .insert_event(&Event {
+                camera: CameraId::try_new("cam1").unwrap(),
+                source: EventSource::Manual,
+                kind: EventKind::Motion,
+                state: EventState::Pulse,
+                nvr_time: WallUs::new(1_500_000),
+                camera_time: None,
+                data: None,
+            })
+            .unwrap();
+        db.retain_event(event_id, Some(WallUs::new(i64::MAX)))
+            .unwrap();
+        assert_eq!(
+            db.mark_deleting_if_unprotected_at_root(id, Path::new("/video"), now, 0)
+                .unwrap(),
+            DeleteMarkResult::Protected
+        );
+        db.retain_event(event_id, None).unwrap();
+        assert_eq!(
+            db.mark_deleting_if_unprotected_at_root(id, Path::new("/video"), now, 0)
+                .unwrap(),
+            DeleteMarkResult::Marked
+        );
+        assert_eq!(
+            db.mark_deleting_if_unprotected_at_root(id, Path::new("/video"), now, 0)
+                .unwrap(),
+            DeleteMarkResult::NotFound,
+            "a marked row is not marked twice"
+        );
     }
 
     #[test]
@@ -2801,7 +3439,7 @@ mod tests {
     }
 
     #[test]
-    fn a_future_schema_is_rejected_before_persistent_pragmas() {
+    fn a_schema_above_the_supported_version_is_rejected_before_persistent_pragmas() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("future.db");
         {
@@ -2855,7 +3493,7 @@ mod tests {
     }
 
     #[test]
-    fn a_plausible_future_schema_is_rejected_without_application_writes() {
+    fn a_complete_schema_above_the_supported_version_is_rejected_without_writes() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("future-complete.db");
         {
@@ -2903,97 +3541,58 @@ mod tests {
     fn event_and_retention_query_plans_use_ordering_indexes() {
         let dir = tempfile::tempdir().unwrap();
         let db = Db::open(&dir.path().join("plans.db")).unwrap();
-        let explain = |sql: &str| -> String {
-            db.conn
-                .prepare(sql)
-                .unwrap()
-                .query_map([], |row| row.get::<_, String>(3))
-                .unwrap()
-                .collect::<Result<Vec<_>, _>>()
-                .unwrap()
-                .join("; ")
-        };
 
+        // The production statements themselves, so a changed predicate or a
+        // dropped tie key fails here.
         for (sql, index) in [
-            (
-                format!(
-                    "EXPLAIN QUERY PLAN SELECT {EVENT_COLUMNS} FROM event \
-                     WHERE camera_id = 'cam1' AND nvr_time_us >= 0 AND nvr_time_us < 100 \
-                     ORDER BY nvr_time_us, id LIMIT 10"
-                ),
-                "event_camera_time",
-            ),
-            (
-                format!(
-                    "EXPLAIN QUERY PLAN \
-                     SELECT {EVENT_COLUMNS} FROM event \
-                     WHERE camera_id = 'cam1' AND nvr_time_us = 50 AND id > 50 \
-                       AND nvr_time_us < 100 \
-                     UNION ALL \
-                     SELECT {EVENT_COLUMNS} FROM event \
-                     WHERE camera_id = 'cam1' AND nvr_time_us > 50 AND nvr_time_us < 100 \
-                     ORDER BY nvr_time_us, id LIMIT 10"
-                ),
-                "event_camera_time",
-            ),
-            (
-                format!(
-                    "EXPLAIN QUERY PLAN SELECT {EVENT_COLUMNS} FROM event \
-                     WHERE nvr_time_us >= 0 AND nvr_time_us < 100 \
-                     ORDER BY nvr_time_us, id LIMIT 10"
-                ),
-                "event_time",
-            ),
-            (
-                format!(
-                    "EXPLAIN QUERY PLAN \
-                     SELECT {EVENT_COLUMNS} FROM event \
-                     WHERE nvr_time_us = 50 AND id > 50 AND nvr_time_us < 100 \
-                     UNION ALL \
-                     SELECT {EVENT_COLUMNS} FROM event \
-                     WHERE nvr_time_us > 50 AND nvr_time_us < 100 \
-                     ORDER BY nvr_time_us, id LIMIT 10"
-                ),
-                "event_time",
-            ),
+            (event_query_sql(true, false), "event_camera_time"),
+            (event_query_sql(true, true), "event_camera_time"),
+            (event_query_sql(false, false), "event_time"),
+            (event_query_sql(false, true), "event_time"),
         ] {
-            let plan = explain(&sql);
-            assert!(plan.contains(index), "{plan}");
-            assert!(!plan.contains("TEMP B-TREE"), "{plan}");
+            let plan = explain(&db.conn, &sql);
+            assert!(plan.contains(index), "{sql}: {plan}");
+            assert!(!plan.contains("TEMP B-TREE"), "{sql}: {plan}");
             if sql.contains("UNION ALL") {
-                assert!(plan.contains("MERGE (UNION ALL)"), "{plan}");
+                assert!(plan.contains("MERGE (UNION ALL)"), "{sql}: {plan}");
             }
         }
 
-        let global_retention = explain(
-            "EXPLAIN QUERY PLAN SELECT id FROM segment \
-             WHERE sealed = 1 AND deleting = 0 \
-             ORDER BY wall_start_us, id LIMIT 10",
-        );
-        assert!(
-            global_retention.contains("segment_retention_time"),
-            "{global_retention}"
-        );
-        assert!(
-            !global_retention.contains("TEMP B-TREE"),
-            "{global_retention}"
-        );
+        for (sql, index) in [
+            (
+                retention_candidate_query_sql(false, false),
+                "segment_retention_time",
+            ),
+            (
+                retention_candidate_query_sql(false, true),
+                "segment_retention_time",
+            ),
+            (
+                retention_candidate_query_sql(true, false),
+                "segment_retention_root_time",
+            ),
+            (
+                retention_candidate_query_sql(true, true),
+                "segment_retention_root_time",
+            ),
+            (
+                expired_candidate_query_sql(false),
+                "segment_retention_stream_time",
+            ),
+            (
+                expired_candidate_query_sql(true),
+                "segment_retention_stream_time",
+            ),
+        ] {
+            let plan = explain(&db.conn, &sql);
+            assert!(plan.contains(index), "{sql}: {plan}");
+            assert!(
+                plan.contains("event_active_camera_deadline_time"),
+                "protection seeks the deadline index: {plan}"
+            );
+        }
 
-        let root_retention = explain(
-            "EXPLAIN QUERY PLAN SELECT id FROM segment \
-             WHERE root = '/video/a' AND sealed = 1 AND deleting = 0 \
-             ORDER BY wall_start_us, id LIMIT 10",
-        );
-        assert!(
-            root_retention.contains("segment_retention_root_time"),
-            "{root_retention}"
-        );
-        assert!(!root_retention.contains("TEMP B-TREE"), "{root_retention}");
-
-        let camera_horizon = explain(
-            "EXPLAIN QUERY PLAN SELECT MIN(wall_start_us) FROM segment \
-             WHERE camera_id = 'cam1' AND deleting = 0",
-        );
+        let camera_horizon = explain(&db.conn, EVENT_HORIZON_SQL);
         assert!(
             camera_horizon.contains("segment_camera_horizon"),
             "{camera_horizon}"
@@ -3004,45 +3603,13 @@ mod tests {
     fn protection_query_plans_use_deadline_indexes() {
         let dir = tempfile::tempdir().unwrap();
         let db = Db::open(&dir.path().join("protection-plans.db")).unwrap();
-        let explain = |sql: &str| -> String {
-            db.conn
-                .prepare(sql)
-                .unwrap()
-                .query_map([], |row| row.get::<_, String>(3))
-                .unwrap()
-                .collect::<Result<Vec<_>, _>>()
-                .unwrap()
-                .join("; ")
-        };
-        let page = explain(
-            "EXPLAIN QUERY PLAN \
-             SELECT id, camera_id, nvr_time_us, retain_until_us FROM event \
-             WHERE retain_until_us = 2 AND id > 3 \
-             UNION ALL \
-             SELECT id, camera_id, nvr_time_us, retain_until_us FROM event \
-             WHERE retain_until_us > 2 \
-             ORDER BY retain_until_us, id LIMIT 10",
-        );
-        assert!(page.contains("event_retain_until"), "{page}");
-        assert!(!page.contains("TEMP B-TREE"), "{page}");
-        assert!(page.contains("MERGE (UNION ALL)"), "{page}");
-
-        let atomic_mark = explain(
-            "EXPLAIN QUERY PLAN \
-             UPDATE segment AS candidate SET deleting = 1 \
-             WHERE candidate.id = 1 AND candidate.sealed = 1 AND candidate.deleting = 0 \
-               AND NOT EXISTS ( \
-                 SELECT 1 FROM event AS protected \
-                 WHERE protected.camera_id = candidate.camera_id \
-                   AND protected.retain_until_us > 1 \
-                   AND protected.nvr_time_us > candidate.wall_start_us - 1 \
-                   AND protected.nvr_time_us < candidate.wall_end_us + 1 \
-               )",
-        );
-        assert!(
-            atomic_mark.contains("event_active_camera_deadline_time"),
-            "{atomic_mark}"
-        );
+        for sql in [mark_sql(false), mark_sql(true)] {
+            let atomic_mark = explain(&db.conn, &sql);
+            assert!(
+                atomic_mark.contains("event_active_camera_deadline_time"),
+                "{sql}: {atomic_mark}"
+            );
+        }
     }
 
     #[test]
@@ -3173,55 +3740,6 @@ mod tests {
         assert_eq!(large_ids.len(), 32);
     }
 
-    fn protection_tie_steps(count: i64) -> (i32, Vec<EventId>) {
-        let dir = tempfile::tempdir().unwrap();
-        let mut db = Db::open(&dir.path().join("protection-ties.db")).unwrap();
-        db.conn
-            .execute(
-                "WITH RECURSIVE seq(value) AS ( \
-                   VALUES(1) UNION ALL SELECT value + 1 FROM seq WHERE value < ?1 \
-                 ) INSERT INTO event( \
-                   id, camera_id, source, kind, state, nvr_time_us, retain_until_us, storage_bytes \
-                 ) SELECT value, 'cam1', 'manual', 'motion', 'pulse', 100, 1000, 0 FROM seq",
-                params![count],
-            )
-            .unwrap();
-        let cursor = EventProtectionCursor {
-            retain_until: WallUs::new(1000),
-            id: EventId(count / 2),
-        };
-        let sql = event_protection_query_sql(true);
-        reset_statement_steps(&db.conn, sql);
-        let rows = db
-            .event_protections(WallUs::new(1), Some(cursor), 32)
-            .unwrap();
-        let steps = statement_steps(&db.conn, sql);
-        let ids: Vec<EventId> = rows.into_iter().map(|row| row.id).collect();
-        assert_eq!(ids.first(), Some(&EventId(count / 2 + 1)));
-        assert_eq!(ids.last(), Some(&EventId(count / 2 + 32)));
-        (steps, ids)
-    }
-
-    #[test]
-    fn tied_protection_continuation_seeks_to_the_midpoint_at_scale() {
-        let (small_steps, small_ids) = protection_tie_steps(1_000);
-        let (large_steps, large_ids) = protection_tie_steps(50_000);
-        assert!(
-            small_steps < 5_000,
-            "small page used {small_steps} VM steps"
-        );
-        assert!(
-            large_steps < 5_000,
-            "large page used {large_steps} VM steps"
-        );
-        assert!(
-            large_steps <= small_steps + 256,
-            "page scaled from {small_steps} to {large_steps} VM steps"
-        );
-        assert_eq!(small_ids.len(), 32);
-        assert_eq!(large_ids.len(), 32);
-    }
-
     fn tied_segment_continuation_steps(count: i64) -> ([i32; 3], Vec<SegmentId>) {
         let dir = tempfile::tempdir().unwrap();
         let mut db = Db::open(&dir.path().join("segment-ties.db")).unwrap();
@@ -3244,7 +3762,7 @@ mod tests {
                 params![count],
             )
             .unwrap();
-        let after = Some((WallUs::new(100), SegmentId(count / 2)));
+        let after = Some(cursor(100, count / 2));
         let global_sql = retention_candidate_query_sql(false, true);
         reset_statement_steps(&db.conn, &global_sql);
         let global = db
@@ -3314,7 +3832,7 @@ mod tests {
         ] {
             reset_statement_steps(&db.conn, sql);
         }
-        let tx = db.conn.transaction().unwrap();
+        let tx = write_transaction(&mut db.conn).unwrap();
         let cursor = maintain_events_tx(
             &tx,
             WallUs::new(0),
@@ -3386,7 +3904,7 @@ mod tests {
 
         let mut cursor = None;
         for pass in 0..4 {
-            let tx = db.conn.transaction().unwrap();
+            let tx = write_transaction(&mut db.conn).unwrap();
             cursor = maintain_events_tx(
                 &tx,
                 WallUs::new(0),
@@ -3424,77 +3942,6 @@ mod tests {
         assert_eq!(remaining_b, 0);
     }
 
-    fn protection_continuation_steps(expired: i64) -> (i32, Vec<EventId>) {
-        let dir = tempfile::tempdir().unwrap();
-        let mut db = Db::open(&dir.path().join("protection-scale.db")).unwrap();
-        db.conn
-            .execute_batch(
-                "WITH RECURSIVE seq(value) AS ( \
-                   VALUES(1) UNION ALL SELECT value + 1 FROM seq WHERE value < 512 \
-                 ) INSERT INTO event( \
-                   id, camera_id, source, kind, state, nvr_time_us, retain_until_us, storage_bytes \
-                 ) SELECT value, 'cam1', 'manual', 'motion', 'pulse', value - 512, 1000, 0 \
-                   FROM seq;",
-            )
-            .unwrap();
-        db.conn
-            .execute(
-                "WITH RECURSIVE seq(value) AS ( \
-                   VALUES(1) UNION ALL SELECT value + 1 FROM seq WHERE value < ?1 \
-                 ) INSERT INTO event( \
-                   id, camera_id, source, kind, state, nvr_time_us, retain_until_us, storage_bytes \
-                 ) SELECT value + 512, 'cam1', 'manual', 'motion', 'pulse', value, 0, 0 \
-                   FROM seq",
-                params![expired],
-            )
-            .unwrap();
-        db.conn
-            .execute(
-                "INSERT INTO event( \
-                   id, camera_id, source, kind, state, nvr_time_us, retain_until_us, storage_bytes \
-                 ) VALUES (?1, 'cam1', 'manual', 'motion', 'pulse', ?2, 2000, 0)",
-                params![expired + 513, expired + 1],
-            )
-            .unwrap();
-        let first = db.event_protections(WallUs::new(1), None, 512).unwrap();
-        let last = first.last().unwrap();
-        let cursor = EventProtectionCursor {
-            retain_until: last.retain_until,
-            id: last.id,
-        };
-        let sql = event_protection_query_sql(true);
-        reset_statement_steps(&db.conn, sql);
-        let second = db
-            .event_protections(WallUs::new(1), Some(cursor), 512)
-            .unwrap();
-        let steps = statement_steps(&db.conn, sql);
-        let ids = first.into_iter().chain(second).map(|row| row.id).collect();
-        (steps, ids)
-    }
-
-    #[test]
-    fn protection_continuation_is_deadline_indexed_at_scale() {
-        let (small_steps, small_ids) = protection_continuation_steps(1_000);
-        let (large_steps, large_ids) = protection_continuation_steps(50_000);
-        assert!(
-            small_steps < 10_000,
-            "small page used {small_steps} VM steps"
-        );
-        assert!(
-            large_steps < 10_000,
-            "large page used {large_steps} VM steps"
-        );
-        assert_eq!(small_steps, large_steps);
-        let expected = |tail| {
-            (1..=512)
-                .map(EventId)
-                .chain(std::iter::once(EventId(tail)))
-                .collect::<Vec<_>>()
-        };
-        assert_eq!(small_ids, expected(1_513));
-        assert_eq!(large_ids, expected(50_513));
-    }
-
     fn inactive_protection_history_steps(count: i64, retain_until: Option<i64>) -> i32 {
         let dir = tempfile::tempdir().unwrap();
         let mut db = Db::open(&dir.path().join("protection-history.db")).unwrap();
@@ -3527,7 +3974,7 @@ mod tests {
             .unwrap();
         let steps = statement_steps(&db.conn, &sql);
         assert_eq!(page.scanned, 1);
-        assert_eq!(page.next, Some((WallUs::new(100), SegmentId(1))));
+        assert_eq!(page.next, Some(cursor(100, 1)));
         assert_eq!(page.rows.len(), 1);
         assert_eq!(
             db.mark_deleting_if_unprotected(SegmentId(1), WallUs::new(2), 1)
@@ -3635,7 +4082,7 @@ mod tests {
             .unwrap();
         assert_eq!(first.rows, Vec::<SegmentRow>::new());
         assert_eq!(first.scanned, 16);
-        assert_eq!(first.next, Some((WallUs::new(16), SegmentId(16))));
+        assert_eq!(first.next, Some(cursor(16, 16)));
         let second = db
             .expired_candidates(&key, WallUs::new(100), first.next, WallUs::new(1), 1, 16)
             .unwrap();
@@ -3689,7 +4136,7 @@ mod tests {
         let first_steps = statement_steps(&db.conn, &first_sql);
         assert_eq!(first.rows, Vec::<SegmentRow>::new());
         assert_eq!(first.scanned, 16);
-        assert_eq!(first.next, Some((WallUs::new(16), SegmentId(16))));
+        assert_eq!(first.next, Some(cursor(16, 16)));
         assert!(
             first_steps < 10_000,
             "first page used {first_steps} VM steps"
@@ -3709,7 +4156,7 @@ mod tests {
         let second_steps = statement_steps(&db.conn, &next_sql);
         assert_eq!(second.rows, Vec::<SegmentRow>::new());
         assert_eq!(second.scanned, 16);
-        assert_eq!(second.next, Some((WallUs::new(32), SegmentId(32))));
+        assert_eq!(second.next, Some(cursor(32, 32)));
         assert!(
             second_steps < 10_000,
             "next page used {second_steps} VM steps"
@@ -3728,7 +4175,7 @@ mod tests {
         };
         let mut sizes = Vec::new();
         for cycle in 0..8 {
-            let tx = db.conn.transaction().unwrap();
+            let tx = write_transaction(&mut db.conn).unwrap();
             for row in 0..64 {
                 let value = Event {
                     camera: CameraId::try_new("cam1").unwrap(),
@@ -3776,7 +4223,7 @@ mod tests {
             .unwrap();
         db.retain_event(active_id, Some(WallUs::new(i64::MAX)))
             .unwrap();
-        let tx = db.conn.transaction().unwrap();
+        let tx = write_transaction(&mut db.conn).unwrap();
         maintain_events_tx(
             &tx,
             WallUs::new(1_700_000_100_000_000),
@@ -3790,11 +4237,18 @@ mod tests {
         )
         .unwrap();
         tx.commit().unwrap();
-        assert!(
-            db.retained_events(WallUs::new(1_700_000_100_000_000))
-                .unwrap()
-                .iter()
-                .any(|row| row.id == active_id)
+        let retain_until: Option<i64> = db
+            .conn
+            .query_row(
+                "SELECT retain_until_us FROM event WHERE id = ?1",
+                params![active_id.0],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            retain_until,
+            Some(i64::MAX),
+            "the active mark survived maintenance"
         );
     }
 
@@ -3820,7 +4274,7 @@ mod tests {
             prune_batch: 2,
         };
         let active_id = {
-            let tx = db.conn.transaction().unwrap();
+            let tx = write_transaction(&mut db.conn).unwrap();
             let mut first = None;
             for at in 1..=4 {
                 let mut event = tiny.clone();
@@ -3841,7 +4295,7 @@ mod tests {
         let mut accepted = 0usize;
         let mut rejected = 0usize;
         for at in 100..120 {
-            let tx = db.conn.transaction().unwrap();
+            let tx = write_transaction(&mut db.conn).unwrap();
             let mut event = large.clone();
             event.nvr_time = WallUs::new(at);
             let mut remaining = limits.prune_batch;
@@ -3945,13 +4399,12 @@ mod tests {
         let id = {
             let mut db = Db::open(&database).unwrap();
             let id = db.adopt_segment(&segment(media.clone())).unwrap();
-            db.mark_deleting(id).unwrap();
+            assert_eq!(db.mark_deleting(id).unwrap(), DeleteMarkResult::Marked);
             let synchronous: i64 = db
                 .conn
                 .pragma_query_value(None, "synchronous", |row| row.get(0))
                 .unwrap();
             assert_eq!(synchronous, 1, "ordinary work must return to NORMAL");
-            eprintln!("mark_deleting returned after its FULL commit");
             assert_eq!(db.segment(id).unwrap(), None);
             assert_eq!(db.segment_by_path(&media).unwrap(), None);
             assert_eq!(
@@ -4081,7 +4534,7 @@ mod tests {
                 wall_start: WallUs::new(1_000_000),
                 media_start: 0,
                 init_len: 700,
-                sample_entry: std::sync::Arc::new(SampleEntry::new(
+                sample_entry: Arc::new(SampleEntry::new(
                     bytes::Bytes::from_static(b"\0\0\0\x10hvc1\0\0\0\0\0\0\0\0"),
                     "hvc1".into(),
                     16,
@@ -4152,7 +4605,7 @@ mod tests {
         let stats = db.stats().unwrap();
         assert_eq!((stats.deleting_segments, stats.deleting_bytes), (0, 0));
 
-        db.mark_deleting(removed).unwrap();
+        assert_eq!(db.mark_deleting(removed).unwrap(), DeleteMarkResult::Marked);
         let stats = db.stats().unwrap();
         assert_eq!(
             (

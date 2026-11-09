@@ -1,11 +1,12 @@
 [package]
 name = "iris-gui"
-description = "A GTK 4 viewer for irisd: live tiles decoded by GStreamer from the daemon's WebSocket feed"
 version.workspace = true
 edition.workspace = true
-rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "A GTK 4 viewer for irisd: live tiles, playback with a timeline, export, and camera provisioning"
 
 [[bin]]
 name = "iris-gui"
@@ -17,12 +18,14 @@ async-channel = { workspace = true }
 axum = { workspace = true }
 clap = { workspace = true, features = ["env"] }
 futures = { workspace = true }
-getrandom = "0.4"
+getrandom = { workspace = true }
 gst = { package = "gstreamer", version = "0.25" }
 gst_app = { package = "gstreamer-app", version = "0.25" }
 gst_video = { package = "gstreamer-video", version = "0.25" }
 gstgtk4 = { package = "gst-plugin-gtk4", version = "0.15", features = ["wayland", "x11egl", "x11glx", "dmabuf", "gtk_v4_14"] }
 gtk = { package = "gtk4", version = "0.11" }
+iris-core = { workspace = true }
+iris-tls = { workspace = true }
 reqwest = { workspace = true }
 rustix = { workspace = true }
 serde = { workspace = true }

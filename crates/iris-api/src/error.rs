@@ -15,15 +15,24 @@ static NEXT_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 ///
 /// HTTP 500 bodies never carry the failure's text: they read
 /// `{"error":"internal error","request_id":<n>}`, and the detail is logged at warn level with
-/// the same process-wide `request_id`. HTTP 400, 404, 502, and 503 bodies keep their message.
+/// the same process-wide `request_id`. HTTP 400, 403, 404, 409, 502, and 503 bodies keep
+/// their message.
 #[derive(Debug, Error)]
-pub enum ApiError {
+pub(crate) enum ApiError {
     /// The request was malformed.
     #[error("{0}")]
     BadRequest(String),
-    /// No such camera, stream, or segment.
+    /// The requested camera, stream, segment, event, or recording does not
+    /// exist or is not served (a row outside every approved root).
     #[error("not found")]
     NotFound,
+    /// The operation is not offered by this deployment, such as camera
+    /// provisioning while `[provisioning]` is disabled.
+    #[error("forbidden: {0}")]
+    Forbidden(String),
+    /// The request conflicts with the daemon's state, such as a camera id in use.
+    #[error("conflict: {0}")]
+    Conflict(String),
     /// The catalog failed.
     #[error("catalog: {0}")]
     Catalog(#[from] iris_catalog::CatalogError),
@@ -33,13 +42,19 @@ pub enum ApiError {
     /// An upstream camera request failed.
     #[error("upstream: {0}")]
     Upstream(String),
-    /// The resource exists but is not ready within the time a client waits.
+    /// A serving budget, an allocation, or a capacity limit was exhausted,
+    /// the daemon's camera control did not answer, or the resource was not
+    /// ready within the time a client waits.
     #[error("unavailable: {0}")]
     Unavailable(String),
     /// An admission budget is full: one media response class, the WebSocket socket caps, or
     /// a camera's single in-flight snapshot. Rendered as HTTP 503 with `Retry-After: 1`.
     #[error("busy: {0}")]
     Busy(String),
+    /// A request body the extractor refused, with the status the rejection
+    /// carries: HTTP 413 for a body over the limit.
+    #[error("{message}")]
+    Rejected { status: StatusCode, message: String },
 }
 
 #[derive(Serialize)]
@@ -54,12 +69,15 @@ impl IntoResponse for ApiError {
         let status = match &self {
             Self::BadRequest(_) => StatusCode::BAD_REQUEST,
             Self::NotFound => StatusCode::NOT_FOUND,
+            Self::Forbidden(_) => StatusCode::FORBIDDEN,
+            Self::Conflict(_) => StatusCode::CONFLICT,
             Self::Catalog(iris_catalog::CatalogError::Overloaded) => {
                 StatusCode::SERVICE_UNAVAILABLE
             }
             Self::Catalog(_) | Self::Io(_) => StatusCode::INTERNAL_SERVER_ERROR,
             Self::Upstream(_) => StatusCode::BAD_GATEWAY,
             Self::Unavailable(_) | Self::Busy(_) => StatusCode::SERVICE_UNAVAILABLE,
+            Self::Rejected { status, .. } => *status,
         };
         if status == StatusCode::INTERNAL_SERVER_ERROR {
             let request_id = NEXT_REQUEST_ID.fetch_add(1, Ordering::Relaxed);

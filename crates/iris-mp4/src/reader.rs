@@ -11,11 +11,19 @@
 //! A complete fragment beyond that limit ends the scan with
 //! [`ScanStop::FragmentLimit`].
 
+use std::fmt;
 use std::io::{self, Read, Seek, SeekFrom};
 
 use crate::boxes::{BoxHeader, be_u32, be_u64};
 use crate::crc::Crc32c;
-use crate::fragment::{MAX_MOOF_LEN, MAX_PAYLOAD_LEN, TRAILER_LEN, decode_trailer};
+use crate::fragment::{
+    MAX_MOOF_LEN, MAX_PAYLOAD_LEN, MAX_PRFT_LEN, MIN_PRFT_LEN, SAMPLE_IS_NON_SYNC,
+    TFHD_BASE_DATA_OFFSET_PRESENT, TFHD_DEFAULT_BASE_IS_MOOF, TFHD_DEFAULT_SAMPLE_DURATION_PRESENT,
+    TFHD_DEFAULT_SAMPLE_FLAGS_PRESENT, TFHD_DEFAULT_SAMPLE_SIZE_PRESENT,
+    TFHD_SAMPLE_DESCRIPTION_INDEX_PRESENT, TRAILER_LEN, TRUN_COMPOSITION_OFFSETS_PRESENT,
+    TRUN_DATA_OFFSET_PRESENT, TRUN_FIRST_SAMPLE_FLAGS_PRESENT, TRUN_SAMPLE_DURATION_PRESENT,
+    TRUN_SAMPLE_FLAGS_PRESENT, TRUN_SAMPLE_SIZE_PRESENT, Trailer, decode_trailer,
+};
 use crate::index::MAX_PERSISTED_INDEX_RECORDS;
 use iris_core::time::WallUs;
 
@@ -30,9 +38,9 @@ pub struct FragmentInfo {
     pub payload_offset: u64,
     /// `mfhd` sequence number.
     pub sequence: u32,
-    /// `tfdt` decode time.
+    /// `tfdt` decode time in 90 kHz ticks.
     pub decode_time: u64,
-    /// Sum of sample durations.
+    /// Sum of sample durations in 90 kHz ticks.
     pub duration: u32,
     /// Number of samples.
     pub sample_count: u16,
@@ -48,6 +56,7 @@ pub struct FragmentInfo {
 
 /// Why a scan stopped before the end of the file.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ScanStop {
     /// The file ended inside a fragment.
     Truncated {
@@ -59,7 +68,8 @@ pub enum ScanStop {
         /// Offset of the zero region.
         offset: u64,
     },
-    /// A box of an unexpected type or size.
+    /// A box of an unexpected type or size, or an initialization segment
+    /// longer than 4 GiB.
     BadBox {
         /// Offset of the box.
         offset: u64,
@@ -95,6 +105,37 @@ pub enum ScanStop {
     },
 }
 
+impl fmt::Display for ScanStop {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Truncated { offset } => {
+                write!(formatter, "the file ends inside the fragment at {offset}")
+            }
+            Self::ZeroFill { offset } => write!(formatter, "zero-filled space at {offset}"),
+            Self::BadBox { offset, kind } => {
+                write!(
+                    formatter,
+                    "unexpected box {} at {offset}",
+                    kind.escape_ascii()
+                )
+            }
+            Self::BadFragment { offset, reason } => {
+                write!(formatter, "malformed fragment at {offset}: {reason}")
+            }
+            Self::BadTrailer { offset } => {
+                write!(formatter, "bad trailer on the fragment at {offset}")
+            }
+            Self::CrcMismatch { offset } => {
+                write!(formatter, "CRC mismatch on the fragment at {offset}")
+            }
+            Self::FragmentLimit { offset, limit } => write!(
+                formatter,
+                "more than {limit} fragments; the first beyond the limit starts at {offset}"
+            ),
+        }
+    }
+}
+
 /// What a scan found: the init segment length, every valid fragment, how many
 /// bytes from the start are valid, and why the scan stopped if it did not reach
 /// a clean end of file. Unless the scan stopped at
@@ -113,12 +154,42 @@ pub struct ScanReport {
 
 /// What a scan reads. The default checks structure only, which is enough to
 /// index a file; recovery and self-checks also verify every trailer CRC.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct ScanOptions {
     /// Read every payload and verify the trailer CRC (slower; used for recovery).
     pub verify_crc: bool,
-    /// Keep per-sample durations and sizes in [`FragmentInfo`].
+    /// Keep per-sample durations and sizes in [`FragmentInfo`]: 8 bytes per
+    /// sample, up to 65,535 samples per fragment, beyond the fragment table
+    /// itself.
     pub collect_samples: bool,
+}
+
+/// Why a stage of a scan ended: the reader failed, or the content stops the
+/// scan. Stages use `?` on both; [`scanned`] separates them again.
+enum Stop {
+    Io(io::Error),
+    Scan(ScanStop),
+}
+
+impl From<io::Error> for Stop {
+    fn from(error: io::Error) -> Self {
+        Self::Io(error)
+    }
+}
+
+impl From<ScanStop> for Stop {
+    fn from(stop: ScanStop) -> Self {
+        Self::Scan(stop)
+    }
+}
+
+/// Splits a stage result into the reader failure and the scan outcome.
+fn scanned<T>(result: Result<T, Stop>) -> io::Result<Result<T, ScanStop>> {
+    match result {
+        Ok(value) => Ok(Ok(value)),
+        Err(Stop::Io(error)) => Err(error),
+        Err(Stop::Scan(stop)) => Ok(Err(stop)),
+    }
 }
 
 /// Scans a recording, accepting at most [`MAX_PERSISTED_INDEX_RECORDS`]
@@ -138,7 +209,8 @@ pub fn scan<R: Read + Seek>(reader: R, options: ScanOptions) -> io::Result<ScanR
 /// report stops with [`ScanStop::FragmentLimit`] at that fragment's offset. A
 /// damaged region right after the limit reports its own stop reason instead,
 /// so a file holding exactly `max_fragments` fragments and a torn tail is
-/// reported like any other torn file.
+/// reported like any other torn file. A file that ends right after its
+/// initialization segment is a clean scan with no fragments.
 ///
 /// # Errors
 ///
@@ -152,7 +224,7 @@ pub fn scan_with_limit<R: Read + Seek>(
     let file_len = reader.seek(SeekFrom::End(0))?;
     reader.seek(SeekFrom::Start(0))?;
 
-    let init_len = match scan_initialization(&mut reader, file_len)? {
+    let init_len = match scanned(scan_initialization(&mut reader, file_len))? {
         Ok(init_len) => init_len,
         Err(stop) => {
             return Ok(ScanReport {
@@ -163,124 +235,18 @@ pub fn scan_with_limit<R: Read + Seek>(
             });
         }
     };
-    scan_fragments(
-        &mut reader,
-        file_len,
-        init_len,
-        u64::from(init_len),
-        options,
-        max_fragments,
-    )
-}
-
-/// Validates the initialization and scans fragments beginning at `start`.
-///
-/// Bytes between the initialization and `start` are not read. The caller must
-/// establish that `start` is a trusted fragment boundary, for example from a
-/// contiguous sidecar index whose last record is then validated by this scan.
-/// Like [`scan`], it accepts at most [`MAX_PERSISTED_INDEX_RECORDS`]
-/// fragments, counted from `start`.
-///
-/// # Errors
-///
-/// Returns an invalid-input error when `start` is before the end of the
-/// initialization or past the file length, and propagates reader failures.
-pub fn scan_from_offset<R: Read + Seek>(
-    mut reader: R,
-    start: u64,
-    options: ScanOptions,
-) -> io::Result<ScanReport> {
-    let file_len = reader.seek(SeekFrom::End(0))?;
-    reader.seek(SeekFrom::Start(0))?;
-    let init_len = match scan_initialization(&mut reader, file_len)? {
-        Ok(init_len) => init_len,
-        Err(stop) => {
-            return Ok(ScanReport {
-                init_len: 0,
-                fragments: Vec::new(),
-                valid_len: 0,
-                stop: Some(stop),
-            });
-        }
-    };
-    if start < u64::from(init_len) || start > file_len {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "scan offset is outside the fragment region",
-        ));
-    }
-    scan_fragments(
-        &mut reader,
-        file_len,
-        init_len,
-        start,
-        options,
-        MAX_PERSISTED_INDEX_RECORDS,
-    )
-}
-
-/// Reads and validates exactly one fragment at `start` without following it
-/// through the remainder of the file.
-///
-/// This is intended for binding a bounded sidecar cache to selected physical
-/// media facts. It does not validate the initialization segment; callers that
-/// trust initialization facts must also validate those independently.
-pub fn scan_fragment_at<R: Read + Seek>(
-    mut reader: R,
-    start: u64,
-    options: ScanOptions,
-) -> io::Result<Option<FragmentInfo>> {
-    let file_len = reader.seek(SeekFrom::End(0))?;
-    match scan_fragment(&mut reader, start, file_len, options)? {
-        Ok(info) => Ok(Some(info)),
-        Err(_) => Ok(None),
-    }
-}
-
-fn scan_initialization<R: Read + Seek>(
-    reader: &mut R,
-    file_len: u64,
-) -> io::Result<Result<u32, ScanStop>> {
-    let mut offset = 0u64;
-    for expected in [*b"ftyp", *b"moov"] {
-        let header = match read_header(reader, offset, file_len)? {
-            Some(header) if header.kind == expected => header,
-            Some(header) => {
-                return Ok(Err(ScanStop::BadBox {
-                    offset,
-                    kind: header.kind,
-                }));
-            }
-            None => return Ok(Err(ScanStop::Truncated { offset })),
-        };
-        let size = header.size.unwrap_or(file_len - offset);
-        // A declared size past the end of the file (a 64-bit `largesize` among them)
-        // must stop the scan, not overflow the offset.
-        if size < u64::from(header.header_len) || size > file_len - offset {
-            return Ok(Err(ScanStop::Truncated { offset }));
-        }
-        offset += size;
-    }
-    let init_len = u32::try_from(offset).map_err(|_| io::Error::other("init segment too large"))?;
-    Ok(Ok(init_len))
-}
-
-fn scan_fragments<R: Read + Seek>(
-    reader: &mut R,
-    file_len: u64,
-    init_len: u32,
-    mut offset: u64,
-    options: ScanOptions,
-    max_fragments: usize,
-) -> io::Result<ScanReport> {
     let mut report = ScanReport {
         init_len,
         fragments: Vec::new(),
-        valid_len: offset,
+        valid_len: u64::from(init_len),
         stop: None,
     };
+    let mut offset = u64::from(init_len);
     loop {
-        match scan_fragment(reader, offset, file_len, options)? {
+        if offset == file_len {
+            return Ok(report);
+        }
+        match scan_fragment(&mut reader, offset, file_len, options)? {
             Ok(_) if report.fragments.len() >= max_fragments => {
                 report.stop = Some(ScanStop::FragmentLimit {
                     offset,
@@ -292,9 +258,6 @@ fn scan_fragments<R: Read + Seek>(
                 offset += u64::from(info.len);
                 report.valid_len = offset;
                 report.fragments.push(info);
-                if offset == file_len {
-                    return Ok(report);
-                }
             }
             Err(stop) => {
                 report.stop = Some(stop);
@@ -304,173 +267,126 @@ fn scan_fragments<R: Read + Seek>(
     }
 }
 
+/// Accepts `ftyp` then `moov` and returns their combined length.
+fn scan_initialization<R: Read + Seek>(reader: &mut R, file_len: u64) -> Result<u32, Stop> {
+    let mut offset = 0u64;
+    let mut moov_offset = 0u64;
+    for expected in [*b"ftyp", *b"moov"] {
+        let header = match read_header(reader, offset, file_len)? {
+            Some(header) if header.kind == expected => header,
+            Some(header) => {
+                return Err(ScanStop::BadBox {
+                    offset,
+                    kind: header.kind,
+                }
+                .into());
+            }
+            None => return Err(ScanStop::Truncated { offset }.into()),
+        };
+        let size = header.size.unwrap_or(file_len - offset);
+        // A declared size past the end of the file (a 64-bit `largesize` among them)
+        // must stop the scan, not overflow the offset.
+        if size < u64::from(header.header_len) || size > file_len - offset {
+            return Err(ScanStop::Truncated { offset }.into());
+        }
+        moov_offset = offset;
+        offset += size;
+    }
+    // The sidecar and the fragment addressing hold the init length in 32 bits.
+    u32::try_from(offset).map_err(|_| {
+        ScanStop::BadBox {
+            offset: moov_offset,
+            kind: *b"moov",
+        }
+        .into()
+    })
+}
+
 fn read_exact_at<R: Read + Seek>(reader: &mut R, offset: u64, buf: &mut [u8]) -> io::Result<()> {
     reader.seek(SeekFrom::Start(offset))?;
     reader.read_exact(buf)
 }
 
+/// The box header at `offset`, or `None` when fewer than 8 bytes remain.
 fn read_header<R: Read + Seek>(
     reader: &mut R,
     offset: u64,
     file_len: u64,
 ) -> io::Result<Option<BoxHeader>> {
-    if offset + 8 > file_len {
+    if offset.saturating_add(8) > file_len {
         return Ok(None);
     }
     let mut buf = [0u8; 16];
-    let n = usize::try_from((file_len - offset).min(16)).expect("bounded");
+    let n = usize::try_from((file_len - offset).min(16)).expect("at most 16 bytes");
     read_exact_at(reader, offset, &mut buf[..n])?;
     Ok(BoxHeader::parse(&buf[..n]))
 }
 
-#[allow(clippy::too_many_lines)]
+/// Reads and validates the fragment at `start`.
 fn scan_fragment<R: Read + Seek>(
     reader: &mut R,
     start: u64,
     file_len: u64,
     options: ScanOptions,
 ) -> io::Result<Result<FragmentInfo, ScanStop>> {
+    scanned(fragment_at(reader, start, file_len, options))
+}
+
+fn fragment_at<R: Read + Seek>(
+    reader: &mut R,
+    start: u64,
+    file_len: u64,
+    options: ScanOptions,
+) -> Result<FragmentInfo, Stop> {
     let mut offset = start;
-    let mut header_buf = [0u8; 8];
-    if offset + 8 > file_len {
-        return Ok(Err(ScanStop::Truncated { offset }));
-    }
-    read_exact_at(reader, offset, &mut header_buf)?;
-    if header_buf == [0u8; 8] {
-        return Ok(Err(ScanStop::ZeroFill { offset }));
-    }
-
-    // Optional prft.
+    let mut header = read_fragment_box_header(reader, offset, start, file_len)?;
     let mut wall = None;
-    let Some(first) = BoxHeader::parse(&header_buf) else {
-        return Ok(Err(ScanStop::BadBox {
-            offset,
-            kind: [header_buf[4], header_buf[5], header_buf[6], header_buf[7]],
-        }));
-    };
-    let mut crc_start = offset;
-    if first.kind == *b"prft" {
-        let Some(size) = first.size.filter(|s| (24..=64).contains(s)) else {
-            return Ok(Err(ScanStop::BadBox {
-                offset,
-                kind: first.kind,
-            }));
-        };
-        if offset + size > file_len {
-            return Ok(Err(ScanStop::Truncated { offset }));
-        }
-        let mut prft = vec![0u8; size as usize];
-        read_exact_at(reader, offset, &mut prft)?;
-        let version = prft[8];
-        wall = if version == 1 {
-            be_u64(&prft, 16).map(WallUs::from_ntp64)
-        } else {
-            be_u32(&prft, 16).map(|_| WallUs::from_ntp64(be_u64(&prft, 16).unwrap_or(0)))
-        };
+    if header.kind == *b"prft" {
+        let (prft_wall, size) = read_prft(reader, offset, header, file_len)?;
+        wall = prft_wall;
         offset += size;
-        crc_start = start;
-        if offset + 8 > file_len {
-            return Ok(Err(ScanStop::Truncated { offset: start }));
-        }
-        read_exact_at(reader, offset, &mut header_buf)?;
+        header = read_fragment_box_header(reader, offset, start, file_len)?;
     }
-
-    // moof
-    let Some(moof) = BoxHeader::parse(&header_buf).filter(|h| h.kind == *b"moof") else {
-        return Ok(Err(ScanStop::BadBox {
+    if header.kind != *b"moof" {
+        return Err(ScanStop::BadBox {
             offset,
-            kind: [header_buf[4], header_buf[5], header_buf[6], header_buf[7]],
-        }));
-    };
-    let Some(moof_size) = moof.size.filter(|s| *s <= MAX_MOOF_LEN as u64) else {
-        return Ok(Err(ScanStop::BadFragment {
+            kind: header.kind,
+        }
+        .into());
+    }
+    let moof_size = header
+        .size
+        .filter(|size| *size <= MAX_MOOF_LEN as u64)
+        .ok_or(ScanStop::BadFragment {
             offset: start,
             reason: "moof size out of range",
-        }));
-    };
-    if offset + moof_size > file_len {
-        return Ok(Err(ScanStop::Truncated { offset: start }));
+        })?;
+    if moof_size > file_len - offset {
+        return Err(ScanStop::Truncated { offset: start }.into());
     }
     let mut moof_buf = vec![0u8; moof_size as usize];
     read_exact_at(reader, offset, &mut moof_buf)?;
-    let parsed = match parse_moof(&moof_buf, options.collect_samples) {
-        Ok(p) => p,
-        Err(reason) => {
-            return Ok(Err(ScanStop::BadFragment {
-                offset: start,
-                reason,
-            }));
-        }
-    };
+    let parsed = parse_moof(
+        &moof_buf[usize::from(header.header_len)..],
+        options.collect_samples,
+    )
+    .map_err(|reason| ScanStop::BadFragment {
+        offset: start,
+        reason,
+    })?;
     offset += moof_size;
 
-    // mdat
-    if offset + 8 > file_len {
-        return Ok(Err(ScanStop::Truncated { offset: start }));
-    }
-    read_exact_at(reader, offset, &mut header_buf)?;
-    let Some(mdat) = BoxHeader::parse(&header_buf).filter(|h| h.kind == *b"mdat") else {
-        return Ok(Err(ScanStop::BadFragment {
-            offset: start,
-            reason: "mdat missing",
-        }));
-    };
-    let Some(mdat_size) = mdat.size else {
-        return Ok(Err(ScanStop::BadFragment {
-            offset: start,
-            reason: "open-ended mdat",
-        }));
-    };
-    let payload_len = mdat_size.saturating_sub(u64::from(mdat.header_len));
-    if payload_len != parsed.total_size || payload_len > MAX_PAYLOAD_LEN {
-        return Ok(Err(ScanStop::BadFragment {
-            offset: start,
-            reason: "mdat size disagrees with trun",
-        }));
-    }
-    let payload_offset = offset + u64::from(mdat.header_len);
-    if u64::try_from(parsed.data_offset).ok() != Some(moof_size + u64::from(mdat.header_len)) {
-        return Ok(Err(ScanStop::BadFragment {
-            offset: start,
-            reason: "trun data offset does not address mdat payload",
-        }));
-    }
-    offset += mdat_size;
+    let (payload_offset, trailer_offset) =
+        read_mdat(reader, offset, start, file_len, &parsed, moof_size)?;
+    let (trailer, end) = read_trailer(reader, trailer_offset, start, file_len)?;
 
-    // trailer
-    if offset + TRAILER_LEN as u64 > file_len {
-        return Ok(Err(ScanStop::Truncated { offset: start }));
-    }
-    let mut trailer_buf = [0u8; TRAILER_LEN];
-    read_exact_at(reader, offset, &mut trailer_buf)?;
-    let Some(trailer) = decode_trailer(&trailer_buf) else {
-        return Ok(Err(ScanStop::BadTrailer { offset: start }));
-    };
-    offset += TRAILER_LEN as u64;
-    if u64::from(trailer.fragment_len) != offset - start {
-        return Ok(Err(ScanStop::BadTrailer { offset: start }));
+    if options.verify_crc && !crc_matches(reader, start, trailer_offset, trailer.crc)? {
+        return Err(ScanStop::CrcMismatch { offset: start }.into());
     }
 
-    if options.verify_crc {
-        let mut crc = Crc32c::new();
-        let mut remaining = payload_offset - crc_start + payload_len;
-        let mut pos = crc_start;
-        let mut buf = vec![0u8; 1 << 16];
-        while remaining > 0 {
-            let n = usize::try_from(remaining.min(buf.len() as u64)).expect("bounded");
-            read_exact_at(reader, pos, &mut buf[..n])?;
-            crc.update(&buf[..n]);
-            pos += n as u64;
-            remaining -= n as u64;
-        }
-        if crc.finish() != trailer.crc {
-            return Ok(Err(ScanStop::CrcMismatch { offset: start }));
-        }
-    }
-
-    Ok(Ok(FragmentInfo {
+    Ok(FragmentInfo {
         offset: start,
-        len: trailer.fragment_len,
+        len: u32::try_from(end - start).expect("the trailer's length field matched"),
         payload_offset,
         sequence: parsed.sequence,
         decode_time: parsed.decode_time,
@@ -480,16 +396,158 @@ fn scan_fragment<R: Read + Seek>(
         wall,
         sample_durations: parsed.durations,
         sample_sizes: parsed.sizes,
-    }))
+    })
+}
+
+/// The 8-byte header of a top-level fragment box at `offset`. At the
+/// fragment's `start`, eight zero bytes are preallocated space.
+fn read_fragment_box_header<R: Read + Seek>(
+    reader: &mut R,
+    offset: u64,
+    start: u64,
+    file_len: u64,
+) -> Result<BoxHeader, Stop> {
+    if offset.saturating_add(8) > file_len {
+        return Err(ScanStop::Truncated { offset: start }.into());
+    }
+    let mut buf = [0u8; 8];
+    read_exact_at(reader, offset, &mut buf)?;
+    if offset == start && buf == [0u8; 8] {
+        return Err(ScanStop::ZeroFill { offset }.into());
+    }
+    BoxHeader::parse(&buf).ok_or_else(|| {
+        ScanStop::BadBox {
+            offset,
+            kind: [buf[4], buf[5], buf[6], buf[7]],
+        }
+        .into()
+    })
+}
+
+/// Reads a `prft` box whose header is `header`: its wall time and its size.
+fn read_prft<R: Read + Seek>(
+    reader: &mut R,
+    offset: u64,
+    header: BoxHeader,
+    file_len: u64,
+) -> Result<(Option<WallUs>, u64), Stop> {
+    let size = header
+        .size
+        .filter(|size| (MIN_PRFT_LEN..=MAX_PRFT_LEN).contains(size))
+        .ok_or(ScanStop::BadBox {
+            offset,
+            kind: header.kind,
+        })?;
+    if size > file_len - offset {
+        return Err(ScanStop::Truncated { offset }.into());
+    }
+    let mut prft = vec![0u8; size as usize];
+    read_exact_at(reader, offset, &mut prft)?;
+    // version/flags(4) track(4) ntp(8) media_time(4 or 8): the NTP timestamp is
+    // 64 bits in both versions.
+    Ok((be_u64(&prft, 16).map(WallUs::from_ntp64), size))
+}
+
+/// Checks the `mdat` header at `offset` against the parsed `moof`; returns the
+/// payload offset and the trailer offset.
+fn read_mdat<R: Read + Seek>(
+    reader: &mut R,
+    offset: u64,
+    start: u64,
+    file_len: u64,
+    parsed: &ParsedMoof,
+    moof_size: u64,
+) -> Result<(u64, u64), Stop> {
+    if offset.saturating_add(8) > file_len {
+        return Err(ScanStop::Truncated { offset: start }.into());
+    }
+    let mut buf = [0u8; 8];
+    read_exact_at(reader, offset, &mut buf)?;
+    let mdat = BoxHeader::parse(&buf)
+        .filter(|header| header.kind == *b"mdat")
+        .ok_or(ScanStop::BadFragment {
+            offset: start,
+            reason: "mdat missing",
+        })?;
+    let mdat_size = mdat.size.ok_or(ScanStop::BadFragment {
+        offset: start,
+        reason: "open-ended mdat",
+    })?;
+    let payload_len = mdat_size.saturating_sub(u64::from(mdat.header_len));
+    if payload_len != parsed.total_size || payload_len > MAX_PAYLOAD_LEN {
+        return Err(ScanStop::BadFragment {
+            offset: start,
+            reason: "mdat size disagrees with trun",
+        }
+        .into());
+    }
+    if u64::try_from(parsed.data_offset).ok() != Some(moof_size + u64::from(mdat.header_len)) {
+        return Err(ScanStop::BadFragment {
+            offset: start,
+            reason: "trun data offset does not address mdat payload",
+        }
+        .into());
+    }
+    let payload_offset = offset + u64::from(mdat.header_len);
+    let trailer_offset = offset
+        .checked_add(mdat_size)
+        .ok_or(ScanStop::Truncated { offset: start })?;
+    Ok((payload_offset, trailer_offset))
+}
+
+/// Reads the trailer at `offset` and checks its length against the fragment
+/// that began at `start`; returns the trailer and the fragment's end.
+fn read_trailer<R: Read + Seek>(
+    reader: &mut R,
+    offset: u64,
+    start: u64,
+    file_len: u64,
+) -> Result<(Trailer, u64), Stop> {
+    if offset.saturating_add(TRAILER_LEN as u64) > file_len {
+        return Err(ScanStop::Truncated { offset: start }.into());
+    }
+    let mut buf = [0u8; TRAILER_LEN];
+    read_exact_at(reader, offset, &mut buf)?;
+    let trailer = decode_trailer(&buf).ok_or(ScanStop::BadTrailer { offset: start })?;
+    let end = offset + TRAILER_LEN as u64;
+    if u64::from(trailer.fragment_len) != end - start {
+        return Err(ScanStop::BadTrailer { offset: start }.into());
+    }
+    Ok((trailer, end))
+}
+
+/// Whether the CRC-32C of `[start, end)` equals `expected`.
+fn crc_matches<R: Read + Seek>(
+    reader: &mut R,
+    start: u64,
+    end: u64,
+    expected: u32,
+) -> io::Result<bool> {
+    let mut crc = Crc32c::new();
+    let mut buf = vec![0u8; 1 << 16];
+    let mut pos = start;
+    while pos < end {
+        let n =
+            usize::try_from((end - pos).min(buf.len() as u64)).expect("at most the 64 KiB buffer");
+        read_exact_at(reader, pos, &mut buf[..n])?;
+        crc.update(&buf[..n]);
+        pos += n as u64;
+    }
+    Ok(crc.finish() == expected)
 }
 
 /// Parses one complete fragment held in memory (optional `prft`, one `moof`,
-/// one `mdat`, final trailer) with its sample tables filled, without verifying the CRC. `offset`
-/// is 0. Returns `None` for anything malformed, including a trailer whose
-/// length disagrees with the buffer. For a serving path that has read one
-/// fragment out of a file; the scanner is for whole files.
+/// one `mdat`, final trailer) with its sample tables filled, without verifying
+/// the CRC. `offset` is 0. Returns `None` for anything malformed, including a
+/// trailer whose length disagrees with the buffer, and for a fragment beyond
+/// the scanner's bounds (`prft` outside 24 to 64 bytes, `moof` over
+/// [`MAX_MOOF_LEN`], payload over [`MAX_PAYLOAD_LEN`]), so a fragment this
+/// function accepts also scans. For a serving path that has read one fragment
+/// out of a file; the scanner is for whole files.
+///
 /// Both readers require `default-base-is-moof` and an explicit `trun` data
-/// offset to the adjacent `mdat` payload, with every declared table field present.
+/// offset to the adjacent `mdat` payload, with every declared table field
+/// present.
 #[must_use]
 pub fn parse_fragment(buf: &[u8]) -> Option<FragmentInfo> {
     let mut pos = 0usize;
@@ -508,12 +566,18 @@ pub fn parse_fragment(buf: &[u8]) -> Option<FragmentInfo> {
         let full = &buf[pos..pos + size];
         let body = &full[header_len..];
         match &header.kind {
-            b"prft" if pos == 0 => wall = Some(WallUs::from_ntp64(be_u64(body, 8)?)),
-            b"moof" if parsed.is_none() && payload.is_none() => {
-                moof_offset = pos;
-                parsed = Some(parse_moof(full, true).ok()?);
+            b"prft" if pos == 0 && (MIN_PRFT_LEN..=MAX_PRFT_LEN).contains(&(size as u64)) => {
+                wall = Some(WallUs::from_ntp64(be_u64(body, 8)?));
             }
-            b"mdat" if parsed.is_some() && payload.is_none() => {
+            b"moof" if parsed.is_none() && payload.is_none() && size <= MAX_MOOF_LEN => {
+                moof_offset = pos;
+                parsed = Some(parse_moof(body, /* collect_samples */ true).ok()?);
+            }
+            b"mdat"
+                if parsed.is_some()
+                    && payload.is_none()
+                    && body.len() as u64 <= MAX_PAYLOAD_LEN =>
+            {
                 payload = Some((pos + header_len, body.len() as u64));
             }
             b"free" if payload.is_some() && size == TRAILER_LEN && pos + size == buf.len() => {
@@ -561,64 +625,65 @@ struct ParsedMoof {
     sizes: Vec<u32>,
 }
 
-fn children(buf: &[u8]) -> impl Iterator<Item = (BoxHeader, &[u8])> {
+/// The sample table of one `trun`.
+struct Trun {
+    data_offset: i32,
+    /// The flags of the first sample, from `first_sample_flags` or the table.
+    first_flags: Option<u32>,
+    total_duration: u32,
+    total_size: u64,
+    sample_count: u16,
+    durations: Vec<u32>,
+    sizes: Vec<u32>,
+}
+
+/// The child boxes of a container body in order. A child whose header or
+/// declared size does not fit ends the walk with an error, so undecodable
+/// bytes inside `moof` or `traf` reject the fragment in both readers.
+fn children(buf: &[u8]) -> impl Iterator<Item = Result<(BoxHeader, &[u8]), &'static str>> {
     let mut pos = 0usize;
+    let mut failed = false;
     std::iter::from_fn(move || {
-        let header = BoxHeader::parse(&buf[pos..])?;
-        let size = usize::try_from(header.size?).ok()?;
-        // `size > buf.len() - pos` rather than `pos + size > buf.len()`: a
-        // declared size near `usize::MAX` must not overflow the addition.
-        if size < usize::from(header.header_len) || size > buf.len() - pos {
+        if failed || pos >= buf.len() {
             return None;
         }
-        let body = &buf[pos + usize::from(header.header_len)..pos + size];
-        pos += size;
-        Some((header, body))
+        let header = BoxHeader::parse(&buf[pos..]);
+        let size = header.and_then(|header| usize::try_from(header.size?).ok());
+        // `size > buf.len() - pos` rather than `pos + size > buf.len()`: a
+        // declared size near `usize::MAX` must not overflow the addition.
+        match (header, size) {
+            (Some(header), Some(size))
+                if size >= usize::from(header.header_len) && size <= buf.len() - pos =>
+            {
+                let body = &buf[pos + usize::from(header.header_len)..pos + size];
+                pos += size;
+                Some(Ok((header, body)))
+            }
+            _ => {
+                failed = true;
+                Some(Err("malformed child box"))
+            }
+        }
     })
 }
 
-#[allow(clippy::too_many_lines)]
-fn parse_moof(moof: &[u8], collect_samples: bool) -> Result<ParsedMoof, &'static str> {
-    let body = &moof[8..];
+/// Parses a `moof` body: `mfhd`, and one `traf` with `tfhd`, `tfdt`, and `trun`.
+fn parse_moof(body: &[u8], collect_samples: bool) -> Result<ParsedMoof, &'static str> {
     let mut sequence = None;
     let mut decode_time = None;
-    let mut default_flags = None;
-    let mut default_base_is_moof = false;
+    let mut tfhd = None;
     let mut trun = None;
-    for (h, b) in children(body) {
-        match &h.kind {
-            b"mfhd" => sequence = be_u32(b, 4),
+    for child in children(body) {
+        let (header, child_body) = child?;
+        match &header.kind {
+            b"mfhd" => sequence = be_u32(child_body, 4),
             b"traf" => {
-                for (th, tb) in children(b) {
-                    match &th.kind {
-                        b"tfhd" => {
-                            let flags = be_u32(tb, 0).ok_or("short tfhd")? & 0x00ff_ffff;
-                            if flags & 0x0002_0000 == 0 || flags & 0x1 != 0 {
-                                return Err("unsupported trun data base");
-                            }
-                            default_base_is_moof = true;
-                            let mut pos = 8;
-                            if flags & 0x2 != 0 {
-                                pos += 4;
-                            }
-                            if flags & 0x8 != 0 {
-                                pos += 4;
-                            }
-                            if flags & 0x10 != 0 {
-                                pos += 4;
-                            }
-                            if flags & 0x20 != 0 {
-                                default_flags = be_u32(tb, pos);
-                            }
-                        }
-                        b"tfdt" => {
-                            decode_time = if tb.first() == Some(&1) {
-                                be_u64(tb, 4)
-                            } else {
-                                be_u32(tb, 4).map(u64::from)
-                            };
-                        }
-                        b"trun" => trun = Some(tb),
+                for child in children(child_body) {
+                    let (header, child_body) = child?;
+                    match &header.kind {
+                        b"tfhd" => tfhd = Some(parse_tfhd(child_body)?),
+                        b"tfdt" => decode_time = parse_tfdt(child_body),
+                        b"trun" => trun = Some(parse_trun(child_body, collect_samples)?),
                         _ => {}
                     }
                 }
@@ -626,46 +691,108 @@ fn parse_moof(moof: &[u8], collect_samples: bool) -> Result<ParsedMoof, &'static
             _ => {}
         }
     }
-    if !default_base_is_moof {
-        return Err("tfhd missing");
-    }
+    let default_flags = tfhd.ok_or("tfhd missing")?;
     let trun = trun.ok_or("trun missing")?;
-    let flags = be_u32(trun, 0).ok_or("short trun")? & 0x00ff_ffff;
-    let count = be_u32(trun, 4).ok_or("short trun")?;
+    // irisd writes a tfhd default, so a fragment without any sample flags is
+    // not one of its own; the `trex` default is not consulted.
+    let first_flags = trun
+        .first_flags
+        .or(default_flags)
+        .ok_or("sample flags missing")?;
+    Ok(ParsedMoof {
+        data_offset: trun.data_offset,
+        sequence: sequence.ok_or("mfhd missing")?,
+        decode_time: decode_time.ok_or("tfdt missing")?,
+        total_duration: trun.total_duration,
+        total_size: trun.total_size,
+        sample_count: trun.sample_count,
+        starts_with_sync: first_flags & SAMPLE_IS_NON_SYNC == 0,
+        durations: trun.durations,
+        sizes: trun.sizes,
+    })
+}
+
+/// Parses a `tfhd` body: requires `default-base-is-moof` without a base data
+/// offset, and returns the default sample flags when declared. Every declared
+/// field must fit.
+fn parse_tfhd(body: &[u8]) -> Result<Option<u32>, &'static str> {
+    let flags = be_u32(body, 0).ok_or("short tfhd")? & 0x00ff_ffff;
+    if flags & TFHD_DEFAULT_BASE_IS_MOOF == 0 || flags & TFHD_BASE_DATA_OFFSET_PRESENT != 0 {
+        return Err("unsupported trun data base");
+    }
+    let mut pos = 8; // version/flags, track_ID
+    for optional in [
+        TFHD_SAMPLE_DESCRIPTION_INDEX_PRESENT,
+        TFHD_DEFAULT_SAMPLE_DURATION_PRESENT,
+        TFHD_DEFAULT_SAMPLE_SIZE_PRESENT,
+    ] {
+        if flags & optional != 0 {
+            pos += 4;
+        }
+    }
+    let default_flags = if flags & TFHD_DEFAULT_SAMPLE_FLAGS_PRESENT != 0 {
+        let value = be_u32(body, pos).ok_or("tfhd truncated")?;
+        pos += 4;
+        Some(value)
+    } else {
+        None
+    };
+    if body.len() < pos {
+        return Err("tfhd truncated");
+    }
+    Ok(default_flags)
+}
+
+/// The decode time of a `tfdt` body, 64 bits in version 1 and 32 in version 0.
+fn parse_tfdt(body: &[u8]) -> Option<u64> {
+    if body.first() == Some(&1) {
+        be_u64(body, 4)
+    } else {
+        be_u32(body, 4).map(u64::from)
+    }
+}
+
+/// Parses a `trun` body: a data offset, per-sample durations and sizes, and
+/// at least one sample.
+fn parse_trun(body: &[u8], collect_samples: bool) -> Result<Trun, &'static str> {
+    let flags = be_u32(body, 0).ok_or("short trun")? & 0x00ff_ffff;
+    let count = be_u32(body, 4).ok_or("short trun")?;
     let sample_count = u16::try_from(count).map_err(|_| "too many samples")?;
-    let mut pos = 8;
-    if flags & 0x1 == 0 {
+    if sample_count == 0 {
+        return Err("trun has no samples");
+    }
+    if flags & TRUN_DATA_OFFSET_PRESENT == 0 {
         return Err("trun data offset missing");
     }
-    let data_offset = be_u32(trun, pos).ok_or("trun truncated")? as i32;
+    let mut pos = 8;
+    let data_offset = be_u32(body, pos).ok_or("trun truncated")? as i32;
     pos += 4;
     let mut first_flags = None;
-    if flags & 0x4 != 0 {
-        first_flags = Some(be_u32(trun, pos).ok_or("trun truncated")?);
+    if flags & TRUN_FIRST_SAMPLE_FLAGS_PRESENT != 0 {
+        first_flags = Some(be_u32(body, pos).ok_or("trun truncated")?);
         pos += 4;
     }
-    if flags & 0x100 == 0 || flags & 0x200 == 0 {
+    if flags & TRUN_SAMPLE_DURATION_PRESENT == 0 || flags & TRUN_SAMPLE_SIZE_PRESENT == 0 {
         return Err("trun lacks per-sample duration or size");
     }
     let mut total_duration = 0u32;
     let mut total_size = 0u64;
     let mut durations = Vec::new();
     let mut sizes = Vec::new();
-    let mut first_sample_flags_in_table = None;
-    for i in 0..count {
-        let duration = be_u32(trun, pos).ok_or("trun truncated")?;
+    for index in 0..count {
+        let duration = be_u32(body, pos).ok_or("trun truncated")?;
         pos += 4;
-        let size = be_u32(trun, pos).ok_or("trun truncated")?;
+        let size = be_u32(body, pos).ok_or("trun truncated")?;
         pos += 4;
-        if flags & 0x400 != 0 {
-            let sample_flags = be_u32(trun, pos).ok_or("trun truncated")?;
-            if i == 0 {
-                first_sample_flags_in_table = Some(sample_flags);
+        if flags & TRUN_SAMPLE_FLAGS_PRESENT != 0 {
+            let sample_flags = be_u32(body, pos).ok_or("trun truncated")?;
+            if index == 0 && first_flags.is_none() {
+                first_flags = Some(sample_flags);
             }
             pos += 4;
         }
-        if flags & 0x800 != 0 {
-            be_u32(trun, pos).ok_or("trun truncated")?;
+        if flags & TRUN_COMPOSITION_OFFSETS_PRESENT != 0 {
+            be_u32(body, pos).ok_or("trun truncated")?;
             pos += 4;
         }
         total_duration = total_duration
@@ -677,19 +804,12 @@ fn parse_moof(moof: &[u8], collect_samples: bool) -> Result<ParsedMoof, &'static
             sizes.push(size);
         }
     }
-    let effective = first_flags
-        .or(first_sample_flags_in_table)
-        .or(default_flags)
-        .unwrap_or(0);
-    let starts_with_sync = effective & 0x0001_0000 == 0;
-    Ok(ParsedMoof {
+    Ok(Trun {
         data_offset,
-        sequence: sequence.ok_or("mfhd missing")?,
-        decode_time: decode_time.ok_or("tfdt missing")?,
+        first_flags,
         total_duration,
         total_size,
         sample_count,
-        starts_with_sync,
         durations,
         sizes,
     })
@@ -702,10 +822,15 @@ mod tests {
     use bytes::Bytes;
 
     use super::*;
+    use crate::crc::crc32c;
+    use crate::export::rebase_fragment;
+    use crate::fragment::{FragmentHeader, Sample, encode_fragment, encode_trailer};
+    use crate::init::build_init_segment;
+    use crate::init::tests::fake_sample_entry;
 
-    #[test]
-    fn parse_fragment_reads_an_encoded_fragment_back_and_rejects_a_short_one() {
-        use crate::fragment::{FragmentHeader, Sample, encode_fragment};
+    /// A two-sample fragment: a sync sample of six bytes and a dependent
+    /// sample of seven.
+    fn two_sample_fragment() -> ([Sample; 2], FragmentHeader, Vec<u8>) {
         let samples = [
             Sample {
                 data: Bytes::from_static(&[0, 0, 0, 2, 0x26, 1]),
@@ -725,10 +850,16 @@ mod tests {
         };
         let encoded = encode_fragment(&header, &samples).unwrap();
         let mut bytes = encoded.prefix.to_vec();
-        for s in &samples {
-            bytes.extend_from_slice(&s.data);
+        for sample in &samples {
+            bytes.extend_from_slice(&sample.data);
         }
         bytes.extend_from_slice(&encoded.trailer);
+        (samples, header, bytes)
+    }
+
+    #[test]
+    fn parse_fragment_reads_an_encoded_fragment_back() {
+        let (samples, header, bytes) = two_sample_fragment();
         let info = parse_fragment(&bytes).unwrap();
         assert_eq!(info.sequence, 7);
         assert_eq!(info.decode_time, 90_000);
@@ -742,13 +873,14 @@ mod tests {
             &samples[0].data[..]
         );
         assert_eq!(info.len as usize, bytes.len());
+    }
+
+    #[test]
+    fn parse_fragment_rejects_a_fragment_cut_at_either_end() {
+        let (_, _, bytes) = two_sample_fragment();
         assert!(parse_fragment(&bytes[..bytes.len() - 1]).is_none());
         assert!(parse_fragment(&bytes[1..]).is_none());
     }
-
-    use crate::fragment::{FragmentHeader, Sample, encode_fragment};
-    use crate::init::build_init_segment;
-    use crate::init::tests::fake_sample_entry;
 
     fn file_with(n: usize) -> Vec<u8> {
         let mut file = build_init_segment(&fake_sample_entry()).to_vec();
@@ -811,14 +943,26 @@ mod tests {
 
     fn repair_crc(bytes: &mut [u8]) {
         let end = bytes.len() - TRAILER_LEN;
-        let trailer =
-            crate::fragment::encode_trailer(crate::crc::crc32c(&bytes[..end]), bytes.len() as u32);
+        let trailer = encode_trailer(crc32c(&bytes[..end]), bytes.len() as u32);
         bytes[end..].copy_from_slice(&trailer);
     }
 
+    /// Adds `delta` to the size field of the box of `kind`.
+    fn grow_box(bytes: &mut [u8], kind: [u8; 4], delta: i64) {
+        let at = box_at(bytes, kind);
+        let size = u32::try_from(i64::from(be_u32(bytes, at).unwrap()) + delta).unwrap();
+        bytes[at..at + 4].copy_from_slice(&size.to_be_bytes());
+    }
+
     fn assert_fragment_rejected(bytes: &[u8]) {
-        assert!(parse_fragment(bytes).is_none());
-        assert!(crate::export::rebase_fragment(&mut bytes.to_vec(), 2, 3000).is_err());
+        assert!(
+            parse_fragment(bytes).is_none(),
+            "the memory parser accepted it"
+        );
+        assert!(
+            rebase_fragment(&mut bytes.to_vec(), 2, 3000).is_err(),
+            "the export rewrite accepted it"
+        );
         let mut file = file_with(1);
         let valid_len = file.len() as u64;
         file.extend_from_slice(bytes);
@@ -832,7 +976,30 @@ mod tests {
         .unwrap();
         assert_eq!(report.fragments.len(), 1);
         assert_eq!(report.valid_len, valid_len);
-        assert!(report.stop.is_some());
+        assert!(report.stop.is_some(), "the scanner accepted it");
+    }
+
+    fn assert_fragment_accepted(bytes: &[u8]) {
+        assert!(
+            parse_fragment(bytes).is_some(),
+            "the memory parser rejected it"
+        );
+        assert!(
+            rebase_fragment(&mut bytes.to_vec(), 2, 3000).is_ok(),
+            "the export rewrite rejected it"
+        );
+        let mut file = build_init_segment(&fake_sample_entry()).to_vec();
+        file.extend_from_slice(bytes);
+        let report = scan(
+            Cursor::new(file),
+            ScanOptions {
+                verify_crc: true,
+                collect_samples: true,
+            },
+        )
+        .unwrap();
+        assert_eq!(report.stop, None);
+        assert_eq!(report.fragments.len(), 1);
     }
 
     #[test]
@@ -852,13 +1019,95 @@ mod tests {
             assert_eq!(report.valid_len, 0);
             assert!(report.stop.is_some());
         }
-        for suffix in [vec![], vec![0, 0, 0, 32, b'p', b'r', b'f', b't']] {
-            let mut file = init.to_vec();
-            file.extend(suffix);
-            let report = scan(Cursor::new(file), ScanOptions::default()).unwrap();
-            assert_eq!(report.init_len as usize, init.len());
-            assert_eq!(report.valid_len as usize, init.len());
+    }
+
+    #[test]
+    fn an_initialization_only_file_is_a_clean_scan_without_fragments() {
+        let init = build_init_segment(&fake_sample_entry());
+        let report = scan(Cursor::new(init.to_vec()), ScanOptions::default()).unwrap();
+        assert_eq!(report.init_len as usize, init.len());
+        assert_eq!(report.valid_len as usize, init.len());
+        assert_eq!(report.fragments, Vec::<FragmentInfo>::new());
+        assert_eq!(report.stop, None);
+    }
+
+    #[test]
+    fn a_partial_fragment_header_after_the_initialization_is_truncation() {
+        let init = build_init_segment(&fake_sample_entry());
+        let mut file = init.to_vec();
+        file.extend([0, 0, 0, 32, b'p', b'r', b'f', b't']);
+        let report = scan(Cursor::new(file), ScanOptions::default()).unwrap();
+        assert_eq!(report.valid_len as usize, init.len());
+        assert_eq!(
+            report.stop,
+            Some(ScanStop::Truncated {
+                offset: init.len() as u64
+            })
+        );
+    }
+
+    /// A reader over `head` followed by zeros up to `len` bytes, for a
+    /// declared box size no test file could hold.
+    struct Sparse {
+        head: Vec<u8>,
+        len: u64,
+        pos: u64,
+    }
+
+    impl Read for Sparse {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            let remaining = self.len.saturating_sub(self.pos);
+            let n = buf
+                .len()
+                .min(usize::try_from(remaining).unwrap_or(usize::MAX));
+            for (i, byte) in buf[..n].iter_mut().enumerate() {
+                *byte = usize::try_from(self.pos + i as u64)
+                    .ok()
+                    .and_then(|at| self.head.get(at))
+                    .copied()
+                    .unwrap_or(0);
+            }
+            self.pos += n as u64;
+            Ok(n)
         }
+    }
+
+    impl Seek for Sparse {
+        fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+            let unreachable = || io::Error::other("seek outside the file");
+            self.pos = match pos {
+                SeekFrom::Start(at) => at,
+                SeekFrom::End(delta) => {
+                    self.len.checked_add_signed(delta).ok_or_else(unreachable)?
+                }
+                SeekFrom::Current(delta) => {
+                    self.pos.checked_add_signed(delta).ok_or_else(unreachable)?
+                }
+            };
+            Ok(self.pos)
+        }
+    }
+
+    #[test]
+    fn an_initialization_segment_over_4_gib_stops_the_scan_at_the_moov() {
+        let mut head = vec![
+            0, 0, 0, 8, b'f', b't', b'y', b'p', 0, 0, 0, 1, b'm', b'o', b'o', b'v',
+        ];
+        head.extend((1u64 << 32).to_be_bytes());
+        let reader = Sparse {
+            head,
+            len: 8 + (1u64 << 32),
+            pos: 0,
+        };
+        let report = scan(reader, ScanOptions::default()).unwrap();
+        assert_eq!(report.init_len, 0);
+        assert_eq!(
+            report.stop,
+            Some(ScanStop::BadBox {
+                offset: 8,
+                kind: *b"moov"
+            })
+        );
     }
 
     #[test]
@@ -886,25 +1135,12 @@ mod tests {
         let mut extra_trailer = [normal.as_slice(), trailer].concat();
         repair_crc(&mut extra_trailer);
         assert!(parse_fragment(&extra_trailer).is_none());
-        assert!(crate::export::rebase_fragment(&mut extra_trailer, 2, 3000).is_err());
+        assert!(rebase_fragment(&mut extra_trailer, 2, 3000).is_err());
         assert_fragment_rejected(&normal[..end]);
         let mut no_prft = normal[moof..].to_vec();
         repair_crc(&mut no_prft);
-        for bytes in [&normal, &no_prft] {
-            assert!(parse_fragment(bytes).is_some());
-            assert!(crate::export::rebase_fragment(&mut bytes.clone(), 2, 3000).is_ok());
-            let mut file = build_init_segment(&fake_sample_entry()).to_vec();
-            file.extend(bytes);
-            let report = scan(
-                Cursor::new(file),
-                ScanOptions {
-                    verify_crc: true,
-                    collect_samples: true,
-                },
-            )
-            .unwrap();
-            assert!(report.stop.is_none());
-        }
+        assert_fragment_accepted(&normal);
+        assert_fragment_accepted(&no_prft);
     }
 
     #[test]
@@ -918,9 +1154,9 @@ mod tests {
             assert_fragment_rejected(&bytes);
         }
         for (kind, clear, set) in [
-            (*b"trun", 1, 0),
-            (*b"tfhd", 0x0002_0000, 0),
-            (*b"tfhd", 0, 1),
+            (*b"trun", TRUN_DATA_OFFSET_PRESENT, 0),
+            (*b"tfhd", TFHD_DEFAULT_BASE_IS_MOOF, 0),
+            (*b"tfhd", 0, TFHD_BASE_DATA_OFFSET_PRESENT),
         ] {
             let mut bytes = normal.clone();
             let at = box_at(&bytes, kind) + 8;
@@ -933,7 +1169,7 @@ mod tests {
 
     #[test]
     fn declared_optional_sample_fields_must_be_complete() {
-        for flag in [0x400, 0x800] {
+        for flag in [TRUN_SAMPLE_FLAGS_PRESENT, TRUN_COMPOSITION_OFFSETS_PRESENT] {
             for extra in 0..=4 {
                 let mut bytes = fragment_bytes(false);
                 let trun = box_at(&bytes, *b"trun");
@@ -942,9 +1178,7 @@ mod tests {
                 let table_end = trun + be_u32(&bytes, trun).unwrap() as usize;
                 bytes.splice(table_end..table_end, vec![0; extra]);
                 for kind in [*b"moof", *b"traf", *b"trun"] {
-                    let at = box_at(&bytes, kind);
-                    let size = be_u32(&bytes, at).unwrap() + extra as u32;
-                    bytes[at..at + 4].copy_from_slice(&size.to_be_bytes());
+                    grow_box(&mut bytes, kind, i64::try_from(extra).unwrap());
                 }
                 let data_offset = be_u32(&bytes, trun + 16).unwrap() + extra as u32;
                 bytes[trun + 16..trun + 20].copy_from_slice(&data_offset.to_be_bytes());
@@ -952,19 +1186,111 @@ mod tests {
                 if extra < 4 {
                     assert_fragment_rejected(&bytes);
                 } else {
-                    assert!(parse_fragment(&bytes).is_some());
-                    assert!(crate::export::rebase_fragment(&mut bytes, 2, 3000).is_ok());
-                    let mut file = build_init_segment(&fake_sample_entry()).to_vec();
-                    file.extend(bytes);
-                    assert!(
-                        scan(Cursor::new(file), ScanOptions::default())
-                            .unwrap()
-                            .stop
-                            .is_none()
-                    );
+                    assert_fragment_accepted(&bytes);
                 }
             }
         }
+    }
+
+    #[test]
+    fn a_declared_tfhd_field_that_does_not_fit_is_rejected() {
+        let mut bytes = fragment_bytes(false);
+        let at = box_at(&bytes, *b"tfhd") + 8;
+        let flags = be_u32(&bytes, at).unwrap() | TFHD_DEFAULT_SAMPLE_DURATION_PRESENT;
+        bytes[at..at + 4].copy_from_slice(&flags.to_be_bytes());
+        repair_crc(&mut bytes);
+        assert_fragment_rejected(&bytes);
+    }
+
+    #[test]
+    fn a_fragment_without_any_sample_flags_is_rejected() {
+        // Clearing the tfhd default leaves a dependent fragment with no flags
+        // at all; reading it as sync would let a segment open on it.
+        let mut bytes = fragment_bytes(false);
+        let at = box_at(&bytes, *b"tfhd") + 8;
+        let flags = be_u32(&bytes, at).unwrap() & !TFHD_DEFAULT_SAMPLE_FLAGS_PRESENT;
+        bytes[at..at + 4].copy_from_slice(&flags.to_be_bytes());
+        bytes.drain(at + 8..at + 12);
+        for kind in [*b"moof", *b"traf", *b"tfhd"] {
+            grow_box(&mut bytes, kind, -4);
+        }
+        let trun = box_at(&bytes, *b"trun");
+        let data_offset = be_u32(&bytes, trun + 16).unwrap() - 4;
+        bytes[trun + 16..trun + 20].copy_from_slice(&data_offset.to_be_bytes());
+        repair_crc(&mut bytes);
+        assert_fragment_rejected(&bytes);
+    }
+
+    #[test]
+    fn undecodable_bytes_inside_a_container_box_are_rejected() {
+        for container in [*b"moof", *b"traf"] {
+            let mut bytes = fragment_bytes(true);
+            let at = box_at(&bytes, container);
+            let end = at + be_u32(&bytes, at).unwrap() as usize;
+            bytes.splice(end..end, [0xaa; 4]);
+            grow_box(&mut bytes, *b"moof", 4);
+            if container == *b"traf" {
+                grow_box(&mut bytes, *b"traf", 4);
+            }
+            let trun = box_at(&bytes, *b"trun");
+            let data_offset = be_u32(&bytes, trun + 16).unwrap() + 4;
+            bytes[trun + 16..trun + 20].copy_from_slice(&data_offset.to_be_bytes());
+            repair_crc(&mut bytes);
+            assert_fragment_rejected(&bytes);
+        }
+    }
+
+    #[test]
+    fn a_fragment_without_samples_is_rejected() {
+        let mut bytes = fragment_bytes(true);
+        let trun = box_at(&bytes, *b"trun");
+        // version/flags(4) count(4) data_offset(4) first_flags(4), then the one
+        // duration and size entry.
+        let entry = trun + 8 + 16;
+        bytes.drain(entry..entry + 8);
+        for kind in [*b"moof", *b"traf", *b"trun"] {
+            grow_box(&mut bytes, kind, -8);
+        }
+        bytes[trun + 12..trun + 16].copy_from_slice(&0u32.to_be_bytes());
+        let data_offset = be_u32(&bytes, trun + 16).unwrap() - 8;
+        bytes[trun + 16..trun + 20].copy_from_slice(&data_offset.to_be_bytes());
+        let mdat = box_at(&bytes, *b"mdat");
+        bytes.drain(mdat + 8..mdat + 8 + 6);
+        bytes[mdat..mdat + 4].copy_from_slice(&8u32.to_be_bytes());
+        repair_crc(&mut bytes);
+        assert_fragment_rejected(&bytes);
+    }
+
+    #[test]
+    fn the_memory_parser_applies_the_scanner_bounds() {
+        let normal = fragment_bytes(true);
+        assert!(parse_fragment(&normal).is_some());
+        let mut long_prft = normal.clone();
+        long_prft.splice(32..32, [0u8; 40]);
+        grow_box(&mut long_prft, *b"prft", 40);
+        repair_crc(&mut long_prft);
+        assert!(parse_fragment(&long_prft).is_none());
+        let mut huge_moof = normal.clone();
+        let moof = box_at(&huge_moof, *b"moof");
+        huge_moof[moof..moof + 4].copy_from_slice(&((MAX_MOOF_LEN as u32) + 1).to_be_bytes());
+        assert!(parse_fragment(&huge_moof).is_none());
+    }
+
+    #[test]
+    fn scan_stops_at_a_trailer_with_the_wrong_length() {
+        let mut bytes = fragment_bytes(true);
+        let len = bytes.len();
+        bytes[len - 8..len - 4].copy_from_slice(&((len as u32) + 1).to_be_bytes());
+        assert!(parse_fragment(&bytes).is_none());
+        let mut file = file_with(1);
+        let valid_len = file.len() as u64;
+        file.extend_from_slice(&bytes);
+        let report = scan(Cursor::new(file), ScanOptions::default()).unwrap();
+        assert_eq!(
+            report.stop,
+            Some(ScanStop::BadTrailer { offset: valid_len })
+        );
+        assert_eq!(report.valid_len, valid_len);
     }
 
     #[test]
@@ -1075,27 +1401,7 @@ mod tests {
     }
 
     #[test]
-    fn scans_from_a_caller_validated_fragment_boundary() {
-        let file = file_with(4);
-        let options = ScanOptions {
-            verify_crc: true,
-            collect_samples: false,
-        };
-        let full = scan(Cursor::new(&file), options).unwrap();
-        let start = full.fragments[2].offset;
-        let tail = scan_from_offset(Cursor::new(&file), start, options).unwrap();
-        assert_eq!(tail.init_len, full.init_len);
-        assert_eq!(tail.fragments, full.fragments[2..]);
-        assert_eq!(tail.valid_len, full.valid_len);
-        assert_eq!(tail.stop, None);
-        assert!(
-            scan_from_offset(Cursor::new(&file), u64::from(full.init_len) - 1, options).is_err()
-        );
-        assert!(scan_from_offset(Cursor::new(&file), file.len() as u64 + 1, options).is_err());
-    }
-
-    #[test]
-    fn stops_at_truncation_and_zero_fill() {
+    fn stops_at_truncation() {
         let full = file_with(2);
         let mut truncated = full.clone();
         truncated.truncate(full.len() - 10);
@@ -1106,7 +1412,11 @@ mod tests {
             report.valid_len,
             report.fragments[0].offset + u64::from(report.fragments[0].len)
         );
+    }
 
+    #[test]
+    fn stops_at_zero_fill() {
+        let full = file_with(2);
         let mut padded = full.clone();
         padded.extend_from_slice(&[0u8; 4096]);
         let report = scan(Cursor::new(&padded), ScanOptions::default()).unwrap();
@@ -1137,5 +1447,29 @@ mod tests {
         assert!(matches!(report.stop, Some(ScanStop::CrcMismatch { .. })));
         let lenient = scan(Cursor::new(&file), ScanOptions::default()).unwrap();
         assert_eq!(lenient.fragments.len(), 2);
+    }
+
+    #[test]
+    fn scan_stops_describe_themselves() {
+        assert_eq!(
+            ScanStop::BadBox {
+                offset: 8,
+                kind: *b"ab\x00\xff",
+            }
+            .to_string(),
+            "unexpected box ab\\x00\\xff at 8"
+        );
+        assert_eq!(
+            ScanStop::FragmentLimit {
+                offset: 4_096,
+                limit: 2,
+            }
+            .to_string(),
+            "more than 2 fragments; the first beyond the limit starts at 4096"
+        );
+        assert_eq!(
+            ScanStop::CrcMismatch { offset: 700 }.to_string(),
+            "CRC mismatch on the fragment at 700"
+        );
     }
 }

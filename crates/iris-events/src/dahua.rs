@@ -14,16 +14,19 @@ use iris_core::time::WallUs;
 pub struct RawEvent {
     /// Vendor event code, for example `VideoMotion`.
     pub code: String,
-    /// `Start`, `Stop`, `Pulse`, or `State`.
+    /// `Start`, `Stop`, `Pulse`, or `State` from well-behaved firmware; any
+    /// text the camera sent is kept, and a missing field reads `Pulse`.
     pub action: String,
-    /// Channel or rule index.
+    /// Channel or rule index: 0 when missing or not a number. An index of 0
+    /// is left out of the normalised payload.
     pub index: u32,
     /// The `data=` payload, usually JSON, if present.
     pub data: Option<String>,
 }
 
 /// Parses one part body. Returns `None` for heartbeats, empty bodies, and
-/// bodies without a `Code=` field.
+/// bodies that do not start with `Code=`; see [`RawEvent`] for the defaults
+/// of the other fields.
 #[must_use]
 pub fn parse_part(body: &str) -> Option<RawEvent> {
     let body = body.trim();
@@ -138,7 +141,7 @@ mod tests {
     }
 
     #[test]
-    fn parses_motion_start_and_state_reports() {
+    fn parses_a_motion_start() {
         let raw = parse_part("Code=VideoMotion;action=Start;index=0\r\n").unwrap();
         assert_eq!(
             raw,
@@ -149,6 +152,19 @@ mod tests {
                 data: None
             }
         );
+    }
+
+    #[test]
+    fn a_missing_action_or_index_takes_the_documented_default() {
+        let raw = parse_part("Code=VideoMotion;index=notanumber").unwrap();
+        assert_eq!((raw.action.as_str(), raw.index), ("Pulse", 0));
+        let raw = parse_part("Code=VideoMotion;action=Odd").unwrap();
+        assert_eq!(raw.action, "Odd");
+        assert_eq!(state_for_action(&raw.action), EventState::Pulse);
+    }
+
+    #[test]
+    fn state_reports_are_pulses() {
         let raw = parse_part("Code=VideoMotionInfo;action=State;index=0").unwrap();
         assert_eq!(raw.action, "State");
         let event = normalize(&cam(), &raw, WallUs::new(5)).unwrap();
@@ -206,13 +222,16 @@ mod tests {
     }
 
     #[test]
-    fn opaque_data_is_quoted_and_index_survives_without_data() {
+    fn opaque_data_is_quoted() {
         let raw = parse_part("Code=VideoMotion;action=Start;index=2;data=plain").unwrap();
         let event = normalize(&cam(), &raw, WallUs::new(0)).unwrap();
         let payload: serde_json::Value =
             serde_json::from_str(event.data.as_deref().unwrap()).unwrap();
         assert_eq!(payload, serde_json::json!({"index": 2, "data": "plain"}));
+    }
 
+    #[test]
+    fn a_nonzero_index_survives_without_data() {
         let raw = parse_part("Code=VideoMotion;action=Start;index=3").unwrap();
         let event = normalize(&cam(), &raw, WallUs::new(0)).unwrap();
         let payload: serde_json::Value =

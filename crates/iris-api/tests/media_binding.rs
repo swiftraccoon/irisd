@@ -15,7 +15,10 @@ use iris_catalog::{CatalogHandle, Change};
 use iris_core::id::{CameraId, StreamKey, StreamKind};
 use iris_core::time::WallUs;
 use iris_mp4::fragment::{Fragment, Sample};
-use iris_mp4::index::{FLAG_STARTS_WITH_SYNC, IndexHeader, IndexRecord, IndexWriter, read_index};
+use iris_mp4::index::{
+    FLAG_STARTS_WITH_SYNC, IndexHeader, IndexRecord, IndexWriter, MAX_PERSISTED_INDEX_RECORDS,
+    read_index_bounded,
+};
 use iris_mp4::init::SampleEntry;
 use iris_store::{ApprovedRoot, RootExpectation, StoragePolicy, WriterHandle};
 use tokio::sync::broadcast;
@@ -86,7 +89,7 @@ async fn record(
             sync_interval: Duration::from_secs(5),
             preallocate_bytes: 1 << 20,
             rotate_bytes: 1 << 30,
-            rotate_secs: 3600,
+            rotate_age: Duration::from_secs(3600),
         },
         64,
     )
@@ -101,8 +104,11 @@ async fn record(
         .expect("writer join")
         .expect("writer shutdown");
     let path = only_recording(root.path());
-    let (header, records) =
-        read_index(&iris_store::layout::index_path(&path)).expect("written sidecar");
+    let (header, records) = read_index_bounded(
+        &iris_store::layout::index_path(&path),
+        MAX_PERSISTED_INDEX_RECORDS,
+    )
+    .expect("written sidecar");
     let last = *records.last().expect("records");
     catalog.notify(Change::SegmentOpened {
         key: key(),
@@ -159,10 +165,12 @@ fn state(roots: Vec<ApprovedRoot>, catalog: CatalogHandle) -> Arc<ApiState> {
         live: Arc::new(LiveRegistry::new()),
         events,
         tokens: Vec::new(),
+        capability_secret: iris_api::CapabilitySecret::new([1; 32]),
         recording_roots: roots,
         public_metrics: false,
-        snapshot_sources: HashMap::new(),
-        active_cameras: HashMap::new(),
+        snapshot_sources: std::sync::RwLock::new(HashMap::new()),
+        active_cameras: std::sync::RwLock::new(HashMap::new()),
+        control: None,
         stats: Arc::new(ApiStats::default()),
         started: WallUs::now(),
         started_monotonic: Instant::now(),
@@ -225,8 +233,8 @@ async fn a_symlinked_recording_is_never_served_on_any_route() {
         init_len: 100,
         sample_entry: Arc::clone(&sample_entry),
     });
-    let mut index = IndexWriter::create(
-        &iris_store::layout::index_path(&media),
+    let mut index = IndexWriter::from_claimed_file(
+        std::fs::File::create(iris_store::layout::index_path(&media)).expect("forged sidecar"),
         &IndexHeader {
             start_wall: start,
             run_id: 7,
@@ -288,6 +296,7 @@ async fn a_symlinked_sidecar_is_never_read() {
     let range = range_query(wall(0), wall(2));
     for uri in [
         format!("/api/streams/cam1/main/hls/vod.m3u8?{range}"),
+        format!("/api/streams/cam1/main/export.mp4?{range}"),
         format!("/api/streams/cam1/main/keyframe?t={}", wall(1).get()),
     ] {
         assert_eq!(complete(&app, &uri).await.0, StatusCode::NOT_FOUND, "{uri}");

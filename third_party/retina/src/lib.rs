@@ -300,9 +300,10 @@ pub struct RtspMessageContext {
     /// can be compared to the relative TCP sequence number.
     pos: u64,
 
-    /// Time when the application parsed the message. Caveat: this may not
-    /// closely match the time on a packet capture if the application is
-    /// overloaded (or if `CLOCK_REALTIME` jumps).
+    /// Time when the read that delivered the message returned; every message
+    /// decoded from one read shares it, so the clock is read once per read.
+    /// Caveat: this may not closely match the time on a packet capture if the
+    /// application is overloaded (or if `CLOCK_REALTIME` jumps).
     received_wall: WallTime,
     received: std::time::Instant,
 }

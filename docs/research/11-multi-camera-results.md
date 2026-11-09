@@ -104,8 +104,10 @@ file, sidecar index agrees, wall-clock drift −8.4 ms, −66.8 ms, and +4.6 ms.
 ## Conclusions
 
 - Twelve streams at ≈ 69 Mbps cost ≈ 12 % of one core and ≈ 60 MiB, with no recorder-side
-  stall, drop, reconnect, or write error in 96 minutes. The budget in `07-architecture.md`
-  holds with margin.
+  stall, drop, reconnect, or write error in 96 minutes. CPU is about six times the
+  `07-architecture.md` §7 budget (2 % of one core for six cameras, twelve streams), and the
+  final RSS sample (67.0 MiB, 70.3 MB) exceeds its 64 MB; `12-ingest-cost.md` records the
+  changes that met the CPU budget.
 - The one problem that more cameras exposed was per-camera, not cross-camera: a second
   session on the same unit kills that unit's sub stream. Configuration avoids it.
 - Camera-declared frame rates are not delivered rates on this family (28.3–29.5 fps against
@@ -144,8 +146,8 @@ seven events delivered, 13.6–14.5 % of one core, 63 MiB RSS, every stream clea
 A storage quota (`quota_gib`) bounds the catalogued recordings on a disk shared with other
 data. With 55 GB of recordings in the catalog and a 20 GiB quota, the first retention pass
 deleted 91 sealed segments (36 GB) while fourteen streams kept recording, and the next pass
-removed one more file as new data arrived; the root settled at 20 GB. In steady state at
-≈ 84 Mbps the quota deletes about one 1 GiB file per minute.
+removed one more file as new data arrived; the root settled at the 20 GiB quota. In steady
+state at ≈ 84 Mbps the quota deletes about one 1 GiB file every 1.7 minutes.
 
 ## Remaining phase-2 evidence
 
@@ -205,7 +207,7 @@ and a 200 GiB quota on the ext4 recording root. The service instance stopped cle
 | Writer | 3,398,635 fragments, 5,225 GiB of file growth, 5,329 files, 0 dropped fragments, 0 write errors; 293 writes or syncs over 1 s, sync max 6.1 s, queue peak 104 fragments / 159.6 MiB |
 | Catalog | 0 failed batches; transaction p99 max 50 ms, event commit p99 max 500 ms; final 448,403 events and 54.8 MiB database |
 | Retention | 5,286 successful passes, 5,349 files and 5,225 GiB removed; pass max 989 ms; resident catalogued media stayed at 199–200 GiB |
-| Host | write amplification 1.0032, container overhead 1.0004, no NIC errors, NTP offset at most 0.735 ms |
+| Host | write amplification 1.0032, container overhead 1.0004 (files over payload, the report's form then: 0.04 %), no NIC errors, NTP offset at most 0.735 ms |
 
 One camera became unreachable for about six minutes near the end: its two streams produced seven
 reconnect gaps totaling about 11.5 minutes of stream-time, its event feed recorded twelve failed
@@ -219,17 +221,65 @@ regression fixes.
 
 A restart on the consolidated hardening build initially held fourteen streams and seven feeds
 with zero writer drops/errors, 2.76 % of one core mean, and 56.8–64.0 MiB RSS. After event
-maintenance pruned exactly 25,000 legacy rows, a bounded materialized SQLite query spilled its
+maintenance pruned exactly 25,000 event rows, a bounded materialized SQLite query spilled its
 temporary B-tree into `/var/tmp`. The service sandbox denied that ambient path. Every retention
 pass then failed, catalogued media reached 205.26 GiB against the 200 GiB quota, and later catalog
 batches failed as well while basic HTTP health checks continued to pass.
 
-That window is not soak evidence. The catalog connection now sets `temp_store=MEMORY`, which keeps
-the already-bounded temporary query state inside the process. The acceptance report and sampled
-Prometheus counters also include catalog failures/rejections, retention failures, reconciliation,
-watchdog/self-check state, stream/feed disconnections, and API problems. A replacement window must
-advance beyond the 25,000-pruned-row trigger, complete several later retention passes, restore the
-quota, and keep those counters at zero before its seven-day clock begins.
+That window is not soak evidence. The fix sets `temp_store=MEMORY` on the catalog connection,
+which keeps the already-bounded temporary query state inside the process. The acceptance
+report and sampled Prometheus counters also include catalog failures/rejections, retention
+failures, reconciliation, watchdog/self-check state, stream/feed disconnections, and API
+problems. A replacement window must advance beyond the 25,000-pruned-row trigger, complete
+several later retention passes, restore the quota, and keep those counters at zero before its
+seven-day clock begins.
+
+## Soak, third window (2026-11-07 to 2026-11-08, 25.2 h, closed by decision)
+
+The packaged service ran the seven cameras and fourteen streams (about 93 Mbit/s) on the
+hardening build from 2026-11-07T21:46Z until 2026-11-08T23:00Z, when it was stopped cleanly to
+deploy the build that carries camera provisioning, ONVIF snapshots, discovery, and stream lookup.
+Verifying those features on hardware was judged worth more than the rest of the week-long window,
+so soak windows wait until the change rate drops (`README.md`, decision table). `iris-tools
+soak-report` and `daemon-stats` over the window:
+
+| Item | Value |
+|---|---|
+| Process | 3.06 % of one core mean (user 1.55, system 1.50), max 4.55 %; loop lag max 4 ms; RSS 60.4–182.6 MiB with a 64.0 MiB first-hour and a 67.5 MiB last-hour mean (slope −1.9 MiB/day); each excursion above 100 MiB coincides with a logged slow sync on the recording HDD and the fragments the writer queue holds meanwhile (peak 78 fragments, 130.9 MiB), and ends within minutes; 14 self-checks passed, 0 failed; the watchdog was never withheld |
+| Writer | 636,247 fragments, 984 GiB, 254,221 syncs, 1,011 files, 0 dropped fragments, 0 write errors; 34 writes or syncs over 1 s (sync max 4.4 s, write max 1.1 s) |
+| Catalog | 0 failed batches, 0 rejected commands, no reconciliation required; transaction p99 max 20 ms (max 33.8 ms), event commit p99 max 200 ms; 213 segments and 194.6 GiB catalogued at the end, 74,239 events, 81.4 MiB database |
+| Streams | medians 29.93–30.05 fps, 0 stalls, 0 reconnects, 0 gaps; holds as `04 §7.3` describes on the units that deliver under 30 fps |
+| Events | seven feeds, 0 reconnects, 0 errors; the ONVIF feed renewed 189 times |
+| Retention | 1,002 passes, 0 failed, 1,029 files and 984 GiB removed, pass max 1.3 s; catalogued media held at 199.0–200.0 GiB |
+| Host | write amplification 1.0037, container overhead 1.0004 (files over payload, the report's form then: 0.04 %), no NIC errors, 0 RTSP retransmits, NTP offset at most 0.29 ms; 26 complete API checks with 0 problems |
+| Journal | one warning, the state-directory permission repair at start |
+
+Every acceptance counter stayed at zero for the whole window. The CPU figure is measured at the
+live bitrate rather than the 56 Mbit/s the `07-architecture.md` §7 budget assumes, and the RSS
+excursions are the writer queue absorbing HDD stalls, which is its purpose.
+
+## Provisioning and ONVIF lookups against the running service (2026-11-08)
+
+The service restarted on the provisioning build with `[provisioning] enabled` and `multicast`
+added to the unit's `IPAddressAllow=`; every check below went through the API with the root
+token, and the viewer's Add camera form was driven under Xvfb against the same daemon.
+
+| Check | Result |
+|---|---|
+| Startup | fourteen streams and seven feeds connected within a second, nothing recovered or adopted; `capability.key` created; the security score stayed 1.3 |
+| ONVIF snapshot | the CGI-less camera's `snapshot.jpg`, a 404 on the CGI path before, answered 200 `image/jpeg` (398 KB) in 1.47 s through `GetSnapshotUri` and in 0.54 s with the URL cached |
+| Discovery | `GET /api/onvif/devices?wait_ms=3000` listed eight devices in 3.0 s: the seven configured cameras plus one unconfigured unit of the same platform; the HTTPS-only unit was advertised with `https` and port 443 |
+| Stream lookup | the CGI-less camera returned four profiles in 0.22 s and the PTZ camera three in 0.17 s, every URL on the configured host; the HTTPS-only unit answered 502 `onvif call failed` in 0.16 s because its firmware answers ONVIF on port 443 with plaintext inside the TLS session (`01-camera-probe.md` §7) |
+| Add and remove | `POST /api/cameras` with a second main-stream camera on the PTZ unit (its third session, the limit) answered 201 in 23 ms; the stream was playing after 0.2 s, its first file open after 3 s, its snapshot served, and `cameras.toml` written with mode 0600; `DELETE` answered 204, the store returned to an empty list, and the unit's sessions fell back to two |
+| Refusals | `DELETE` of a configured camera 409; a URL on a port outside `connect_ports` 400 |
+| Viewer | Discover listed the eight devices with scheme, host, and port and filled the name from the picked one; "Fetch streams via ONVIF" filled the main and sub URLs of the CGI-less camera from its four profiles and ticked ONVIF pull-point events |
+
+One defect surfaced: the per-minute `stream` and `events` lines and the systemd status text came
+from lists captured at start, so the added camera recorded without appearing in them (fourteen lines
+for fifteen streams). The report adopts fresh lists at its next launch after a change
+(`07-architecture.md` §9). On the redeployed build the added camera's line appeared in the first
+report after the add and was gone from the first report after the removal, with the status text
+following.
 
 ## Low-latency HLS against a replayed camera (2026-11-02)
 
@@ -244,5 +294,39 @@ daemon on the development host; `ffmpeg` and `curl` as clients:
   after 84 ms, the time for its last frames to arrive.
 - `_HLS_msn` two segments ahead blocked 5.5 s, then returned the playlist holding it.
 
-Not yet done: `mediastreamvalidator` and `AVPlayer`, which need Apple hardware
+Open: `mediastreamvalidator` and `AVPlayer`, which need Apple hardware
 (`08-roadmap.md` phase-2 exit criteria).
+
+## Report memory (2026-11-07)
+
+Measured with debug builds on a copy of a soak sampler directory spanning 2026-10-31 to
+2026-11-07 (`journal.log` 140,890,767 bytes in 268,713 lines, `host.jsonl` 20,031,867 bytes),
+as the maximum resident set from `/usr/bin/time -f %M`, before and after the reports read their
+inputs line by line; the reports were byte-identical. The `--since` window covers the last
+3.1 hours.
+
+| Command | Whole files read | Line by line |
+|---|---:|---:|
+| `iris-tools soak-report --since 2026-11-07T17:31:15Z DIR` | 826,784 KiB | 28,300 KiB |
+| `iris-tools soak-report DIR` | 923,608 KiB | 923,540 KiB |
+| `iris-tools daemon-stats DIR/journal.log` | 698,972 KiB | 695,324 KiB |
+
+The whole-soak report and `daemon-stats` keep every statistics row of the window they
+summarise, and those rows, not the input text, set their peak: memory follows the window, not
+the soak.
+
+## Soak report computations (2026-11-09)
+
+From this date `soak-report` computes write amplification from the cgroup's bytes written and
+the stream payload interpolated over the same accepted sample intervals, printing the share of
+the sampled span they cover, and prints container overhead as a percentage from the daemon's
+own file and payload counters. The windows above were reported by the earlier computation,
+which compared the bytes of the accepted intervals with the payload of the whole span. Over the
+sampler directory of 2026-10-31 to 2026-11-09 (12 service instances, 197.9 h) the two give:
+
+| Figure | Earlier computation | From 2026-11-09 |
+|---|---:|---:|
+| Write amplification | 0.9982 | 1.0039 (99.1 % of the span) |
+| Container overhead | 1.0004 (ratio) | 0.0389 % |
+
+The command was `iris-tools soak-report DIR` with each build on the same copy of the directory.

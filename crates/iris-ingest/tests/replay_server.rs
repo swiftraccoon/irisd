@@ -10,7 +10,8 @@ use iris_ingest::{
 };
 use iris_mp4::fragment::Fragment;
 use iris_replay::media::Media;
-use iris_replay::server::{Options, Server};
+use iris_replay::rtsp::MountName;
+use iris_replay::server::{Mounts, Options, Server};
 use iris_replay::synth::{self, Plan};
 use tokio_util::sync::CancellationToken;
 
@@ -32,9 +33,7 @@ async fn record(read_interval: Option<Duration>) -> (Arc<Media>, Arc<StreamStats
         ..Plan::default()
     };
     let media = Arc::new(Media::from_bytes(synth::recording(plan).unwrap()).unwrap());
-    let mounts = [("cam".to_owned(), Arc::clone(&media))]
-        .into_iter()
-        .collect();
+    let mounts = Mounts::from([(MountName::try_new("cam").unwrap(), Arc::clone(&media))]);
     let server = Server::bind("127.0.0.1:0".parse().unwrap(), mounts, Options::default())
         .await
         .unwrap();
@@ -80,23 +79,25 @@ async fn record(read_interval: Option<Duration>) -> (Arc<Media>, Arc<StreamStats
 }
 
 fn check(media: &Media, stats: &StreamStats, fragments: &[Fragment]) {
-    assert!(fragments.len() >= 3);
+    assert!(fragments.len() >= 3, "only {} fragments", fragments.len());
     assert_eq!(stats.reconnects(), 0);
     assert_eq!(stats.dropped_sink(), 0);
     assert!(stats.frames() >= 30, "frames {}", stats.frames());
-    assert!(stats.sender_reports() >= 1);
+    assert!(stats.sender_reports() >= 1, "no sender report received");
     assert!(
         stats
             .camera_offset_us()
-            .is_some_and(|us| us.abs() < 1_000_000)
+            .is_some_and(|us| us.abs() < 1_000_000),
+        "camera offset {:?}",
+        stats.camera_offset_us()
     );
     for (i, fragment) in fragments.iter().take(2).enumerate() {
         assert_eq!(fragment.samples.len(), 10, "fragment {i}");
         assert!(fragment.starts_with_sync());
         for (j, sample) in fragment.samples.iter().enumerate() {
-            let frame = &media.frames[(i * 10 + j) % media.frames.len()];
+            let frame = &media.frames()[(i * 10 + j) % media.frames().len()];
             assert_eq!(
-                &sample.data[..],
+                Some(&sample.data[..]),
                 media.sample(frame),
                 "fragment {i} sample {j}"
             );
@@ -148,9 +149,7 @@ async fn timer_driven_reads_reconnect_after_a_stall() {
         ..Plan::default()
     };
     let media = Arc::new(Media::from_bytes(synth::recording(plan).unwrap()).unwrap());
-    let mounts = [("cam".to_owned(), Arc::clone(&media))]
-        .into_iter()
-        .collect();
+    let mounts = Mounts::from([(MountName::try_new("cam").unwrap(), Arc::clone(&media))]);
     let options = Options {
         stall_after: Some(Duration::from_millis(1_500)),
         stall_for: Duration::from_secs(30),

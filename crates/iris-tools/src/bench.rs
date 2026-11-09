@@ -2,22 +2,30 @@
 //! but loopback involved.
 
 use std::collections::BTreeMap;
-use std::io::Write as _;
+use std::fs::{DirBuilder, File, Metadata, OpenOptions};
+use std::io::{self, Write as _};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream};
 use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::sync::Arc;
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use clap::Parser;
+use rustix::fs::{Mode, OFlags};
+use rustix::process::{Pid, Signal};
 use serde::Serialize;
-use serde_json::json;
+use serde_json::{Value, json};
+use tokio::signal::unix::SignalKind;
 
-use crate::logs::{kv, number, split, strip_ansi};
+use crate::logs::{self, Fields, Series, Statistics};
 use crate::time;
+
+/// How long the daemon runs before its cost is measured.
+const WARM_UP: Duration = Duration::from_secs(20);
+/// How often the daemon's process counters are read.
+const SAMPLE_INTERVAL: Duration = Duration::from_secs(5);
 
 /// Arguments of `replay-bench`.
 #[derive(Debug, Parser)]
@@ -29,9 +37,14 @@ pub struct Args {
     #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..=256))]
     cameras: u32,
     /// How long the daemon runs.
-    #[arg(long, default_value_t = 120, value_parser = clap::value_parser!(u64).range(25..=86_400))]
+    #[arg(
+        long,
+        default_value_t = 120,
+        value_parser = clap::value_parser!(u64).range(25..=86_400)
+    )]
     seconds: u64,
-    /// Fresh or marker-owned scratch root.
+    /// Fresh or marker-owned scratch root, at least three components below
+    /// `/` and outside the working directory.
     #[arg(long)]
     root: PathBuf,
     /// The daemon binary.
@@ -52,7 +65,8 @@ pub struct Args {
     /// `ingest.recv_low_water_kib` for the daemon.
     #[arg(long, default_value_t = 0, value_parser = clap::value_parser!(u32).range(..=1_024))]
     recv_low_water_kib: u32,
-    /// The daemon's statistics interval.
+    /// The daemon's statistics interval: a number with an `ms`, `s`, or `m`
+    /// suffix, from 0.1 s to 1 h.
     #[arg(long, default_value = "30s")]
     stats_interval: String,
     /// Extra arguments for `irisd run`.
@@ -69,8 +83,14 @@ pub struct Args {
     keep: bool,
     /// After 20 s of warm-up, sample the daemon with `perf record` for this
     /// long into `ROOT/perf.data` (through `sudo -n`, so kernel frames are
-    /// included). The file holds perf's pipe format: `perf report -i - < ROOT/perf.data`.
-    #[arg(long, default_value_t = 0, value_name = "SECONDS", value_parser = clap::value_parser!(u64).range(..=86_400))]
+    /// included). The file holds perf's pipe format:
+    /// `perf report -i - < ROOT/perf.data`.
+    #[arg(
+        long,
+        default_value_t = 0,
+        value_name = "SECONDS",
+        value_parser = clap::value_parser!(u64).range(..=86_400)
+    )]
     perf: u64,
 }
 
@@ -87,7 +107,10 @@ struct Sample {
 fn proc_sample(pid: u32) -> anyhow::Result<Sample> {
     let status = std::fs::read_to_string(format!("/proc/{pid}/status"))?;
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat"))?;
-    let after = &stat[stat.rfind(')').map_or(0, |i| i + 2)..];
+    // The command name may hold spaces and parentheses; fields follow the last `)`.
+    let after = stat
+        .get(stat.rfind(')').map_or(0, |i| i + 2)..)
+        .unwrap_or_default();
     let fields: Vec<&str> = after.split_whitespace().collect();
     let n = |i: usize| {
         fields
@@ -131,15 +154,25 @@ struct Measurement {
 }
 
 fn interpolate(points: &[(f64, f64)], time: f64) -> Option<f64> {
-    for pair in points.windows(2) {
+    points.windows(2).find_map(|pair| {
         let [(a, av), (b, bv)] = pair else {
-            unreachable!("two-element window")
+            return None;
         };
-        if *a <= time && time <= *b && b > a {
-            return Some(av + (bv - av) * ((time - a) / (b - a)));
+        (*a <= time && time <= *b && b > a).then(|| av + (bv - av) * ((time - a) / (b - a)))
+    })
+}
+
+/// The stream statistics rows of a daemon log: each row's stream, time, and fields.
+fn stream_rows(text: &str) -> impl Iterator<Item = (String, f64, Fields)> + '_ {
+    text.lines().filter_map(|raw| {
+        let line = logs::strip_ansi(raw);
+        let split = logs::split(&line)?;
+        let t = time::parse_seconds(split.timestamp)?;
+        match logs::statistics(&split)? {
+            Statistics::Row(Series::Stream(name), fields) => Some((name, t, fields)),
+            _ => None,
         }
-    }
-    None
+    })
 }
 
 /// Intersects the stream-counter and process windows before calculating any rate.
@@ -170,19 +203,9 @@ fn measure(
     let mut from = eligible.wall;
     let mut to = last.wall;
     let mut streams: BTreeMap<String, Vec<(f64, f64)>> = BTreeMap::new();
-    for raw in text.lines() {
-        let line = strip_ansi(raw);
-        let Some(line) = split(&line) else { continue };
-        if line.level != "INFO" || !line.rest.starts_with("stream ") {
-            continue;
-        }
-        let fields = kv(line.rest);
-        if let (Some(name), Some(mib), Some(ts)) = (
-            fields.get("stream"),
-            number(&fields, "mib"),
-            time::parse_seconds(line.ts),
-        ) {
-            streams.entry(name.clone()).or_default().push((ts, mib));
+    for (name, t, fields) in stream_rows(text) {
+        if let Some(mib) = logs::number(&fields, "mib") {
+            streams.entry(name).or_default().push((t, mib));
         }
     }
     anyhow::ensure!(
@@ -190,6 +213,9 @@ fn measure(
         "no timestamped stream counters in the daemon log"
     );
     for series in streams.values() {
+        let (Some(first), Some(last)) = (series.first(), series.last()) else {
+            continue;
+        };
         anyhow::ensure!(
             series.len() >= 2,
             "need two stream statistics snapshots; increase --seconds or shorten --stats-interval"
@@ -200,12 +226,13 @@ fn measure(
                 .all(|p| p[1].0 > p[0].0 && p[1].1 >= p[0].1),
             "stream counter reset or non-increasing timestamp in benchmark"
         );
-        from = from.max(series[0].0);
-        to = to.min(series[series.len() - 1].0);
+        from = from.max(first.0);
+        to = to.min(last.0);
     }
     anyhow::ensure!(
         to > from,
-        "no shared measurement window after warm-up; increase --seconds or shorten --stats-interval"
+        "no shared measurement window after warm-up; increase --seconds or shorten \
+         --stats-interval"
     );
     let delta = |series: &[(f64, f64)]| -> anyhow::Result<f64> {
         Ok(interpolate(series, to).context("missing ending counter")?
@@ -235,10 +262,13 @@ fn measure(
 
 const ROOT_MARKER: &str = "irisd-replay-bench-v1\n";
 
+/// The files a run writes at the top of the root, reset before each run.
+const ROOT_FILES: [&str; 4] = ["bench.toml", "irisd.log", "replay.log", "perf.data"];
+
 /// Whether the directory holding the benchmark root keeps other users from
 /// renaming or replacing it: owned by the caller or root, and writable by no
 /// one else unless the sticky bit restricts renames to an entry's owner.
-fn parent_is_private(metadata: &std::fs::Metadata, uid: u32) -> bool {
+fn parent_is_private(metadata: &Metadata, uid: u32) -> bool {
     let mode = metadata.mode();
     let owner_trusted = metadata.uid() == uid || metadata.uid() == 0;
     let shared_write = mode & 0o022 != 0;
@@ -263,23 +293,19 @@ fn perf_command_args(pid: u32, seconds: u64) -> Vec<String> {
 
 /// Creates the profile file as the caller: exclusively, as a private (0600)
 /// regular file, never through a symlink.
-fn create_perf_output(path: &Path) -> anyhow::Result<std::fs::File> {
+fn create_perf_output(path: &Path) -> anyhow::Result<File> {
     let fd = rustix::fs::open(
         path,
-        rustix::fs::OFlags::WRONLY
-            | rustix::fs::OFlags::CREATE
-            | rustix::fs::OFlags::EXCL
-            | rustix::fs::OFlags::NOFOLLOW
-            | rustix::fs::OFlags::CLOEXEC,
-        rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR,
+        OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::RUSR | Mode::WUSR,
     )
     .with_context(|| format!("creating {}", path.display()))?;
-    Ok(std::fs::File::from(fd))
+    Ok(File::from(fd))
 }
 
 /// Checks, through the tool's own descriptor, that perf wrote a nonempty
 /// regular file and that `path` still names that file.
-fn verify_perf_output(file: &std::fs::File, path: &Path) -> anyhow::Result<()> {
+fn verify_perf_output(file: &File, path: &Path) -> anyhow::Result<()> {
     let written = file
         .metadata()
         .context("reading the perf output descriptor")?;
@@ -296,6 +322,9 @@ fn verify_perf_output(file: &std::fs::File, path: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Whether `root` is a place the benchmark may own: at least three
+/// components below `/`, not named `tmp`, `home`, `var`, `mnt`, or `target`,
+/// and neither inside nor containing the working directory.
 fn safe_root_location(root: &Path, cwd: &Path) -> bool {
     root != Path::new("/")
         && root != cwd
@@ -346,7 +375,7 @@ fn validate_args(args: &Args) -> anyhow::Result<()> {
     anyhow::ensure!(args.perf <= args.seconds, "--perf cannot exceed --seconds");
     let interval = parse_interval(&args.stats_interval)?;
     anyhow::ensure!(
-        interval < Duration::from_secs(args.seconds.saturating_sub(20)),
+        interval < Duration::from_secs(args.seconds).saturating_sub(WARM_UP),
         "benchmark needs at least two post-warmup statistics intervals"
     );
     anyhow::ensure!(
@@ -367,12 +396,22 @@ fn validate_args(args: &Args) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Whether `path` is a real entry of the kind wanted, owned by `uid`.
+fn owned_entry(path: &Path, directory: bool, uid: u32) -> anyhow::Result<bool> {
+    let metadata = std::fs::symlink_metadata(path)?;
+    let kind = if directory {
+        metadata.is_dir()
+    } else {
+        metadata.is_file()
+    };
+    Ok(kind && !metadata.file_type().is_symlink() && metadata.uid() == uid)
+}
+
 /// Admits a root that is already present only when it is the tool's own: a
 /// caller-owned real directory carrying the marker, with mode 0700.
 fn check_existing_root(root: &Path, uid: u32) -> anyhow::Result<()> {
-    let metadata = std::fs::symlink_metadata(root)?;
     anyhow::ensure!(
-        metadata.is_dir() && !metadata.file_type().is_symlink() && metadata.uid() == uid,
+        owned_entry(root, true, uid)?,
         "existing benchmark root must be a caller-owned real directory"
     );
     let marker = root.join(".irisd-replay-bench");
@@ -387,11 +426,12 @@ fn check_existing_root(root: &Path, uid: u32) -> anyhow::Result<()> {
         "refusing pre-existing unmarked benchmark root {}",
         root.display()
     );
+    let mode = std::fs::symlink_metadata(root)?.mode();
     anyhow::ensure!(
-        metadata.mode() & 0o777 == 0o700,
+        mode & 0o777 == 0o700,
         "existing benchmark root {} has mode {:o}; it must be private (chmod 700)",
         root.display(),
-        metadata.mode() & 0o7777
+        mode & 0o7777
     );
     Ok(())
 }
@@ -403,6 +443,8 @@ struct BenchRoot {
 }
 
 impl BenchRoot {
+    /// Creates the root, or admits one the tool owns, and resets the previous
+    /// run's `run/` and `state/` directories and [`ROOT_FILES`] in it.
     fn prepare(args: &Args) -> anyhow::Result<Self> {
         let root = std::path::absolute(&args.root)?;
         let cwd = std::env::current_dir()?.canonicalize()?;
@@ -414,9 +456,11 @@ impl BenchRoot {
         let resolved_root = parent.join(root.file_name().context("benchmark root has no name")?);
         anyhow::ensure!(
             safe_root_location(&root, &cwd) && safe_root_location(&resolved_root, &cwd),
-            "unsafe benchmark root"
+            "benchmark root {} must be at least three components below /, not named tmp, home, \
+             var, mnt, or target, and neither inside nor containing the working directory",
+            root.display()
         );
-        let uid = rustix::process::getuid().as_raw();
+        let uid = rustix::process::geteuid().as_raw();
         anyhow::ensure!(
             parent_is_private(&std::fs::metadata(&parent)?, uid),
             "the directory holding the benchmark root, {}, must be owned by the caller or root \
@@ -426,8 +470,8 @@ impl BenchRoot {
         if root.exists() {
             check_existing_root(&root, uid)?;
         } else {
-            std::fs::DirBuilder::new().mode(0o700).create(&root)?;
-            let mut marker = std::fs::OpenOptions::new()
+            DirBuilder::new().mode(0o700).create(&root)?;
+            let mut marker = OpenOptions::new()
                 .write(true)
                 .create_new(true)
                 .open(root.join(".irisd-replay-bench"))?;
@@ -453,31 +497,19 @@ impl BenchRoot {
         for name in ["run", "state"] {
             let path = root.join(name);
             if path.exists() {
-                let metadata = std::fs::symlink_metadata(&path)?;
                 anyhow::ensure!(
-                    metadata.is_dir()
-                        && !metadata.file_type().is_symlink()
-                        && metadata.uid() == rustix::process::getuid().as_raw(),
+                    owned_entry(&path, true, uid)?,
                     "unsafe {name} entry in benchmark root"
                 );
                 std::fs::remove_dir_all(&path)?;
             }
             std::fs::create_dir(&path)?;
         }
-        for name in [
-            "bench.toml",
-            "irisd.log",
-            "replay.log",
-            "perf.log",
-            "perf.data",
-        ] {
+        for name in ROOT_FILES {
             let path = root.join(name);
             if path.exists() {
-                let metadata = std::fs::symlink_metadata(&path)?;
                 anyhow::ensure!(
-                    metadata.is_file()
-                        && !metadata.file_type().is_symlink()
-                        && metadata.uid() == rustix::process::getuid().as_raw(),
+                    owned_entry(&path, false, uid)?,
                     "unsafe {name} entry in benchmark root"
                 );
                 std::fs::remove_file(path)?;
@@ -490,15 +522,13 @@ impl BenchRoot {
         })
     }
 
+    /// Deletes `run/`, the recordings, unless `--keep` was given.
     fn cleanup(&mut self) -> anyhow::Result<()> {
         if self.cleanup_pending && !self.keep {
             let path = self.root.join("run");
             if path.exists() {
-                let metadata = std::fs::symlink_metadata(&path)?;
                 anyhow::ensure!(
-                    metadata.is_dir()
-                        && !metadata.file_type().is_symlink()
-                        && metadata.uid() == rustix::process::getuid().as_raw(),
+                    owned_entry(&path, true, rustix::process::geteuid().as_raw())?,
                     "refusing unsafe recording cleanup"
                 );
                 std::fs::remove_dir_all(path)?;
@@ -560,12 +590,8 @@ struct BenchConfig<'a> {
 /// characters from the kernel, the shortest the daemon accepts. The benchmark
 /// never calls the API, so the token only satisfies the configuration check.
 fn bench_api_token() -> anyhow::Result<String> {
-    use std::io::Read as _;
-
     let mut bytes = [0_u8; 16];
-    std::fs::File::open("/dev/urandom")
-        .and_then(|mut source| source.read_exact(&mut bytes))
-        .context("reading random bytes for the benchmark API token")?;
+    getrandom::fill(&mut bytes).context("drawing the benchmark API token")?;
     Ok(hex::encode(bytes))
 }
 
@@ -605,7 +631,7 @@ fn write_config(path: &Path, root: &Path, args: &Args) -> anyhow::Result<()> {
 
 struct ManagedChild {
     name: &'static str,
-    child: std::process::Child,
+    child: Child,
     reaped: bool,
 }
 
@@ -625,7 +651,7 @@ impl ManagedChild {
         self.child.id()
     }
 
-    fn try_wait(&mut self) -> anyhow::Result<Option<std::process::ExitStatus>> {
+    fn try_wait(&mut self) -> anyhow::Result<Option<ExitStatus>> {
         let status = self.child.try_wait()?;
         if status.is_some() {
             self.reaped = true;
@@ -633,31 +659,36 @@ impl ManagedChild {
         Ok(status)
     }
 
-    fn terminate(&mut self, signal: rustix::process::Signal, wait: Duration) -> anyhow::Result<()> {
+    /// Waits for the child to exit within `deadline`, polling every `period`.
+    fn wait_until(&mut self, deadline: Instant, period: Duration) -> anyhow::Result<bool> {
+        while Instant::now() < deadline {
+            if self.try_wait()?.is_some() {
+                return Ok(true);
+            }
+            std::thread::sleep(period);
+        }
+        Ok(false)
+    }
+
+    fn terminate(&mut self, signal: Signal, wait: Duration) -> anyhow::Result<()> {
         if self.reaped || self.try_wait()?.is_some() {
             return Ok(());
         }
-        let pid = rustix::process::Pid::from_raw(self.child.id() as i32)
-            .context("child pid is out of range")?;
+        let pid = Pid::from_raw(self.child.id() as i32).context("child pid is out of range")?;
         if rustix::process::kill_process_group(pid, signal).is_err() {
             let _ = rustix::process::kill_process(pid, signal);
         }
-        let deadline = Instant::now() + wait;
-        while Instant::now() < deadline {
-            if self.try_wait()?.is_some() {
-                return Ok(());
-            }
-            std::thread::sleep(Duration::from_millis(50));
+        if self.wait_until(Instant::now() + wait, Duration::from_millis(50))? {
+            return Ok(());
         }
-        if rustix::process::kill_process_group(pid, rustix::process::Signal::KILL).is_err() {
+        if rustix::process::kill_process_group(pid, Signal::KILL).is_err() {
             let _ = self.child.kill();
         }
-        let kill_deadline = Instant::now() + Duration::from_secs(5);
-        while Instant::now() < kill_deadline {
-            if self.try_wait()?.is_some() {
-                return Ok(());
-            }
-            std::thread::sleep(Duration::from_millis(20));
+        if self.wait_until(
+            Instant::now() + Duration::from_secs(5),
+            Duration::from_millis(20),
+        )? {
+            return Ok(());
         }
         anyhow::bail!("{} did not exit after SIGKILL", self.name)
     }
@@ -671,48 +702,56 @@ impl ManagedChild {
             }
             std::thread::sleep(Duration::from_millis(50));
         }
-        self.terminate(rustix::process::Signal::TERM, Duration::from_secs(2))?;
+        self.terminate(Signal::TERM, Duration::from_secs(2))?;
         anyhow::bail!("{} timed out", self.name)
     }
 }
 
 impl Drop for ManagedChild {
     fn drop(&mut self) {
-        let _ = self.terminate(rustix::process::Signal::TERM, Duration::from_secs(2));
+        let _ = self.terminate(Signal::TERM, Duration::from_secs(2));
     }
 }
 
-fn cancellation_flag() -> Arc<AtomicBool> {
-    let cancelled = Arc::new(AtomicBool::new(false));
-    let flag = Arc::clone(&cancelled);
-    std::thread::spawn(move || {
-        let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-        else {
-            return;
-        };
-        runtime.block_on(async move {
-            let Ok(mut terminate) =
-                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-            else {
-                return;
-            };
-            tokio::select! {
-                _ = tokio::signal::ctrl_c() => {},
-                _ = terminate.recv() => {},
-            }
-            flag.store(true, Ordering::SeqCst);
-        });
-    });
-    cancelled
+/// Set once SIGINT or SIGTERM arrives; the run then stops and cleans up.
+static CANCELLED: AtomicBool = AtomicBool::new(false);
+
+fn cancelled() -> bool {
+    CANCELLED.load(Ordering::SeqCst)
 }
 
-fn wait_replay(replay: &mut ManagedChild, port: u16, cancelled: &AtomicBool) -> anyhow::Result<()> {
+/// Registers SIGINT and SIGTERM on the calling thread, so a failure is an
+/// error rather than leaving the signals' default action, then waits for
+/// either on a thread of its own.
+fn watch_for_cancellation() -> anyhow::Result<()> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("building the signal runtime")?;
+    let (mut interrupt, mut terminate) = {
+        let _context = runtime.enter();
+        (
+            tokio::signal::unix::signal(SignalKind::interrupt()).context("registering SIGINT")?,
+            tokio::signal::unix::signal(SignalKind::terminate()).context("registering SIGTERM")?,
+        )
+    };
+    std::thread::spawn(move || {
+        runtime.block_on(async {
+            tokio::select! {
+                _ = interrupt.recv() => {},
+                _ = terminate.recv() => {},
+            }
+        });
+        CANCELLED.store(true, Ordering::SeqCst);
+    });
+    Ok(())
+}
+
+fn wait_replay(replay: &mut ManagedChild, port: u16) -> anyhow::Result<()> {
     let address = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
     let deadline = Instant::now() + Duration::from_secs(30);
     while Instant::now() < deadline {
-        anyhow::ensure!(!cancelled.load(Ordering::SeqCst), "benchmark cancelled");
+        anyhow::ensure!(!cancelled(), "benchmark cancelled");
         if let Some(status) = replay.try_wait()? {
             anyhow::bail!("iris-replay exited before readiness with {status}");
         }
@@ -728,168 +767,189 @@ fn wait_replay(replay: &mut ManagedChild, port: u16, cancelled: &AtomicBool) -> 
     anyhow::bail!("iris-replay did not start listening")
 }
 
-/// Runs the tool.
-#[allow(clippy::too_many_lines)]
+fn start_replay(args: &Args, root: &Path) -> anyhow::Result<ManagedChild> {
+    let mut command = Command::new("setsid");
+    command
+        .arg(&args.replay)
+        .args([
+            "--listen",
+            &format!("127.0.0.1:{}", args.port),
+            "--mount",
+            &format!("main={}", args.file.display()),
+        ])
+        .args(&args.replay_arg)
+        .stdout(File::create(root.join("replay.log"))?)
+        .stderr(Stdio::inherit());
+    let mut replay = ManagedChild::spawn("iris-replay", &mut command)?;
+    wait_replay(&mut replay, args.port)?;
+    Ok(replay)
+}
+
+/// Starts the daemon with both of its output streams on one descriptor of
+/// `log`, so neither overwrites the other.
+fn start_daemon(args: &Args, config: &Path, log: &Path) -> anyhow::Result<ManagedChild> {
+    let log_file = File::create(log)?;
+    let mut command = Command::new("setsid");
+    command
+        .arg(&args.irisd)
+        .args([
+            "run",
+            "--config",
+            config.to_str().context("config path is not UTF-8")?,
+            "--stats-interval",
+            &args.stats_interval,
+        ])
+        .args(&args.daemon_arg)
+        .stdout(log_file.try_clone()?)
+        .stderr(log_file);
+    ManagedChild::spawn("irisd", &mut command)
+}
+
+/// Samples the daemon's process counters until the run ends, starting the
+/// profiler after the warm-up when `--perf` asks for it.
+fn sample_until(
+    args: &Args,
+    replay: &mut ManagedChild,
+    daemon: &mut ManagedChild,
+    log: &Path,
+    perf_path: &Path,
+) -> anyhow::Result<Vec<Sample>> {
+    let daemon_pid = daemon.id();
+    let mut samples = vec![proc_sample(daemon_pid)?];
+    let started = Instant::now();
+    let mut next_sample = started + SAMPLE_INTERVAL;
+    let mut perf: Option<(ManagedChild, File)> = None;
+    while started.elapsed() < Duration::from_secs(args.seconds) {
+        anyhow::ensure!(!cancelled(), "benchmark cancelled");
+        if let Some(status) = replay.try_wait()? {
+            anyhow::bail!("iris-replay exited early with {status}");
+        }
+        if let Some(status) = daemon.try_wait()? {
+            anyhow::bail!("irisd exited early with {status}; see {}", log.display());
+        }
+        if Instant::now() >= next_sample {
+            samples.push(proc_sample(daemon_pid)?);
+            next_sample += SAMPLE_INTERVAL;
+        }
+        if args.perf > 0 && perf.is_none() && started.elapsed() >= WARM_UP {
+            let output = create_perf_output(perf_path)?;
+            let mut command = Command::new("setsid");
+            command
+                .args(perf_command_args(daemon_pid, args.perf))
+                .stdout(output.try_clone()?)
+                .stderr(Stdio::inherit());
+            perf = Some((ManagedChild::spawn("perf", &mut command)?, output));
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    if let Some((mut profiler, output)) = perf.take() {
+        profiler.wait_success(Duration::from_secs(args.perf.saturating_add(10)))?;
+        verify_perf_output(&output, perf_path)?;
+    }
+    Ok(samples)
+}
+
+/// The result line: cost and traffic over the shared window, and the
+/// counters summed over the last statistics row of every stream.
+fn result_line(args: &Args, samples: &[Sample], text: &str) -> anyhow::Result<Value> {
+    let ticks = rustix::param::clock_ticks_per_second() as f64;
+    let rss = samples
+        .iter()
+        .map(|sample| sample.rss_kib)
+        .max()
+        .unwrap_or(0) as f64
+        / 1024.0;
+    let Measurement {
+        seconds,
+        user,
+        system,
+        wakeups,
+        mbps,
+    } = measure(samples, text, ticks, WARM_UP)?;
+    anyhow::ensure!(
+        mbps.is_finite() && mbps > 0.0,
+        "benchmark observed no payload traffic"
+    );
+    let streams: BTreeMap<String, Fields> = stream_rows(text)
+        .map(|(name, _, fields)| (name, fields))
+        .collect();
+    anyhow::ensure!(
+        streams.len() == args.cameras as usize,
+        "expected {} reporting streams, observed {}",
+        args.cameras,
+        streams.len()
+    );
+    let checked_sum = |key: &str| -> anyhow::Result<u64> {
+        streams.values().try_fold(0u64, |total, fields| {
+            let value = fields
+                .get(key)
+                .context("missing benchmark counter")?
+                .parse::<u64>()
+                .with_context(|| format!("invalid benchmark counter {key}"))?;
+            total
+                .checked_add(value)
+                .context("benchmark counter overflow")
+        })
+    };
+    let frames = checked_sum("frames")?;
+    anyhow::ensure!(frames > 0, "benchmark observed zero frames");
+    Ok(json!({
+        "label": args.label,
+        "cameras": args.cameras,
+        "read_interval_ms": args.read_interval_ms,
+        "recv_low_water_kib": args.recv_low_water_kib,
+        "window_s": (seconds * 10.0).round() / 10.0,
+        "payload_mbps": (mbps * 10.0).round() / 10.0,
+        "cpu_user_pct": (user * 100.0).round() / 100.0,
+        "cpu_sys_pct": (system * 100.0).round() / 100.0,
+        "cpu_pct": ((user + system) * 100.0).round() / 100.0,
+        "pct_per_mbps": ((user + system) / mbps * 10_000.0).round() / 10_000.0,
+        "wakeups_per_s": wakeups.round() as i64,
+        "rss_mib": (rss * 10.0).round() / 10.0,
+        "frames": frames,
+        "reconnects": checked_sum("reconnects")?,
+        "dropped": checked_sum("dropped")?,
+        "loss": checked_sum("loss")?,
+        "streams_reporting": streams.len(),
+    }))
+}
+
+/// Starts the replay server and the daemon in the root, samples the run, and
+/// prints the result line. The children stop in order (the daemon first) on
+/// every path.
+fn benchmark(args: &Args, root: &Path) -> anyhow::Result<()> {
+    let config = root.join("bench.toml");
+    write_config(&config, root, args)?;
+    let log = root.join("irisd.log");
+    let perf_path = root.join("perf.data");
+    let mut replay = start_replay(args, root)?;
+    let mut daemon = start_daemon(args, &config, &log)?;
+    let collected = sample_until(args, &mut replay, &mut daemon, &log, &perf_path);
+    let daemon_stop = daemon.terminate(Signal::INT, Duration::from_secs(30));
+    let replay_stop = replay.terminate(Signal::TERM, Duration::from_secs(10));
+    let samples = collected?;
+    daemon_stop?;
+    replay_stop?;
+    let text = std::fs::read_to_string(&log)?;
+    println!("{}", result_line(args, &samples, &text)?);
+    if args.perf > 0 {
+        writeln!(
+            io::stderr(),
+            "perf data (pipe format; perf report -i - < FILE): {}",
+            perf_path.display()
+        )?;
+    }
+    Ok(())
+}
+
+/// Runs the benchmark in a fresh or marker-owned root and deletes its
+/// recordings afterwards unless `--keep` is given; SIGINT and SIGTERM stop the
+/// run and still clean up.
 pub fn run(args: &Args) -> anyhow::Result<()> {
     validate_args(args)?;
-    let cancelled = cancellation_flag();
+    watch_for_cancellation()?;
     let mut owned_root = BenchRoot::prepare(args)?;
-    let root = owned_root.root.clone();
-    let operation = (|| -> anyhow::Result<()> {
-        let config = root.join("bench.toml");
-        write_config(&config, &root, args)?;
-        let log = root.join("irisd.log");
-
-        let mut replay_command = Command::new("setsid");
-        replay_command
-            .arg(&args.replay)
-            .args([
-                "--listen",
-                &format!("127.0.0.1:{}", args.port),
-                "--mount",
-                &format!("main={}", args.file.display()),
-            ])
-            .args(&args.replay_arg)
-            .stdout(std::fs::File::create(root.join("replay.log"))?)
-            .stderr(Stdio::inherit());
-        let mut replay = ManagedChild::spawn("iris-replay", &mut replay_command)?;
-        wait_replay(&mut replay, args.port, &cancelled)?;
-
-        let mut daemon_command = Command::new("setsid");
-        daemon_command
-            .arg(&args.irisd)
-            .args([
-                "run",
-                "--config",
-                config.to_str().context("config path is not UTF-8")?,
-                "--stats-interval",
-                &args.stats_interval,
-            ])
-            .args(&args.daemon_arg)
-            .stdout(std::fs::File::create(&log)?)
-            .stderr(std::fs::File::options().append(true).open(&log)?);
-        let mut daemon = ManagedChild::spawn("irisd", &mut daemon_command)?;
-        let daemon_pid = daemon.id();
-        let mut samples = vec![proc_sample(daemon_pid)?];
-        let started = Instant::now();
-        let mut next_sample = started + Duration::from_secs(5);
-        let mut perf: Option<(ManagedChild, std::fs::File)> = None;
-        let perf_path = root.join("perf.data");
-        let loop_result = (|| -> anyhow::Result<()> {
-            while started.elapsed() < Duration::from_secs(args.seconds) {
-                anyhow::ensure!(!cancelled.load(Ordering::SeqCst), "benchmark cancelled");
-                if let Some(status) = replay.try_wait()? {
-                    anyhow::bail!("iris-replay exited early with {status}");
-                }
-                if let Some(status) = daemon.try_wait()? {
-                    anyhow::bail!("irisd exited early with {status}; see {}", log.display());
-                }
-                if Instant::now() >= next_sample {
-                    samples.push(proc_sample(daemon_pid)?);
-                    next_sample += Duration::from_secs(5);
-                }
-                if args.perf > 0 && perf.is_none() && started.elapsed() >= Duration::from_secs(20) {
-                    let output = create_perf_output(&perf_path)?;
-                    let mut perf_command = Command::new("setsid");
-                    perf_command
-                        .args(perf_command_args(daemon_pid, args.perf))
-                        .stdout(output.try_clone()?)
-                        .stderr(Stdio::inherit());
-                    perf = Some((ManagedChild::spawn("perf", &mut perf_command)?, output));
-                }
-                std::thread::sleep(Duration::from_millis(100));
-            }
-            if let Some((mut profiler, output)) = perf.take() {
-                profiler.wait_success(Duration::from_secs(args.perf.saturating_add(10)))?;
-                verify_perf_output(&output, &perf_path)?;
-            }
-            Ok(())
-        })();
-        let daemon_stop = daemon.terminate(rustix::process::Signal::INT, Duration::from_secs(30));
-        let replay_stop = replay.terminate(rustix::process::Signal::TERM, Duration::from_secs(10));
-        loop_result?;
-        daemon_stop?;
-        replay_stop?;
-        anyhow::ensure!(!samples.is_empty(), "no samples taken");
-
-        let ticks = rustix::param::clock_ticks_per_second() as f64;
-        let rss = samples
-            .iter()
-            .map(|sample| sample.rss_kib)
-            .max()
-            .unwrap_or(0) as f64
-            / 1024.0;
-        let text = std::fs::read_to_string(&log)?;
-        let Measurement {
-            seconds: secs,
-            user,
-            system,
-            wakeups,
-            mbps,
-        } = measure(&samples, &text, ticks, Duration::from_secs(20))?;
-        anyhow::ensure!(
-            mbps.is_finite() && mbps > 0.0,
-            "benchmark observed no payload traffic"
-        );
-        let mut streams = BTreeMap::new();
-        for raw in text.lines() {
-            let line = strip_ansi(raw);
-            if line.contains(" INFO stream ") {
-                let fields = kv(&line);
-                if let Some(name) = fields.get("stream").cloned() {
-                    streams.insert(name, fields);
-                }
-            }
-        }
-        anyhow::ensure!(
-            streams.len() == args.cameras as usize,
-            "expected {} reporting streams, observed {}",
-            args.cameras,
-            streams.len()
-        );
-        let checked_sum = |key: &str| -> anyhow::Result<u64> {
-            streams.values().try_fold(0u64, |total, fields| {
-                let value = fields
-                    .get(key)
-                    .context("missing benchmark counter")?
-                    .parse::<u64>()
-                    .with_context(|| format!("invalid benchmark counter {key}"))?;
-                total
-                    .checked_add(value)
-                    .context("benchmark counter overflow")
-            })
-        };
-        let frames = checked_sum("frames")?;
-        anyhow::ensure!(frames > 0, "benchmark observed zero frames");
-        let result = json!({
-            "label": args.label,
-            "cameras": args.cameras,
-            "read_interval_ms": args.read_interval_ms,
-            "recv_low_water_kib": args.recv_low_water_kib,
-            "window_s": (secs * 10.0).round() / 10.0,
-            "payload_mbps": (mbps * 10.0).round() / 10.0,
-            "cpu_user_pct": (user * 100.0).round() / 100.0,
-            "cpu_sys_pct": (system * 100.0).round() / 100.0,
-            "cpu_pct": ((user + system) * 100.0).round() / 100.0,
-            "pct_per_mbps": ((user + system) / mbps * 10_000.0).round() / 10_000.0,
-            "wakeups_per_s": wakeups.round() as i64,
-            "rss_mib": (rss * 10.0).round() / 10.0,
-            "frames": frames,
-            "reconnects": checked_sum("reconnects")?,
-            "dropped": checked_sum("dropped")?,
-            "loss": checked_sum("loss")?,
-            "streams_reporting": streams.len(),
-        });
-        println!("{result}");
-        if args.perf > 0 {
-            writeln!(
-                std::io::stderr(),
-                "perf data (pipe format; perf report -i - < FILE): {}",
-                perf_path.display()
-            )?;
-        }
-        Ok(())
-    })();
+    let operation = benchmark(args, &owned_root.root);
     let cleanup = owned_root.cleanup();
     match (operation, cleanup) {
         (Ok(()), Ok(())) => Ok(()),
@@ -903,6 +963,9 @@ pub fn run(args: &Args) -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::fs::Permissions;
+    use std::os::unix::fs::PermissionsExt as _;
+
     use super::*;
 
     fn args(root: PathBuf, executable: PathBuf) -> Args {
@@ -955,7 +1018,7 @@ mod tests {
             "2026-11-01T00:01:05Z INFO stream stream=b/main mib=1200\n",
             "2026-11-01T00:01:35Z INFO stream stream=b/main mib=1500\n",
         );
-        let measured = measure(&samples(), text, 100.0, Duration::from_secs(20)).unwrap();
+        let measured = measure(&samples(), text, 100.0, WARM_UP).unwrap();
         assert_eq!(measured.seconds, 55.0);
         assert!((measured.mbps - 167.77216).abs() < 1e-6);
         assert_eq!(measured.user, 10.0);
@@ -966,7 +1029,7 @@ mod tests {
     #[test]
     fn a_single_statistics_snapshot_cannot_produce_a_payload_rate() {
         let text = "2026-11-01T00:00:30Z INFO stream stream=a/main mib=100\n";
-        assert!(measure(&samples(), text, 100.0, Duration::from_secs(20)).is_err());
+        assert!(measure(&samples(), text, 100.0, WARM_UP).is_err());
     }
 
     #[test]
@@ -975,7 +1038,7 @@ mod tests {
             "2026-11-01T00:00:30Z INFO stream stream=a/main mib=100\n",
             "2026-11-01T00:01:00Z INFO stream stream=a/main mib=10\n",
         );
-        assert!(measure(&samples(), text, 100.0, Duration::from_secs(20)).is_err());
+        assert!(measure(&samples(), text, 100.0, WARM_UP).is_err());
     }
 
     #[test]
@@ -989,7 +1052,7 @@ mod tests {
             "2026-11-01T00:01:00Z INFO stream stream=a/main mib=400\n",
             "2026-11-01T00:01:30Z INFO stream stream=a/main mib=700\n",
         );
-        assert!(measure(&stepped, text, 100.0, Duration::from_secs(20)).is_err());
+        assert!(measure(&stepped, text, 100.0, WARM_UP).is_err());
     }
 
     #[test]
@@ -1040,7 +1103,6 @@ mod tests {
                 "sleep", "30"
             ]
         );
-        assert!(args.windows(2).any(|pair| pair == ["-o", "-"]));
         assert!(!args.iter().any(|arg| arg.contains("chown")));
         assert!(!args.iter().any(|arg| arg.contains("perf.data")));
     }
@@ -1049,12 +1111,18 @@ mod tests {
     fn the_perf_output_is_a_new_private_caller_file() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("perf.data");
-        let mut output = create_perf_output(&path).unwrap();
+        create_perf_output(&path).unwrap();
         let metadata = std::fs::symlink_metadata(&path).unwrap();
         assert_eq!(metadata.mode() & 0o7777, 0o600);
-        assert_eq!(metadata.uid(), rustix::process::getuid().as_raw());
+        assert_eq!(metadata.uid(), rustix::process::geteuid().as_raw());
         assert!(create_perf_output(&path).is_err(), "never reuses a file");
+    }
 
+    #[test]
+    fn a_perf_output_must_be_nonempty_and_still_named() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("perf.data");
+        let mut output = create_perf_output(&path).unwrap();
         assert!(verify_perf_output(&output, &path).is_err(), "empty profile");
         output.write_all(b"PERFILE2").unwrap();
         verify_perf_output(&output, &path).unwrap();
@@ -1065,7 +1133,11 @@ mod tests {
             verify_perf_output(&output, &path).is_err(),
             "a renamed-over path no longer names the profile"
         );
+    }
 
+    #[test]
+    fn the_perf_output_is_never_created_through_a_symlink() {
+        let directory = tempfile::tempdir().unwrap();
         let victim = directory.path().join("victim");
         std::fs::write(&victim, b"unchanged").unwrap();
         for (name, target) in [
@@ -1082,8 +1154,6 @@ mod tests {
 
     #[test]
     fn existing_roots_must_be_private() {
-        use std::os::unix::fs::PermissionsExt as _;
-
         let parent = tempfile::tempdir().unwrap();
         let root = parent.path().join("bench-root");
         let executable = std::env::current_exe().unwrap();
@@ -1091,7 +1161,7 @@ mod tests {
         assert_eq!(std::fs::metadata(&root).unwrap().mode() & 0o7777, 0o700);
         drop(BenchRoot::prepare(&args(root.clone(), executable.clone())).unwrap());
         for mode in [0o770, 0o707, 0o777, 0o750] {
-            std::fs::set_permissions(&root, std::fs::Permissions::from_mode(mode)).unwrap();
+            std::fs::set_permissions(&root, Permissions::from_mode(mode)).unwrap();
             let error = BenchRoot::prepare(&args(root.clone(), executable.clone()))
                 .err()
                 .unwrap_or_else(|| panic!("mode {mode:o} must be rejected"));
@@ -1101,18 +1171,16 @@ mod tests {
 
     #[test]
     fn a_shared_parent_needs_the_sticky_bit() {
-        use std::os::unix::fs::PermissionsExt as _;
-
         let parent = tempfile::tempdir().unwrap();
         let root = parent.path().join("bench-root");
         let executable = std::env::current_exe().unwrap();
-        std::fs::set_permissions(parent.path(), std::fs::Permissions::from_mode(0o770)).unwrap();
+        std::fs::set_permissions(parent.path(), Permissions::from_mode(0o770)).unwrap();
         assert!(BenchRoot::prepare(&args(root.clone(), executable.clone())).is_err());
         assert!(!root.exists(), "nothing is created under a shared parent");
-        std::fs::set_permissions(parent.path(), std::fs::Permissions::from_mode(0o1770)).unwrap();
+        std::fs::set_permissions(parent.path(), Permissions::from_mode(0o1770)).unwrap();
         drop(BenchRoot::prepare(&args(root.clone(), executable)).unwrap());
         assert!(root.is_dir());
-        std::fs::set_permissions(parent.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::set_permissions(parent.path(), Permissions::from_mode(0o700)).unwrap();
     }
 
     #[test]
@@ -1127,13 +1195,31 @@ mod tests {
     }
 
     #[test]
+    fn a_reused_root_is_reset_and_its_recordings_deleted_afterwards() {
+        let parent = tempfile::tempdir().unwrap();
+        let root = parent.path().join("bench-root");
+        let executable = std::env::current_exe().unwrap();
+        let mut kept = BenchRoot::prepare(&args(root.clone(), executable.clone())).unwrap();
+        std::fs::write(root.join("run").join("kept.mp4"), b"x").unwrap();
+        std::fs::write(root.join("irisd.log"), b"old").unwrap();
+        // As after a run with `--keep`.
+        kept.keep = true;
+        drop(kept);
+        let mut prepared = BenchRoot::prepare(&args(root.clone(), executable)).unwrap();
+        assert!(!root.join("run").join("kept.mp4").exists());
+        assert!(!root.join("irisd.log").exists());
+        prepared.cleanup().unwrap();
+        assert!(!root.join("run").exists());
+        assert!(root.join("state").is_dir());
+    }
+
+    #[test]
     fn scratch_roots_cannot_contain_or_enter_the_worktree() {
         let cwd = std::env::current_dir().unwrap().canonicalize().unwrap();
         assert!(!safe_root_location(&cwd.join("scratch-root"), &cwd));
         assert!(!safe_root_location(cwd.parent().unwrap(), &cwd));
     }
 
-    #[cfg(unix)]
     #[test]
     fn non_utf8_root_is_rejected_before_creation() {
         use std::ffi::OsString;

@@ -2,9 +2,13 @@
 //! fragmented MP4 byte stream into the tile's `appsrc`, reconnecting until
 //! it is cancelled.
 
+use std::fmt;
+use std::sync::Arc;
 use std::time::Duration;
 
 use futures::StreamExt as _;
+use iris_core::id::{CameraId, StreamKind};
+use iris_tls::ClientConfig;
 use tokio_tungstenite::Connector;
 use tokio_tungstenite::tungstenite::Error as WebSocketError;
 use tokio_tungstenite::tungstenite::Message;
@@ -35,17 +39,31 @@ const MAX_OVERSIZED_DELAY: Duration = Duration::from_secs(60);
 /// Big) when a sync frame exceeds it.
 pub(crate) const LIVE_MESSAGE_BYTES: usize = SOURCE_QUEUE_BYTES as usize + 1;
 
-/// Where a feed connects.
-#[derive(Clone, Debug)]
+/// Where a feed connects. Its `Debug` output redacts the token.
+#[derive(Clone)]
 pub struct Feed {
-    /// Base URL of the API.
+    /// The API origin.
     pub api: Url,
     /// Bearer token, sent in the WebSocket handshake's Authorization header.
     pub token: Option<String>,
     /// Camera id.
-    pub camera: String,
+    pub camera: CameraId,
     /// Stream kind.
-    pub kind: String,
+    pub kind: StreamKind,
+    /// The trust a `wss` feed verifies the server with: the platform's store
+    /// plus any `--ca-file` authorities, shared with the API client.
+    pub tls: Arc<ClientConfig>,
+}
+
+impl fmt::Debug for Feed {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Feed")
+            .field("api", &self.api.as_str())
+            .field("token", &self.token.as_ref().map(|_| "<redacted>"))
+            .field("camera", &self.camera)
+            .field("kind", &self.kind)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Feed {
@@ -83,9 +101,10 @@ fn next_oversized_delay(previous: Option<Duration>) -> Duration {
     })
 }
 
-/// Runs the feed until `cancel` fires: connects, pushes every message's
-/// payload into `source`, and on any failure tells the tile to restart its
-/// pipeline and reconnects after a pause. A frame above the message ceiling
+/// Runs the feed until `cancel` fires: connects and pushes every message's
+/// payload into `source`. After every session, closed or failed, it tells the
+/// tile to restart its branch and reconnects after a pause. A frame above the
+/// message ceiling
 /// puts the tile in its oversized state and backs off exponentially until the
 /// feed delivers video again.
 pub async fn run(
@@ -107,8 +126,14 @@ pub async fn run(
         let announce = oversized_delay.is_some().then_some(&tile_events);
         let outcome = tokio::select! {
             () = cancel.cancelled() => return,
-            // `None` verifies a `wss` server against the platform's native roots.
-            outcome = session(&url, feed.token.as_deref(), None, &source, announce, &mut streamed) => outcome,
+            outcome = session(
+                &url,
+                feed.token.as_deref(),
+                Some(Connector::Rustls(Arc::clone(&feed.tls))),
+                &source,
+                announce,
+                &mut streamed,
+            ) => outcome,
         };
         if streamed {
             oversized_delay = None;
@@ -155,9 +180,11 @@ fn connect_request(url: &Url, token: Option<&str>) -> anyhow::Result<Request<()>
 }
 
 /// One connection: pushes every payload into `source` until the server closes.
-/// `connector` selects the TLS trust for `wss` (`None` uses the platform's
-/// native roots). `announce` receives [`TileEvent::Live`] at the first fragment,
-/// and `streamed` records that a fragment arrived.
+/// A text message, an empty message, or an unknown type byte breaks the fixed
+/// protocol and fails the session. `connector` selects the TLS trust for
+/// `wss`; the feed passes its shared configuration. `announce` receives
+/// [`TileEvent::Live`] at the first fragment, and `streamed` records that a
+/// fragment arrived.
 async fn session(
     url: &Url,
     token: Option<&str>,
@@ -170,7 +197,7 @@ async fn session(
     let (stream, _) = tokio_tungstenite::connect_async_tls_with_config(
         request,
         Some(websocket_config()),
-        false,
+        /* disable_nagle */ false,
         connector,
     )
     .await?;
@@ -188,6 +215,8 @@ async fn session(
                 }
             }
             Ok(Message::Close(frame)) => return Ok(close_ending(frame.as_ref())),
+            Ok(Message::Text(_)) => anyhow::bail!("text message on the binary live feed"),
+            // Pings, pongs, and raw frames: tungstenite answers pings itself.
             Ok(_) => {}
             Err(WebSocketError::Capacity(_)) => return Ok(Ending::Oversized),
             Err(error) => return Err(error.into()),
@@ -229,39 +258,57 @@ mod tests {
     use axum::extract::WebSocketUpgrade;
     use axum::extract::ws::CloseFrame as AxumCloseFrame;
     use axum::extract::ws::Message as AxumMessage;
-    use axum::routing::get;
+    use axum::routing;
     use futures::SinkExt as _;
     use tokio_rustls::TlsAcceptor;
     use tokio_rustls::rustls::pki_types::PrivatePkcs8KeyDer;
-    use tokio_rustls::rustls::{CertificateError, ClientConfig, RootCertStore, ServerConfig};
+    use tokio_rustls::rustls::{CertificateError, ServerConfig};
 
     use super::*;
 
     /// Bounds every network step of a test.
     const TEST_DEADLINE: Duration = Duration::from_secs(10);
 
+    fn feed(api: &str, token: Option<&str>) -> Feed {
+        Feed {
+            api: Url::parse(api).unwrap(),
+            token: token.map(str::to_owned),
+            camera: CameraId::try_new("cam1").unwrap(),
+            kind: StreamKind::Sub,
+            tls: iris_tls::client_config(None).unwrap(),
+        }
+    }
+
     #[test]
-    fn live_url_switches_scheme_and_keeps_the_bearer_in_a_header() {
-        let feed = Feed {
-            api: Url::parse("http://192.0.2.10:8554").unwrap(),
-            token: Some("a b".into()),
-            camera: "cam1".into(),
-            kind: "sub".into(),
-        };
+    fn an_http_api_gives_a_ws_feed_and_an_https_api_a_wss_feed() {
         assert_eq!(
-            feed.url().unwrap().as_str(),
+            feed("http://192.0.2.10:8554", None).url().unwrap().as_str(),
             "ws://192.0.2.10:8554/api/streams/cam1/sub/live"
         );
-        let request = connect_request(&feed.url().unwrap(), feed.token.as_deref()).unwrap();
-        assert_eq!(request.headers()[header::AUTHORIZATION], "Bearer a b");
-        let secure = Feed {
-            api: Url::parse("https://example.invalid/").unwrap(),
-            token: None,
-            ..feed
-        };
         assert_eq!(
-            secure.url().unwrap().as_str(),
+            feed("https://example.invalid/", None)
+                .url()
+                .unwrap()
+                .as_str(),
             "wss://example.invalid/api/streams/cam1/sub/live"
+        );
+    }
+
+    #[test]
+    fn the_bearer_travels_in_the_handshake_header() {
+        let feed = feed("http://192.0.2.10:8554", Some("a b"));
+        let url = feed.url().unwrap();
+        let request = connect_request(&url, feed.token.as_deref()).unwrap();
+        assert_eq!(request.headers()[header::AUTHORIZATION], "Bearer a b");
+        assert!(!url.as_str().contains("a b") && url.query().is_none());
+    }
+
+    #[test]
+    fn the_feed_redacts_its_token() {
+        let shown = format!("{:?}", feed("http://192.0.2.10:8554", Some("t0ken")));
+        assert!(
+            shown.contains("<redacted>") && !shown.contains("t0ken"),
+            "{shown}"
         );
     }
 
@@ -279,9 +326,13 @@ mod tests {
     }
 
     #[test]
-    fn malformed_fixed_protocol_messages_end_the_session() {
+    fn live_payload_rejects_empty_and_unknown_types() {
         assert!(live_payload(&[]).is_err());
         assert!(live_payload(&[0xff]).is_err());
+    }
+
+    #[test]
+    fn live_payload_strips_the_type_byte_of_inits_and_fragments() {
         assert_eq!(live_payload(&[MSG_INIT, 7]).unwrap(), &[7]);
         assert_eq!(live_payload(&[MSG_FRAGMENT, 8]).unwrap(), &[8]);
     }
@@ -342,12 +393,20 @@ mod tests {
 
         let source = Source::for_tests();
         let mut streamed = false;
+        let platform_only = iris_tls::client_config(None).unwrap();
         let untrusted = tokio::time::timeout(
             TEST_DEADLINE,
-            session(&url, Some("fixture"), None, &source, None, &mut streamed),
+            session(
+                &url,
+                Some("fixture"),
+                Some(Connector::Rustls(platform_only)),
+                &source,
+                None,
+                &mut streamed,
+            ),
         )
         .await
-        .expect("the default trust store decides before the deadline")
+        .expect("the platform trust store decides before the deadline")
         .expect_err("a self-signed server is not in the platform trust store");
         let rustls_error = untrusted
             .downcast_ref::<WebSocketError>()
@@ -368,17 +427,17 @@ mod tests {
         assert!(!streamed);
         assert_eq!(source.queued_bytes(), 0);
 
-        let mut roots = RootCertStore::empty();
-        roots.add(certified.cert.der().clone()).unwrap();
-        let config = ClientConfig::builder()
-            .with_root_certificates(roots)
-            .with_no_client_auth();
+        // The same path an operator takes: the proxy's authority in `--ca-file`.
+        let directory = tempfile::tempdir().unwrap();
+        let ca_file = directory.path().join("proxy-ca.pem");
+        std::fs::write(&ca_file, certified.cert.pem()).unwrap();
+        let with_ca_file = iris_tls::client_config(Some(&ca_file)).unwrap();
         let ending = tokio::time::timeout(
             TEST_DEADLINE,
             session(
                 &url,
                 Some("fixture"),
-                Some(Connector::Rustls(Arc::new(config))),
+                Some(Connector::Rustls(with_ca_file)),
                 &source,
                 None,
                 &mut streamed,
@@ -386,7 +445,7 @@ mod tests {
         )
         .await
         .expect("the trusted session ends before the deadline")
-        .expect("WSS connects when the fixture root is trusted");
+        .expect("WSS connects when the CA file names the fixture root");
         assert_eq!(ending, Ending::Closed);
         assert!(streamed);
         assert_eq!(source.queued_bytes(), 5, "both payloads reach the source");
@@ -399,12 +458,16 @@ mod tests {
         Fragment(usize),
         /// A close with code 1009, as the daemon sends for an oversized sync frame.
         TooBig,
+        /// A binary message whose type byte the protocol does not define.
+        UnknownType,
+        /// A text message.
+        Text,
     }
 
     async fn plain_websocket_fixture(script: Script) -> SocketAddr {
         let app = Router::new().route(
             "/api/streams/{camera}/{kind}/live",
-            get(move |upgrade: WebSocketUpgrade| async move {
+            routing::get(move |upgrade: WebSocketUpgrade| async move {
                 upgrade.on_upgrade(move |mut socket| async move {
                     let init = vec![MSG_INIT, 0, 0, 0, 8];
                     let _ = socket.send(AxumMessage::Binary(init.into())).await;
@@ -421,6 +484,15 @@ mod tests {
                                 reason: "frame exceeds the live message ceiling".into(),
                             };
                             let _ = socket.send(AxumMessage::Close(Some(frame))).await;
+                        }
+                        Script::UnknownType => {
+                            let message = AxumMessage::Binary(vec![0x03, 1, 2].into());
+                            let _ = socket.send(message).await;
+                            let _ = socket.send(AxumMessage::Close(None)).await;
+                        }
+                        Script::Text => {
+                            let _ = socket.send(AxumMessage::Text("hello".into())).await;
+                            let _ = socket.send(AxumMessage::Close(None)).await;
                         }
                     }
                 })
@@ -462,14 +534,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_unknown_message_type_fails_the_session() {
+        gst::init().unwrap();
+        let address = plain_websocket_fixture(Script::UnknownType).await;
+        let error = plain_session(address).await.unwrap_err();
+        assert!(
+            format!("{error:#}").contains("unknown live message type"),
+            "{error:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_text_message_fails_the_session() {
+        gst::init().unwrap();
+        let address = plain_websocket_fixture(Script::Text).await;
+        let error = plain_session(address).await.unwrap_err();
+        assert!(format!("{error:#}").contains("text message"), "{error:#}");
+    }
+
+    #[tokio::test]
     async fn an_oversized_stream_backs_off_instead_of_reconnecting_every_two_seconds() {
         gst::init().unwrap();
         let address = plain_websocket_fixture(Script::TooBig).await;
         let feed = Feed {
-            api: Url::parse(&format!("http://{address}")).unwrap(),
-            token: None,
-            camera: "cam1".into(),
-            kind: "main".into(),
+            kind: StreamKind::Main,
+            ..feed(&format!("http://{address}"), None)
         };
         let (events_tx, events_rx) = async_channel::unbounded();
         let cancel = CancellationToken::new();

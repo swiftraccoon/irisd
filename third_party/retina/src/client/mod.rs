@@ -709,9 +709,11 @@ impl PlayOptions {
     /// After `PLAY` on a TCP session, takes the socket out of tokio's reactor:
     /// reads that would block return `Pending` without a waker and never wake
     /// `epoll`, so a caller that polls the session on its own timer pays no
-    /// per-packet wake-up. Writes (keepalives, `TEARDOWN`) block briefly.
-    /// Only for callers that poll on a timer: with an ordinary `.await` the
-    /// session would hang.
+    /// per-packet wake-up. Writes never block: a flush that would block
+    /// returns `Pending`, keeps the unsent bytes, and continues on a later
+    /// poll; a `TEARDOWN` first returns the socket to the reactor. Only for
+    /// callers that poll on a timer: with an ordinary `.await` the session
+    /// would hang. A failed detach fails the `PLAY`, since it loses the socket.
     pub fn detach_from_reactor(self, detach: bool) -> Self {
         Self {
             detach_from_reactor: detach,
@@ -2016,11 +2018,11 @@ impl Session<Described> {
         {
             warn!("unable to set SO_RCVLOWAT to {bytes} on the RTSP socket: {e}");
         }
-        if policy.detach_from_reactor
-            && (*inner.flags & (SessionFlag::TcpStreams as u8)) != 0
-            && let Err(e) = conn.inner.detach_from_reactor()
-        {
-            warn!("unable to detach the RTSP socket from the reactor: {e}");
+        if policy.detach_from_reactor && (*inner.flags & (SessionFlag::TcpStreams as u8)) != 0 {
+            // A failed detach loses the socket, so the session cannot go on.
+            conn.inner
+                .detach_from_reactor()
+                .map_err(|e| wrap!(ErrorInt::Internal(e.into())))?;
         }
         Ok(Session(self.0, Playing(())))
     }

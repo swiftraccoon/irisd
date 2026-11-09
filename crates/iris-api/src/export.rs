@@ -24,7 +24,7 @@ use crate::hls::{
 use crate::media_admission::{self, MediaPermit};
 use crate::query::{TimeParams, resolve_range};
 use crate::segments::stream_key;
-use crate::state::{ApiState, MediaClass, admitted_media_bytes};
+use crate::state::{ApiState, MediaClass};
 
 pub(crate) async fn export(
     State(state): State<Arc<ApiState>>,
@@ -58,7 +58,7 @@ pub(crate) async fn export(
     drop(producer);
     let stream = futures_util::stream::poll_fn(move |cx| match rx.poll_recv(cx) {
         Poll::Ready(Some(Ok(bytes))) => {
-            Poll::Ready(Some(Ok(admitted_media_bytes(bytes, Arc::clone(&permit)))))
+            Poll::Ready(Some(Ok(media_admission::attach(bytes, &permit))))
         }
         other => other,
     });
@@ -99,7 +99,7 @@ async fn compatible_init(
             let file = media.reopen()?;
             let mut init = Vec::new();
             init.try_reserve_exact(init_len as usize)
-                .map_err(|error| io::Error::other(error.to_string()))?;
+                .map_err(io::Error::other)?;
             init.resize(init_len as usize, 0);
             file.read_exact_at(&mut init, 0)?;
             Ok::<_, io::Error>(init)
@@ -158,7 +158,7 @@ async fn stream_segments(
             let mut fragment = Vec::new();
             fragment
                 .try_reserve_exact(record.len as usize)
-                .map_err(|error| io::Error::other(error.to_string()))?;
+                .map_err(io::Error::other)?;
             fragment.resize(record.len as usize, 0);
             file.read_exact(&mut fragment).await?;
             validate_fragment_record(&fragment, record)?;
@@ -236,6 +236,8 @@ fn ticks_through(from: WallUs, to: WallUs) -> u64 {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
     use crate::hls::ValidatedMedia;
     use iris_catalog::{SegmentId, SegmentRow};
@@ -357,6 +359,7 @@ mod tests {
                 width: 0,
                 height: 0,
                 sample_entry_hash: 0,
+                sample_entry_id: iris_catalog::SampleEntryId(1),
             },
             records,
             media,
@@ -364,7 +367,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn export_reserves_queue_capacity_before_opening_the_next_fragment() {
         use iris_mp4::init::{SampleEntry, build_init_segment};
 
@@ -387,8 +390,10 @@ mod tests {
         let mut producer =
             tokio::spawn(async move { stream_segments(vec![source], range, &init, &tx).await });
 
+        // Under paused time the deadline fires as soon as the producer is idle,
+        // so this proves it is blocked on the queue and not on time.
         assert!(
-            tokio::time::timeout(std::time::Duration::from_millis(50), &mut producer)
+            tokio::time::timeout(Duration::from_millis(50), &mut producer)
                 .await
                 .is_err(),
             "the producer must wait for capacity before opening the missing media file"
@@ -404,19 +409,28 @@ mod tests {
         assert_eq!(error.kind(), io::ErrorKind::NotFound);
     }
 
+    fn three_fragments(directory: &std::path::Path) -> Vec<SegmentFragments> {
+        vec![
+            segment(directory, vec![record(0), record(1)]),
+            segment(directory, vec![record(2)]),
+        ]
+    }
+
     #[test]
     fn the_edit_list_trims_both_ends_to_the_range() {
         let directory = tempfile::tempdir().expect("temporary directory");
-        let segments = vec![
-            segment(directory.path(), vec![record(0), record(1)]),
-            segment(directory.path(), vec![record(2)]),
-        ];
+        let segments = three_fragments(directory.path());
         let from = record(0).wall.offset(500_000);
         let to = record(2).wall.offset(1_500_000);
         let edit = edit_list(&segments, TimeRange { from, to }).unwrap();
         assert_eq!(edit.media_time, 45_000);
         assert_eq!(edit.duration_ms, 5_000);
-        // A range wider than the recording trims nothing.
+    }
+
+    #[test]
+    fn a_range_wider_than_the_recording_trims_nothing() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let segments = three_fragments(directory.path());
         let wide = edit_list(
             &segments,
             TimeRange {
@@ -432,6 +446,12 @@ mod tests {
                 duration_ms: 6_000
             }
         );
+    }
+
+    #[test]
+    fn an_empty_selection_has_no_edit_list() {
+        let from = record(0).wall.offset(500_000);
+        let to = record(2).wall.offset(1_500_000);
         assert_eq!(edit_list(&[], TimeRange { from, to }), None);
     }
 }

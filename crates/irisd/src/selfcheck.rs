@@ -1,14 +1,12 @@
 //! A rotating integrity check of sealed recordings.
 //!
-//! Each run scans the newest sealed file of one stream with CRC verification and
-//! compares the scan with the catalog row, so silent corruption of written data or
-//! of the catalog shows up in the log within a day instead of at the first playback.
-//! The scan runs on a blocking thread; the monitor loop only launches it.
+//! Each run scans the newest sealed file of one stream with CRC verification
+//! and compares the scan with the catalog row, so silent corruption of written
+//! data or of the catalog shows up in the log within a day instead of at the
+//! first playback. The scan runs on a thread of its own; the monitor loop only
+//! launches it.
 
-use std::io;
-use std::io::Read;
-use std::io::Seek;
-use std::io::SeekFrom;
+use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -17,18 +15,20 @@ use std::time::{Duration, Instant};
 use iris_catalog::{CatalogHandle, SegmentRow};
 use iris_core::id::StreamKey;
 use iris_core::time::{MediaTicks, WallUs};
-use iris_mp4::reader::{ScanOptions, ScanReport, scan};
+use iris_mp4::reader::{self, ScanOptions, ScanReport};
+use iris_store::ApprovedRoot;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
-type ScanStarter = Arc<dyn Fn(PathBuf, CancellationToken) -> io::Result<ScanWorker> + Send + Sync>;
+/// The result a scan thread sends when it finishes; a dropped sender means
+/// the thread ended without one.
+type ScanResult = oneshot::Receiver<io::Result<ScanReport>>;
 
-struct ScanWorker {
-    result: oneshot::Receiver<io::Result<ScanReport>>,
-    thread: std::thread::JoinHandle<()>,
-}
+type ScanStarter = Arc<
+    dyn Fn(Arc<[ApprovedRoot]>, PathBuf, CancellationToken) -> io::Result<ScanResult> + Send + Sync,
+>;
 
 /// Outcome counters shared with the statistics reporter.
 #[derive(Debug, Default)]
@@ -59,6 +59,8 @@ impl SelfCheckStats {
 /// Picks streams in turn and checks each one's newest sealed file.
 pub struct SelfCheck {
     streams: Vec<StreamKey>,
+    /// The roots admitted at startup; a recording is opened beneath its root.
+    roots: Arc<[ApprovedRoot]>,
     next: usize,
     stats: Arc<SelfCheckStats>,
     active: Option<JoinHandle<()>>,
@@ -71,6 +73,7 @@ impl std::fmt::Debug for SelfCheck {
         formatter
             .debug_struct("SelfCheck")
             .field("streams", &self.streams)
+            .field("roots", &self.roots)
             .field("next", &self.next)
             .field("stats", &self.stats)
             .field("active", &self.active)
@@ -85,6 +88,7 @@ impl SelfCheck {
     pub fn new(streams: Vec<StreamKey>, shutdown: CancellationToken) -> Self {
         Self {
             streams,
+            roots: Arc::from(Vec::new()),
             next: 0,
             stats: Arc::new(SelfCheckStats::default()),
             active: None,
@@ -97,6 +101,23 @@ impl SelfCheck {
     #[must_use]
     pub fn stats(&self) -> Arc<SelfCheckStats> {
         Arc::clone(&self.stats)
+    }
+
+    /// Points the checker at the roots admitted at startup. Each check opens
+    /// its recording beneath the root that holds it, without following a link
+    /// or crossing a mount; a recording outside every root fails its check.
+    pub fn set_roots(&mut self, roots: Vec<ApprovedRoot>) {
+        self.roots = Arc::from(roots);
+    }
+
+    /// Replaces the streams the checker rotates over, as cameras are added
+    /// and removed at run time; the rotation continues from its position,
+    /// wrapping to the first stream when the list got shorter.
+    pub fn set_streams(&mut self, streams: Vec<StreamKey>) {
+        if self.next >= streams.len() {
+            self.next = 0;
+        }
+        self.streams = streams;
     }
 
     /// The interval between runs that visits every stream once per `cycle`.
@@ -128,9 +149,10 @@ impl SelfCheck {
         let catalog = catalog.clone();
         let stats = Arc::clone(&self.stats);
         let shutdown = self.shutdown.clone();
+        let roots = Arc::clone(&self.roots);
         let scan_starter = Arc::clone(&self.scan_starter);
         self.active = Some(tokio::spawn(async move {
-            check_stream(&catalog, &key, &stats, &shutdown, scan_starter).await;
+            check_stream(&catalog, &key, &stats, &shutdown, roots, scan_starter).await;
         }));
     }
 
@@ -147,6 +169,7 @@ async fn check_stream(
     key: &StreamKey,
     stats: &SelfCheckStats,
     shutdown: &CancellationToken,
+    roots: Arc<[ApprovedRoot]>,
     scan_starter: ScanStarter,
 ) {
     let row = match tokio::select! {
@@ -167,17 +190,15 @@ async fn check_stream(
     };
     let path = row.path.clone();
     let started = Instant::now();
-    let worker = match scan_starter(path, shutdown.clone()) {
-        Ok(worker) => worker,
+    let result = match scan_starter(roots, path, shutdown.clone()) {
+        Ok(result) => result,
         Err(err) => {
             stats.failed.fetch_add(1, Ordering::Relaxed);
             warn!(stream = %key, %err, "selfcheck failed: cannot start scan thread");
             return;
         }
     };
-    let ScanWorker { result, thread } = worker;
     let scanned = result.await;
-    let thread_panicked = thread.join().is_err();
     let ms = started.elapsed().as_millis();
     if shutdown.is_cancelled() {
         debug!(stream = %key, ms, "selfcheck cancelled");
@@ -186,8 +207,7 @@ async fn check_stream(
     let outcome = match scanned {
         Ok(Ok(report)) => compare(&row, &report),
         Ok(Err(err)) => Err(format!("cannot scan: {err}")),
-        Err(err) if thread_panicked => Err(format!("scan thread panicked: {err}")),
-        Err(err) => Err(format!("scan thread stopped without a result: {err}")),
+        Err(_) => Err("scan thread stopped without a result".to_owned()),
     };
     match outcome {
         Ok(()) => {
@@ -216,22 +236,44 @@ async fn check_stream(
     }
 }
 
-fn start_scan(path: PathBuf, shutdown: CancellationToken) -> io::Result<ScanWorker> {
+/// Starts the scan of `path` on a thread named `irisd-selfcheck`; the
+/// thread's last action is sending its result.
+fn start_scan(
+    roots: Arc<[ApprovedRoot]>,
+    path: PathBuf,
+    shutdown: CancellationToken,
+) -> io::Result<ScanResult> {
     let (result_tx, result) = oneshot::channel();
-    let thread = std::thread::Builder::new()
+    std::thread::Builder::new()
         .name("irisd-selfcheck".into())
         .spawn(move || {
-            let _ = result_tx.send(scan_file(&path, shutdown));
+            let _ = result_tx.send(scan_file(&roots, &path, shutdown));
         })?;
-    Ok(ScanWorker { result, thread })
+    Ok(result)
 }
 
-/// Scans a file completely, verifying every trailer CRC. The open never
-/// follows a final symlink or blocks on a FIFO or device, and the scan accepts
-/// at most the sidecar record limit of fragments.
-fn scan_file(path: &Path, shutdown: CancellationToken) -> io::Result<ScanReport> {
-    let file = iris_store::open_regular_file(path)?;
-    scan(
+/// Scans a file completely, verifying every trailer CRC. The file is opened
+/// beneath the approved root that holds it, so the open follows no link,
+/// crosses no mount, never blocks on a FIFO or device, and refuses a path
+/// outside every root; the scan accepts at most the sidecar record limit of
+/// fragments.
+fn scan_file(
+    roots: &[ApprovedRoot],
+    path: &Path,
+    shutdown: CancellationToken,
+) -> io::Result<ScanReport> {
+    let root = roots
+        .iter()
+        .filter(|root| path.starts_with(root.path()))
+        .max_by_key(|root| root.path().as_os_str().len())
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "recording path is outside every approved root",
+            )
+        })?;
+    let file = iris_store::open_segment_beneath(root, path)?;
+    reader::scan(
         io::BufReader::new(CancellableReader {
             inner: file,
             shutdown,
@@ -243,15 +285,24 @@ fn scan_file(path: &Path, shutdown: CancellationToken) -> io::Result<ScanReport>
     )
 }
 
+/// A reader that fails every read and seek once `shutdown` is cancelled. The
+/// failure is not `Interrupted`: the standard library's `read_exact` retries
+/// that kind, which would spin for as long as the token stays cancelled.
 struct CancellableReader<R> {
     inner: R,
     shutdown: CancellationToken,
 }
 
+impl<R> CancellableReader<R> {
+    fn cancelled() -> io::Error {
+        io::Error::other("scan cancelled")
+    }
+}
+
 impl<R: Read> Read for CancellableReader<R> {
     fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
         if self.shutdown.is_cancelled() {
-            return Err(io::Error::new(io::ErrorKind::Interrupted, "scan cancelled"));
+            return Err(Self::cancelled());
         }
         self.inner.read(buffer)
     }
@@ -260,18 +311,19 @@ impl<R: Read> Read for CancellableReader<R> {
 impl<R: Seek> Seek for CancellableReader<R> {
     fn seek(&mut self, position: SeekFrom) -> io::Result<u64> {
         if self.shutdown.is_cancelled() {
-            return Err(io::Error::new(io::ErrorKind::Interrupted, "scan cancelled"));
+            return Err(Self::cancelled());
         }
         self.inner.seek(position)
     }
 }
 
 /// Compares a sealed row with a CRC-verified scan of its file. The error lists
-/// every mismatch.
-pub fn compare(row: &SegmentRow, report: &ScanReport) -> Result<(), String> {
+/// every mismatch; a fragment without a `prft` leaves a wall boundary
+/// unverifiable, which is a mismatch too.
+fn compare(row: &SegmentRow, report: &ScanReport) -> Result<(), String> {
     let mut problems = Vec::new();
     if let Some(stop) = &report.stop {
-        problems.push(format!("scan stopped: {stop:?}"));
+        problems.push(format!("scan stopped: {stop}"));
     }
     let fragments = u32::try_from(report.fragments.len()).unwrap_or(u32::MAX);
     if fragments != row.fragments {
@@ -317,10 +369,14 @@ pub fn compare(row: &SegmentRow, report: &ScanReport) -> Result<(), String> {
         } else {
             problems.push("media end overflows".to_owned());
         }
-        if let Some(wall) = first.wall
-            && wall != row.wall_start
-        {
-            problems.push(format!("wall start {wall} vs catalog {}", row.wall_start));
+        match first.wall {
+            Some(wall) if wall != row.wall_start => {
+                problems.push(format!("wall start {wall} vs catalog {}", row.wall_start));
+            }
+            Some(_) => {}
+            None => {
+                problems.push("wall start unavailable: first fragment has no prft".to_owned());
+            }
         }
         match last.wall {
             Some(wall) => {
@@ -350,7 +406,7 @@ mod tests {
     use std::path::PathBuf;
 
     use iris_catalog::{NewSegment, SegmentId};
-    use iris_core::id::StreamKind;
+    use iris_core::id::{CameraId, StreamKind};
     use iris_core::time::WallUs;
     use iris_mp4::reader::{FragmentInfo, ScanStop};
 
@@ -395,6 +451,7 @@ mod tests {
             width: 1,
             height: 1,
             sample_entry_hash: 0,
+            sample_entry_id: iris_catalog::SampleEntryId(1),
         }
     }
 
@@ -410,6 +467,13 @@ mod tests {
         }
     }
 
+    fn key(camera: &str) -> StreamKey {
+        StreamKey {
+            camera: CameraId::try_new(camera).unwrap(),
+            kind: StreamKind::Main,
+        }
+    }
+
     #[test]
     fn matching_scan_passes() {
         assert_eq!(compare(&row(), &report()), Ok(()));
@@ -422,7 +486,10 @@ mod tests {
         bad.stop = Some(ScanStop::CrcMismatch { offset: 1_768 });
         bad.fragments.pop();
         let reason = compare(&row(), &bad).unwrap_err();
-        assert!(reason.contains("scan stopped"), "{reason}");
+        assert!(
+            reason.contains("scan stopped: CRC mismatch on the fragment at 1768"),
+            "{reason}"
+        );
         assert!(reason.contains("fragments 1 vs catalog 2"), "{reason}");
         assert!(
             reason.contains("valid bytes 2000 vs catalog 2768"),
@@ -435,14 +502,30 @@ mod tests {
     }
 
     #[test]
+    fn replacing_the_streams_keeps_the_rotation_in_range() {
+        let mut check =
+            SelfCheck::new(vec![key("a"), key("b"), key("c")], CancellationToken::new());
+        check.next = 2;
+        check.set_streams(vec![key("a"), key("b"), key("c"), key("d")]);
+        assert_eq!(check.next, 2, "a longer list keeps the position");
+        assert_eq!(
+            check.interval(Duration::from_secs(400)),
+            Some(Duration::from_secs(100))
+        );
+        check.set_streams(vec![key("a")]);
+        assert_eq!(check.next, 0, "a shorter list wraps to the first stream");
+        check.set_streams(Vec::new());
+        assert_eq!(check.next, 0);
+        assert_eq!(
+            check.interval(Duration::from_secs(400)),
+            Some(Duration::from_secs(400)),
+            "no streams still yields a positive interval"
+        );
+    }
+
+    #[test]
     fn interval_divides_the_cycle_over_the_streams() {
-        let keys = vec![
-            StreamKey {
-                camera: "a".parse().unwrap(),
-                kind: StreamKind::Main
-            };
-            4
-        ];
+        let keys = vec![key("a"); 4];
         assert_eq!(
             SelfCheck::new(keys, CancellationToken::new()).interval(Duration::from_secs(3_600)),
             Some(Duration::from_mins(15))
@@ -451,17 +534,24 @@ mod tests {
             SelfCheck::new(Vec::new(), CancellationToken::new()).interval(Duration::from_secs(60)),
             Some(Duration::from_secs(60))
         );
-        let keys = vec![
-            StreamKey {
-                camera: "a".parse().unwrap(),
-                kind: StreamKind::Main,
-            };
-            2
-        ];
         assert_eq!(
-            SelfCheck::new(keys, CancellationToken::new()).interval(Duration::from_nanos(1)),
+            SelfCheck::new(vec![key("a"); 2], CancellationToken::new())
+                .interval(Duration::from_nanos(1)),
             None
         );
+    }
+
+    #[test]
+    fn wall_start_is_derived_from_the_first_prft() {
+        let mut mismatched = report();
+        mismatched.fragments[0].wall = Some(WallUs::new(2_000_000));
+        let reason = compare(&row(), &mismatched).unwrap_err();
+        assert!(reason.contains("wall start"), "{reason}");
+
+        let mut no_prft = report();
+        no_prft.fragments[0].wall = None;
+        let reason = compare(&row(), &no_prft).unwrap_err();
+        assert!(reason.contains("first fragment has no prft"), "{reason}");
     }
 
     #[test]
@@ -474,7 +564,7 @@ mod tests {
         let mut no_prft = report();
         no_prft.fragments[1].wall = None;
         let reason = compare(&row(), &no_prft).unwrap_err();
-        assert!(reason.contains("no prft"), "{reason}");
+        assert!(reason.contains("final fragment has no prft"), "{reason}");
 
         let mut zero_wall = report();
         zero_wall.fragments[1].wall = Some(WallUs::new(0));
@@ -493,10 +583,7 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let catalog = CatalogHandle::open(&dir.path().join("catalog.db")).unwrap();
-        let key = StreamKey {
-            camera: "cam1".parse().unwrap(),
-            kind: StreamKind::Main,
-        };
+        let key = key("cam1");
         let corrupt_path = PathBuf::from("/x/corrupt-newest.mp4");
         catalog
             .adopt_segment(NewSegment {
@@ -537,13 +624,13 @@ mod tests {
 
         let selected = Arc::new(Mutex::new(None));
         let selected_by_scan = Arc::clone(&selected);
-        let scan_starter: ScanStarter = Arc::new(move |path, _shutdown| {
+        let scan_starter: ScanStarter = Arc::new(move |_roots, path, _shutdown| {
             *selected_by_scan.lock().unwrap() = Some(path);
             let (result_tx, result) = oneshot::channel();
-            let thread = std::thread::spawn(move || {
+            std::thread::spawn(move || {
                 let _ = result_tx.send(Ok(report()));
             });
-            Ok(ScanWorker { result, thread })
+            Ok(result)
         });
         let mut check = SelfCheck::new(vec![key], CancellationToken::new());
         check.scan_starter = scan_starter;
@@ -566,7 +653,7 @@ mod tests {
     }
 
     #[test]
-    fn selfcheck_rejects_decode_end_overflow_and_accepts_u64_boundaries() {
+    fn selfcheck_rejects_decode_end_overflow() {
         let mut overflow_report = report();
         overflow_report.fragments = vec![fragment(768, u64::MAX, Some(WallUs::new(0)))];
         overflow_report.fragments[0].duration = 1;
@@ -580,11 +667,21 @@ mod tests {
         overflow_row.wall_end = WallUs::new(11);
         let reason = compare(&overflow_row, &overflow_report).unwrap_err();
         assert!(reason.contains("media end overflows"), "{reason}");
+    }
 
-        let mut boundary_report = overflow_report.clone();
-        boundary_report.fragments[0].decode_time = u64::MAX - 1;
-        let mut boundary_row = overflow_row.clone();
+    #[test]
+    fn selfcheck_accepts_u64_media_boundaries() {
+        let mut boundary_report = report();
+        boundary_report.fragments = vec![fragment(768, u64::MAX - 1, Some(WallUs::new(0)))];
+        boundary_report.fragments[0].duration = 1;
+        boundary_report.valid_len = 1_768;
+        let mut boundary_row = row();
+        boundary_row.fragments = 1;
+        boundary_row.bytes = 1_768;
         boundary_row.media_start = u64::MAX - 1;
+        boundary_row.media_end = u64::MAX;
+        boundary_row.wall_start = WallUs::new(0);
+        boundary_row.wall_end = WallUs::new(11);
         assert_eq!(compare(&boundary_row, &boundary_report), Ok(()));
 
         let mut wide_report = report();
@@ -601,15 +698,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn catalogued_gated_scan_is_single_flight_cancelled_joined_and_closes_its_file() {
+    async fn a_running_scan_is_single_flight_until_cancellation_releases_it() {
         use std::sync::atomic::AtomicBool;
 
         let dir = tempfile::tempdir().unwrap();
         let catalog = CatalogHandle::open(&dir.path().join("catalog.db")).unwrap();
-        let key = StreamKey {
-            camera: "a".parse().unwrap(),
-            kind: StreamKind::Main,
-        };
+        let key = key("a");
         let path = dir.path().join("recording.mp4");
         std::fs::write(&path, b"synthetic scan gate").unwrap();
         catalog
@@ -634,11 +728,11 @@ mod tests {
         let closed = Arc::new(AtomicBool::new(false));
         let scan_opened = Arc::clone(&opened);
         let scan_closed = Arc::clone(&closed);
-        let scan_starter: ScanStarter = Arc::new(move |path, shutdown| {
+        let scan_starter: ScanStarter = Arc::new(move |_roots, path, shutdown| {
             let (result_tx, result) = oneshot::channel();
             let opened = Arc::clone(&scan_opened);
             let closed = Arc::clone(&scan_closed);
-            let thread = std::thread::Builder::new()
+            std::thread::Builder::new()
                 .name("irisd-selfcheck-gated-test".into())
                 .spawn(move || {
                     let file = std::fs::File::open(path).unwrap();
@@ -648,12 +742,9 @@ mod tests {
                     }
                     drop(file);
                     closed.store(true, Ordering::Release);
-                    let _ = result_tx.send(Err(io::Error::new(
-                        io::ErrorKind::Interrupted,
-                        "gated scan cancelled",
-                    )));
+                    let _ = result_tx.send(Err(io::Error::other("gated scan cancelled")));
                 })?;
-            Ok(ScanWorker { result, thread })
+            Ok(result)
         });
         let shutdown = CancellationToken::new();
         let mut check = SelfCheck::new(vec![key], shutdown);
@@ -682,10 +773,113 @@ mod tests {
         catalog.shutdown();
     }
 
+    /// A reader that yields one zero byte per read and cancels its token
+    /// after the first, so the scan's next read sees the cancellation.
+    struct OneByteThenCancel {
+        shutdown: CancellationToken,
+    }
+
+    impl Read for OneByteThenCancel {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            let Some(first) = buffer.first_mut() else {
+                return Ok(0);
+            };
+            *first = 0;
+            self.shutdown.cancel();
+            Ok(1)
+        }
+    }
+
+    impl Seek for OneByteThenCancel {
+        fn seek(&mut self, position: SeekFrom) -> io::Result<u64> {
+            Ok(match position {
+                SeekFrom::Start(offset) => offset,
+                SeekFrom::End(_) => 1 << 20,
+                SeekFrom::Current(_) => 0,
+            })
+        }
+    }
+
+    #[test]
+    fn a_cancelled_scan_stops_instead_of_retrying_the_read() {
+        let shutdown = CancellationToken::new();
+        let reader = CancellableReader {
+            inner: OneByteThenCancel {
+                shutdown: shutdown.clone(),
+            },
+            shutdown,
+        };
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = result_tx.send(reader::scan(
+                io::BufReader::new(reader),
+                ScanOptions {
+                    verify_crc: true,
+                    collect_samples: false,
+                },
+            ));
+        });
+        let error = result_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the scan must return once its token is cancelled")
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        assert!(error.to_string().contains("scan cancelled"), "{error}");
+    }
+
+    /// Admits `dir` as a fresh root and returns it with a layout-conforming
+    /// recording path whose directories exist.
+    fn rooted(dir: &tempfile::TempDir) -> (Vec<ApprovedRoot>, PathBuf) {
+        let approved =
+            iris_store::admit_recording_root(dir.path(), iris_store::RootExpectation::Fresh)
+                .unwrap();
+        let parent = dir.path().join("cam1").join("main").join("2026-01-01");
+        std::fs::create_dir_all(&parent).unwrap();
+        (vec![approved], parent.join("recording.mp4"))
+    }
+
+    #[test]
+    fn a_recording_outside_every_root_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let (roots, _) = rooted(&dir);
+        let elsewhere = tempfile::tempdir().unwrap();
+        let path = elsewhere.path().join("recording.mp4");
+        std::fs::write(&path, b"synthetic").unwrap();
+        assert_eq!(
+            scan_file(&roots, &path, CancellationToken::new())
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidInput
+        );
+    }
+
+    #[test]
+    fn a_symlinked_layout_directory_is_not_followed() {
+        let dir = tempfile::tempdir().unwrap();
+        let (roots, path) = rooted(&dir);
+        let elsewhere = tempfile::tempdir().unwrap();
+        let target = elsewhere.path().join("main").join("2026-01-01");
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::write(target.join("recording.mp4"), b"synthetic").unwrap();
+        std::fs::remove_dir_all(dir.path().join("cam1")).unwrap();
+        std::os::unix::fs::symlink(elsewhere.path(), dir.path().join("cam1")).unwrap();
+        // The rooted open refuses the link: ELOOP from the no-symlink resolution,
+        // or ENOTDIR when the kernel checks the directory flag first.
+        let error = scan_file(&roots, &path, CancellationToken::new()).unwrap_err();
+        assert!(
+            matches!(
+                error.raw_os_error(),
+                Some(code) if code == rustix::io::Errno::LOOP.raw_os_error()
+                    || code == rustix::io::Errno::NOTDIR.raw_os_error()
+            ),
+            "{error}"
+        );
+    }
+
     #[test]
     fn a_fifo_in_place_of_a_recording_fails_the_scan_promptly() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("recording.mp4");
+        let (roots, path) = rooted(&dir);
         rustix::fs::mkfifoat(
             rustix::fs::CWD,
             &path,
@@ -695,7 +889,7 @@ mod tests {
         let (sender, receiver) = std::sync::mpsc::channel();
         let scanned = path.clone();
         std::thread::spawn(move || {
-            let _ = sender.send(scan_file(&scanned, CancellationToken::new()).map(drop));
+            let _ = sender.send(scan_file(&roots, &scanned, CancellationToken::new()).map(drop));
         });
         let Ok(result) = receiver.recv_timeout(Duration::from_secs(2)) else {
             // Release a reader blocked in open; this never blocks the test.
@@ -711,17 +905,6 @@ mod tests {
     }
 
     #[test]
-    fn a_scan_beyond_the_fragment_limit_fails_the_comparison() {
-        let mut limited = report();
-        limited.stop = Some(ScanStop::FragmentLimit {
-            offset: 2_768,
-            limit: 2,
-        });
-        let reason = compare(&row(), &limited).unwrap_err();
-        assert!(reason.contains("FragmentLimit"), "{reason}");
-    }
-
-    #[test]
     fn cancelled_reader_stops_before_more_io() {
         let shutdown = CancellationToken::new();
         shutdown.cancel();
@@ -729,16 +912,19 @@ mod tests {
             inner: io::Cursor::new([1, 2, 3]),
             shutdown,
         };
-        assert_eq!(
-            reader.read(&mut [0; 1]).unwrap_err().kind(),
-            io::ErrorKind::Interrupted
+        let error = reader.read(&mut [0; 1]).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        assert_ne!(
+            error.kind(),
+            io::ErrorKind::Interrupted,
+            "read_exact retries Interrupted"
         );
     }
 
     #[test]
     fn cancelled_scan_closes_its_file_descriptor() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("recording.mp4");
+        let (roots, path) = rooted(&dir);
         std::fs::write(&path, b"synthetic").unwrap();
         let descriptors_for_path = || {
             std::fs::read_dir("/proc/self/fd")
@@ -751,9 +937,20 @@ mod tests {
         let shutdown = CancellationToken::new();
         shutdown.cancel();
         assert_eq!(
-            scan_file(&path, shutdown).unwrap_err().kind(),
-            io::ErrorKind::Interrupted
+            scan_file(&roots, &path, shutdown).unwrap_err().kind(),
+            io::ErrorKind::Other
         );
         assert_eq!(descriptors_for_path(), 0);
+    }
+
+    #[test]
+    fn a_file_beyond_the_fragment_limit_fails_the_check() {
+        let mut limited = report();
+        limited.stop = Some(ScanStop::FragmentLimit {
+            offset: 2_768,
+            limit: 2,
+        });
+        let reason = compare(&row(), &limited).unwrap_err();
+        assert!(reason.contains("more than 2 fragments"), "{reason}");
     }
 }

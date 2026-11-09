@@ -8,17 +8,20 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
+use iris_ingest::{MAX_BACKGROUND_TEARDOWNS, background_teardowns};
 use iris_replay::rtsp::{self, Parsed};
 use iris_replay::{sdp, synth};
 use retina::client::{
-    Credentials, MAX_BACKGROUND_TEARDOWNS, Session, SessionOptions, SetupOptions,
-    TcpTransportOptions, TeardownPolicy, Transport, background_teardowns,
+    Credentials, Session, SessionOptions, SetupOptions, TcpTransportOptions, TeardownPolicy,
+    Transport,
 };
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::{TcpListener, TcpStream};
 
 /// `TEARDOWN`s a camera received, on a session's own connection and on fresh
-/// ones.
+/// ones. Retina retries a dropped session's `TEARDOWN` on a fresh connection
+/// after its 5 s deadline on the session's own, so `fresh` depends on how
+/// long the test runs and is counted only for inspection, never asserted.
 #[derive(Default)]
 struct Teardowns {
     own_connection: AtomicUsize,
@@ -58,8 +61,8 @@ async fn serve(mut socket: TcpStream, teardowns: Arc<Teardowns>) {
                     200,
                     "OK",
                     &[
-                        ("Content-Type", "application/sdp".to_owned()),
-                        ("Content-Base", format!("{}/", request.url)),
+                        ("Content-Type", "application/sdp"),
+                        ("Content-Base", &format!("{}/", request.url)),
                     ],
                     body.as_bytes(),
                 )
@@ -71,10 +74,10 @@ async fn serve(mut socket: TcpStream, teardowns: Arc<Teardowns>) {
                     200,
                     "OK",
                     &[
-                        ("Session", "unanswered;timeout=60".to_owned()),
+                        ("Session", "unanswered;timeout=60"),
                         (
                             "Transport",
-                            "RTP/AVP/TCP;unicast;interleaved=0-1;ssrc=12345678".to_owned(),
+                            "RTP/AVP/TCP;unicast;interleaved=0-1;ssrc=12345678",
                         ),
                     ],
                     b"",
@@ -153,6 +156,8 @@ async fn dropped_sessions_hold_a_bounded_number_of_teardown_tasks() {
         .await
         .is_ok();
         assert!(all_sent, "not every running task sent its TEARDOWN");
+        // The window in which a TEARDOWN from a task beyond the bound would
+        // arrive; the count must not grow during it.
         tokio::time::sleep(Duration::from_millis(200)).await;
         assert_eq!(
             teardowns.own_connection.load(Ordering::SeqCst),

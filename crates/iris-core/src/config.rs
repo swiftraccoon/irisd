@@ -23,9 +23,12 @@
 //! # Ok::<(), iris_core::config::ConfigError>(())
 //! ```
 
+use std::collections::HashSet;
 use std::fmt;
 use std::net::SocketAddr;
+use std::ops::Range;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -35,21 +38,22 @@ use crate::id::{CameraId, StreamKind};
 
 /// Errors from loading configuration.
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum ConfigError {
     /// The file could not be read.
-    #[error("cannot read configuration file {path}: {source}")]
+    #[error("cannot read configuration file {}: {source}", .path.display())]
     Io {
         /// The path that failed.
-        path: String,
+        path: PathBuf,
         /// The underlying error.
         #[source]
         source: std::io::Error,
     },
     /// The TOML did not parse or did not match the schema.
-    #[error("invalid configuration syntax or schema (byte span: {span:?})")]
+    #[error("invalid configuration syntax or schema {}", describe_span(.span.as_ref()))]
     Parse {
         /// Location supplied by the parser, without input text or value-bearing messages.
-        span: Option<std::ops::Range<usize>>,
+        span: Option<Range<usize>>,
     },
     /// Two cameras share an id.
     #[error("duplicate camera id {0}")]
@@ -71,7 +75,7 @@ pub enum ConfigError {
         kind: StreamKind,
     },
     /// One camera subscribes to the same event source more than once.
-    #[error("camera {camera} subscribes to event source {event_source:?} more than once")]
+    #[error("camera {camera} subscribes to event source {event_source} more than once")]
     DuplicateEventSource {
         /// The camera with the repeated source.
         camera: CameraId,
@@ -79,7 +83,7 @@ pub enum ConfigError {
         event_source: EventSource,
     },
     /// One camera requests an event source the daemon cannot subscribe to.
-    #[error("camera {camera} requests unsupported event source {event_source:?}")]
+    #[error("camera {camera} requests unsupported event source {event_source}")]
     UnsupportedEventSource {
         /// The camera with the unsupported source.
         camera: CameraId,
@@ -182,6 +186,46 @@ pub enum ConfigError {
         /// The rejected value.
         value: usize,
     },
+    /// A camera URL is not an `rtsp://` URL with a host.
+    #[error("camera {camera}: {field} must be an rtsp:// URL with a host")]
+    InvalidCameraUrl {
+        /// The camera.
+        camera: CameraId,
+        /// The field, `rtsp_url` or `sub_url`.
+        field: &'static str,
+    },
+    /// A camera URL embeds credentials in its authority. The message names
+    /// the field, never the URL.
+    #[error("camera {camera}: {field} must not embed credentials; set username and password")]
+    CredentialsInCameraUrl {
+        /// The camera.
+        camera: CameraId,
+        /// The field, `rtsp_url` or `sub_url`.
+        field: &'static str,
+    },
+    /// The socket read interval is above its ceiling.
+    #[error("ingest.read_interval_ms must be at most {MAX_READ_INTERVAL_MS}, got {0}")]
+    InvalidReadIntervalMs(u64),
+    /// The receive low-water mark is above its ceiling.
+    #[error("ingest.recv_low_water_kib must be at most {MAX_RECV_LOW_WATER_KIB}, got {0}")]
+    InvalidRecvLowWaterKib(u32),
+    /// The provisioned-camera limit is outside its supported range.
+    #[error("provisioning.max_cameras must be between 1 and {MAX_PROVISIONED_CAMERAS}, got {0}")]
+    InvalidProvisioningLimit(usize),
+    /// Provisioning is enabled without a port a provisioned camera may use.
+    #[error("provisioning.connect_ports must name a port when provisioning is enabled")]
+    ProvisioningWithoutPorts,
+    /// A provisioning port is zero.
+    #[error("provisioning.connect_ports must not contain port 0")]
+    InvalidProvisioningPort,
+}
+
+/// The parser's location for a [`ConfigError::Parse`] message.
+fn describe_span(span: Option<&Range<usize>>) -> String {
+    match span {
+        Some(span) => format!("at bytes {}..{}", span.start, span.end),
+        None => "at an unknown location".to_owned(),
+    }
 }
 
 /// Largest accepted fragment duration, in milliseconds.
@@ -189,6 +233,21 @@ pub enum ConfigError {
 /// One minute is thirty times the ordinary two-second GOP cap and prevents an
 /// invalid configuration from producing a pathological fragment allocation.
 pub const MAX_FRAGMENT_MS: u64 = 60_000;
+
+/// Longest accepted socket read interval, in milliseconds.
+///
+/// Every stream sleeps to the same tick, so a long interval delays live
+/// viewers by that much and lets that much of every stream queue in the
+/// kernel (about 2.3 MB per second at 18 Mbit/s); one second is the outer
+/// bound (`docs/research/12-ingest-cost.md` §3).
+pub const MAX_READ_INTERVAL_MS: u64 = 1_000;
+
+/// Largest accepted receive low-water mark, in KiB.
+///
+/// A slow stream waits for this many bytes before its frames are read, so
+/// the mark stays well under a second of the slowest stream; one MiB is
+/// eight seconds at 1 Mbit/s and the outer bound.
+pub const MAX_RECV_LOW_WATER_KIB: u32 = 1_024;
 
 /// Largest accepted number of queued fragments per stream.
 ///
@@ -198,6 +257,10 @@ pub const MAX_QUEUED_FRAGMENTS: usize = 4_096;
 
 /// Largest retention age whose microsecond span fits in an [`i64`].
 pub const MAX_RETENTION_DAYS: u32 = 106_751_991;
+
+/// Largest accepted `provisioning.max_cameras`: the writer queue and the
+/// descriptor budget are sized for the configured cameras plus this many.
+pub const MAX_PROVISIONED_CAMERAS: usize = 64;
 
 /// Largest accepted free-space floor, in percent of a root's capacity.
 ///
@@ -271,7 +334,8 @@ pub struct IngestConfig {
     /// accumulate between reads so one system call covers many of them, and all
     /// streams are read in the same wake-up, at the cost of that much extra live
     /// latency. The default of 20 ms costs about a quarter less CPU than zero
-    /// (docs/research/12-ingest-cost.md).
+    /// (docs/research/12-ingest-cost.md). Must be at most
+    /// [`MAX_READ_INTERVAL_MS`].
     pub read_interval_ms: u64,
     /// Receive low-water mark per camera socket in KiB (`SO_RCVLOWAT`, set once
     /// a session plays): the kernel reports the socket readable only once this
@@ -279,7 +343,8 @@ pub struct IngestConfig {
     /// bytes instead of once per packet. Zero leaves the kernel default of one
     /// byte. A slow stream waits up to this many bytes before its frames are
     /// read (a quarter second at 1 Mbit/s with the default of 32), so keep it
-    /// well under a second of the slowest stream's bitrate.
+    /// well under a second of the slowest stream's bitrate. Must be at most
+    /// [`MAX_RECV_LOW_WATER_KIB`].
     pub recv_low_water_kib: u32,
 }
 
@@ -292,6 +357,70 @@ impl Default for IngestConfig {
     }
 }
 
+/// Runtime camera provisioning through the API (`[provisioning]`).
+///
+/// With `enabled`, `POST /api/cameras` adds a camera and
+/// `DELETE /api/cameras/{camera}` removes one the API added; the daemon keeps
+/// them in `cameras.toml` in its state directory, so they survive a restart.
+/// Configured `[[camera]]` entries stay authoritative and are never removed
+/// through the API. Added cameras may use only the TCP ports in
+/// `connect_ports`, which the sandbox allows at startup.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields, default)]
+pub struct ProvisioningConfig {
+    /// Accept camera additions and removals through the API.
+    pub enabled: bool,
+    /// Most cameras the API may add beyond the configured ones
+    /// (1 to [`MAX_PROVISIONED_CAMERAS`]).
+    pub max_cameras: usize,
+    /// TCP ports an added camera may use for RTSP and HTTP(S).
+    pub connect_ports: Vec<u16>,
+}
+
+impl Default for ProvisioningConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_cameras: 16,
+            connect_ports: vec![554, 80, 443],
+        }
+    }
+}
+
+impl ProvisioningConfig {
+    fn validate(&self) -> Result<(), ConfigError> {
+        if self.max_cameras == 0 || self.max_cameras > MAX_PROVISIONED_CAMERAS {
+            return Err(ConfigError::InvalidProvisioningLimit(self.max_cameras));
+        }
+        if self.connect_ports.contains(&0) {
+            return Err(ConfigError::InvalidProvisioningPort);
+        }
+        if self.enabled && self.connect_ports.is_empty() {
+            return Err(ConfigError::ProvisioningWithoutPorts);
+        }
+        Ok(())
+    }
+
+    /// The allowed ports, sorted without repeats.
+    #[must_use]
+    pub fn sorted_connect_ports(&self) -> Vec<u16> {
+        let mut ports = self.connect_ports.clone();
+        ports.sort_unstable();
+        ports.dedup();
+        ports
+    }
+
+    /// The first port `camera` connects to that is not an allowed port, or
+    /// `None` when every RTSP and HTTP port of the camera is allowed.
+    #[must_use]
+    pub fn refused_port(&self, camera: &CameraConfig) -> Option<u16> {
+        camera
+            .connect_ports()
+            .into_iter()
+            .find(|port| !self.connect_ports.contains(port))
+    }
+}
+
 impl IngestConfig {
     /// The receive low-water mark in bytes, `None` for the kernel default.
     #[must_use]
@@ -301,8 +430,8 @@ impl IngestConfig {
 
     /// The read interval, `None` when sockets are read as packets arrive.
     #[must_use]
-    pub fn read_interval(&self) -> Option<std::time::Duration> {
-        (self.read_interval_ms > 0).then(|| std::time::Duration::from_millis(self.read_interval_ms))
+    pub fn read_interval(&self) -> Option<Duration> {
+        (self.read_interval_ms > 0).then(|| Duration::from_millis(self.read_interval_ms))
     }
 }
 
@@ -328,6 +457,9 @@ pub struct Config {
     /// Ingest policy; every field has a default.
     #[serde(default)]
     pub ingest: IngestConfig,
+    /// Runtime camera provisioning through the API; off by default.
+    #[serde(default)]
+    pub provisioning: ProvisioningConfig,
     /// The cameras to record.
     #[serde(default, rename = "camera")]
     pub cameras: Vec<CameraConfig>,
@@ -338,6 +470,12 @@ impl Config {
     ///
     /// Parse failures expose only a generic description and byte span, because
     /// parser messages and source excerpts can contain credentials.
+    ///
+    /// # Errors
+    ///
+    /// [`ConfigError::Parse`] for text that is not the schema, then the
+    /// validation errors: every other [`ConfigError`] variant names the rule
+    /// it checks.
     pub fn from_toml_str(text: &str) -> Result<Self, ConfigError> {
         let config: Self = toml::from_str(text)
             .map_err(|error: toml::de::Error| ConfigError::Parse { span: error.span() })?;
@@ -346,9 +484,14 @@ impl Config {
     }
 
     /// Loads configuration from a file.
+    ///
+    /// # Errors
+    ///
+    /// [`ConfigError::Io`] when the file cannot be read, then the errors of
+    /// [`Config::from_toml_str`].
     pub fn load(path: &Path) -> Result<Self, ConfigError> {
         let text = std::fs::read_to_string(path).map_err(|source| ConfigError::Io {
-            path: path.display().to_string(),
+            path: path.to_path_buf(),
             source,
         })?;
         Self::from_toml_str(&text)
@@ -388,62 +531,35 @@ impl Config {
                 self.storage.max_queued_fragments,
             ));
         }
-        let mut seen = std::collections::HashSet::new();
+        if self.ingest.read_interval_ms > MAX_READ_INTERVAL_MS {
+            return Err(ConfigError::InvalidReadIntervalMs(
+                self.ingest.read_interval_ms,
+            ));
+        }
+        if self.ingest.recv_low_water_kib > MAX_RECV_LOW_WATER_KIB {
+            return Err(ConfigError::InvalidRecvLowWaterKib(
+                self.ingest.recv_low_water_kib,
+            ));
+        }
+        let mut seen = HashSet::new();
         for camera in &self.cameras {
             if !seen.insert(&camera.id) {
                 return Err(ConfigError::DuplicateCamera(camera.id.clone()));
             }
-            if let Some(days) = camera.retention_days
-                && (days == 0 || days > MAX_RETENTION_DAYS)
-            {
-                return Err(ConfigError::InvalidRetentionDays {
-                    camera: camera.id.clone(),
-                    days,
-                });
-            }
-            let mut kinds = std::collections::HashSet::new();
-            for &kind in &camera.record {
-                if kind == StreamKind::Audio {
-                    return Err(ConfigError::UnsupportedRecordedKind {
-                        camera: camera.id.clone(),
-                        kind,
-                    });
-                }
-                if !kinds.insert(kind) {
-                    return Err(ConfigError::DuplicateRecordedKind {
-                        camera: camera.id.clone(),
-                        kind,
-                    });
-                }
-            }
-            let mut event_sources = std::collections::HashSet::new();
-            for &event_source in &camera.events {
-                if matches!(
-                    event_source,
-                    EventSource::OnvifMetadata | EventSource::Manual
-                ) {
-                    return Err(ConfigError::UnsupportedEventSource {
-                        camera: camera.id.clone(),
-                        event_source,
-                    });
-                }
-                if !event_sources.insert(event_source) {
-                    return Err(ConfigError::DuplicateEventSource {
-                        camera: camera.id.clone(),
-                        event_source,
-                    });
-                }
-            }
+            camera.validate()?;
         }
-        Ok(())
+        self.provisioning.validate()
     }
 }
 
-/// Storage policy. Sizes are in bytes, intervals in milliseconds.
+/// Storage policy. Field names carry their units (`_bytes`, `_gib`, `_ms`, `_secs`,
+/// `_percent`).
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct StorageConfig {
-    /// Directories that receive recordings; the first with enough free space is used.
+    /// Directories that receive recordings: the first eligible root is used, with later roots
+    /// as ordered failover targets (`docs/research/04-storage-format.md` §8). A root path must
+    /// hold no symbolic link in any component: configure the resolved physical path.
     pub video_roots: Vec<PathBuf>,
     /// Directory for the catalog database and other small state.
     pub state_dir: PathBuf,
@@ -457,16 +573,19 @@ pub struct StorageConfig {
     /// How often open files are `fdatasync`ed. Bounds the power-loss window. Must be in
     /// [`MIN_SYNC_INTERVAL_MS`]`..=`[`MAX_SYNC_INTERVAL_MS`].
     pub sync_interval_ms: u64,
-    /// Longest fragment; a GOP longer than this is split. Must be in
-    /// `1..=MAX_FRAGMENT_MS`.
+    /// Fragment duration cap: a GOP is split once it spans this plus a quarter, so timestamp
+    /// jitter never splits a GOP of exactly this length, and a fragment lasts at most 1.25
+    /// times this. Must be in `1..=`[`MAX_FRAGMENT_MS`].
     pub max_fragment_ms: u64,
     /// Space reserved ahead of the write position with `fallocate`. Must not exceed the
     /// smaller of `rotate_bytes` and [`MAX_PREALLOCATE_BYTES`]; zero disables it.
     pub preallocate_bytes: u64,
-    /// A file is sealed and a new one started once it reaches this size … Must be in
+    /// Size at which a file is sealed and the next one started (at the next sync fragment),
+    /// whichever of size and `rotate_secs` comes first. Must be in
     /// [`MIN_ROTATE_BYTES`]`..=`[`MAX_ROTATE_BYTES`].
     pub rotate_bytes: u64,
-    /// … or this age in seconds, whichever comes first (at the next IRAP). Must be in
+    /// Age in seconds at which a file is sealed and the next one started (at the next sync
+    /// fragment), whichever of age and `rotate_bytes` comes first. Must be in
     /// [`MIN_ROTATE_SECS`]`..=`[`MAX_ROTATE_SECS`].
     pub rotate_secs: u64,
     /// Fragments queued for the writer per stream before new ones are dropped.
@@ -627,6 +746,31 @@ pub enum TimestampMode {
     Passthrough,
 }
 
+/// Where a camera's snapshot comes from (`snapshot` in a `[[camera]]` table).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SnapshotMethod {
+    /// ONVIF `GetSnapshotUri` for a camera whose event sources are ONVIF
+    /// pull-point alone, else the Dahua CGI snapshot endpoint.
+    #[default]
+    Auto,
+    /// `/cgi-bin/snapshot.cgi?channel=1` with digest authentication.
+    DahuaCgi,
+    /// The URL the camera's ONVIF Media service names for its first profile.
+    Onvif,
+    /// No snapshot route for this camera.
+    None,
+}
+
+/// The snapshot source a camera's configuration resolves to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ResolvedSnapshot {
+    /// The Dahua CGI snapshot endpoint.
+    DahuaCgi,
+    /// The camera's ONVIF Media service.
+    Onvif,
+}
+
 /// One camera. Its `Debug` output shows the password as `<redacted>`.
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -635,7 +779,8 @@ pub struct CameraConfig {
     pub id: CameraId,
     /// Human-readable name.
     pub name: String,
-    /// RTSP URL of the main stream, without credentials.
+    /// RTSP URL of the main stream, without credentials: a URL that embeds
+    /// them is rejected.
     pub rtsp_url: String,
     /// RTSP URL of the sub stream. Derived from `rtsp_url` for Dahua-style
     /// URLs (`subtype=0` → `subtype=1`) when absent.
@@ -671,6 +816,9 @@ pub struct CameraConfig {
     /// Distinct event sources to subscribe to.
     #[serde(default)]
     pub events: Vec<EventSource>,
+    /// Where snapshots come from; `auto` follows the event sources.
+    #[serde(default)]
+    pub snapshot: SnapshotMethod,
 }
 
 impl fmt::Debug for CameraConfig {
@@ -691,6 +839,7 @@ impl fmt::Debug for CameraConfig {
             tls_verify,
             retention_days,
             events,
+            snapshot,
         } = self;
         f.debug_struct("CameraConfig")
             .field("id", id)
@@ -707,6 +856,7 @@ impl fmt::Debug for CameraConfig {
             .field("tls_verify", tls_verify)
             .field("retention_days", retention_days)
             .field("events", events)
+            .field("snapshot", snapshot)
             .finish()
     }
 }
@@ -720,6 +870,109 @@ fn default_record() -> Vec<StreamKind> {
 }
 
 impl CameraConfig {
+    /// The snapshot source: the configured method, with `auto` choosing the
+    /// ONVIF Media service for a camera whose event sources are ONVIF
+    /// pull-point alone and the Dahua CGI endpoint otherwise; `None` for a
+    /// camera without snapshots.
+    #[must_use]
+    pub fn snapshot_method(&self) -> Option<ResolvedSnapshot> {
+        match self.snapshot {
+            SnapshotMethod::None => None,
+            SnapshotMethod::DahuaCgi => Some(ResolvedSnapshot::DahuaCgi),
+            SnapshotMethod::Onvif => Some(ResolvedSnapshot::Onvif),
+            SnapshotMethod::Auto => {
+                let onvif_only = self.events.contains(&EventSource::OnvifPullPoint)
+                    && !self.events.contains(&EventSource::DahuaCgi);
+                Some(if onvif_only {
+                    ResolvedSnapshot::Onvif
+                } else {
+                    ResolvedSnapshot::DahuaCgi
+                })
+            }
+        }
+    }
+
+    /// Checks one camera on its own: `rtsp://` URLs with a host and without
+    /// embedded credentials, a retention age in range, recorded kinds and
+    /// event sources that are supported and not repeated. Configuration
+    /// loading applies it to every camera, and the API applies it to a camera
+    /// it is asked to add.
+    ///
+    /// # Errors
+    ///
+    /// [`ConfigError::InvalidCameraUrl`], [`ConfigError::CredentialsInCameraUrl`],
+    /// [`ConfigError::InvalidRetentionDays`],
+    /// [`ConfigError::UnsupportedRecordedKind`],
+    /// [`ConfigError::DuplicateRecordedKind`],
+    /// [`ConfigError::UnsupportedEventSource`], or
+    /// [`ConfigError::DuplicateEventSource`], for the first rule that fails.
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        for (field, url) in [
+            ("rtsp_url", Some(&self.rtsp_url)),
+            ("sub_url", self.sub_url.as_ref()),
+        ] {
+            let Some(url) = url else {
+                continue;
+            };
+            if url_has_userinfo(url) {
+                return Err(ConfigError::CredentialsInCameraUrl {
+                    camera: self.id.clone(),
+                    field,
+                });
+            }
+            if !url.starts_with("rtsp://")
+                || !url_host(url).is_some_and(|host| is_valid_host(&host))
+            {
+                return Err(ConfigError::InvalidCameraUrl {
+                    camera: self.id.clone(),
+                    field,
+                });
+            }
+        }
+        if let Some(days) = self.retention_days
+            && (days == 0 || days > MAX_RETENTION_DAYS)
+        {
+            return Err(ConfigError::InvalidRetentionDays {
+                camera: self.id.clone(),
+                days,
+            });
+        }
+        let mut kinds = HashSet::new();
+        for &kind in &self.record {
+            if kind == StreamKind::Audio {
+                return Err(ConfigError::UnsupportedRecordedKind {
+                    camera: self.id.clone(),
+                    kind,
+                });
+            }
+            if !kinds.insert(kind) {
+                return Err(ConfigError::DuplicateRecordedKind {
+                    camera: self.id.clone(),
+                    kind,
+                });
+            }
+        }
+        let mut event_sources = HashSet::new();
+        for &event_source in &self.events {
+            if matches!(
+                event_source,
+                EventSource::OnvifMetadata | EventSource::Manual
+            ) {
+                return Err(ConfigError::UnsupportedEventSource {
+                    camera: self.id.clone(),
+                    event_source,
+                });
+            }
+            if !event_sources.insert(event_source) {
+                return Err(ConfigError::DuplicateEventSource {
+                    camera: self.id.clone(),
+                    event_source,
+                });
+            }
+        }
+        Ok(())
+    }
+
     /// Returns the sub-stream URL, deriving it from the main URL when the
     /// configuration omits it and the URL follows the Dahua `subtype=` scheme.
     #[must_use]
@@ -763,19 +1016,21 @@ impl CameraConfig {
             .collect()
     }
 
+    /// The TCP ports the daemon connects to for this camera: its RTSP ports
+    /// ([`Self::rtsp_ports`]) followed by its HTTP port
+    /// ([`Self::http_port_or_default`]).
+    #[must_use]
+    pub fn connect_ports(&self) -> Vec<u16> {
+        let mut ports = self.rtsp_ports();
+        ports.push(self.http_port_or_default());
+        ports
+    }
+
     /// Returns the host part of `rtsp_url`, used for vendor HTTP and ONVIF calls.
     /// IPv6 hosts have no brackets; URL builders must add them to the authority.
     #[must_use]
     pub fn host(&self) -> Option<String> {
-        let rest = self.rtsp_url.split("://").nth(1)?;
-        let authority = rest.split(['/', '?', '#']).next()?;
-        let host_port = authority.rsplit('@').next()?;
-        let host = if let Some(stripped) = host_port.strip_prefix('[') {
-            stripped.split(']').next()?
-        } else {
-            host_port.split(':').next()?
-        };
-        (!host.is_empty()).then(|| host.to_owned())
+        url_host(&self.rtsp_url)
     }
 
     /// Returns the URL for a stream kind, if that kind is a video stream with
@@ -790,13 +1045,77 @@ impl CameraConfig {
     }
 }
 
-/// The port of an RTSP URL: the explicit one, or 554 for an `rtsp://` URL
-/// without one. `None` when the URL has no authority.
+/// Longest host name accepted in a camera address (RFC 1035).
+pub const MAX_HOST_BYTES: usize = 253;
+
+/// Whether `host` is a bare host name or IP address: what `http://{host}/`
+/// parses back to, with no port, path, query, or userinfo smuggled in, and at
+/// most [`MAX_HOST_BYTES`] long. An IPv6 address is given without brackets.
+/// The daemon builds camera URLs from such a host, so a host that fails this
+/// check is refused when it is configured or added rather than when a call is
+/// made.
+///
+/// ```
+/// use iris_core::config::is_valid_host;
+///
+/// assert!(is_valid_host("192.0.2.10"));
+/// assert!(is_valid_host("camera.example"));
+/// assert!(is_valid_host("2001:db8::7"));
+/// assert!(!is_valid_host("cam host"));
+/// assert!(!is_valid_host("192.0.2.10:80"));
+/// assert!(!is_valid_host("[2001:db8::7]"));
+/// ```
 #[must_use]
-pub fn rtsp_port(url: &str) -> Option<u16> {
+pub fn is_valid_host(host: &str) -> bool {
+    if host.is_empty() || host.len() > MAX_HOST_BYTES {
+        return false;
+    }
+    let authority = if host.contains(':') {
+        format!("[{host}]")
+    } else {
+        host.to_owned()
+    };
+    let Ok(url) = url::Url::parse(&format!("http://{authority}/")) else {
+        return false;
+    };
+    url.host_str()
+        .is_some_and(|parsed| parsed.eq_ignore_ascii_case(&authority))
+        && url.port().is_none()
+        && url.path() == "/"
+        && url.query().is_none()
+        && url.username().is_empty()
+}
+
+/// The authority of a URL (`host`, `host:port`, `[v6]:port`, with any
+/// userinfo before an `@`); `None` without a scheme separator.
+fn url_authority(url: &str) -> Option<&str> {
     let rest = url.split("://").nth(1)?;
-    let authority = rest.split(['/', '?', '#']).next()?;
-    let host_port = authority.rsplit('@').next()?;
+    rest.split(['/', '?', '#']).next()
+}
+
+/// Whether the URL's authority carries userinfo (`user:password@host`).
+fn url_has_userinfo(url: &str) -> bool {
+    url_authority(url).is_some_and(|authority| authority.contains('@'))
+}
+
+/// The host of a URL's authority, without brackets, port, or userinfo; `None`
+/// without a scheme separator or with an empty host.
+fn url_host(url: &str) -> Option<String> {
+    let host_port = url_authority(url)?.rsplit('@').next()?;
+    let host = if let Some(stripped) = host_port.strip_prefix('[') {
+        stripped.split(']').next()?
+    } else {
+        host_port.split(':').next()?
+    };
+    (!host.is_empty()).then(|| host.to_owned())
+}
+
+/// The port of a URL with a host: the explicit one, or 554, the RTSP default,
+/// without one (the scheme is not checked). `None` without a scheme separator
+/// or a host, or when the port text is not a `u16`.
+fn rtsp_port(url: &str) -> Option<u16> {
+    url_host(url)?;
+    let host_port = url_authority(url)?.rsplit('@').next()?;
     let port = if host_port.starts_with('[') {
         host_port
             .split(']')
@@ -813,6 +1132,162 @@ pub fn rtsp_port(url: &str) -> Option<u16> {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    /// An unauthenticated loopback API section, so a fixture exercises only the
+    /// rule under test.
+    const DEV_API: &str = "[api]\nallow_unauthenticated = true\n";
+
+    fn parse(text: &str) -> Result<Config, ConfigError> {
+        Config::from_toml_str(&format!("{DEV_API}{text}"))
+    }
+
+    #[test]
+    fn the_snapshot_method_follows_the_event_sources_unless_configured() {
+        let camera = |extra: &str| {
+            Config::from_toml_str(&format!(
+                "[api]\nallow_unauthenticated=true\n[[camera]]\nid=\"cam1\"\nname=\"n\"\n\
+                 rtsp_url=\"rtsp://192.0.2.7/x\"\nusername=\"u\"\npassword=\"p\"\n{extra}"
+            ))
+            .unwrap()
+            .cameras
+            .remove(0)
+        };
+        assert_eq!(camera("").snapshot, SnapshotMethod::Auto);
+        assert_eq!(
+            camera("").snapshot_method(),
+            Some(ResolvedSnapshot::DahuaCgi)
+        );
+        assert_eq!(
+            camera("events=['onvif_pull_point']\n").snapshot_method(),
+            Some(ResolvedSnapshot::Onvif)
+        );
+        assert_eq!(
+            camera("events=['dahua_cgi','onvif_pull_point']\n").snapshot_method(),
+            Some(ResolvedSnapshot::DahuaCgi)
+        );
+        assert_eq!(
+            camera("snapshot='onvif'\n").snapshot_method(),
+            Some(ResolvedSnapshot::Onvif)
+        );
+        assert_eq!(
+            camera("snapshot='dahua_cgi'\nevents=['onvif_pull_point']\n").snapshot_method(),
+            Some(ResolvedSnapshot::DahuaCgi)
+        );
+        assert_eq!(camera("snapshot='none'\n").snapshot_method(), None);
+        assert!(
+            Config::from_toml_str(
+                "[api]\nallow_unauthenticated=true\n[[camera]]\nid=\"cam1\"\nname=\"n\"\n\
+                 rtsp_url=\"rtsp://192.0.2.7/x\"\nusername=\"u\"\npassword=\"p\"\nsnapshot='cgi'\n"
+            )
+            .is_err(),
+            "an unknown method is rejected"
+        );
+    }
+
+    #[test]
+    fn provisioning_is_off_by_default_with_the_standard_ports() {
+        let config = Config::from_toml_str("[api]\nallow_unauthenticated=true\n").unwrap();
+        assert!(!config.provisioning.enabled);
+        assert_eq!(config.provisioning.max_cameras, 16);
+        assert_eq!(config.provisioning.sorted_connect_ports(), [80, 443, 554]);
+    }
+
+    #[test]
+    fn provisioning_limits_and_ports_are_checked() {
+        for (section, expected) in [
+            (
+                "[provisioning]\nmax_cameras = 0\n",
+                "provisioning.max_cameras",
+            ),
+            (
+                "[provisioning]\nmax_cameras = 65\n",
+                "provisioning.max_cameras",
+            ),
+            ("[provisioning]\nconnect_ports = [554, 0]\n", "port 0"),
+            (
+                "[provisioning]\nenabled = true\nconnect_ports = []\n",
+                "must name a port",
+            ),
+        ] {
+            let text = format!("[api]\nallow_unauthenticated=true\n{section}");
+            let error = Config::from_toml_str(&text).unwrap_err().to_string();
+            assert!(error.contains(expected), "{section}: {error}");
+        }
+        let text = "[api]\nallow_unauthenticated=true\n[provisioning]\nenabled = true\n\
+                    max_cameras = 64\nconnect_ports = [8554, 554, 554]\n";
+        let config = Config::from_toml_str(text).unwrap();
+        assert_eq!(config.provisioning.sorted_connect_ports(), [554, 8554]);
+    }
+
+    #[test]
+    fn camera_urls_must_be_rtsp_with_a_host_and_ports_match_the_provisioning_set() {
+        let camera = |url: &str, sub: Option<&str>| {
+            format!(
+                "[api]\nallow_unauthenticated=true\n[[camera]]\nid=\"cam1\"\nname=\"n\"\n\
+                 rtsp_url=\"{url}\"\n{}username=\"u\"\npassword=\"p\"\n",
+                sub.map(|sub| format!("sub_url=\"{sub}\"\n"))
+                    .unwrap_or_default()
+            )
+        };
+        assert!(Config::from_toml_str(&camera("rtsp://192.0.2.10:554/a", None)).is_ok());
+        for (url, sub) in [
+            ("http://192.0.2.10/a", None),
+            ("rtsp:///a", None),
+            ("rtsp://192.0.2.10/a", Some("rtsp://")),
+            ("rtsp://cam host/a", None),
+            ("rtsp://[fe80::1%25eth0]/a", None),
+        ] {
+            let error = Config::from_toml_str(&camera(url, sub))
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains("rtsp:// URL with a host"),
+                "{url} {sub:?}: {error}"
+            );
+        }
+        let provisioning = ProvisioningConfig::default();
+        let other_port = Config::from_toml_str(&camera("rtsp://192.0.2.10:8554/a", None)).unwrap();
+        assert_eq!(
+            provisioning.refused_port(&other_port.cameras[0]),
+            Some(8554)
+        );
+        assert_eq!(other_port.cameras[0].connect_ports(), vec![8554, 80]);
+        let standard = Config::from_toml_str(&camera("rtsp://192.0.2.10/a", None)).unwrap();
+        assert_eq!(provisioning.refused_port(&standard.cameras[0]), None);
+        assert!(standard.cameras[0].validate().is_ok());
+    }
+
+    #[test]
+    fn camera_urls_must_not_embed_credentials() {
+        for (url, sub, field) in [
+            (
+                "rtsp://distinctive-user:distinctive-password@192.0.2.10/a",
+                None,
+                "rtsp_url",
+            ),
+            (
+                "rtsp://192.0.2.10/a",
+                Some("rtsp://distinctive-user@192.0.2.10/b"),
+                "sub_url",
+            ),
+        ] {
+            let text = format!(
+                "[api]\nallow_unauthenticated=true\n[[camera]]\nid=\"cam1\"\nname=\"n\"\n\
+                 rtsp_url=\"{url}\"\n{}username=\"u\"\npassword=\"p\"\n",
+                sub.map(|sub| format!("sub_url=\"{sub}\"\n"))
+                    .unwrap_or_default()
+            );
+            let error = Config::from_toml_str(&text).unwrap_err();
+            assert!(
+                matches!(&error, ConfigError::CredentialsInCameraUrl { field: rejected, .. } if *rejected == field),
+                "{error:?}"
+            );
+            let rendered = format!("{error}\n{error:?}");
+            assert!(!rendered.contains("distinctive"), "{rendered}");
+        }
+    }
+
     #[test]
     fn parse_errors_do_not_expose_configuration_values() {
         use std::error::Error as _;
@@ -842,7 +1317,7 @@ mod tests {
         };
         assert!(span.start >= "[storage]\n".len());
         assert!(span.end <= text.len());
-        assert!(error.to_string().contains("byte span"));
+        assert!(error.to_string().contains("at bytes "), "{error}");
     }
 
     #[test]
@@ -1051,14 +1526,19 @@ mod tests {
 
     #[test]
     fn recorded_stream_kinds_are_unique_per_camera() {
-        let camera = "[[camera]]\nid='a'\nname=''\nrtsp_url=''\nusername=''\npassword=''\n";
-        for kinds in ["['main','main']", "['sub','sub']", "['audio','audio']"] {
-            assert!(parse(&format!("{camera}record={kinds}\n")).is_err());
+        let camera = "[[camera]]\nid='a'\nname=''\nrtsp_url='rtsp://192.0.2.7/x'\nusername=''\npassword=''\n";
+        for kinds in ["['main','main']", "['sub','sub']"] {
+            assert!(matches!(
+                parse(&format!("{camera}record={kinds}\n")),
+                Err(ConfigError::DuplicateRecordedKind { .. })
+            ));
         }
-        assert!(matches!(
-            parse(&format!("{camera}record=['audio']\n")),
-            Err(ConfigError::UnsupportedRecordedKind { .. })
-        ));
+        for kinds in ["['audio']", "['audio','audio']"] {
+            assert!(matches!(
+                parse(&format!("{camera}record={kinds}\n")),
+                Err(ConfigError::UnsupportedRecordedKind { .. })
+            ));
+        }
         for kinds in ["['main','sub']", "[]"] {
             assert!(parse(&format!("{camera}record={kinds}\n")).is_ok());
         }
@@ -1066,8 +1546,7 @@ mod tests {
 
     #[test]
     fn event_sources_are_unique_per_camera() {
-        let camera =
-            "[[camera]]\nid='a'\nname=''\nrtsp_url=''\nusername=''\npassword=''\nrecord=[]\n";
+        let camera = "[[camera]]\nid='a'\nname=''\nrtsp_url='rtsp://192.0.2.7/x'\nusername=''\npassword=''\nrecord=[]\n";
         for sources in [
             "['dahua_cgi','dahua_cgi']",
             "['onvif_pull_point','onvif_pull_point']",
@@ -1230,7 +1709,7 @@ mod tests {
     }
 
     #[test]
-    fn storage_resource_limits_are_profile_independent() {
+    fn fragment_cap_and_queue_bound_are_checked() {
         for value in [1, MAX_FRAGMENT_MS] {
             assert!(
                 parse(&format!("[storage]\nmax_fragment_ms={value}\n")).is_ok(),
@@ -1264,7 +1743,7 @@ mod tests {
 
     #[test]
     fn retention_age_rejects_unrepresentable_microsecond_spans() {
-        let camera = "[[camera]]\nid='a'\nname=''\nrtsp_url=''\nusername=''\npassword=''\n";
+        let camera = "[[camera]]\nid='a'\nname=''\nrtsp_url='rtsp://192.0.2.7/x'\nusername=''\npassword=''\n";
         for days in [1, 2, MAX_RETENTION_DAYS] {
             assert!(
                 parse(&format!("{camera}retention_days={days}\n")).is_ok(),
@@ -1282,7 +1761,7 @@ mod tests {
     #[test]
     fn rtsp_authorities_end_before_queries_and_fragments() {
         let mut camera =
-            parse("[[camera]]\nid='a'\nname=''\nrtsp_url=''\nusername=''\npassword=''\n")
+            parse("[[camera]]\nid='a'\nname=''\nrtsp_url='rtsp://192.0.2.7/x'\nusername=''\npassword=''\n")
                 .unwrap()
                 .cameras
                 .remove(0);
@@ -1330,21 +1809,53 @@ mod tests {
     }
 
     #[test]
-    fn ingest_read_interval_defaults_to_twenty_milliseconds() {
-        let config = parse("[[camera]]\nid=\"a\"\nname=\"\"\nrtsp_url=\"rtsp://192.0.2.1/x\"\nusername=\"\"\npassword=\"\"\n").unwrap();
+    fn ingest_defaults_are_a_twenty_millisecond_tick_and_a_32_kib_low_water_mark() {
+        let config = parse("").unwrap();
         assert_eq!(
             config.ingest.read_interval(),
-            Some(std::time::Duration::from_millis(20))
+            Some(Duration::from_millis(20))
         );
         assert_eq!(config.ingest.recv_low_water(), Some(32 * 1024));
+    }
+
+    #[test]
+    fn zero_ingest_knobs_mean_packet_driven_reads_and_the_kernel_low_water_default() {
         let config = parse("[ingest]\nread_interval_ms = 0\nrecv_low_water_kib = 0\n").unwrap();
         assert_eq!(config.ingest.read_interval(), None);
         assert_eq!(config.ingest.recv_low_water(), None);
+    }
+
+    #[test]
+    fn an_explicit_read_interval_is_kept() {
         let config = parse("[ingest]\nread_interval_ms = 40\n").unwrap();
         assert_eq!(
             config.ingest.read_interval(),
-            Some(std::time::Duration::from_millis(40))
+            Some(Duration::from_millis(40))
         );
+    }
+
+    #[test]
+    fn ingest_knobs_are_bounded() {
+        assert!(
+            parse(&format!(
+                "[ingest]\nread_interval_ms = {MAX_READ_INTERVAL_MS}\n"
+            ))
+            .is_ok()
+        );
+        assert!(matches!(
+            parse(&format!("[ingest]\nread_interval_ms = {}\n", MAX_READ_INTERVAL_MS + 1)),
+            Err(ConfigError::InvalidReadIntervalMs(value)) if value == MAX_READ_INTERVAL_MS + 1
+        ));
+        assert!(
+            parse(&format!(
+                "[ingest]\nrecv_low_water_kib = {MAX_RECV_LOW_WATER_KIB}\n"
+            ))
+            .is_ok()
+        );
+        assert!(matches!(
+            parse(&format!("[ingest]\nrecv_low_water_kib = {}\n", MAX_RECV_LOW_WATER_KIB + 1)),
+            Err(ConfigError::InvalidRecvLowWaterKib(value)) if value == MAX_RECV_LOW_WATER_KIB + 1
+        ));
     }
 
     #[test]
@@ -1354,17 +1865,9 @@ mod tests {
         assert_eq!(rtsp_port("rtsp://[2001:db8::1]:8554/x"), Some(8554));
         assert_eq!(rtsp_port("rtsp://[2001:db8::1]/x"), Some(554));
         assert_eq!(rtsp_port("rtsp://192.0.2.1:bad/x"), None);
+        assert_eq!(rtsp_port("rtsp:///x"), None);
+        assert_eq!(rtsp_port("rtsp://"), None);
         assert_eq!(rtsp_port("not a url"), None);
-    }
-
-    use super::*;
-
-    /// An unauthenticated loopback API section, so a fixture exercises only the
-    /// rule under test.
-    const DEV_API: &str = "[api]\nallow_unauthenticated = true\n";
-
-    fn parse(text: &str) -> Result<Config, ConfigError> {
-        Config::from_toml_str(&format!("{DEV_API}{text}"))
     }
 
     #[test]
@@ -1414,15 +1917,54 @@ password = "p"
             config.cameras[0].sub_url().as_deref(),
             Some("rtsp://h:554/cam/realmonitor?channel=1&subtype=1&unicast=true")
         );
-        assert_eq!(config.storage.sync_interval_ms, 5_000);
         assert_eq!(config.cameras[0].host().as_deref(), Some("h"));
-        assert_eq!(config.cameras[0].http_port_or_default(), 80);
-        assert!(config.cameras[0].tls_verify);
-        assert_eq!(
-            config.cameras[0].http_base().as_deref(),
-            Some("http://h:80")
-        );
+    }
+
+    #[test]
+    fn sections_left_out_take_their_defaults() {
+        let config = parse("").unwrap();
+        assert_eq!(config.storage.sync_interval_ms, 5_000);
         assert_eq!(config.api.listen.port(), 8554);
+    }
+
+    #[test]
+    fn http_helpers_default_to_port_80_with_verified_tls() {
+        let camera = parse(
+            "[[camera]]\nid=\"a\"\nname=\"\"\nrtsp_url=\"rtsp://h:554/x\"\nusername=\"\"\npassword=\"\"\n",
+        )
+        .unwrap()
+        .cameras
+        .remove(0);
+        assert_eq!(camera.http_port_or_default(), 80);
+        assert!(camera.tls_verify);
+        assert_eq!(camera.http_base().as_deref(), Some("http://h:80"));
+    }
+
+    #[test]
+    fn hosts_are_bare_names_or_addresses() {
+        for good in [
+            "192.0.2.7",
+            "camera.example",
+            "Camera.Example",
+            "2001:db8::7",
+        ] {
+            assert!(is_valid_host(good), "{good}");
+        }
+        let long = "a".repeat(MAX_HOST_BYTES + 1);
+        for bad in [
+            "",
+            "a b",
+            "a/b",
+            "a:1",
+            "u@h",
+            "h?x",
+            "[::1]",
+            "h#f",
+            "fe80::1%25eth0",
+            long.as_str(),
+        ] {
+            assert!(!is_valid_host(bad), "{bad}");
+        }
     }
 
     #[test]
@@ -1454,11 +1996,21 @@ password = "p"
     }
 
     #[test]
-    fn rejects_duplicate_ids_and_unknown_fields() {
-        let dup = "[[camera]]\nid=\"a\"\nname=\"\"\nrtsp_url=\"\"\nusername=\"\"\npassword=\"\"\n[[camera]]\nid=\"a\"\nname=\"\"\nrtsp_url=\"\"\nusername=\"\"\npassword=\"\"\n";
+    fn rejects_duplicate_camera_ids() {
+        let dup = "[[camera]]\nid=\"a\"\nname=\"\"\nrtsp_url=\"rtsp://192.0.2.7/x\"\nusername=\"\"\npassword=\"\"\n[[camera]]\nid=\"a\"\nname=\"\"\nrtsp_url=\"rtsp://192.0.2.7/x\"\nusername=\"\"\npassword=\"\"\n";
         assert!(matches!(parse(dup), Err(ConfigError::DuplicateCamera(_))));
-        assert!(parse("[storage]\nbogus = 1\n").is_err());
-        let unsupported_audio = "[[camera]]\nid=\"a\"\nname=\"\"\nrtsp_url=\"\"\nusername=\"\"\npassword=\"\"\naudio=false\n";
-        assert!(parse(unsupported_audio).is_err());
+    }
+
+    #[test]
+    fn rejects_unknown_keys_in_any_table() {
+        assert!(matches!(
+            parse("[storage]\nbogus = 1\n"),
+            Err(ConfigError::Parse { .. })
+        ));
+        let unknown_camera_key = "[[camera]]\nid=\"a\"\nname=\"\"\nrtsp_url=\"rtsp://192.0.2.7/x\"\nusername=\"\"\npassword=\"\"\naudio=false\n";
+        assert!(matches!(
+            parse(unknown_camera_key),
+            Err(ConfigError::Parse { .. })
+        ));
     }
 }

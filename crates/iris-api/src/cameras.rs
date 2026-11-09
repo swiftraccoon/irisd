@@ -18,6 +18,8 @@ pub(crate) struct CameraDto {
     name: String,
     vendor: Option<String>,
     has_snapshot: bool,
+    /// Added through the API; `DELETE /api/cameras/{camera}` applies to it.
+    provisioned: bool,
 }
 
 pub(crate) async fn list(
@@ -25,6 +27,8 @@ pub(crate) async fn list(
 ) -> Result<Json<Vec<CameraDto>>, ApiError> {
     let mut cameras: Vec<CameraDto> = state
         .active_cameras
+        .read()
+        .expect("no holder panics while the camera registry is locked")
         .values()
         .map(|camera| camera_dto(camera, &state))
         .collect();
@@ -68,7 +72,13 @@ pub(crate) async fn detail(
     Path(camera): Path<String>,
 ) -> Result<Json<CameraDetailDto>, ApiError> {
     let id = CameraId::try_new(&camera).map_err(|e| ApiError::BadRequest(e.to_string()))?;
-    let camera = state.active_cameras.get(&id).ok_or(ApiError::NotFound)?;
+    let camera = state
+        .active_cameras
+        .read()
+        .expect("no holder panics while the camera registry is locked")
+        .get(&id)
+        .cloned()
+        .ok_or(ApiError::NotFound)?;
     let streams = state
         .live
         .camera_stats(&id)
@@ -84,7 +94,7 @@ pub(crate) async fn detail(
                 reconnects: stats.reconnects(),
                 loss_events: stats.loss_events(),
                 gaps: stats.gaps(),
-                last_frame: last_frame.map(rfc3339),
+                last_frame: last_frame.map(|wall| wall.to_string()),
                 last_frame_us: last_frame.map(WallUs::get),
                 codec: stats.codec_description(),
                 nominal_ticks: stats.nominal_ticks(),
@@ -94,30 +104,21 @@ pub(crate) async fn detail(
         })
         .collect();
     Ok(Json(CameraDetailDto {
-        camera: camera_dto(camera, &state),
+        camera: camera_dto(&camera, &state),
         streams,
     }))
 }
 
-fn camera_dto(camera: &ActiveCamera, state: &ApiState) -> CameraDto {
+pub(crate) fn camera_dto(camera: &ActiveCamera, state: &ApiState) -> CameraDto {
     CameraDto {
-        has_snapshot: state.snapshot_sources.contains_key(&camera.id),
+        has_snapshot: state
+            .snapshot_sources
+            .read()
+            .expect("no holder panics while the snapshot registry is locked")
+            .contains_key(&camera.id),
         id: camera.id.to_string(),
         name: camera.name.clone(),
         vendor: camera.vendor.clone(),
+        provisioned: camera.provisioned,
     }
-}
-
-fn rfc3339(wall: WallUs) -> String {
-    let c = wall.to_civil();
-    format!(
-        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:06}Z",
-        c.year,
-        c.month,
-        c.day,
-        c.hour,
-        c.minute,
-        c.second,
-        wall.get().rem_euclid(1_000_000)
-    )
 }

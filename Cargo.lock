@@ -1966,16 +1966,14 @@ dependencies = [
  "bytes",
  "futures-util",
  "hex",
- "http-body-util",
  "hyper",
  "hyper-util",
  "iris-catalog",
  "iris-core",
+ "iris-events",
  "iris-ingest",
  "iris-mp4",
  "iris-store",
- "md-5 0.11.0",
- "mime_guess",
  "reqwest",
  "rusqlite",
  "serde",
@@ -1987,8 +1985,8 @@ dependencies = [
  "tokio-tungstenite 0.30.0",
  "tokio-util",
  "tower",
- "tower-http 0.7.1",
  "tracing",
+ "url",
 ]
 
 [[package]]
@@ -2011,10 +2009,12 @@ dependencies = [
 name = "iris-core"
 version = "0.1.0"
 dependencies = [
+ "getrandom 0.4.3",
  "serde",
  "serde_json",
  "thiserror",
  "toml",
+ "url",
 ]
 
 [[package]]
@@ -2022,7 +2022,6 @@ name = "iris-events"
 version = "0.1.0"
 dependencies = [
  "async-trait",
- "bytes",
  "diqwest",
  "futures-util",
  "hex",
@@ -2031,9 +2030,7 @@ dependencies = [
  "oxvif",
  "rcgen",
  "reqwest",
- "serde",
  "serde_json",
- "tempfile",
  "thiserror",
  "tokio",
  "tokio-rustls",
@@ -2057,6 +2054,8 @@ dependencies = [
  "gstreamer-app",
  "gstreamer-video",
  "gtk4",
+ "iris-core",
+ "iris-tls",
  "rcgen",
  "reqwest",
  "rustix",
@@ -2123,7 +2122,7 @@ dependencies = [
  "iris-h265",
  "iris-mp4",
  "retina",
- "tempfile",
+ "thiserror",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -2145,13 +2144,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "iris-tls"
+version = "0.1.0"
+dependencies = [
+ "rcgen",
+ "reqwest",
+ "rustls",
+ "rustls-platform-verifier",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tokio-rustls",
+]
+
+[[package]]
 name = "iris-tools"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
  "clap",
+ "getrandom 0.4.3",
  "hex",
+ "iris-core",
+ "iris-h265",
+ "iris-replay",
+ "iris-tls",
  "md-5 0.11.0",
  "reqwest",
  "rustix",
@@ -2171,12 +2189,12 @@ dependencies = [
  "axum",
  "bytes",
  "clap",
+ "getrandom 0.4.3",
  "humantime",
  "iris-api",
  "iris-catalog",
  "iris-core",
  "iris-events",
- "iris-h265",
  "iris-ingest",
  "iris-mp4",
  "iris-store",
@@ -2185,7 +2203,6 @@ dependencies = [
  "rustix",
  "sd-notify",
  "serde",
- "serde_json",
  "tempfile",
  "tokio",
  "tokio-util",

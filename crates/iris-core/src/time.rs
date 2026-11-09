@@ -1,6 +1,7 @@
 //! Time units: wall-clock microseconds and 90 kHz media ticks.
 
 use std::fmt;
+use std::ops::{Add, Sub};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -13,6 +14,9 @@ pub const TIMESCALE: u32 = 90_000;
 
 /// Seconds between the NTP epoch (1900-01-01) and the Unix epoch (1970-01-01).
 const NTP_UNIX_OFFSET_SECS: u64 = 2_208_988_800;
+/// The Unix second at which the 32-bit NTP seconds field wraps into era 1:
+/// 2036-02-07T06:28:16Z.
+const NTP_ERA_1_UNIX_SECS: u64 = (1 << 32) - NTP_UNIX_OFFSET_SECS;
 
 /// A wall-clock instant in microseconds since the Unix epoch, taken from the
 /// NVR's `CLOCK_REALTIME`.
@@ -42,8 +46,11 @@ impl WallUs {
     pub fn now() -> Self {
         let since_epoch = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .expect("system clock is set before the Unix epoch");
-        Self(i64::try_from(since_epoch.as_micros()).expect("microseconds overflow i64"))
+            .expect("the system clock is after the Unix epoch");
+        Self(
+            i64::try_from(since_epoch.as_micros())
+                .expect("microseconds since the epoch fit in i64"),
+        )
     }
 
     /// Returns the microsecond count.
@@ -62,11 +69,14 @@ impl WallUs {
     /// bits, binary fraction in the low 32 bits), the format used by RTCP
     /// sender reports and the `prft` box.
     ///
-    /// Times before the Unix epoch saturate to zero.
+    /// The seconds field wraps at 2036-02-07T06:28:16Z into NTP era 1, as
+    /// RFC 4330 §3 describes; [`WallUs::from_ntp64`] reads both eras, so the
+    /// round trip is exact from 1970 through 2104-02-26. A time before the
+    /// Unix epoch is written as the Unix epoch.
     #[must_use]
     pub fn to_ntp64(self) -> u64 {
         let micros = u64::try_from(self.0).unwrap_or(0);
-        let secs = micros / 1_000_000 + NTP_UNIX_OFFSET_SECS;
+        let secs = (micros / 1_000_000 + NTP_UNIX_OFFSET_SECS) & 0xffff_ffff;
         let frac_micros = micros % 1_000_000;
         let frac = (frac_micros << 32) / 1_000_000;
         (secs << 32) | frac
@@ -75,11 +85,19 @@ impl WallUs {
     /// Converts a 64-bit NTP timestamp to wall time, the inverse of
     /// [`WallUs::to_ntp64`]. The fraction is rounded to the nearest microsecond,
     /// so a value produced by [`WallUs::to_ntp64`] (which truncates) converts back
-    /// exactly. Times before 1970 saturate to zero.
+    /// exactly. Seconds with the top bit set belong to era 0 (1968 to 2036) and
+    /// the others to era 1 (2036 to 2104), the RFC 4330 §3 rule; an era-0 time
+    /// before 1970 saturates to zero.
     #[must_use]
     pub fn from_ntp64(ntp: u64) -> Self {
-        let Some(secs) = (ntp >> 32).checked_sub(NTP_UNIX_OFFSET_SECS) else {
-            return Self(0);
+        let ntp_secs = ntp >> 32;
+        let secs = if ntp_secs & 0x8000_0000 == 0 {
+            ntp_secs + NTP_ERA_1_UNIX_SECS
+        } else {
+            match ntp_secs.checked_sub(NTP_UNIX_OFFSET_SECS) {
+                Some(secs) => secs,
+                None => return Self(0),
+            }
         };
         let frac_micros = ((ntp & 0xffff_ffff) * 1_000_000 + (1 << 31)) >> 32;
         Self(i64::try_from(secs * 1_000_000 + frac_micros).unwrap_or(i64::MAX))
@@ -137,7 +155,8 @@ pub struct CivilTime {
 
 impl fmt::Display for WallUs {
     /// Formats as `YYYY-MM-DDTHH:MM:SS.ffffffZ` without pulling in a calendar
-    /// crate; the civil-date conversion follows Howard Hinnant's algorithm.
+    /// crate; the civil-date conversion is the `civil_from_days` algorithm of
+    /// *chrono-Compatible Low-Level Date Algorithms*.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let c = self.to_civil();
         write!(
@@ -219,9 +238,16 @@ impl MediaTicks {
         // 90 kHz ticks to microseconds: multiply by 1000 / 90 = 100 / 9.
         (self.0 * 100).div_euclid(9)
     }
+
+    /// Returns the value in microseconds, rounded toward negative infinity,
+    /// or `None` when the result does not fit `i64`.
+    #[must_use]
+    pub fn checked_as_micros(self) -> Option<i64> {
+        i64::try_from((i128::from(self.0) * 100).div_euclid(9)).ok()
+    }
 }
 
-impl std::ops::Add for MediaTicks {
+impl Add for MediaTicks {
     type Output = Self;
 
     fn add(self, rhs: Self) -> Self {
@@ -229,7 +255,7 @@ impl std::ops::Add for MediaTicks {
     }
 }
 
-impl std::ops::Sub for MediaTicks {
+impl Sub for MediaTicks {
     type Output = Self;
 
     fn sub(self, rhs: Self) -> Self {
@@ -267,23 +293,32 @@ mod tests {
     }
 
     #[test]
-    fn ntp_conversion_matches_epoch_offset() {
+    fn the_unix_epoch_is_the_ntp_offset_with_a_zero_fraction() {
         let unix_epoch = WallUs::new(0).to_ntp64();
         assert_eq!(unix_epoch >> 32, NTP_UNIX_OFFSET_SECS);
         assert_eq!(unix_epoch & 0xffff_ffff, 0);
+        assert_eq!(WallUs::new(-1).to_ntp64(), unix_epoch);
+    }
+
+    #[test]
+    fn half_a_second_is_the_top_fraction_bit() {
         let half_second = WallUs::new(500_000).to_ntp64();
         assert_eq!(half_second & 0xffff_ffff, 1 << 31);
     }
 
     #[test]
     fn every_microsecond_fraction_round_trips_exactly() {
-        // Stepping through a second in 997 µs strides covers both residues that
-        // truncation used to lose; the two ends are checked explicitly.
+        // 997 µs strides through a second cover the residues a truncating
+        // inverse would lose; 999,999 and 379,376 are added explicitly.
         let base = 1_761_955_200_000_000i64;
         for offset in (0..1_000_000).step_by(997).chain([999_999, 379_376]) {
             let wall = WallUs::new(base + offset);
             assert_eq!(WallUs::from_ntp64(wall.to_ntp64()), wall, "offset {offset}");
         }
+    }
+
+    #[test]
+    fn the_top_fraction_carries_into_the_next_second() {
         assert_eq!(
             WallUs::from_ntp64(0xffff_ffff | (NTP_UNIX_OFFSET_SECS << 32)),
             WallUs::new(1_000_000)
@@ -291,10 +326,37 @@ mod tests {
     }
 
     #[test]
-    fn ntp_round_trips() {
+    fn ntp_round_trips_exactly() {
         let t = WallUs::new(1_793_460_958_000_123);
-        let back = WallUs::from_ntp64(t.to_ntp64());
-        assert!((back.get() - t.get()).abs() <= 1, "{back:?} vs {t:?}");
+        assert_eq!(WallUs::from_ntp64(t.to_ntp64()), t);
+    }
+
+    #[test]
+    fn ntp_conversions_cross_the_2036_era_boundary_exactly() {
+        let era_1_start = WallUs::new(i64::try_from(NTP_ERA_1_UNIX_SECS).unwrap() * 1_000_000);
+        assert_eq!(
+            era_1_start.to_ntp64() >> 32,
+            0,
+            "era 1 begins at NTP second zero"
+        );
+        assert_eq!(
+            era_1_start.offset(-1).to_ntp64() >> 32,
+            0xffff_ffff,
+            "the last era-0 second"
+        );
+        let year_2100 = WallUs::new(4_102_444_800_000_000);
+        for wall in [
+            era_1_start.offset(-1_000_000),
+            era_1_start.offset(-1),
+            era_1_start,
+            era_1_start.offset(1),
+            era_1_start.offset(123_456_789),
+            year_2100,
+        ] {
+            assert_eq!(WallUs::from_ntp64(wall.to_ntp64()), wall, "{wall}");
+        }
+        assert_eq!(era_1_start.to_string(), "2036-02-07T06:28:16.000000Z");
+        assert_eq!(WallUs::from_ntp64(0), era_1_start);
     }
 
     #[test]
@@ -313,5 +375,18 @@ mod tests {
         );
         assert_eq!(MediaTicks::checked_from_millis(largest + 1), None);
         assert_eq!(MediaTicks::checked_from_millis(u64::MAX), None);
+    }
+
+    #[test]
+    fn checked_microsecond_conversion_refuses_overflow() {
+        assert_eq!(MediaTicks::new(90).checked_as_micros(), Some(1_000));
+        assert_eq!(MediaTicks::new(-1).checked_as_micros(), Some(-12));
+        let largest = i64::try_from(i128::from(i64::MAX) * 9 / 100).unwrap();
+        assert_eq!(
+            MediaTicks::new(largest).checked_as_micros(),
+            Some(i64::try_from(i128::from(largest) * 100 / 9).unwrap())
+        );
+        assert_eq!(MediaTicks::new(largest + 1).checked_as_micros(), None);
+        assert_eq!(MediaTicks::new(i64::MIN).checked_as_micros(), None);
     }
 }

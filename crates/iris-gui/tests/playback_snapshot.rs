@@ -12,7 +12,7 @@ use axum::Router;
 use axum::extract::{OriginalUri, Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use axum::routing::get;
+use axum::routing;
 
 #[derive(Default)]
 struct Fixture {
@@ -32,7 +32,7 @@ async fn respond(
     if path == "/api/cameras" {
         return (
             [(header::CONTENT_TYPE, "application/json")],
-            r#"[{"id":"fixture","name":"Fixture"}]"#,
+            r#"[{"id":"fixture","name":"Fixture","provisioned":false}]"#,
         )
             .into_response();
     }
@@ -69,7 +69,13 @@ async fn respond(
         .to_owned();
         for i in if first { 0..3 } else { 1..3 } {
             use std::fmt::Write as _;
-            writeln!(playlist, "#IRIS-FRAGMENT:WALL-US={},DURATION-TICKS=180000\n#EXTINF:2.00000,\ntest{i}.m4s?token=fixture-token", wall_start + i * 2_000_000).unwrap();
+            writeln!(
+                playlist,
+                "#IRIS-FRAGMENT:WALL-US={},DURATION-TICKS=180000\n\
+                 #EXTINF:2.00000,\ntest{i}.m4s?token=fixture-token",
+                wall_start + i * 2_000_000
+            )
+            .unwrap();
         }
         playlist.push_str("#EXT-X-ENDLIST\n");
         return (
@@ -156,7 +162,9 @@ fn player_uses_the_playlist_snapshot_that_supplied_its_timeline() {
         async move {
             axum::serve(
                 listener,
-                Router::new().fallback(get(respond)).with_state(fixture),
+                Router::new()
+                    .fallback(routing::get(respond))
+                    .with_state(fixture),
             )
             .await
             .unwrap();

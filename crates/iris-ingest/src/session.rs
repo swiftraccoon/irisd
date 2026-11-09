@@ -1,7 +1,5 @@
 //! One RTSP session at a time per stream, reconnecting forever.
 
-use std::fmt;
-use std::fmt::Write as _;
 use std::num::NonZeroU32;
 use std::pin::Pin;
 use std::sync::{Arc, OnceLock};
@@ -12,27 +10,29 @@ use bytes::Bytes;
 use futures::Stream as _;
 use futures::StreamExt as _;
 use iris_core::id::StreamKey;
+use iris_core::text::LogSafe;
 use iris_core::time::WallUs;
+use iris_mp4::fragment::Fragment;
 use iris_mp4::init::{SampleEntry, build_init_segment};
 use retina::client::{
     Credentials, Demuxed, PlayOptions, Session, SessionOptions, SetupOptions, TcpTransportOptions,
     TeardownPolicy, Transport,
 };
-use retina::codec::{CodecItem, FrameFormat, ParametersRef, VideoParameters};
+use retina::codec::{CodecItem, FrameFormat, ParametersRef, VideoFrame, VideoParameters};
+use retina::rtcp::ReceivedCompoundPacket;
 use thiserror::Error;
 use tokio::sync::Notify;
+use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use crate::assembler::{FragmentAssembler, Frame};
 use crate::live::LiveFrame;
-use crate::regularize::Regularizer;
+use crate::regularize::{Regularizer, SNAP_TOLERANCE};
 use crate::sink::FragmentSink;
 use crate::source::{IngestOptions, StreamSource};
 use crate::stats::StreamStats;
 
-/// Default tolerance before the regulariser snaps to the camera timeline.
-const SNAP_TOLERANCE_MS: i64 = 500;
 /// Longest pause between reconnection attempts.
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
 /// How long a DESCRIBE, SETUP, or PLAY may take before the session is abandoned.
@@ -43,10 +43,6 @@ const HEALTHY_SESSION: Duration = Duration::from_secs(60);
 const GAP_HOLD_TICKS: i64 = 90_000;
 /// A recorder realtime step larger than this ends the run.
 const CLOCK_STEP_US: u64 = 2_000_000;
-/// Longest text, marker included, that one session error puts in a log line.
-const MAX_LOGGED_ERROR_CHARS: usize = 512;
-/// Ends a session error cut at [`MAX_LOGGED_ERROR_CHARS`].
-const TRUNCATED: &str = "...";
 
 /// Why a session ended.
 #[derive(Debug, Error)]
@@ -60,7 +56,8 @@ enum SessionError {
     /// An RTSP request went unanswered.
     #[error("{0} not answered within {SETUP_TIMEOUT:?}")]
     SetupTimeout(&'static str),
-    #[error("no frames for {0:?}")]
+    /// No RTSP data at all, neither frames nor RTCP, for the inactivity timeout.
+    #[error("no data for {0:?}")]
     Inactivity(Duration),
     #[error("camera closed the stream")]
     EndOfStream,
@@ -91,7 +88,11 @@ pub async fn run_stream(
             Ok(()) => return,
             Err(error) => {
                 // Session errors quote camera-supplied text.
-                warn!(stream = %source.key, error = %LogSafe(&error), "session ended; reconnecting");
+                warn!(
+                    stream = %source.key,
+                    error = %LogSafe(&error),
+                    "session ended; reconnecting"
+                );
                 stats.record_reconnect();
             }
         }
@@ -195,7 +196,10 @@ async fn run_session(
         } else {
             tokio::select! {
                 () = shutdown.cancelled() => break 'session Ok(()),
-                item = tokio::time::timeout(options.inactivity_timeout, demuxed.next()) => match item {
+                item = tokio::time::timeout(
+                    options.inactivity_timeout,
+                    demuxed.next(),
+                ) => match item {
                     Ok(item) => item,
                     Err(_elapsed) => {
                         break 'session Err(SessionError::Inactivity(options.inactivity_timeout));
@@ -215,7 +219,7 @@ async fn run_session(
             CodecItem::VideoFrame(frame) => {
                 session_state.on_frame(frame, &demuxed, source, options, sink, stats)
             }
-            CodecItem::Rtcp(packet) => session_state.on_rtcp(&packet, stats),
+            CodecItem::Rtcp(packet) => session_state.on_rtcp(&packet, &source.key, stats),
             _ => Ok(()),
         };
         if let Err(error) = result {
@@ -276,7 +280,8 @@ async fn start_session(
         ) => setup,
     }
     .map_err(|_| SessionError::SetupTimeout("SETUP"))??;
-    let max_jump = NonZeroU32::new(options.max_jump_secs.max(1)).expect("non-zero");
+    let max_jump_secs = u32::try_from(options.max_jump.as_secs()).unwrap_or(u32::MAX);
+    let max_jump = NonZeroU32::new(max_jump_secs.max(1)).expect("at least one second");
     let mut play_options = PlayOptions::default().enforce_timestamps_with_max_jump_secs(max_jump);
     if let Some(bytes) = options.recv_low_water {
         play_options = play_options.recv_low_water(bytes);
@@ -329,7 +334,7 @@ pub struct ReadTicker {
 }
 
 #[derive(Debug)]
-struct TickerTask(tokio::task::JoinHandle<()>);
+struct TickerTask(JoinHandle<()>);
 
 impl Drop for TickerTask {
     fn drop(&mut self) {
@@ -340,6 +345,10 @@ impl Drop for TickerTask {
 impl ReadTicker {
     /// Spawns the ticker on the current runtime, ticking at every multiple of
     /// `interval` on the shared clock.
+    ///
+    /// # Panics
+    ///
+    /// Panics when called outside a Tokio runtime (it calls [`tokio::spawn`]).
     #[must_use]
     pub fn spawn(interval: Duration) -> Self {
         let notify = Arc::new(Notify::new());
@@ -402,7 +411,7 @@ impl SessionState {
 
     fn close_fragment(
         &mut self,
-        fragment: iris_mp4::fragment::Fragment,
+        fragment: Fragment,
         sink: &dyn FragmentSink,
         source: &StreamSource,
         stats: &StreamStats,
@@ -435,17 +444,25 @@ impl SessionState {
         }
     }
 
-    /// Records the camera clock offset carried by RTCP sender reports.
+    /// Records the camera clock offset carried by RTCP sender reports. A
+    /// report retina cannot read is logged at debug level and skipped.
     fn on_rtcp(
         &mut self,
-        packet: &retina::rtcp::ReceivedCompoundPacket,
+        packet: &ReceivedCompoundPacket,
+        key: &StreamKey,
         stats: &StreamStats,
     ) -> Result<(), SessionError> {
         let nvr = self.clock.wall_at(packet.ctx().received())?;
         for pkt in packet.pkts() {
-            if let Ok(Some(report)) = pkt.as_sender_report() {
-                let camera = WallUs::from_ntp64(report.ntp_timestamp().0);
-                stats.record_sender_report(camera.micros_since(nvr));
+            match pkt.as_sender_report() {
+                Ok(Some(report)) => {
+                    let camera = WallUs::from_ntp64(report.ntp_timestamp().0);
+                    stats.record_sender_report(camera.micros_since(nvr));
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    debug!(stream = %key, error = %LogSafe(&error), "unreadable RTCP sender report");
+                }
             }
         }
         Ok(())
@@ -453,7 +470,7 @@ impl SessionState {
 
     fn on_frame(
         &mut self,
-        frame: retina::codec::VideoFrame,
+        frame: VideoFrame,
         demuxed: &Demuxed,
         source: &StreamSource,
         options: &IngestOptions,
@@ -471,7 +488,7 @@ impl SessionState {
         if lost {
             debug!(stream = %source.key, lost = frame.loss(), "packet loss before frame");
         }
-        let data = framed_data(frame.into_data());
+        let data = framed_data(&source.key, frame.into_data());
         stats.record_frame(data.len() as u64, wall, lost);
 
         let mut retarget_nominal = None;
@@ -499,7 +516,7 @@ impl SessionState {
                 self.nominal = parameter_nominal;
             }
             if self.assembler.is_none() {
-                tracing::info!(
+                info!(
                     stream = %source.key,
                     declared_fps = ?demuxed.streams()[self.stream_index].framerate(),
                     sps_frame_rate = ?video.frame_rate(),
@@ -510,11 +527,8 @@ impl SessionState {
             if let Some(assembler) = self.assembler.as_mut() {
                 assembler.set_sample_entry(entry);
             } else {
-                let regularizer = Regularizer::new(
-                    options.timestamp_mode,
-                    self.nominal,
-                    iris_core::time::MediaTicks::from_millis(SNAP_TOLERANCE_MS),
-                );
+                let regularizer =
+                    Regularizer::new(options.timestamp_mode, self.nominal, SNAP_TOLERANCE);
                 self.assembler = Some(FragmentAssembler::new(options, regularizer, entry));
             }
         }
@@ -579,7 +593,7 @@ fn log_reconnect_gap(key: &StreamKey, previous: WallUs, wall: WallUs, stats: &St
 fn note_closed_fragment(
     holds_seen: &mut (u64, u64),
     assembler: &FragmentAssembler,
-    fragment: &iris_mp4::fragment::Fragment,
+    fragment: &Fragment,
     key: &StreamKey,
     stats: &StreamStats,
 ) {
@@ -613,11 +627,15 @@ fn note_closed_fragment(
 
 /// Hands one complete fragment to `sink` and records its acceptance in `stats`.
 ///
-/// This is the delivery/accounting seam used by [`run_stream`].
+/// This is the delivery/accounting seam used by [`run_stream`], which the
+/// daemon's sink tests drive directly. It does not end recording continuity
+/// on a rejection: the session does that from the result, so a `false` must
+/// not be ignored.
+#[must_use = "a rejected fragment ends recording continuity"]
 pub fn deliver_fragment(
     sink: &dyn FragmentSink,
     key: &StreamKey,
-    fragment: iris_mp4::fragment::Fragment,
+    fragment: Fragment,
     stats: &StreamStats,
 ) -> bool {
     let accepted = sink.send(key, fragment).is_ok();
@@ -629,11 +647,17 @@ pub fn deliver_fragment(
 }
 
 /// Strips any in-band parameter sets as a safety net; the frame format
-/// already asks retina to keep them out of frame data.
-fn framed_data(data: Vec<u8>) -> Bytes {
+/// already asks retina to keep them out of frame data. A framing error means
+/// the depacketizer produced an access unit this crate cannot walk, which is
+/// logged at debug level; the frame is recorded as received.
+fn framed_data(key: &StreamKey, data: Vec<u8>) -> Bytes {
     match iris_h265::strip_parameter_sets(&data) {
         Ok(Some(stripped)) => Bytes::from(stripped),
-        Ok(None) | Err(_) => Bytes::from(data),
+        Ok(None) => Bytes::from(data),
+        Err(error) => {
+            debug!(stream = %key, error = %LogSafe(&error), "access unit framing could not be walked");
+            Bytes::from(data)
+        }
     }
 }
 
@@ -736,49 +760,6 @@ fn signed_micros(at: Instant, anchor: Instant) -> i64 {
     }
 }
 
-/// Displays text a camera can influence, such as a session error, as one
-/// bounded line: printable ASCII passes, `\n`, `\r`, and `\t` become those
-/// escapes, every other character becomes `\u{…}`, and a longer text is cut to
-/// [`MAX_LOGGED_ERROR_CHARS`] characters ending in [`TRUNCATED`]. A camera can
-/// then neither split a journal entry, start a line with a forged priority
-/// prefix, carry terminal controls into the log, nor make the line grow with
-/// what it sends.
-struct LogSafe<'a, T: ?Sized>(&'a T);
-
-impl<T: fmt::Display + ?Sized> fmt::Display for LogSafe<'_, T> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let mut line = EscapedLine(String::with_capacity(MAX_LOGGED_ERROR_CHARS + 16));
-        // The only error is the line filling up, which stops the formatting.
-        if write!(line, "{}", self.0).is_err() {
-            line.0.truncate(MAX_LOGGED_ERROR_CHARS - TRUNCATED.len());
-            line.0.push_str(TRUNCATED);
-        }
-        f.write_str(&line.0)
-    }
-}
-
-/// The escaped text of [`LogSafe`], ASCII only, refusing more once it is
-/// longer than [`MAX_LOGGED_ERROR_CHARS`].
-struct EscapedLine(String);
-
-impl fmt::Write for EscapedLine {
-    fn write_str(&mut self, text: &str) -> fmt::Result {
-        for c in text.chars() {
-            match c {
-                ' '..='~' => self.0.push(c),
-                '\n' => self.0.push_str("\\n"),
-                '\r' => self.0.push_str("\\r"),
-                '\t' => self.0.push_str("\\t"),
-                _ => write!(self.0, "\\u{{{:x}}}", u32::from(c))?,
-            }
-            if self.0.len() > MAX_LOGGED_ERROR_CHARS {
-                return Err(fmt::Error);
-            }
-        }
-        Ok(())
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;
@@ -786,7 +767,6 @@ mod tests {
 
     use iris_core::config::TimestampMode;
     use iris_core::time::MediaTicks;
-    use iris_mp4::fragment::Fragment;
     use tokio::io::AsyncReadExt as _;
     use tokio::net::TcpListener;
     use tokio::sync::oneshot;
@@ -941,6 +921,10 @@ mod tests {
         assert_eq!(nominal_from_rate((1001, 30000)), Some(3003));
         assert_eq!(nominal_from_rate((0, 7)), None);
         assert_eq!(nominal_from_rate((1, 241)), None);
+    }
+
+    #[test]
+    fn retargets_only_on_a_changed_valid_parameter_rate() {
         assert_eq!(
             changed_parameter_nominal(None, Some(6000), true),
             Some(6000)
@@ -1132,29 +1116,7 @@ mod tests {
     }
 
     #[test]
-    fn log_safe_text_escapes_line_breaks_and_controls() {
-        let text = "RTSP framing error: bad\n<0>forged\r\x1b[31m\tend é\u{202e}";
-        assert_eq!(
-            LogSafe(text).to_string(),
-            "RTSP framing error: bad\\n<0>forged\\r\\u{1b}[31m\\tend \\u{e9}\\u{202e}"
-        );
-    }
-
-    #[test]
-    fn log_safe_text_is_cut_to_the_limit() {
-        let exact = "x".repeat(MAX_LOGGED_ERROR_CHARS);
-        assert_eq!(LogSafe(&exact).to_string(), exact);
-
-        let long = format!("{}\n", "y\n".repeat(1 << 20));
-        let line = LogSafe(&long).to_string();
-        assert_eq!(line.len(), MAX_LOGGED_ERROR_CHARS);
-        assert!(line.starts_with("y\\ny\\n"));
-        assert!(line.ends_with(TRUNCATED));
-        assert!(!line.bytes().any(|b| b.is_ascii_control()), "{line:?}");
-    }
-
-    #[test]
-    fn log_safe_session_error_is_one_line() {
+    fn a_logged_session_error_is_one_line() {
         let error = SessionError::SetupTimeout("DESCRIBE");
         assert_eq!(
             LogSafe(&error).to_string(),

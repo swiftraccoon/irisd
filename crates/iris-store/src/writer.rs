@@ -1,10 +1,11 @@
-//! The writer thread and its handle.
+//! The writer handle, its counters, and the queue commands shared with each
+//! root's thread body in [`crate::root_worker`].
 
 use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::{SyncSender, TrySendError, sync_channel};
+use std::sync::mpsc::{self, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
@@ -18,44 +19,43 @@ use crate::fs::{ApprovedRoot, FreeSpace};
 use crate::observer::{NoopObserver, StoreObserver};
 use crate::policy::StoragePolicy;
 
-mod worker;
+use crate::root_worker::RootWorker;
 
-use worker::RootWorker;
-
-/// A write or sync that takes longer than this is counted and logged as slow.
 /// Streams are spread over this many phases of the sync interval, in order of
 /// first appearance, so that their `fdatasync`s do not land on the disk together.
 const SYNC_SLOTS: usize = 16;
 
 /// The sync phase of the stream in `slot`: a fraction of `interval`.
-fn sync_phase(slot: usize, interval: Duration) -> Duration {
+pub(crate) fn sync_phase(slot: usize, interval: Duration) -> Duration {
     interval * u32::try_from(slot % SYNC_SLOTS).unwrap_or(0)
         / u32::try_from(SYNC_SLOTS).unwrap_or(1)
 }
 
-const SLOW_IO: Duration = Duration::from_secs(1);
+/// A write or sync that takes longer than this is counted and logged as slow.
+pub(crate) const SLOW_IO: Duration = Duration::from_secs(1);
 
 /// Counters maintained by the writer thread and its handle, readable from any
 /// thread.
 ///
-/// Byte counts are bytes written to disk, headers and trailers included;
-/// latencies are per write or per `fdatasync`; peaks reset when taken. The
-/// daemon's `writer` statistics line is built from these accessors.
+/// Byte counts are fragment bytes (`prft` through trailer) appended to media
+/// files; latencies are per fragment write or per `fdatasync`; peaks reset
+/// when taken. The daemon's `writer` statistics line is built from these
+/// accessors.
 #[derive(Debug, Default)]
 pub struct WriterStats {
-    fragments: AtomicU64,
-    bytes: AtomicU64,
-    syncs: AtomicU64,
-    dropped: AtomicU64,
-    files_opened: AtomicU64,
-    write_errors: AtomicU64,
-    write_latency: Histogram,
-    sync_latency: Histogram,
+    pub(crate) fragments: AtomicU64,
+    pub(crate) bytes: AtomicU64,
+    pub(crate) syncs: AtomicU64,
+    pub(crate) dropped: AtomicU64,
+    pub(crate) files_opened: AtomicU64,
+    pub(crate) write_errors: AtomicU64,
+    pub(crate) write_latency: Histogram,
+    pub(crate) sync_latency: Histogram,
     queued: AtomicU64,
     queue_peak: Peak,
     queued_bytes: AtomicU64,
     queue_bytes_peak: Peak,
-    slow_writes: AtomicU64,
+    pub(crate) slow_writes: AtomicU64,
 }
 
 impl WriterStats {
@@ -64,7 +64,8 @@ impl WriterStats {
         self.fragments.load(Ordering::Relaxed)
     }
 
-    /// Bytes written to disk, trailers and headers included.
+    /// Fragment bytes (`prft` through trailer) appended to media files;
+    /// initialization segments and sidecar records are not counted.
     pub fn bytes(&self) -> u64 {
         self.bytes.load(Ordering::Relaxed)
     }
@@ -84,12 +85,16 @@ impl WriterStats {
         self.files_opened.load(Ordering::Relaxed)
     }
 
-    /// I/O errors; each one abandons the affected file until the next sync sample.
+    /// Write, sync, seal, and free-space probe failures. Each one except a seal
+    /// failure during failover abandons every open file of that root for
+    /// recovery and retires the root: until restart when a fallback root exists,
+    /// otherwise until a sync fragment after a one-second cooldown.
     pub fn write_errors(&self) -> u64 {
         self.write_errors.load(Ordering::Relaxed)
     }
 
-    /// Time spent writing one fragment, headers and trailer included.
+    /// Time spent per fragment in the stream writer, a rotation's seal and
+    /// file creation included.
     pub fn write_latency(&self) -> &Histogram {
         &self.write_latency
     }
@@ -124,18 +129,26 @@ impl WriterStats {
         self.slow_writes.load(Ordering::Relaxed)
     }
 
-    /// Accounts for a fragment entering the queue.
-    fn enqueue(&self, bytes: u64) {
+    /// Accounts for a fragment entering the queue and returns the depth and
+    /// queued bytes it produced; a sender that got the fragment into the queue
+    /// passes them to [`WriterStats::observe_queue`].
+    pub(crate) fn enqueue(&self, bytes: u64) -> (u64, u64) {
         let depth = self.queued.fetch_add(1, Ordering::Relaxed) + 1;
-        self.queue_peak.observe(depth);
         let queued_bytes = self.queued_bytes.fetch_add(bytes, Ordering::Relaxed) + bytes;
+        (depth, queued_bytes)
+    }
+
+    /// Raises the queue peaks for a fragment that entered the queue, so a
+    /// rejected fragment never counts toward them.
+    pub(crate) fn observe_queue(&self, depth: u64, queued_bytes: u64) {
+        self.queue_peak.observe(depth);
         self.queue_bytes_peak.observe(queued_bytes);
     }
 
     /// Accounts for a fragment leaving the queue (or never entering it). Every
     /// call pairs with an earlier [`WriterStats::enqueue`] for the same fragment,
     /// so the counters never go below zero.
-    fn dequeue(&self, bytes: u64) {
+    pub(crate) fn dequeue(&self, bytes: u64) {
         self.queued.fetch_sub(1, Ordering::Relaxed);
         self.queued_bytes.fetch_sub(bytes, Ordering::Relaxed);
     }
@@ -153,7 +166,8 @@ impl fmt::Display for QueueFull {
 
 impl std::error::Error for QueueFull {}
 
-enum Command {
+/// What a root's thread receives on its queue.
+pub(crate) enum Command {
     Fragment { key: StreamKey, fragment: Fragment },
     Shutdown,
 }
@@ -179,12 +193,21 @@ impl fmt::Debug for WriterHandle {
 impl WriterHandle {
     /// Creates `root` and starts the writer thread with a queue of
     /// `queue_capacity` fragments and no observer.
+    ///
+    /// # Errors
+    ///
+    /// The root cannot be created, `queue_capacity` is zero, or the thread
+    /// cannot start.
     pub fn spawn(root: PathBuf, policy: StoragePolicy, queue_capacity: usize) -> io::Result<Self> {
         Self::spawn_with_observer(root, policy, queue_capacity, Arc::new(NoopObserver))
     }
 
     /// Like [`WriterHandle::spawn`], notifying `observer` about every file
     /// opened, synced, and sealed. Notifications run on the writer thread.
+    ///
+    /// # Errors
+    ///
+    /// As [`WriterHandle::spawn`].
     pub fn spawn_with_observer(
         root: PathBuf,
         policy: StoragePolicy,
@@ -211,7 +234,8 @@ impl WriterHandle {
     /// # Errors
     ///
     /// Returns an error for an empty root list, when every root fails directory
-    /// creation, or when a writer thread cannot be started.
+    /// creation, when `queue_capacity` is zero or `min_free_percent` exceeds
+    /// 100, or when a writer thread cannot be started.
     pub fn spawn_with_roots(
         roots: Vec<PathBuf>,
         policy: StoragePolicy,
@@ -234,6 +258,12 @@ impl WriterHandle {
     /// physical inode are rechecked immediately before threads start and
     /// before every segment open.
     /// Unlike [`WriterHandle::spawn_with_roots`], this never creates a root.
+    ///
+    /// # Errors
+    ///
+    /// An empty list; any root that fails re-verification, which fails the
+    /// whole call rather than skipping the root; a zero `queue_capacity` or a
+    /// `min_free_percent` over 100; a thread that cannot start.
     pub fn spawn_with_approved_roots(
         roots: Vec<ApprovedRoot>,
         policy: StoragePolicy,
@@ -303,6 +333,18 @@ impl WriterHandle {
         observer: Arc<dyn StoreObserver>,
         space_probe: fn(&Path) -> io::Result<FreeSpace>,
     ) -> io::Result<Self> {
+        if queue_capacity == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "writer queue capacity must be at least one fragment",
+            ));
+        }
+        if min_free_percent > 100 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "min_free_percent must be at most 100",
+            ));
+        }
         let stats = Arc::new(WriterStats::default());
         let mut threads = Vec::with_capacity(ready.len());
         let mut next = None;
@@ -310,7 +352,7 @@ impl WriterHandle {
         for ((root, approved_root), (policy, observer)) in
             ready.into_iter().rev().zip(configurations)
         {
-            let (tx, rx) = sync_channel(queue_capacity.max(1));
+            let (tx, rx) = mpsc::sync_channel(queue_capacity);
             let worker = RootWorker::new(
                 root,
                 policy,
@@ -335,14 +377,22 @@ impl WriterHandle {
     }
 
     /// Queues a fragment without blocking. A full (or closed) queue drops the
-    /// fragment, counts it, and returns [`QueueFull`].
+    /// fragment, counts it, and returns [`QueueFull`]. A fragment accepted after
+    /// [`WriterHandle::shutdown`] queued its marker is discarded unwritten.
+    ///
+    /// # Errors
+    ///
+    /// [`QueueFull`] when the writer's queue is full or the writer has stopped.
     pub fn try_send(&self, key: StreamKey, fragment: Fragment) -> Result<(), QueueFull> {
         // Counted before the send so the writer thread's matching decrement can
         // never run first.
         let bytes = fragment.payload_len();
-        self.stats.enqueue(bytes);
+        let (depth, queued_bytes) = self.stats.enqueue(bytes);
         match self.tx.try_send(Command::Fragment { key, fragment }) {
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                self.stats.observe_queue(depth, queued_bytes);
+                Ok(())
+            }
             Err(TrySendError::Full(_) | TrySendError::Disconnected(_)) => {
                 self.stats.dequeue(bytes);
                 self.stats.dropped.fetch_add(1, Ordering::Relaxed);
@@ -352,12 +402,19 @@ impl WriterHandle {
     }
 
     /// Shared counters.
+    #[must_use]
     pub fn stats(&self) -> Arc<WriterStats> {
         Arc::clone(&self.stats)
     }
 
     /// Drains the queue, seals every open file, and joins the thread. A
-    /// second call returns `Ok(())` without doing anything.
+    /// second call returns `Ok(())` without doing anything. Blocks until every
+    /// root's queue drains, so async callers run it off the runtime.
+    ///
+    /// # Errors
+    ///
+    /// The first sealing error a worker returned, a panicked worker, or a
+    /// poisoned handle mutex.
     pub fn shutdown(&self) -> io::Result<()> {
         let threads = self
             .threads
@@ -395,6 +452,13 @@ mod tests {
     use std::fs::{self, File};
     use std::time::Instant;
 
+    /// Whether a test fragment starts with a sync sample.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Start {
+        Sync,
+        Continuation,
+    }
+
     fn key() -> StreamKey {
         StreamKey {
             camera: "cam1".parse().unwrap(),
@@ -402,12 +466,12 @@ mod tests {
         }
     }
 
-    fn fragment(index: u64, is_sync: bool) -> Fragment {
+    fn fragment(index: u64, start: Start) -> Fragment {
         Fragment {
             samples: vec![Sample {
                 data: Bytes::from_static(&[0, 0, 0, 2, 0x26, 1]),
                 duration: 3000,
-                is_sync,
+                is_sync: start == Start::Sync,
             }],
             decode_time: index * 3000,
             wall: WallUs::new(1_700_000_000_000_000 + i64::try_from(index).unwrap() * 1_000_000),
@@ -469,7 +533,7 @@ mod tests {
         )
         .unwrap();
 
-        writer.try_send(key(), fragment(0, true)).unwrap();
+        writer.try_send(key(), fragment(0, Start::Sync)).unwrap();
         writer.shutdown().unwrap();
         assert_eq!(writer.stats().write_errors(), 1);
         assert!(!root.join("cam1").exists());
@@ -492,11 +556,11 @@ mod tests {
             marker_space,
         )
         .unwrap();
-        writer.try_send(key(), fragment(0, true)).unwrap();
+        writer.try_send(key(), fragment(0, Start::Sync)).unwrap();
         wait_for(|| writer.stats().dropped() == 1);
         fs::remove_file(dir.path().join("space-low")).unwrap();
         thread::sleep(Duration::from_millis(1100));
-        writer.try_send(key(), fragment(1, true)).unwrap();
+        writer.try_send(key(), fragment(1, Start::Sync)).unwrap();
         writer.shutdown().unwrap();
         assert_eq!(writer.stats().fragments(), 1);
     }
@@ -521,11 +585,23 @@ mod tests {
         )
         .unwrap();
         for index in 0..3 {
-            writer.try_send(key(), fragment(index, index != 1)).unwrap();
+            writer
+                .try_send(
+                    key(),
+                    fragment(
+                        index,
+                        if index == 1 {
+                            Start::Continuation
+                        } else {
+                            Start::Sync
+                        },
+                    ),
+                )
+                .unwrap();
         }
         writer.shutdown().unwrap();
         assert!(!first.join("cam1").exists());
-        let path = crate::layout::segment_path(&second, &key(), fragment(0, true).wall);
+        let path = crate::layout::segment_path(&second, &key(), fragment(0, Start::Sync).wall);
         let report = scan(
             File::open(path).unwrap(),
             ScanOptions {
@@ -568,10 +644,22 @@ mod tests {
         )
         .unwrap();
         for index in 0..3 {
-            writer.try_send(key(), fragment(index, index != 1)).unwrap();
+            writer
+                .try_send(
+                    key(),
+                    fragment(
+                        index,
+                        if index == 1 {
+                            Start::Continuation
+                        } else {
+                            Start::Sync
+                        },
+                    ),
+                )
+                .unwrap();
         }
         writer.shutdown().unwrap();
-        let path = crate::layout::segment_path(&second, &key(), fragment(0, true).wall);
+        let path = crate::layout::segment_path(&second, &key(), fragment(0, Start::Sync).wall);
         let report = scan(
             File::open(path).unwrap(),
             ScanOptions {
@@ -609,14 +697,16 @@ mod tests {
             8,
         )
         .unwrap();
-        writer.try_send(key(), fragment(0, true)).unwrap();
+        writer.try_send(key(), fragment(0, Start::Sync)).unwrap();
         wait_for(|| writer.stats().write_errors() == 1);
         fs::remove_file(dir.path().join("cam1")).unwrap();
         thread::sleep(Duration::from_millis(1100));
-        writer.try_send(key(), fragment(1, false)).unwrap();
-        writer.try_send(key(), fragment(2, true)).unwrap();
+        writer
+            .try_send(key(), fragment(1, Start::Continuation))
+            .unwrap();
+        writer.try_send(key(), fragment(2, Start::Sync)).unwrap();
         writer.shutdown().unwrap();
-        let path = crate::layout::segment_path(dir.path(), &key(), fragment(2, true).wall);
+        let path = crate::layout::segment_path(dir.path(), &key(), fragment(2, Start::Sync).wall);
         let report = scan(
             File::open(path).unwrap(),
             ScanOptions {
@@ -649,23 +739,23 @@ mod tests {
             Arc::new(NoopObserver),
         )
         .unwrap();
-        writer.try_send(key(), fragment(0, true)).unwrap();
+        writer.try_send(key(), fragment(0, Start::Sync)).unwrap();
         writer.shutdown().unwrap();
-        assert!(crate::layout::segment_path(&good, &key(), fragment(0, true).wall).exists());
+        assert!(crate::layout::segment_path(&good, &key(), fragment(0, Start::Sync).wall).exists());
         assert_eq!(writer.stats().fragments(), 1);
     }
 
-    #[test]
-    fn pressure_switches_every_stream_at_its_next_sync_and_keeps_the_upstream_retired() {
-        let dir = tempfile::tempdir().unwrap();
-        let first = dir.path().join("first");
-        let second = dir.path().join("second");
+    /// Two roots with a space marker on the first: two streams write one
+    /// fragment each, the first root reports pressure, and both streams send
+    /// more fragments (the second stream's first one is not a sync fragment).
+    /// Returns the handle and the stream key of the second stream.
+    fn pressure_failover(first: &Path, second: &Path) -> (WriterHandle, StreamKey) {
         let other = StreamKey {
             camera: "cam2".parse().unwrap(),
             kind: StreamKind::Main,
         };
         let writer = WriterHandle::spawn_with_probe(
-            vec![first.clone(), second.clone()],
+            vec![first.to_path_buf(), second.to_path_buf()],
             StoragePolicy {
                 preallocate_bytes: 0,
                 ..StoragePolicy::default()
@@ -676,20 +766,33 @@ mod tests {
             marker_space,
         )
         .unwrap();
-        writer.try_send(key(), fragment(0, true)).unwrap();
-        writer.try_send(other.clone(), fragment(0, true)).unwrap();
+        writer.try_send(key(), fragment(0, Start::Sync)).unwrap();
+        writer
+            .try_send(other.clone(), fragment(0, Start::Sync))
+            .unwrap();
         wait_for(|| writer.stats().fragments() == 2);
         fs::write(first.join("space-low"), b"").unwrap();
         thread::sleep(Duration::from_millis(1100));
-        writer.try_send(key(), fragment(1, true)).unwrap();
-        writer.try_send(other.clone(), fragment(1, false)).unwrap();
-        writer.try_send(other.clone(), fragment(2, true)).unwrap();
+        writer.try_send(key(), fragment(1, Start::Sync)).unwrap();
+        writer
+            .try_send(other.clone(), fragment(1, Start::Continuation))
+            .unwrap();
+        writer
+            .try_send(other.clone(), fragment(2, Start::Sync))
+            .unwrap();
         wait_for(|| writer.stats().fragments() == 4);
-        fs::remove_file(first.join("space-low")).unwrap();
-        writer.try_send(key(), fragment(3, true)).unwrap();
+        (writer, other)
+    }
+
+    #[test]
+    fn pressure_switches_every_stream_at_its_next_sync() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("first");
+        let second = dir.path().join("second");
+        let (writer, other) = pressure_failover(&first, &second);
         writer.shutdown().unwrap();
-        let old = crate::layout::segment_path(&first, &key(), fragment(0, true).wall);
-        let fallback = crate::layout::segment_path(&second, &other, fragment(2, true).wall);
+        let old = crate::layout::segment_path(&first, &key(), fragment(0, Start::Sync).wall);
+        let fallback = crate::layout::segment_path(&second, &other, fragment(2, Start::Sync).wall);
         let options = ScanOptions {
             verify_crc: true,
             collect_samples: false,
@@ -704,10 +807,38 @@ mod tests {
         let report = scan(File::open(fallback).unwrap(), options).unwrap();
         assert_eq!(report.fragments.len(), 1);
         assert!(report.fragments[0].starts_with_sync);
-        assert_eq!(writer.stats().fragments(), 5);
-        assert_eq!(writer.stats().dropped(), 1);
+        assert_eq!(
+            writer.stats().dropped(),
+            1,
+            "the non-sync fragment waited for no file"
+        );
         assert_eq!(writer.stats().queued(), 0);
         assert_eq!(writer.stats().queued_bytes(), 0);
+    }
+
+    #[test]
+    fn a_retired_root_stays_retired_after_its_space_returns() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("first");
+        let second = dir.path().join("second");
+        let (writer, _) = pressure_failover(&first, &second);
+        fs::remove_file(first.join("space-low")).unwrap();
+        writer.try_send(key(), fragment(3, Start::Sync)).unwrap();
+        writer.shutdown().unwrap();
+        let old = crate::layout::segment_path(&first, &key(), fragment(0, Start::Sync).wall);
+        let options = ScanOptions {
+            verify_crc: true,
+            collect_samples: false,
+        };
+        assert_eq!(
+            scan(File::open(old).unwrap(), options)
+                .unwrap()
+                .fragments
+                .len(),
+            1,
+            "the retired root took nothing after its space returned"
+        );
+        assert_eq!(writer.stats().fragments(), 5);
     }
 
     #[test]
@@ -727,23 +858,25 @@ mod tests {
             marker_space,
         )
         .unwrap();
-        writer.try_send(key(), fragment(0, true)).unwrap();
+        writer.try_send(key(), fragment(0, Start::Sync)).unwrap();
         wait_for(|| writer.stats().fragments() == 1);
         fs::write(first.join("space-low"), b"").unwrap();
         thread::sleep(Duration::from_millis(1_100));
 
-        writer.try_send(key(), fragment(1, false)).unwrap();
-        writer.try_send(key(), fragment(2, true)).unwrap();
+        writer
+            .try_send(key(), fragment(1, Start::Continuation))
+            .unwrap();
+        writer.try_send(key(), fragment(2, Start::Sync)).unwrap();
         writer.shutdown().unwrap();
 
         let options = ScanOptions {
             verify_crc: true,
             collect_samples: false,
         };
-        let old = crate::layout::segment_path(&first, &key(), fragment(0, true).wall);
+        let old = crate::layout::segment_path(&first, &key(), fragment(0, Start::Sync).wall);
         let old_report = scan(File::open(old).unwrap(), options).unwrap();
         assert_eq!(old_report.fragments.len(), 1);
-        let fallback = crate::layout::segment_path(&second, &key(), fragment(2, true).wall);
+        let fallback = crate::layout::segment_path(&second, &key(), fragment(2, Start::Sync).wall);
         let fallback_report = scan(File::open(fallback).unwrap(), options).unwrap();
         assert_eq!(fallback_report.fragments.len(), 1);
         assert_eq!(fallback_report.fragments[0].decode_time, 6_000);
