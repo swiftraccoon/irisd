@@ -1,10 +1,18 @@
-//! Timestamps as the daemon logs them: RFC 3339 in UTC with a `Z`.
+//! Timestamps as the daemon logs them: RFC 3339 in UTC with a `Z`. Instants
+//! are `f64` seconds since the Unix epoch, the unit the reports compute rates
+//! and regressions in.
+//!
+//! The `tools_protocol` and `tools_logs` fuzz targets include this file by
+//! path, so it uses nothing outside the standard library.
 
-/// Strictly parses RFC 3339 `YYYY-MM-DDTHH:MM:SS[.fraction](Z|+HH:MM)` into
-/// seconds since the Unix epoch.
+use std::time::{SystemTime, UNIX_EPOCH};
+
+/// Parses the RFC 3339 subset the daemon writes,
+/// `YYYY-MM-DDTHH:MM:SS[.fraction](Z|+HH:MM|-HH:MM)` with an upper-case `T`
+/// and `Z`, into seconds since the Unix epoch. A leap second (`:60`), lower-case
+/// designators, surrounding whitespace, and every other form give `None`.
 pub fn parse_seconds(text: &str) -> Option<f64> {
-    let t = text;
-    let b = t.as_bytes();
+    let b = text.as_bytes();
     if b.len() < 20
         || b.get(4) != Some(&b'-')
         || b.get(7) != Some(&b'-')
@@ -21,16 +29,16 @@ pub fn parse_seconds(text: &str) -> Option<f64> {
             .then(|| s.parse::<i64>().ok())
             .flatten()
     };
-    let year = num(t.get(0..4)?)?;
-    let month = num(t.get(5..7)?)?;
-    let day = num(t.get(8..10)?)?;
-    let hour = num(t.get(11..13)?)?;
-    let minute = num(t.get(14..16)?)?;
-    let second = num(t.get(17..19)?)?;
+    let year = num(text.get(0..4)?)?;
+    let month = num(text.get(5..7)?)?;
+    let day = num(text.get(8..10)?)?;
+    let hour = num(text.get(11..13)?)?;
+    let minute = num(text.get(14..16)?)?;
+    let second = num(text.get(17..19)?)?;
     if !(1..=9999).contains(&year) || hour > 23 || minute > 59 || second > 59 {
         return None;
     }
-    let mut rest = t.get(19..)?;
+    let mut rest = text.get(19..)?;
     let mut fraction = 0.0;
     if let Some(after) = rest.strip_prefix('.') {
         let digits_len = after.bytes().take_while(u8::is_ascii_digit).count();
@@ -52,12 +60,12 @@ pub fn parse_seconds(text: &str) -> Option<f64> {
                 b'-' => -1,
                 _ => return None,
             };
-            let oh = num(other.get(1..3)?)?;
-            let om = num(other.get(4..6)?)?;
-            if oh > 23 || om > 59 {
+            let offset_hours = num(other.get(1..3)?)?;
+            let offset_minutes = num(other.get(4..6)?)?;
+            if offset_hours > 23 || offset_minutes > 59 {
                 return None;
             }
-            sign * (oh * 3600 + om * 60)
+            sign * (offset_hours * 3600 + offset_minutes * 60)
         }
     };
     let days = days_from_civil(year, month, day)?;
@@ -70,7 +78,8 @@ pub fn parse_seconds(text: &str) -> Option<f64> {
     Some(whole as f64 + fraction)
 }
 
-/// Formats seconds since the epoch as `YYYY-MM-DDTHH:MM:SSZ`.
+/// Formats seconds since the epoch as `YYYY-MM-DDTHH:MM:SSZ`, rounding down to
+/// the whole second.
 pub fn iso(seconds: f64) -> String {
     let total = seconds.floor() as i64;
     let days = total.div_euclid(86_400);
@@ -84,7 +93,8 @@ pub fn iso(seconds: f64) -> String {
     )
 }
 
-/// Days since 1970-01-01 for a proleptic Gregorian date.
+/// Days since 1970-01-01 for a proleptic Gregorian date; `None` for an invalid
+/// month or day, or when the count overflows.
 pub fn days_from_civil(y: i64, m: i64, d: i64) -> Option<i64> {
     if !(1..=12).contains(&m) {
         return None;
@@ -119,8 +129,10 @@ pub fn days_from_civil(y: i64, m: i64, d: i64) -> Option<i64> {
         .checked_sub(719_468)
 }
 
-/// The civil date of a day count since 1970-01-01.
-pub fn civil_from_days(days: i64) -> (i64, i64, i64) {
+/// The civil date of a day count since 1970-01-01. [`iso`] passes at most
+/// `i64::MAX / 86_400` days either side of the epoch, far inside the range the
+/// arithmetic holds.
+fn civil_from_days(days: i64) -> (i64, i64, i64) {
     let z = days + 719_468;
     let era = z.div_euclid(146_097);
     let doe = z - era * 146_097;
@@ -133,11 +145,12 @@ pub fn civil_from_days(days: i64) -> (i64, i64, i64) {
     (if m <= 2 { y + 1 } else { y }, m, d)
 }
 
-/// The current time as seconds since the epoch.
+/// The current time as seconds since the epoch; 0.0 when the clock reads
+/// before 1970.
 pub fn now() -> f64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0.0, |d| d.as_secs_f64())
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0.0, |elapsed| elapsed.as_secs_f64())
 }
 
 #[cfg(test)]
@@ -145,18 +158,42 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parses_and_formats_round_trip() {
-        let s = parse_seconds("2026-11-02T01:44:23Z").unwrap();
-        assert_eq!(iso(s), "2026-11-02T01:44:23Z");
-        assert_eq!(parse_seconds("2026-11-02T01:44:23.5Z"), Some(s + 0.5));
-        assert_eq!(parse_seconds("2026-11-02T03:44:23+02:00"), Some(s));
-        assert_eq!(parse_seconds("1970-01-01T00:00:00Z"), Some(0.0));
-        assert_eq!(parse_seconds("nope"), None);
+    fn formats_what_it_parses() {
+        let seconds = parse_seconds("2026-11-02T01:44:23Z").unwrap();
+        assert_eq!(iso(seconds), "2026-11-02T01:44:23Z");
     }
 
     #[test]
-    fn rejects_non_rfc3339_and_invalid_calendar_values() {
+    fn the_epoch_is_zero() {
+        assert_eq!(parse_seconds("1970-01-01T00:00:00Z"), Some(0.0));
+    }
+
+    #[test]
+    fn a_fraction_adds_to_the_whole_seconds() {
+        let whole = parse_seconds("2026-11-02T01:44:23Z").unwrap();
+        assert_eq!(parse_seconds("2026-11-02T01:44:23.5Z"), Some(whole + 0.5));
+    }
+
+    #[test]
+    fn an_offset_converts_to_utc() {
+        assert_eq!(
+            parse_seconds("2026-11-02T03:44:23+02:00"),
+            parse_seconds("2026-11-02T01:44:23Z")
+        );
+    }
+
+    #[test]
+    fn a_leap_day_with_a_negative_offset_parses() {
+        assert_eq!(
+            parse_seconds("2024-02-29T23:59:59.25-05:30"),
+            parse_seconds("2024-03-01T05:29:59.25Z")
+        );
+    }
+
+    #[test]
+    fn rejects_other_forms_and_invalid_calendar_values() {
         for invalid in [
+            "nope",
             "2026-11-02 01:44:23Z",
             "2026/11/02T01:44:23Z",
             "2026-02-29T01:44:23Z",
@@ -166,6 +203,7 @@ mod tests {
             "2026-11-02T00:00:60Z",
             "2026-11-02T00:00:00",
             "2026-11-02T00:00:00z",
+            "2026-11-02t00:00:00Z",
             "2026-11-02T00:00:00+24:00",
             "2026-11-02T00:00:00Zjunk",
             "2026-11-02T00:00:00.Z",
@@ -174,6 +212,18 @@ mod tests {
         ] {
             assert_eq!(parse_seconds(invalid), None, "{invalid}");
         }
-        assert!(parse_seconds("2024-02-29T23:59:59.123-05:30").is_some());
+    }
+
+    #[test]
+    fn iso_rounds_down_to_the_whole_second() {
+        assert_eq!(iso(0.999), "1970-01-01T00:00:00Z");
+        assert_eq!(iso(-0.5), "1969-12-31T23:59:59Z");
+    }
+
+    #[test]
+    fn iso_formats_any_float_without_overflow() {
+        for seconds in [f64::MAX, f64::MIN, f64::NAN, f64::INFINITY] {
+            assert!(iso(seconds).ends_with('Z'), "{seconds}");
+        }
     }
 }

@@ -5,7 +5,8 @@
 
 An H.265 network video recorder for Linux whose record path never decodes video: RTSP in,
 standard fragmented MP4 on disk, and authenticated serving to a Linux GUI and other clients.
-Written in Rust; SQLite, linked through `rusqlite`, is the one C library in the daemon.
+Written in Rust; the daemon links two C libraries: SQLite (bundled through `rusqlite`) and
+AWS-LC (the `rustls` crypto provider, through `aws-lc-rs`).
 
 The `0.1.0` workspace is unreleased alpha software. It makes no compatibility promises:
 APIs, configuration, command-line behavior, storage schemas, and formats may change in pursuit
@@ -15,7 +16,9 @@ of correctness, efficiency, readability, and simplicity.
 
 - Records every configured camera stream over RTSP/TCP into CMAF-style fragmented MP4
   (`hvc1`), one fragment per GOP, each with a wall-clock `prft` box and a CRC-32C trailer,
-  plus a sidecar fragment index per file. Files are playable by any MP4 player as written.
+  plus a sidecar fragment index per file. ffmpeg and GStreamer play the files as written;
+  the AVPlayer and `mediastreamvalidator` checks are open items in
+  `docs/research/10-phase2-results.md`.
 - Keeps the NVR clock as the authority for time: a constant-frame-rate regulariser turns
   camera RTP timestamps into exact frame durations and renders camera-dropped frames as holds.
 - Catalogs files, runs, and camera events in SQLite; enforces retention by free space, a
@@ -29,8 +32,8 @@ of correctness, efficiency, readability, and simplicity.
   ingest progress, and a statistics line per stream, feed, writer, catalog, and root every
   minute.
 
-Cost, measured with the replay harness: about 0.021 % of one core per Mbit/s of H.265 at
-132 Mbit/s for fourteen streams (`docs/research/12-ingest-cost.md` §6).
+Cost, measured with the replay harness on 2026-11-08: about 0.024 % of one core per Mbit/s of
+H.265 at 143 Mbit/s for fourteen replayed streams (`docs/research/12-ingest-cost.md` §6).
 
 ## Layout
 
@@ -38,10 +41,13 @@ The crates and the rest of the tree are listed in [`crates/README.md`](crates/RE
 
 ## Build, test, run
 
-Requires a stable Rust toolchain (`rust-toolchain.toml`), `just`, and for the viewer the
-GTK 4 and GStreamer development libraries.
+Requires a stable Rust toolchain (`rust-toolchain.toml`; the minimum supported version is
+Rust 1.92), `just`, a C compiler (and a cross C compiler for `just cross-check`), and the
+GTK 4 and GStreamer development libraries, which `just check` needs too because the viewer is
+a workspace member.
 
-    just check          # format check, clippy with warnings as errors, tests, rustdoc
+    just check          # format check, clippy with warnings as errors, tests, rustdoc,
+                        # and the vendored crates' tests
     just audit          # cargo audit and cargo deny
     just build          # release build of the daemon
     just doc            # rustdoc for every crate into target/doc
@@ -50,8 +56,8 @@ Configure cameras in a private copy of `config/cameras.example.toml`, then:
 
     irisd run --config /etc/irisd/irisd.toml
 
-`packaging/README.md` describes the service user, the unit, and the drop-in for the
-recording root. `irisd inspect FILE.mp4` lists a recording's fragments and timing;
+`packaging/README.md` describes the service user, the unit, the recording root, and the
+network drop-in. `irisd inspect FILE.mp4` lists a recording's fragments and timing;
 `irisd recover` seals files left open by a crash; `irisd hls` and `irisd serve` exercise the
 playlist and API paths without the daemon.
 
@@ -59,15 +65,19 @@ Benchmarks and fault injection need no hardware:
 
     cargo build --release -p irisd -p iris-replay -p iris-tools
     target/release/iris-tools replay-bench --file RECORDING.mp4 --cameras 14 --seconds 90 \
-      --root SCRATCH --irisd target/release/irisd --replay target/release/iris-replay --replay-arg=--pace
+      --read-interval-ms 20 --recv-low-water-kib 32 --root SCRATCH \
+      --irisd target/release/irisd --replay target/release/iris-replay --replay-arg=--pace
+
+The two ingest flags select the daemon's default reads; `replay-bench` itself defaults to
+packet-driven reads without the low-water mark.
 
 ## Documentation
 
-- **rustdoc** — published at <https://swiftraccoon.github.io/irisd/> (the badge above links
-  there; the daemon's crate opens first, with the other crates in the sidebar). The `docs`
-  workflow builds `cargo doc --workspace --no-deps` on every push to `main` and deploys it
-  to GitHub Pages, whose source must be set to GitHub Actions. Locally, `just doc` writes it
-  to `target/doc/irisd/index.html`.
+- **rustdoc** — published to GitHub Pages (the rustdoc badge above links there; the daemon's
+  crate opens first, with the other crates in the sidebar). The `docs` workflow builds
+  `cargo doc --workspace --no-deps` on every push to `main` and deploys it to GitHub Pages,
+  whose source must be set to GitHub Actions. Locally, `just doc` writes it to
+  `target/doc/irisd/index.html`.
 - **Design** — `docs/research/README.md` holds the decision table and the reading order;
   `04-storage-format.md` fixes the on-disk format and time model, `07-architecture.md` the
   crates, threads, budgets, and observability, `12-ingest-cost.md` the measured cost.
@@ -78,5 +88,7 @@ Benchmarks and fault injection need no hardware:
 
 ## License
 
-MIT OR Apache-2.0. `third_party/` carries vendored code under its own licenses, listed in
-`third_party/README.md`.
+irisd's own code is licensed under either MIT (`LICENSE-MIT`) or Apache-2.0 (`LICENSE-APACHE`),
+at your option. Vendored material keeps its own licenses: `third_party/` (see its README), the
+reference pack in `.rust-reference/` (its `LICENSE` and `references/README.md`), and the IETF
+documents in `docs/standards/` (its README).

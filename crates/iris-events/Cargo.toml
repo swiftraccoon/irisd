@@ -1,36 +1,34 @@
 [package]
 name = "iris-events"
-description = "Camera event sources (Dahua CGI feed, ONVIF PullPoint) for irisd"
 version.workspace = true
 edition.workspace = true
-rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Camera event sources (Dahua CGI feed, ONVIF PullPoint) for irisd"
 
 [features]
 fuzzing = []
 
 [dependencies]
 async-trait = { workspace = true }
-bytes = { workspace = true }
 diqwest = { workspace = true }
 futures-util = { workspace = true }
-md-5 = { workspace = true }
 hex = { workspace = true }
+iris-core = { workspace = true }
+md-5 = { workspace = true }
+oxvif = { workspace = true }
 reqwest = { workspace = true }
-serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 tracing = { workspace = true }
 url = { workspace = true }
-iris-core = { workspace = true }
-oxvif = { workspace = true }
 
 [dev-dependencies]
 rcgen = { workspace = true }
-tempfile = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 tokio-rustls = { workspace = true }
 

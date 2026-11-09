@@ -17,7 +17,10 @@ impl BoxWriter {
         }
     }
 
-    /// Starts a box; returns the position to pass to [`BoxWriter::end`].
+    /// Starts a box; returns the position to pass to [`BoxWriter::end`]. A
+    /// box never ended keeps a zero size, which every reader takes as "to
+    /// the end of the file".
+    #[must_use = "pass the position to BoxWriter::end"]
     pub fn begin(&mut self, kind: &[u8; 4]) -> usize {
         let start = self.buf.len();
         self.buf.extend_from_slice(&[0, 0, 0, 0]);
@@ -25,7 +28,9 @@ impl BoxWriter {
         start
     }
 
-    /// Starts a full box (version and 24-bit flags).
+    /// Starts a full box (version and 24-bit flags); returns the position to
+    /// pass to [`BoxWriter::end`].
+    #[must_use = "pass the position to BoxWriter::end"]
     pub fn begin_full(&mut self, kind: &[u8; 4], version: u8, flags: u32) -> usize {
         let start = self.begin(kind);
         self.u8(version);
@@ -137,10 +142,7 @@ impl BoxHeader {
                 header_len: 8,
             }),
             1 => {
-                if buf.len() < 16 {
-                    return None;
-                }
-                let large = u64::from_be_bytes(buf[8..16].try_into().expect("8 bytes"));
+                let large = u64::from_be_bytes(*buf.get(8..)?.first_chunk::<8>()?);
                 (large >= 16).then_some(Self {
                     kind,
                     size: Some(large),
@@ -156,25 +158,25 @@ impl BoxHeader {
         }
     }
 
-    /// Returns the payload length when the size is known.
+    /// Returns the payload length when the size is known and covers the
+    /// header; `None` for an open-ended box or a header built by hand whose
+    /// size is smaller than its header.
     #[must_use]
     pub fn payload_len(&self) -> Option<u64> {
-        self.size.map(|s| s - u64::from(self.header_len))
+        self.size?.checked_sub(u64::from(self.header_len))
     }
 }
 
-/// Reads a big-endian `u32` at `offset`.
+/// Reads a big-endian `u32` at `offset`; `None` when the field does not fit.
 #[must_use]
 pub fn be_u32(buf: &[u8], offset: usize) -> Option<u32> {
-    buf.get(offset..offset + 4)
-        .map(|b| u32::from_be_bytes([b[0], b[1], b[2], b[3]]))
+    Some(u32::from_be_bytes(*buf.get(offset..)?.first_chunk::<4>()?))
 }
 
-/// Reads a big-endian `u64` at `offset`.
+/// Reads a big-endian `u64` at `offset`; `None` when the field does not fit.
 #[must_use]
 pub fn be_u64(buf: &[u8], offset: usize) -> Option<u64> {
-    buf.get(offset..offset + 8)
-        .map(|b| u64::from_be_bytes(b.try_into().expect("8 bytes")))
+    Some(u64::from_be_bytes(*buf.get(offset..)?.first_chunk::<8>()?))
 }
 
 #[cfg(test)]
@@ -208,5 +210,38 @@ mod tests {
         let open = [0, 0, 0, 0, b'm', b'd', b'a', b't'];
         assert_eq!(BoxHeader::parse(&open).unwrap().size, None);
         assert!(BoxHeader::parse(&[0, 0, 0, 4, b'x', b'x', b'x', b'x']).is_none());
+    }
+
+    #[test]
+    fn field_readers_refuse_offsets_that_do_not_fit() {
+        let buf = [1, 2, 3, 4, 5, 6, 7, 8, 9];
+        assert_eq!(be_u32(&buf, 0), Some(0x0102_0304));
+        assert_eq!(be_u64(&buf, 1), Some(0x0203_0405_0607_0809));
+        assert_eq!(be_u32(&buf, 6), None);
+        assert_eq!(be_u64(&buf, 2), None);
+        assert_eq!(be_u32(&buf, usize::MAX), None);
+        assert_eq!(be_u64(&buf, usize::MAX - 4), None);
+    }
+
+    #[test]
+    fn payload_len_is_none_for_open_ended_and_undersized_headers() {
+        let open = BoxHeader {
+            kind: *b"mdat",
+            size: None,
+            header_len: 8,
+        };
+        assert_eq!(open.payload_len(), None);
+        let undersized = BoxHeader {
+            kind: *b"mdat",
+            size: Some(4),
+            header_len: 8,
+        };
+        assert_eq!(undersized.payload_len(), None);
+        assert_eq!(
+            BoxHeader::parse(&[0, 0, 0, 24, b'f', b'r', b'e', b'e'])
+                .unwrap()
+                .payload_len(),
+            Some(16)
+        );
     }
 }

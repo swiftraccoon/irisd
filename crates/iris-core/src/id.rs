@@ -3,7 +3,7 @@
 use std::fmt;
 use std::str::FromStr;
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use thiserror::Error;
 
 /// A camera identifier: 1 to 32 characters from `[a-z0-9_-]`, usable as a
@@ -19,6 +19,11 @@ pub struct InvalidCameraId(String);
 
 impl CameraId {
     /// Validates and wraps an id.
+    ///
+    /// # Errors
+    ///
+    /// [`InvalidCameraId`] when `id` is empty, longer than 32 bytes, or holds a
+    /// character outside `[a-z0-9_-]`.
     pub fn try_new(id: &str) -> Result<Self, InvalidCameraId> {
         let valid_len = (1..=32).contains(&id.len());
         let valid_chars = id
@@ -53,7 +58,7 @@ impl fmt::Display for CameraId {
 }
 
 impl<'de> Deserialize<'de> for CameraId {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let raw = String::deserialize(deserializer)?;
         Self::try_new(&raw).map_err(serde::de::Error::custom)
     }
@@ -67,7 +72,8 @@ pub enum StreamKind {
     Main,
     /// The low-resolution video stream used for grids and thumbnails.
     Sub,
-    /// The audio stream, stored in its own file.
+    /// The audio stream. Reserved: catalog types carry it, and configuration
+    /// rejects recording it.
     Audio,
 }
 
@@ -107,8 +113,67 @@ impl FromStr for StreamKind {
     }
 }
 
+/// Durable random identity of one recording root: 16 bytes, written to the
+/// root's marker file and to the catalog as 32 lowercase hexadecimal
+/// characters.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct RootIdentity([u8; 16]);
+
+/// A string that is not a recording-root identity: anything but exactly 32
+/// lowercase hexadecimal characters.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Error)]
+#[error("recording-root identity must be exactly 32 lowercase hexadecimal characters")]
+pub struct InvalidRootIdentity;
+
+impl RootIdentity {
+    /// Characters in the text form.
+    pub const HEX_LEN: usize = 32;
+
+    /// Wraps the identity's bytes.
+    #[must_use]
+    pub const fn from_bytes(bytes: [u8; 16]) -> Self {
+        Self(bytes)
+    }
+
+    /// The identity's bytes.
+    #[must_use]
+    pub const fn as_bytes(&self) -> &[u8; 16] {
+        &self.0
+    }
+}
+
+impl fmt::Display for RootIdentity {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for byte in self.0 {
+            write!(f, "{byte:02x}")?;
+        }
+        Ok(())
+    }
+}
+
+impl FromStr for RootIdentity {
+    type Err = InvalidRootIdentity;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        if value.len() != Self::HEX_LEN
+            || !value
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err(InvalidRootIdentity);
+        }
+        let mut identity = [0u8; 16];
+        for (index, output) in identity.iter_mut().enumerate() {
+            *output = u8::from_str_radix(&value[index * 2..index * 2 + 2], 16)
+                .map_err(|_| InvalidRootIdentity)?;
+        }
+        Ok(Self(identity))
+    }
+}
+
 /// A camera id paired with a stream kind: the unit that owns a recording.
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+/// Serializes as `{"camera": …, "kind": …}`.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct StreamKey {
     /// The owning camera.
     pub camera: CameraId,
@@ -134,6 +199,42 @@ mod tests {
         assert!(CameraId::try_new("Cam1").is_err());
         assert!(CameraId::try_new("a/b").is_err());
         assert!(CameraId::try_new(&"x".repeat(33)).is_err());
+    }
+
+    #[test]
+    fn stream_keys_serialize_as_camera_and_kind() {
+        let key = StreamKey {
+            camera: CameraId::try_new("cam1").unwrap(),
+            kind: StreamKind::Sub,
+        };
+        let json = serde_json::to_string(&key).unwrap();
+        assert_eq!(json, r#"{"camera":"cam1","kind":"sub"}"#);
+        assert_eq!(serde_json::from_str::<StreamKey>(&json).unwrap(), key);
+        assert!(serde_json::from_str::<StreamKey>(r#"{"camera":"Cam/1","kind":"sub"}"#).is_err());
+    }
+
+    #[test]
+    fn root_identities_round_trip_through_lowercase_hex() {
+        let identity = RootIdentity::from_bytes([
+            0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0xfe, 0xdc, 0xba, 0x98, 0x76, 0x54,
+            0x32, 0x10,
+        ]);
+        let text = identity.to_string();
+        assert_eq!(text, "0123456789abcdeffedcba9876543210");
+        assert_eq!(text.parse::<RootIdentity>().unwrap(), identity);
+        for bad in [
+            "",
+            "0123456789abcdeffedcba987654321",
+            "0123456789abcdeffedcba98765432100",
+            "0123456789ABCDEFFEDCBA9876543210",
+            "0123456789abcdeffedcba987654321g",
+        ] {
+            assert_eq!(
+                bad.parse::<RootIdentity>(),
+                Err(InvalidRootIdentity),
+                "{bad:?}"
+            );
+        }
     }
 
     #[test]

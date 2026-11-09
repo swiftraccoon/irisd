@@ -2,14 +2,13 @@
 //! slices with the right NAL headers, and the exact on-disk format irisd writes.
 
 use std::collections::TryReserveError;
-use std::fmt;
-use std::io;
-use std::path::Path;
 
 use bytes::Bytes;
 use iris_core::time::WallUs;
 use iris_mp4::fragment::{FragmentError, FragmentHeader, Sample, encode_fragment};
 use iris_mp4::init::{SampleEntry, build_init_segment};
+
+use crate::media::{MAX_REPLAY_TICKS, Ticks};
 
 /// A video parameter set for a 1920x1080 Main profile stream.
 pub const TEST_VPS: &[u8] = &[
@@ -35,13 +34,15 @@ pub const MAX_SYNTH_FRAMES_PER_GOP: usize = u16::MAX as usize;
 /// Largest combined sample payload accepted by [`recording`].
 pub const MAX_SYNTH_PAYLOAD_BYTES: usize = 1 << 30;
 
-/// Error while building or writing synthetic replay media.
-#[derive(Debug)]
+/// Error while building synthetic replay media.
+#[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum SynthError {
     /// A parameter-set collection cannot form a usable `hvcC`.
+    #[error("invalid parameter sets: {0}")]
     InvalidParameterSets(&'static str),
     /// A NAL-unit length is outside the supported range.
+    #[error("NAL-unit length {len} is outside 2..={maximum}")]
     InvalidNalLength {
         /// Rejected byte length.
         len: usize,
@@ -49,73 +50,35 @@ pub enum SynthError {
         maximum: usize,
     },
     /// A plan field or combination is outside the supported bounds.
+    #[error("invalid synthetic plan: {0}")]
     InvalidPlan(&'static str),
     /// Checked plan arithmetic overflowed.
+    #[error("synthetic plan overflows {0}")]
     ArithmeticOverflow(&'static str),
     /// The planned sample payload exceeds the synthetic recording ceiling.
+    #[error(
+        "synthetic payload has {bytes} bytes; at most {} allowed",
+        MAX_SYNTH_PAYLOAD_BYTES
+    )]
     PayloadTooLarge {
         /// Planned payload bytes.
         bytes: u64,
     },
     /// Memory reservation failed before mutation.
-    Allocation(TryReserveError),
+    #[error("allocating the synthetic recording")]
+    Allocation(#[from] TryReserveError),
     /// Fragment encoding rejected the validated samples.
-    Fragment(FragmentError),
-    /// Writing the completed recording failed.
-    Io(io::Error),
+    #[error("encoding a synthetic fragment")]
+    Fragment(#[from] FragmentError),
 }
 
-impl fmt::Display for SynthError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::InvalidParameterSets(reason) => {
-                write!(formatter, "invalid parameter sets: {reason}")
-            }
-            Self::InvalidNalLength { len, maximum } => {
-                write!(formatter, "NAL-unit length {len} is outside 2..={maximum}")
-            }
-            Self::InvalidPlan(reason) => write!(formatter, "invalid synthetic plan: {reason}"),
-            Self::ArithmeticOverflow(field) => {
-                write!(formatter, "synthetic plan overflows {field}")
-            }
-            Self::PayloadTooLarge { bytes } => write!(
-                formatter,
-                "synthetic payload has {bytes} bytes; at most {MAX_SYNTH_PAYLOAD_BYTES} allowed"
-            ),
-            Self::Allocation(error) => write!(formatter, "allocating synthetic recording: {error}"),
-            Self::Fragment(error) => write!(formatter, "encoding synthetic fragment: {error}"),
-            Self::Io(error) => write!(formatter, "writing synthetic recording: {error}"),
-        }
-    }
-}
-
-impl std::error::Error for SynthError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::Allocation(error) => Some(error),
-            Self::Fragment(error) => Some(error),
-            Self::Io(error) => Some(error),
-            _ => None,
-        }
-    }
-}
-
-impl From<TryReserveError> for SynthError {
-    fn from(error: TryReserveError) -> Self {
-        Self::Allocation(error)
-    }
-}
-
-impl From<FragmentError> for SynthError {
-    fn from(error: FragmentError) -> Self {
-        Self::Fragment(error)
-    }
-}
-
-impl From<io::Error> for SynthError {
-    fn from(error: io::Error) -> Self {
-        Self::Io(error)
-    }
+/// Which slice [`slice()`] builds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SliceKind {
+    /// An `IDR_W_RADL` slice (NAL unit type 19), a sync sample.
+    Idr,
+    /// A `TRAIL_R` slice (NAL unit type 1).
+    Trail,
 }
 
 /// Shape of a synthetic recording.
@@ -125,15 +88,16 @@ pub struct Plan {
     pub gops: usize,
     /// Frames per group; the first is a sync sample.
     pub frames_per_gop: usize,
-    /// Frame duration in 90 kHz ticks.
-    pub frame_ticks: u32,
+    /// Frame duration; positive and at most `u32::MAX` ticks, the widest
+    /// sample duration the format stores.
+    pub frame_ticks: Ticks,
     /// Slice bytes of a sync frame.
     pub idr_len: usize,
     /// Slice bytes of every other frame.
     pub trail_len: usize,
-    /// Decode time of the first sample in ticks, as a file that is not the
-    /// first of its run has.
-    pub start_ticks: u64,
+    /// Decode time of the first sample, as a file that is not the first of its
+    /// run has.
+    pub start_ticks: Ticks,
 }
 
 impl Default for Plan {
@@ -142,10 +106,10 @@ impl Default for Plan {
         Self {
             gops: 30,
             frames_per_gop: 60,
-            frame_ticks: 3_000,
+            frame_ticks: Ticks::new(3_000),
             idr_len: 60_000,
             trail_len: 6_000,
-            start_ticks: 0,
+            start_ticks: Ticks::ZERO,
         }
     }
 }
@@ -229,18 +193,21 @@ fn boxed(kind: [u8; 4], body: &[u8]) -> Result<Vec<u8>, SynthError> {
     Ok(out)
 }
 
-/// A dummy slice NAL unit of `len` bytes: type 19 (`IDR_W_RADL`) for sync
-/// frames, type 1 (`TRAIL_R`) otherwise, with a deterministic pseudo-random body.
+/// A dummy slice NAL unit of `len` bytes of `kind`, with a deterministic
+/// pseudo-random body seeded by `index`.
 ///
 /// # Errors
 ///
 /// Returns an error when `len` cannot hold an H.265 NAL-unit header, exceeds
 /// the synthetic payload ceiling, or memory reservation fails.
-pub fn slice(index: u64, is_sync: bool, len: usize) -> Result<Vec<u8>, SynthError> {
+pub fn slice(index: u64, kind: SliceKind, len: usize) -> Result<Vec<u8>, SynthError> {
     validate_nal_len(len, MAX_SYNTH_PAYLOAD_BYTES)?;
     let mut nal = Vec::new();
     nal.try_reserve_exact(len)?;
-    nal.push(if is_sync { 0x26 } else { 0x02 });
+    nal.push(match kind {
+        SliceKind::Idr => 0x26,
+        SliceKind::Trail => 0x02,
+    });
     nal.push(0x01);
     let mut state = index
         .wrapping_mul(6_364_136_223_846_793_005)
@@ -264,11 +231,9 @@ pub fn slice(index: u64, is_sync: bool, len: usize) -> Result<Vec<u8>, SynthErro
 /// validated fragment cannot be encoded.
 pub fn recording(plan: Plan) -> Result<Bytes, SynthError> {
     let bounds = validate_plan(plan)?;
-    let entry = std::sync::Arc::new(sample_entry(&[
-        TEST_VPS.to_vec(),
-        TEST_SPS.to_vec(),
-        TEST_PPS.to_vec(),
-    ])?);
+    let frame_ticks = u32::try_from(plan.frame_ticks.get())
+        .map_err(|_| SynthError::InvalidPlan("frame_ticks must fit a sample duration"))?;
+    let entry = sample_entry(&[TEST_VPS.to_vec(), TEST_SPS.to_vec(), TEST_PPS.to_vec()])?;
     let mut out = build_init_segment(&entry).to_vec();
     let mut decode_time = plan.start_ticks;
     let mut index = 0u64;
@@ -277,15 +242,12 @@ pub fn recording(plan: Plan) -> Result<Bytes, SynthError> {
         samples.try_reserve_exact(plan.frames_per_gop)?;
         for frame in 0..plan.frames_per_gop {
             let is_sync = frame == 0;
-            let nal = slice(
-                index,
-                is_sync,
-                if is_sync {
-                    plan.idr_len
-                } else {
-                    plan.trail_len
-                },
-            )?;
+            let (kind, len) = if is_sync {
+                (SliceKind::Idr, plan.idr_len)
+            } else {
+                (SliceKind::Trail, plan.trail_len)
+            };
+            let nal = slice(index, kind, len)?;
             index = index
                 .checked_add(1)
                 .ok_or(SynthError::ArithmeticOverflow("frame index"))?;
@@ -298,13 +260,13 @@ pub fn recording(plan: Plan) -> Result<Bytes, SynthError> {
             data.extend_from_slice(&nal);
             samples.push(Sample {
                 data: Bytes::from(data),
-                duration: plan.frame_ticks,
+                duration: frame_ticks,
                 is_sync,
             });
         }
         let header = FragmentHeader {
             sequence: (gop + 1) as u32,
-            decode_time,
+            decode_time: decode_time.get(),
             wall: wall_for_decode_time(decode_time)?,
         };
         let encoded = encode_fragment(&header, &samples)?;
@@ -327,20 +289,10 @@ pub fn recording(plan: Plan) -> Result<Bytes, SynthError> {
     Ok(Bytes::from(out))
 }
 
-/// Writes a recording to `path`.
-///
-/// # Errors
-///
-/// Returns errors from [`recording`] or the filesystem write.
-pub fn write_recording(path: &Path, plan: Plan) -> Result<(), SynthError> {
-    std::fs::write(path, recording(plan)?)?;
-    Ok(())
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct PlanBounds {
     payload_per_gop: usize,
-    ticks_per_gop: u64,
+    ticks_per_gop: Ticks,
 }
 
 fn validate_nal_len(len: usize, maximum: usize) -> Result<(), SynthError> {
@@ -361,9 +313,9 @@ fn validate_plan(plan: Plan) -> Result<PlanBounds, SynthError> {
             "frames_per_gop must be within 1..=MAX_SYNTH_FRAMES_PER_GOP",
         ));
     }
-    if plan.frame_ticks == 0 {
+    if !(1..=u64::from(u32::MAX)).contains(&plan.frame_ticks.get()) {
         return Err(SynthError::InvalidPlan(
-            "frame_ticks must be greater than zero",
+            "frame_ticks must be within 1..=u32::MAX",
         ));
     }
     validate_nal_len(plan.idr_len, MAX_SYNTH_PAYLOAD_BYTES)?;
@@ -398,17 +350,22 @@ fn validate_plan(plan: Plan) -> Result<PlanBounds, SynthError> {
         });
     }
 
-    let ticks_per_gop = u64::from(plan.frame_ticks)
+    let ticks_per_gop = plan
+        .frame_ticks
+        .get()
         .checked_mul(plan.frames_per_gop as u64)
+        .map(Ticks::new)
         .ok_or(SynthError::ArithmeticOverflow("group duration"))?;
     let total_ticks = ticks_per_gop
+        .get()
         .checked_mul(plan.gops as u64)
+        .map(Ticks::new)
         .ok_or(SynthError::ArithmeticOverflow("recording duration"))?;
     let end_ticks = plan
         .start_ticks
         .checked_add(total_ticks)
         .ok_or(SynthError::ArithmeticOverflow("decode time"))?;
-    if end_ticks > crate::media::MAX_REPLAY_TICKS {
+    if end_ticks > MAX_REPLAY_TICKS {
         return Err(SynthError::InvalidPlan(
             "decode time exceeds the replay clock range",
         ));
@@ -420,9 +377,9 @@ fn validate_plan(plan: Plan) -> Result<PlanBounds, SynthError> {
     })
 }
 
-fn wall_for_decode_time(decode_time: u64) -> Result<WallUs, SynthError> {
+fn wall_for_decode_time(decode_time: Ticks) -> Result<WallUs, SynthError> {
     const START_WALL_US: i128 = 1_700_000_000_000_000;
-    let offset = i128::from(decode_time)
+    let offset = i128::from(decode_time.get())
         .checked_mul(100)
         .ok_or(SynthError::ArithmeticOverflow("wall time"))?
         / 9;
@@ -435,8 +392,11 @@ fn wall_for_decode_time(decode_time: u64) -> Result<WallUs, SynthError> {
 
 #[cfg(test)]
 mod tests {
+    use std::io::Cursor;
+
+    use iris_mp4::reader::{self, ScanOptions};
+
     use super::*;
-    use iris_mp4::reader::{ScanOptions, scan};
 
     #[test]
     fn recording_scans_cleanly_with_crc_verification() {
@@ -446,8 +406,8 @@ mod tests {
             ..Plan::default()
         })
         .unwrap();
-        let report = scan(
-            io::Cursor::new(&bytes[..]),
+        let report = reader::scan(
+            Cursor::new(&bytes[..]),
             ScanOptions {
                 verify_crc: true,
                 collect_samples: true,
@@ -462,17 +422,26 @@ mod tests {
     }
 
     #[test]
-    fn public_builders_reject_short_nals_and_invalid_plans() {
-        assert!(matches!(
-            slice(0, true, 0),
-            Err(SynthError::InvalidNalLength { .. })
-        ));
-        assert!(matches!(
-            slice(0, true, 1),
-            Err(SynthError::InvalidNalLength { .. })
-        ));
-        assert_eq!(slice(0, true, 2).unwrap(), vec![0x26, 0x01]);
+    fn slices_shorter_than_a_nal_header_are_rejected() {
+        for len in [0, 1] {
+            assert!(
+                matches!(
+                    slice(0, SliceKind::Idr, len),
+                    Err(SynthError::InvalidNalLength { .. })
+                ),
+                "{len}"
+            );
+        }
+    }
 
+    #[test]
+    fn slices_carry_the_nal_header_of_their_kind() {
+        assert_eq!(slice(0, SliceKind::Idr, 2).unwrap(), vec![0x26, 0x01]);
+        assert_eq!(slice(0, SliceKind::Trail, 2).unwrap(), vec![0x02, 0x01]);
+    }
+
+    #[test]
+    fn plans_with_a_zero_field_are_rejected() {
         for plan in [
             Plan {
                 gops: 0,
@@ -483,7 +452,11 @@ mod tests {
                 ..Plan::default()
             },
             Plan {
-                frame_ticks: 0,
+                frame_ticks: Ticks::ZERO,
+                ..Plan::default()
+            },
+            Plan {
+                frame_ticks: Ticks::new(u64::from(u32::MAX) + 1),
                 ..Plan::default()
             },
             Plan {
@@ -500,10 +473,10 @@ mod tests {
         validate_plan(Plan {
             gops: MAX_SYNTH_GOPS,
             frames_per_gop: MAX_SYNTH_FRAMES / MAX_SYNTH_GOPS,
-            frame_ticks: 1,
+            frame_ticks: Ticks::new(1),
             idr_len: 2,
             trail_len: 2,
-            start_ticks: 0,
+            start_ticks: Ticks::ZERO,
         })
         .unwrap();
         assert!(matches!(
@@ -516,50 +489,50 @@ mod tests {
         validate_plan(Plan {
             gops: 1,
             frames_per_gop: MAX_SYNTH_FRAMES_PER_GOP,
-            frame_ticks: 1,
+            frame_ticks: Ticks::new(1),
             idr_len: 2,
             trail_len: 2,
-            start_ticks: 0,
+            start_ticks: Ticks::ZERO,
         })
         .unwrap();
         assert!(matches!(
             validate_plan(Plan {
                 gops: 1,
                 frames_per_gop: MAX_SYNTH_FRAMES_PER_GOP + 1,
-                frame_ticks: 1,
+                frame_ticks: Ticks::new(1),
                 idr_len: 2,
                 trail_len: 2,
-                start_ticks: 0,
+                start_ticks: Ticks::ZERO,
             }),
             Err(SynthError::InvalidPlan(_))
         ));
         validate_plan(Plan {
             gops: 100,
             frames_per_gop: 10_000,
-            frame_ticks: 1,
+            frame_ticks: Ticks::new(1),
             idr_len: 2,
             trail_len: 2,
-            start_ticks: 0,
+            start_ticks: Ticks::ZERO,
         })
         .unwrap();
         assert!(matches!(
             validate_plan(Plan {
                 gops: 101,
                 frames_per_gop: 9_901,
-                frame_ticks: 1,
+                frame_ticks: Ticks::new(1),
                 idr_len: 2,
                 trail_len: 2,
-                start_ticks: 0,
+                start_ticks: Ticks::ZERO,
             }),
             Err(SynthError::InvalidPlan(_))
         ));
         validate_plan(Plan {
             gops: 1,
             frames_per_gop: 1,
-            frame_ticks: 1,
+            frame_ticks: Ticks::new(1),
             idr_len: MAX_SYNTH_PAYLOAD_BYTES - 4,
             trail_len: 2,
-            start_ticks: 0,
+            start_ticks: Ticks::ZERO,
         })
         .unwrap();
         assert!(matches!(
@@ -575,25 +548,25 @@ mod tests {
         validate_plan(Plan {
             gops: 1,
             frames_per_gop: 1,
-            frame_ticks: 1,
+            frame_ticks: Ticks::new(1),
             idr_len: 2,
             trail_len: 2,
-            start_ticks: crate::media::MAX_REPLAY_TICKS - 1,
+            start_ticks: Ticks::new(MAX_REPLAY_TICKS.get() - 1),
         })
         .unwrap();
         assert!(matches!(
             validate_plan(Plan {
                 gops: 1,
                 frames_per_gop: 1,
-                frame_ticks: 1,
+                frame_ticks: Ticks::new(1),
                 idr_len: 2,
                 trail_len: 2,
-                start_ticks: crate::media::MAX_REPLAY_TICKS,
+                start_ticks: MAX_REPLAY_TICKS,
             }),
             Err(SynthError::InvalidPlan(_))
         ));
         assert!(matches!(
-            slice(0, true, MAX_SYNTH_PAYLOAD_BYTES + 1),
+            slice(0, SliceKind::Idr, MAX_SYNTH_PAYLOAD_BYTES + 1),
             Err(SynthError::InvalidNalLength { .. })
         ));
     }

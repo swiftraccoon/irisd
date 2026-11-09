@@ -152,15 +152,24 @@ pub const fn nal_type(header_byte0: u8) -> NalType {
 
 /// Error from walking a length-prefixed access unit.
 #[derive(Clone, Debug, PartialEq, Eq, Error)]
+#[non_exhaustive]
 pub enum FramingError {
+    /// Fewer than four bytes remain where a length prefix should start.
+    #[error("incomplete NAL length prefix at offset {offset}: {remaining} of 4 bytes")]
+    IncompletePrefix {
+        /// Offset of the incomplete prefix.
+        offset: usize,
+        /// Bytes present of the four.
+        remaining: usize,
+    },
     /// A length prefix points past the end of the buffer.
     #[error("NAL length {len} at offset {offset} exceeds remaining {remaining} bytes")]
     Truncated {
-        /// Declared NAL length, or zero for an incomplete prefix.
+        /// Declared NAL length.
         len: usize,
         /// Offset of the length prefix.
         offset: usize,
-        /// Bytes left after a complete prefix, or bytes of an incomplete prefix.
+        /// Bytes left after the prefix.
         remaining: usize,
     },
     /// A NAL unit shorter than its two-byte header.
@@ -195,11 +204,7 @@ impl<'a> Iterator for LengthPrefixedNals<'a> {
         if remaining < 4 {
             let offset = self.offset;
             self.offset = self.data.len();
-            return Some(Err(FramingError::Truncated {
-                len: 0,
-                offset,
-                remaining,
-            }));
+            return Some(Err(FramingError::IncompletePrefix { offset, remaining }));
         }
         let prefix = &self.data[self.offset..self.offset + 4];
         let len = u32::from_be_bytes([prefix[0], prefix[1], prefix[2], prefix[3]]) as usize;
@@ -236,7 +241,14 @@ pub struct AccessUnitInfo {
     pub parameter_set_bytes: usize,
 }
 
-/// Inspects a length-prefixed access unit.
+/// Counts the NAL units of a 4-byte length-prefixed access unit, notes
+/// whether any is an IRAP picture, and totals the bytes of in-band VPS, SPS,
+/// and PPS units with their prefixes.
+///
+/// # Errors
+///
+/// The first [`FramingError`] of the walk: an incomplete prefix, a length
+/// past the end, or a unit shorter than its header.
 pub fn inspect_access_unit(data: &[u8]) -> Result<AccessUnitInfo, FramingError> {
     let mut info = AccessUnitInfo::default();
     for nal in LengthPrefixedNals::new(data) {
@@ -254,6 +266,10 @@ pub fn inspect_access_unit(data: &[u8]) -> Result<AccessUnitInfo, FramingError> 
 
 /// Returns a copy of the access unit without VPS/SPS/PPS NAL units, or `None`
 /// when there is nothing to strip (so callers can keep the original buffer).
+///
+/// # Errors
+///
+/// The first [`FramingError`] of the walk, as [`inspect_access_unit`].
 pub fn strip_parameter_sets(data: &[u8]) -> Result<Option<Vec<u8>>, FramingError> {
     let info = inspect_access_unit(data)?;
     if !info.has_parameter_sets {
@@ -315,8 +331,7 @@ mod tests {
             for remaining in 1..=3 {
                 let mut data = prefix.clone();
                 data.extend_from_slice(&[0xff; 3][..remaining]);
-                let expected = FramingError::Truncated {
-                    len: 0,
+                let expected = FramingError::IncompletePrefix {
                     offset: prefix.len(),
                     remaining,
                 };

@@ -1,4 +1,4 @@
-# 02 — Prior art: what existing NVRs do and what irisd takes from them
+# 02 — Prior art: what other NVRs do and what irisd takes from them
 
 Condensed from a source-level survey (full notes with citations: `appendix/A-prior-art.md`).
 Versions are as of 2026-10-31.
@@ -36,7 +36,7 @@ irisd must therefore measure its own numbers (07 §7) rather than compare agains
 
 | Pitfall | Seen in | Handling |
 |---|---|---|
-| Timestamp jumps / backwards | retina allows by default (opt-in max-jump); Moonfire panicked on extreme jumps (#113, #346, fixed); Frigate uses `-use_wallclock_as_timestamps 1 -reset_timestamps 1` | irisd: regulariser + run boundaries (04 §6) |
+| Timestamp jumps / backwards | retina allows by default (opt-in max-jump); Moonfire panicked on extreme jumps (#113, #346, fixed); Frigate uses `-use_wallclock_as_timestamps 1 -reset_timestamps 1` | irisd: regulariser + run boundaries (04 §7) |
 | Identical RTP timestamp on consecutive frames | Moonfire #322 (open; proposal: derive from frame rate/arrival) — and **our cam1 does this on 4 % of frames** | irisd: CFR regulariser |
 | Parameter sets change mid-stream | retina `has_new_parameters()`; Moonfire seals the recording on `video_sample_entry_id` change | irisd: new sample entry → seal file, new init segment |
 | Parameter sets repeated at every IDR | Moonfire #43 (wasted space) | irisd: strip into `hvcC` (hvc1) |
@@ -44,7 +44,7 @@ irisd must therefore measure its own numbers (07 §7) rather than compare agains
 | Consumer falls behind → camera drops session | Moonfire "Stream ended" / "getting next packet took…"; Frigate 10 s socket timeout | irisd: bounded writer queue, drop whole fragments with a logged gap, reconnect with backoff |
 | RTCP SR absent, late, or wrong clock | Moonfire uses SR start only if within 5 s of local; retina drops unknown-SSRC RTCP | irisd: SRs diagnostic only |
 | NVR clock steps (no RTC on SBCs) | Moonfire: unhandled (wrong until restart) | irisd: monotonic vs realtime watchdog → new run |
-| B-frames | Moonfire rejects (pts not monotonic); SentryShot forked retina for DTS | irisd 0.1 alpha: passthrough mode with `ctts`-style composition offsets deferred; Dahua/Hik IPCs emit P-only streams |
+| B-frames | Moonfire rejects (pts not monotonic); SentryShot forked retina for DTS | irisd 0.1 alpha: unsupported (no composition offsets; 04 §4, 08 deferred list); Dahua/Hik IPCs emit P-only streams |
 
 ## 4. Lessons adopted
 
@@ -61,13 +61,14 @@ irisd must therefore measure its own numbers (07 §7) rather than compare agains
 6. **Explicit durability order** (write → fsync file → fsync dir → catalog row; delete = mark →
    unlink → fsync dir → drop row) and bounded deletion work.
 7. **Parameter-set epochs** as first-class objects (sample entries), deduplicated.
-8. **Events from the camera** (ONVIF / vendor feed) rather than server-side decoding; any
-   future on-NVR analytics runs on the sub stream at low fps and never in the record path.
+8. **Events from the camera** (ONVIF / vendor feed) rather than server-side decoding; on-NVR
+   analytics, if added, runs on the secondary stream at low fps and never in the record path.
 
 ## 5. What irisd does that none of the surveyed projects do together
 
-- Standard CMAF fMP4 on disk **and** zero-copy byte-range serving **and** sub-2-second crash
-  loss **and** index rebuildable by local scan.
+- Standard CMAF fMP4 on disk **and** zero-copy byte-range serving **and** crash loss of at most
+  one fragment plus the writer queue (2.5 s per fragment at the default cap) **and** index
+  rebuildable by local scan.
 - Measured CPU/RSS/write-amplification budgets with a reproducible benchmark harness (07 §7).
 - Regularised constant-frame-rate timing with the raw camera timeline preserved per fragment.
 - One camera connection shared by all clients (live ring → WebSocket per-frame fragments, LL-HLS

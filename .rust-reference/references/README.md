@@ -11,15 +11,16 @@ retrieval time, exact Git commit where available, and every snapshot file's SHA-
 | `google-styleguide` | [README](google-styleguide/README.md), [Rust source](google-styleguide/rustguide.md) | [google/styleguide](https://github.com/google/styleguide), [rendered Rust guide](https://google.github.io/styleguide/rustguide.html) |
 | `google-timeless-documentation` | [Readable guide](google-timeless-documentation/timeless-documentation.md), [original HTML](google-timeless-documentation/source.html) | [Timeless documentation](https://developers.google.com/style/timeless-documentation) |
 | `conventional-commits` | [1.0.0 specification](conventional-commits/content/v1.0.0/index.md), [README](conventional-commits/README.md) | [conventionalcommits.org repository](https://github.com/conventional-commits/conventionalcommits.org) |
-| `semver` | [2.0.0 specification](semver/spec/v2.0.0.md), [site source](semver/index.md) | [semver.org](https://semver.org/), [source repository](https://github.com/semver/semver.org) |
+| `semver` | [2.0.0 specification](semver/spec/v2.0.0.md), [README](semver/README.md) | [semver.org](https://semver.org/), [source repository](https://github.com/semver/semver.org) |
 
 The Rust snapshot preserves the repository path `src/doc/style-guide/` and root
-license notices. Other Git snapshots retain their tracked repository trees,
-including translations and supporting files. The Google Rust source supplies the
+license notices. The Conventional Commits snapshot keeps the 1.0.0 specification
+with its translations, the repository README, and the license; the SemVer snapshot
+keeps the specification directory and the README; neither carries its site
+generator, theme, or package manifests. The API guidelines and Google snapshots
+retain their tracked repository trees. The Google Rust source supplies the
 requested rendered guide's content. The timeless guide is a web snapshot, with
 source attribution and a generated Markdown reading copy.
-SemVer's tracked symlink is materialized as a regular copy of its tracked target;
-this transformation is recorded in the manifest and keeps exports self-contained.
 
 ## Licenses and attribution
 
@@ -42,8 +43,8 @@ together when redistributing these references.
 - Google timeless documentation: page text is CC BY 4.0, and code samples are
   Apache-2.0 except where otherwise noted; attribution is included in the snapshot.
 - Conventional Commits: [repository license](conventional-commits/LICENSE);
-  the published specification's CC BY 3.0 footer is recorded in the
-  [site configuration](conventional-commits/config.yaml).
+  the published specification carries a CC BY 3.0 notice in the site footer, as the
+  manifest's license entry records.
 - Semantic Versioning: CC BY 3.0, as stated in the
   [specification](semver/spec/v2.0.0.md).
 

@@ -61,11 +61,38 @@ kernel, the catalog open, both streams recording within 2 s, the event feed conn
 `CDLA-Permissive-2.0` for the webpki root-certificate bundle pulled in by rustls.
 `cargo audit`: no advisories against the 319 crates in the lock file.
 
-## Not yet done (phase-2 exit criteria in `08-roadmap.md`)
+## Fuzzing (2026-11-01 to 2026-11-02)
+
+Ten targets each ran for 24 h of libFuzzer time (`cargo fuzz run <target> --
+-max_total_time=86400` on the pinned nightly, niced beside the soak) without a finding. The
+five crashes the targets had found in their first minutes on 2026-11-01 (two in the ONVIF
+timestamp parser, two in the recording scanner, one in the replay server's RTSP parser) were
+fixed before the run, and their artifacts did not reproduce on 2026-11-02.
+
+| Target | Runs in 24 h |
+|---|---|
+| `access_unit` | 4.95 × 10⁹ |
+| `box_header` | 1.80 × 10¹⁰ |
+| `dahua_part` | 2.38 × 10⁹ |
+| `digest_challenge` | 1.46 × 10⁹ |
+| `index` | 5.22 × 10⁹ |
+| `multipart` | 4.62 × 10⁸ |
+| `onvif_utc` | 6.14 × 10⁹ |
+| `rtsp_request` | 1.96 × 10⁹ |
+| `scan` | 7.29 × 10⁹ |
+| `trailer` | 1.93 × 10¹⁰ |
+
+## Open items (phase-2 exit criteria in `08-roadmap.md`)
+
+ONVIF PullPoint events, open on 2026-11-02, ran against hardware later
+(`11-multi-camera-results.md`, the seventh camera).
 
 - Seven-day soak: run the daemon as the packaged systemd service.
-- ONVIF PullPoint events: implemented with oxvif but not exercised against hardware.
 - `mediastreamvalidator` on the daemon's playlists and AVPlayer on an iPhone (needs a LAN
   `listen` address).
-- Fuzzing runs on the new parsers (multipart, digest, SOAP responses): targets exist for the
-  phase-1 parsers only.
+- Fuzzing: the targets added after 2026-11-02 (`api_time`, `api_range`, `api_auth`,
+  `export_rebase`, `onvif_soap`, `onvif_notification`, `discovery_parts`, `tools_protocol`,
+  `tools_logs`, `describe_diagnostics`, `rtsp_message`, `depacketize_h265`, `rtp_packet`,
+  `vod_playlist`) lack a completed 24 h run. So does `rtsp_request` since it was extended to the
+  replay server's `Transport` and `Session` parsers, and `tools_protocol` since it was extended
+  to the probe's interleaved-stream, RTCP, H.265 payload, SDP, and digest parsers.

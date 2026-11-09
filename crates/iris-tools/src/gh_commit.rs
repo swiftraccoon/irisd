@@ -5,19 +5,30 @@
 //! The source commit is pinned, the origin host and branch must be
 //! unambiguous, paths are literal and full-tree, and the checked-out ref is
 //! updated with a compare-and-swap only after verifying the returned tree.
+//! Each run first plans, changing no branch and no recovery state; a dry run
+//! prints the plan and stops there.
 
-use std::io::Write as _;
+use std::fs::{File, OpenOptions};
+use std::io::{ErrorKind, Write as _};
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::process::{Command, ExitStatus, Stdio};
 use std::time::Duration;
 
 use anyhow::Context;
 use base64::Engine as _;
 use clap::Parser;
+use reqwest::Url;
+use rustix::process::{Pid, Signal};
 use serde_json::{Value, json};
-use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWriteExt as _};
+use tokio::signal::unix::SignalKind;
+use tokio::time::Instant;
+
+use crate::logs;
 
 const GH_TIMEOUT: Duration = Duration::from_secs(120);
+/// How long a helper's output may stay open after it exits, at least.
+const PIPE_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 const GH_OUTPUT_LIMIT: u64 = 1024 * 1024;
 const BASE_REF: &str = "refs/irisd/gh-commit/base";
 const RESULT_REF: &str = "refs/irisd/gh-commit/result";
@@ -40,7 +51,8 @@ pub struct Args {
     /// The commit message's body.
     #[arg(long)]
     body: Option<String>,
-    /// Show what would be committed and stop.
+    /// Print what would be published, recovered, or adopted, and stop before
+    /// changing any branch or recovery state.
     #[arg(long)]
     dry_run: bool,
 }
@@ -53,9 +65,15 @@ struct Target {
 
 #[derive(Debug)]
 struct GhOutput {
-    status: std::process::ExitStatus,
+    status: ExitStatus,
     stdout: Vec<u8>,
     stderr: Vec<u8>,
+}
+
+/// A helper's stderr for an error message: text the remote controls,
+/// escaped for the terminal.
+fn remote_text(bytes: &[u8]) -> String {
+    logs::terminal_safe(String::from_utf8_lossy(bytes).trim())
 }
 
 fn git(args: &[&str]) -> anyhow::Result<String> {
@@ -74,7 +92,7 @@ fn git_bytes(args: &[&str]) -> anyhow::Result<Vec<u8>> {
         output.status.success(),
         "git {} failed: {}",
         args.join(" "),
-        String::from_utf8_lossy(&output.stderr).trim()
+        remote_text(&output.stderr)
     );
     Ok(output.stdout)
 }
@@ -116,7 +134,7 @@ fn valid_oid(oid: &str) -> bool {
 /// GitHub host and owner/name from an HTTPS, ssh URL, or scp-style URL.
 fn target_from_url(url: &str) -> Option<Target> {
     let raw = url.trim();
-    let (hostname, path) = if let Ok(parsed) = reqwest::Url::parse(raw) {
+    let (hostname, path) = if let Ok(parsed) = Url::parse(raw) {
         if !matches!(parsed.scheme(), "https" | "ssh" | "git") || parsed.password().is_some() {
             return None;
         }
@@ -147,12 +165,6 @@ fn target_from_url(url: &str) -> Option<Target> {
     validate_hostname(&target.hostname).ok()?;
     validate_repo(&target.repo).ok()?;
     Some(target)
-}
-
-/// Compatibility helper used by documentation tests.
-#[cfg(test)]
-pub fn repo_from_url(url: &str) -> Option<String> {
-    target_from_url(url).map(|target| target.repo)
 }
 
 fn resolve_target(args: &Args) -> anyhow::Result<Target> {
@@ -271,14 +283,19 @@ fn verify_published_commit(
         signature.get("isValid") == Some(&Value::Bool(true))
             && signature.get("state").and_then(Value::as_str) == Some("VALID")
             && signature.get("wasSignedByGitHub") == Some(&Value::Bool(true)),
-        "GitHub reports the commit signature as not valid or not made by GitHub: {signature}"
+        "GitHub reports the commit signature as not valid or not made by GitHub: {}",
+        logs::terminal_safe(&signature.to_string())
     );
     let parents = commit
         .pointer("/parents/nodes")
         .and_then(Value::as_array)
         .context("GitHub returned the commit without its parents")?;
+    let parent = match parents.as_slice() {
+        [parent] => parent.get("oid").and_then(Value::as_str),
+        _ => None,
+    };
     anyhow::ensure!(
-        parents.len() == 1 && parents[0].get("oid").and_then(Value::as_str) == Some(remote_oid),
+        parent == Some(remote_oid),
         "the published commit's parents are not exactly the remote head {remote_oid}"
     );
     let text = |name: &str| commit.get(name).and_then(Value::as_str);
@@ -295,8 +312,8 @@ fn verify_published_commit(
 
 /// Checks a commit from GitHub's REST API (`repos/OWNER/NAME/git/commits/OID`)
 /// before a recovery, or a remote head that already has the local tree, is
-/// adopted: the requested
-/// OID, `verification.verified`, and exactly one parent, which it returns.
+/// adopted: the requested OID, `verification.verified`, and exactly one
+/// parent, which it returns.
 fn verified_rest_parent(commit: &Value, oid: &str) -> anyhow::Result<String> {
     anyhow::ensure!(
         commit.get("sha").and_then(Value::as_str) == Some(oid),
@@ -305,16 +322,21 @@ fn verified_rest_parent(commit: &Value, oid: &str) -> anyhow::Result<String> {
     anyhow::ensure!(
         commit.pointer("/verification/verified") == Some(&Value::Bool(true)),
         "GitHub does not verify the signature of {oid}: {}",
-        commit
-            .pointer("/verification/reason")
-            .unwrap_or(&Value::Null)
+        logs::terminal_safe(
+            &commit
+                .pointer("/verification/reason")
+                .unwrap_or(&Value::Null)
+                .to_string()
+        )
     );
     let parents = commit
         .get("parents")
         .and_then(Value::as_array)
         .context("GitHub returned the commit without its parents")?;
-    anyhow::ensure!(parents.len() == 1, "{oid} does not have exactly one parent");
-    parents[0]
+    let [parent] = parents.as_slice() else {
+        anyhow::bail!("{oid} does not have exactly one parent");
+    };
+    parent
         .get("sha")
         .and_then(Value::as_str)
         .filter(|parent| valid_oid(parent))
@@ -336,7 +358,7 @@ fn remote_verified_parent(target: &Target, oid: &str) -> anyhow::Result<String> 
     anyhow::ensure!(
         output.status.success(),
         "reading {oid} from GitHub failed: {}",
-        String::from_utf8_lossy(&output.stderr).trim()
+        remote_text(&output.stderr)
     );
     let commit: Value =
         serde_json::from_slice(&output.stdout).context("GitHub returned an invalid commit")?;
@@ -376,7 +398,8 @@ fn reconcile(branch: &str, source_oid: &str, published_oid: &str) -> anyhow::Res
     let current = git(&["rev-parse", "HEAD"])?;
     anyhow::ensure!(
         current == source_oid,
-        "remote commit {published_oid} exists, but local {branch} moved from {source_oid} to {current}; no local state was overwritten"
+        "remote commit {published_oid} exists, but local {branch} moved from {source_oid} to \
+         {current}; no local state was overwritten"
     );
     git(&[
         "update-ref",
@@ -390,7 +413,7 @@ fn reconcile(branch: &str, source_oid: &str, published_oid: &str) -> anyhow::Res
     Ok(())
 }
 
-async fn read_bounded<R: tokio::io::AsyncRead + Unpin>(reader: R) -> anyhow::Result<Vec<u8>> {
+async fn read_bounded<R: AsyncRead + Unpin>(reader: R) -> anyhow::Result<Vec<u8>> {
     let mut bytes = Vec::new();
     reader
         .take(GH_OUTPUT_LIMIT + 1)
@@ -398,9 +421,16 @@ async fn read_bounded<R: tokio::io::AsyncRead + Unpin>(reader: R) -> anyhow::Res
         .await?;
     anyhow::ensure!(
         bytes.len() as u64 <= GH_OUTPUT_LIMIT,
-        "gh output exceeded 1 MiB"
+        "gh output exceeded {} MiB",
+        GH_OUTPUT_LIMIT / (1024 * 1024)
     );
     Ok(bytes)
+}
+
+fn kill_group(pid: u32) {
+    if let Some(group) = Pid::from_raw(pid as i32) {
+        let _ = rustix::process::kill_process_group(group, Signal::KILL);
+    }
 }
 
 async fn command_async(
@@ -408,6 +438,9 @@ async fn command_async(
     args: &[&str],
     input: Option<Vec<u8>>,
 ) -> anyhow::Result<GhOutput> {
+    let deadline = Instant::now() + GH_TIMEOUT;
+    let ambiguous =
+        |what: &str| anyhow::anyhow!("{program} {what}; publication outcome may be ambiguous");
     // A private process group lets timeout and cancellation stop helpers too.
     let mut child = tokio::process::Command::new("setsid")
         .arg(program)
@@ -435,25 +468,34 @@ async fn command_async(
             stdin.shutdown().await
         })
     });
-    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    let mut terminate = tokio::signal::unix::signal(SignalKind::terminate())?;
     let outcome = tokio::select! {
         status = child.wait() => Ok(status?),
-        () = tokio::time::sleep(GH_TIMEOUT) => Err(anyhow::anyhow!("{program} timed out; publication outcome may be ambiguous")),
-        _ = tokio::signal::ctrl_c() => Err(anyhow::anyhow!("{program} interrupted; publication outcome may be ambiguous")),
-        _ = terminate.recv() => Err(anyhow::anyhow!("{program} terminated; publication outcome may be ambiguous")),
+        () = tokio::time::sleep_until(deadline) => Err(ambiguous("timed out")),
+        _ = tokio::signal::ctrl_c() => Err(ambiguous("interrupted")),
+        _ = terminate.recv() => Err(ambiguous("terminated")),
     };
     if outcome.is_err() {
-        if let Some(group) = rustix::process::Pid::from_raw(pid as i32) {
-            let _ = rustix::process::kill_process_group(group, rustix::process::Signal::KILL);
-        }
+        kill_group(pid);
         let _ = child.start_kill();
-        let _ = tokio::time::timeout(Duration::from_secs(5), child.wait()).await;
+        let _ = tokio::time::timeout(PIPE_DRAIN_TIMEOUT, child.wait()).await;
     }
-    if let Some(task) = input_task {
-        let _ = task.await;
-    }
-    let stdout = stdout_task.await.context("joining gh stdout reader")??;
-    let stderr = stderr_task.await.context("joining gh stderr reader")??;
+    // A helper's own child can keep the pipes open after it exits; bound the
+    // drain and stop the whole group if it lasts.
+    let drain_deadline = deadline.max(Instant::now() + PIPE_DRAIN_TIMEOUT);
+    let drained = tokio::time::timeout_at(drain_deadline, async {
+        if let Some(task) = input_task {
+            let _ = task.await;
+        }
+        (stdout_task.await, stderr_task.await)
+    })
+    .await;
+    let Ok((stdout, stderr)) = drained else {
+        kill_group(pid);
+        return Err(ambiguous("exited, but its output stayed open"));
+    };
+    let stdout = stdout.context("joining gh stdout reader")??;
+    let stderr = stderr.context("joining gh stderr reader")??;
     Ok(GhOutput {
         status: outcome?,
         stdout,
@@ -477,7 +519,7 @@ fn git_network(args: &[&str]) -> anyhow::Result<()> {
         output.status.success(),
         "git {} failed: {}",
         args.join(" "),
-        String::from_utf8_lossy(&output.stderr).trim()
+        remote_text(&output.stderr)
     );
     Ok(())
 }
@@ -491,7 +533,7 @@ fn require_github_host(target: &Target) -> anyhow::Result<()> {
         output.status.success(),
         "{} is not configured as an authenticated GitHub Enterprise host: {}",
         target.hostname,
-        String::from_utf8_lossy(&output.stderr).trim()
+        remote_text(&output.stderr)
     );
     let metadata = gh(
         &[
@@ -508,7 +550,7 @@ fn require_github_host(target: &Target) -> anyhow::Result<()> {
         metadata.status.success() && !metadata.stdout.is_empty(),
         "{} did not identify itself as GitHub Enterprise: {}",
         target.hostname,
-        String::from_utf8_lossy(&metadata.stderr).trim()
+        remote_text(&metadata.stderr)
     );
     Ok(())
 }
@@ -526,20 +568,18 @@ fn changed_paths(remote_oid: &str, source_oid: &str) -> anyhow::Result<Vec<(u8, 
     let fields = bytes.split(|byte| *byte == 0).collect::<Vec<_>>();
     let mut changes = Vec::new();
     for pair in fields.chunks(2) {
-        if pair.len() == 1 && pair[0].is_empty() {
-            break;
+        match pair {
+            [[]] => break,
+            [status, path] if !status.is_empty() => {
+                anyhow::ensure!(
+                    matches!(status[0], b'A' | b'M' | b'D' | b'T'),
+                    "unsupported diff status"
+                );
+                let path = String::from_utf8(path.to_vec()).context("Git path is not UTF-8")?;
+                changes.push((status[0], path));
+            }
+            _ => anyhow::bail!("truncated git diff output"),
         }
-        anyhow::ensure!(
-            pair.len() == 2 && !pair[0].is_empty(),
-            "truncated git diff output"
-        );
-        let status = pair[0][0];
-        anyhow::ensure!(
-            matches!(status, b'A' | b'M' | b'D' | b'T'),
-            "unsupported diff status"
-        );
-        let path = String::from_utf8(pair[1].to_vec()).context("Git path is not UTF-8")?;
-        changes.push((status, path));
     }
     Ok(changes)
 }
@@ -563,19 +603,19 @@ fn addition(source_oid: &str, path: &str) -> anyhow::Result<Value> {
 }
 
 fn regular_blob_oid<'a>(entry: &'a str, path: &str) -> anyhow::Result<&'a str> {
-    let mut fields = entry.splitn(2, '\t');
-    let header = fields.next().context("missing tree entry")?;
-    let tree_path = fields.next().context("missing tree path")?;
+    let (header, tree_path) = entry.split_once('\t').context("missing tree path")?;
     anyhow::ensure!(
         tree_path.strip_suffix('\0') == Some(path),
         "unexpected tree path for {path}"
     );
     let fields: Vec<&str> = header.split_whitespace().collect();
-    anyhow::ensure!(
-        fields.len() == 3 && fields[0] == "100644" && fields[1] == "blob",
-        "cannot publish {path}: GitHub file additions support only ordinary non-executable files; symlinks, executable files and submodules are unsupported"
-    );
-    Ok(fields[2])
+    let ["100644", "blob", oid] = fields.as_slice() else {
+        anyhow::bail!(
+            "cannot publish {path}: GitHub file additions support only ordinary non-executable \
+             files; symlinks, executable files and submodules are unsupported"
+        );
+    };
+    Ok(oid)
 }
 
 fn recovery_path() -> anyhow::Result<PathBuf> {
@@ -606,117 +646,158 @@ fn write_recovery(
         "published": oid,
         "base": base,
     }))?;
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&tmp)?;
+    let mut file = OpenOptions::new().write(true).create_new(true).open(&tmp)?;
     file.write_all(&bytes)?;
     file.sync_all()?;
     std::fs::rename(&tmp, &path)?;
     if let Some(parent) = path.parent() {
-        std::fs::File::open(parent)?.sync_all()?;
+        File::open(parent)?.sync_all()?;
     }
     Ok(path)
 }
 
-fn recover_pending(target: &Target, branch: &str, source: &str) -> anyhow::Result<bool> {
+/// A publication a previous run recorded but did not adopt.
+#[derive(Debug, PartialEq, Eq)]
+struct Recovery {
+    /// The source commit that run published.
+    source: String,
+    /// The published commit.
+    published: String,
+    /// The remote head the published commit must have as its parent.
+    base: String,
+}
+
+impl Recovery {
+    /// Reads the recovery state for `target` and `branch`; state recorded for
+    /// another target, or without its parent, needs manual reconciliation.
+    fn parse(bytes: &[u8], target: &Target, branch: &str, path: &str) -> anyhow::Result<Self> {
+        let state: Value =
+            serde_json::from_slice(bytes).context("decoding gh-commit recovery state")?;
+        let field = |name: &str| {
+            state
+                .get(name)
+                .and_then(Value::as_str)
+                .with_context(|| format!("recovery state is missing {name}"))
+        };
+        anyhow::ensure!(
+            field("hostname")? == target.hostname
+                && field("repo")? == target.repo
+                && field("branch")? == branch,
+            "pending gh-commit recovery state belongs to a different target; reconcile {path} \
+             manually"
+        );
+        let published = field("published")?.to_owned();
+        anyhow::ensure!(valid_oid(&published), "recovery state has an invalid OID");
+        let base = field("base").with_context(|| {
+            format!(
+                "recovery state does not record the published commit's parent; reconcile {path} \
+                 manually"
+            )
+        })?;
+        Ok(Self {
+            source: field("source")?.to_owned(),
+            published,
+            base: base.to_owned(),
+        })
+    }
+}
+
+/// What a run does, decided by reading git, the recovery state, and GitHub
+/// and by fetching the remote head into a temporary ref; planning changes no
+/// branch and no recovery state.
+#[derive(Debug)]
+enum Plan {
+    /// Adopt a publication a previous run recorded.
+    Recover { path: PathBuf, recovery: Recovery },
+    /// Adopt the remote head, a signed commit that already has the local tree.
+    AdoptExisting { remote_oid: String },
+    /// Publish the difference from the remote head.
+    Publish {
+        remote_oid: String,
+        additions: Vec<Value>,
+        deletions: Vec<Value>,
+    },
+}
+
+impl Plan {
+    /// What a dry run reports for this plan.
+    fn describe(&self, target: &Target, branch: &str) -> String {
+        match self {
+            Self::Recover { path, recovery } => format!(
+                "would recover published commit {} from {}",
+                recovery.published,
+                path.display()
+            ),
+            Self::AdoptExisting { remote_oid } => {
+                format!("would adopt existing signed commit {remote_oid}")
+            }
+            Self::Publish {
+                remote_oid,
+                additions,
+                deletions,
+            } => format!(
+                "{} {} {branch}: {} additions, {} deletions on top of {}",
+                target.hostname,
+                target.repo,
+                additions.len(),
+                deletions.len(),
+                remote_oid.get(..12).unwrap_or(remote_oid)
+            ),
+        }
+    }
+}
+
+/// The pending recovery for this target, verified through the REST API.
+fn pending_recovery(
+    target: &Target,
+    branch: &str,
+    source: &str,
+) -> anyhow::Result<Option<(PathBuf, Recovery)>> {
     let path = recovery_path()?;
     let bytes = match std::fs::read(&path) {
         Ok(bytes) => bytes,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error).context("reading gh-commit recovery state"),
     };
-    let state: Value =
-        serde_json::from_slice(&bytes).context("decoding gh-commit recovery state")?;
-    let field = |name: &str| {
-        state
-            .get(name)
-            .and_then(Value::as_str)
-            .with_context(|| format!("recovery state is missing {name}"))
-    };
-    anyhow::ensure!(
-        field("hostname")? == target.hostname
-            && field("repo")? == target.repo
-            && field("branch")? == branch,
-        "pending gh-commit recovery state belongs to a different target; reconcile {} manually",
-        path.display()
-    );
-    let prior_source = field("source")?.to_owned();
-    let published = field("published")?.to_owned();
-    anyhow::ensure!(valid_oid(&published), "recovery state has an invalid OID");
-    let base = field("base").with_context(|| {
-        format!(
-            "recovery state does not record the published commit's parent; reconcile {} manually",
-            path.display()
-        )
-    })?;
-    let parent = remote_verified_parent(target, &published)
+    let display = path.display().to_string();
+    let recovery = Recovery::parse(&bytes, target, branch, &display)?;
+    let published = &recovery.published;
+    let parent = remote_verified_parent(target, published)
         .with_context(|| format!("published {published} but not adopted"))?;
     anyhow::ensure!(
-        parent == base,
-        "published {published} but not adopted: its parent is {parent}, not the recorded remote head {base}"
+        parent == recovery.base,
+        "published {published} but not adopted: its parent is {parent}, not the recorded \
+         remote head {}",
+        recovery.base
     );
-    if prior_source == source {
-        reconcile(branch, source, &published).with_context(|| {
-            format!(
-                "recovering published commit {published} from {}",
-                path.display()
-            )
-        })?;
-    } else {
-        anyhow::ensure!(
-            published == source,
-            "pending gh-commit recovery state belongs to source {prior_source}, but local HEAD is {source}; reconcile {} manually",
-            path.display()
-        );
-        fetch_oid(&published)?;
-        anyhow::ensure!(
-            trees_equal(source, RESULT_REF)?,
-            "adopted recovery commit no longer verifies"
-        );
-    }
-    std::fs::remove_file(&path)?;
-    if let Some(parent) = path.parent() {
-        std::fs::File::open(parent)?.sync_all()?;
-    }
-    delete_temp_refs();
-    println!("recovered and adopted published commit {published}");
-    Ok(true)
+    anyhow::ensure!(
+        recovery.source == source || recovery.published == source,
+        "pending gh-commit recovery state belongs to source {}, but local HEAD is {source}; \
+         reconcile {display} manually",
+        recovery.source
+    );
+    Ok(Some((path, recovery)))
 }
 
-/// Runs the tool.
-#[allow(clippy::too_many_lines)]
-pub fn run(args: &Args) -> anyhow::Result<()> {
-    let target = resolve_target(args)?;
-    require_github_host(&target)?;
-    let branch = current_branch()?;
-    if let Some(requested) = &args.branch {
-        anyhow::ensure!(
-            requested == &branch,
-            "--branch must match checked-out branch {branch}"
-        );
+fn plan(target: &Target, branch: &str, source_oid: &str) -> anyhow::Result<Plan> {
+    if let Some((path, recovery)) = pending_recovery(target, branch, source_oid)? {
+        return Ok(Plan::Recover { path, recovery });
     }
-    ensure_clean()?;
-    let source_oid = git(&["rev-parse", "HEAD^{commit}"])?;
-    if recover_pending(&target, &branch, &source_oid)? {
-        return Ok(());
-    }
-    let remote_oid = fetch_ref(&branch)?;
-    let changes = changed_paths(&remote_oid, &source_oid)?;
+    let remote_oid = fetch_ref(branch)?;
+    let changes = changed_paths(&remote_oid, source_oid)?;
     if changes.is_empty() {
-        if remote_oid != source_oid && trees_equal(&remote_oid, &source_oid)? {
-            let parent = remote_verified_parent(&target, &remote_oid)
-                .with_context(|| format!("cannot adopt existing remote commit {remote_oid}"))?;
-            anyhow::ensure!(
-                is_ancestor(&parent, &source_oid)?,
-                "cannot adopt existing remote commit {remote_oid}: its parent {parent} is not in the local history"
-            );
-            reconcile(&branch, &source_oid, &remote_oid)?;
-            delete_temp_refs();
-            println!("adopted existing signed commit {remote_oid}");
-            return Ok(());
-        }
-        anyhow::bail!("nothing differs from origin/{branch}");
+        anyhow::ensure!(
+            remote_oid != source_oid && trees_equal(&remote_oid, source_oid)?,
+            "nothing differs from origin/{branch}"
+        );
+        let parent = remote_verified_parent(target, &remote_oid)
+            .with_context(|| format!("cannot adopt existing remote commit {remote_oid}"))?;
+        anyhow::ensure!(
+            is_ancestor(&parent, source_oid)?,
+            "cannot adopt existing remote commit {remote_oid}: its parent {parent} is not in the \
+             local history"
+        );
+        return Ok(Plan::AdoptExisting { remote_oid });
     }
     let mut additions = Vec::new();
     let mut deletions = Vec::new();
@@ -724,38 +805,67 @@ pub fn run(args: &Args) -> anyhow::Result<()> {
         if status == b'D' {
             deletions.push(json!({ "path": path }));
         } else {
-            additions.push(addition(&source_oid, &path)?);
+            additions.push(addition(source_oid, &path)?);
         }
     }
-    println!(
-        "{} {} {}: {} additions, {} deletions on top of {}",
-        target.hostname,
-        target.repo,
-        branch,
-        additions.len(),
-        deletions.len(),
-        &remote_oid[..12]
-    );
-    if args.dry_run {
-        delete_temp_refs();
-        return Ok(());
+    Ok(Plan::Publish {
+        remote_oid,
+        additions,
+        deletions,
+    })
+}
+
+/// Removes the recovery state once its publication is adopted.
+fn remove_recovery(path: &PathBuf) -> anyhow::Result<()> {
+    std::fs::remove_file(path)?;
+    if let Some(parent) = path.parent() {
+        File::open(parent)?.sync_all()?;
     }
-    anyhow::ensure!(
-        current_branch()? == branch,
-        "checked-out branch changed while planning"
-    );
-    ensure_clean()?;
-    anyhow::ensure!(
-        git(&["rev-parse", "HEAD"])? == source_oid,
-        "HEAD changed while planning"
-    );
-    let body = args.body.clone().unwrap_or_default();
+    Ok(())
+}
+
+fn recover(path: &PathBuf, recovery: &Recovery, branch: &str, source: &str) -> anyhow::Result<()> {
+    let published = &recovery.published;
+    if recovery.source == source {
+        reconcile(branch, source, published).with_context(|| {
+            format!(
+                "recovering published commit {published} from {}",
+                path.display()
+            )
+        })?;
+    } else {
+        // An earlier run adopted the commit but stopped before removing the state.
+        fetch_oid(published)?;
+        anyhow::ensure!(
+            trees_equal(source, RESULT_REF)?,
+            "adopted recovery commit no longer verifies"
+        );
+    }
+    remove_recovery(path)?;
+    println!("recovered and adopted published commit {published}");
+    Ok(())
+}
+
+/// Sends the `createCommitOnBranch` mutation and returns the published
+/// commit's OID and fields.
+fn create_commit(
+    target: &Target,
+    branch: &str,
+    message: (&str, &str),
+    remote_oid: &str,
+    changes: (Vec<Value>, Vec<Value>),
+) -> anyhow::Result<(String, Value)> {
+    let (headline, body) = message;
+    let (additions, deletions) = changes;
     let input = json!({
-        "query": format!("mutation($input: CreateCommitOnBranchInput!) {{ createCommitOnBranch(input: $input) {{ commit {{ {PUBLISHED_COMMIT_FIELDS} }} }} }}"),
+        "query": format!(
+            "mutation($input: CreateCommitOnBranchInput!) {{ createCommitOnBranch(input: $input) \
+             {{ commit {{ {PUBLISHED_COMMIT_FIELDS} }} }} }}"
+        ),
         "variables": { "input": {
             "branch": { "repositoryNameWithOwner": target.repo, "branchName": branch },
             "expectedHeadOid": remote_oid,
-            "message": { "headline": args.message, "body": body },
+            "message": { "headline": headline, "body": body },
             "fileChanges": { "additions": additions, "deletions": deletions },
         }},
     });
@@ -773,32 +883,113 @@ pub fn run(args: &Args) -> anyhow::Result<()> {
     anyhow::ensure!(
         output.status.success(),
         "gh failed; publication outcome may be ambiguous: {}",
-        String::from_utf8_lossy(&output.stderr).trim()
+        remote_text(&output.stderr)
     );
     let response: Value = serde_json::from_slice(&output.stdout)
         .context("gh returned an invalid response; publication outcome may be ambiguous")?;
-    let oid = response
-        .pointer("/data/createCommitOnBranch/commit/oid")
-        .and_then(Value::as_str)
-        .with_context(|| format!("publication response is ambiguous: {response}"))?
-        .to_owned();
-    anyhow::ensure!(valid_oid(&oid), "invalid published commit OID");
-    let recovery = write_recovery(&target, &branch, &source_oid, &oid, &remote_oid)?;
     let commit = response
         .pointer("/data/createCommitOnBranch/commit")
-        .unwrap_or(&Value::Null);
-    verify_published_commit(commit, &remote_oid, &args.message, &body).with_context(|| {
+        .cloned()
+        .unwrap_or(Value::Null);
+    let oid = commit
+        .get("oid")
+        .and_then(Value::as_str)
+        .with_context(|| {
+            format!(
+                "publication response is ambiguous: {}",
+                logs::terminal_safe(&response.to_string())
+            )
+        })?
+        .to_owned();
+    anyhow::ensure!(valid_oid(&oid), "invalid published commit OID");
+    Ok((oid, commit))
+}
+
+fn publish(
+    args: &Args,
+    target: &Target,
+    branch: &str,
+    source_oid: &str,
+    plan: (String, Vec<Value>, Vec<Value>),
+) -> anyhow::Result<()> {
+    let (remote_oid, additions, deletions) = plan;
+    anyhow::ensure!(
+        current_branch()? == branch,
+        "checked-out branch changed while planning"
+    );
+    ensure_clean()?;
+    anyhow::ensure!(
+        git(&["rev-parse", "HEAD"])? == source_oid,
+        "HEAD changed while planning"
+    );
+    let body = args.body.clone().unwrap_or_default();
+    let (oid, commit) = create_commit(
+        target,
+        branch,
+        (&args.message, &body),
+        &remote_oid,
+        (additions, deletions),
+    )?;
+    let recovery = write_recovery(target, branch, source_oid, &oid, &remote_oid)?;
+    verify_published_commit(&commit, &remote_oid, &args.message, &body).with_context(|| {
         format!(
             "published {oid} but not adopted; recovery state is {}",
             recovery.display()
         )
     })?;
-    reconcile(&branch, &source_oid, &oid)
+    reconcile(branch, source_oid, &oid)
         .with_context(|| format!("published {oid}; recovery state is {}", recovery.display()))?;
     std::fs::remove_file(&recovery)?;
-    delete_temp_refs();
     println!("committed {oid} (signed by GitHub); local {branch} adopted it by CAS");
     Ok(())
+}
+
+/// Plans the run, then, unless `--dry-run` asks only for the plan, recovers
+/// a recorded publication, adopts a remote head that already has the local
+/// tree, or publishes the difference and adopts the signed commit.
+pub fn run(args: &Args) -> anyhow::Result<()> {
+    let target = resolve_target(args)?;
+    require_github_host(&target)?;
+    let branch = current_branch()?;
+    if let Some(requested) = &args.branch {
+        anyhow::ensure!(
+            requested == &branch,
+            "--branch must match checked-out branch {branch}"
+        );
+    }
+    ensure_clean()?;
+    let source_oid = git(&["rev-parse", "HEAD^{commit}"])?;
+    let plan = plan(&target, &branch, &source_oid)?;
+    if args.dry_run || matches!(plan, Plan::Publish { .. }) {
+        println!("{}", plan.describe(&target, &branch));
+    }
+    if args.dry_run {
+        delete_temp_refs();
+        return Ok(());
+    }
+    let result = match plan {
+        Plan::Recover { path, recovery } => recover(&path, &recovery, &branch, &source_oid),
+        Plan::AdoptExisting { remote_oid } => {
+            reconcile(&branch, &source_oid, &remote_oid).map(|()| {
+                println!("adopted existing signed commit {remote_oid}");
+            })
+        }
+        Plan::Publish {
+            remote_oid,
+            additions,
+            deletions,
+        } => publish(
+            args,
+            &target,
+            &branch,
+            &source_oid,
+            (remote_oid, additions, deletions),
+        ),
+    };
+    if result.is_ok() {
+        delete_temp_refs();
+    }
+    result
 }
 
 #[cfg(test)]
@@ -816,17 +1007,26 @@ mod tests {
         })
     }
 
-    #[test]
-    fn a_published_commit_is_adopted_only_when_signed_on_the_remote_head_with_its_message() {
-        let remote = "a".repeat(40);
-        let (headline, body) = ("fix(store): keep the sync phase", "Why it matters.");
-        verify_published_commit(&published(&remote), &remote, headline, body).unwrap();
+    const HEADLINE: &str = "fix(store): keep the sync phase";
+    const BODY: &str = "Why it matters.";
 
+    #[test]
+    fn a_signed_commit_on_the_remote_head_with_its_message_is_adopted() {
+        let remote = "a".repeat(40);
+        verify_published_commit(&published(&remote), &remote, HEADLINE, BODY).unwrap();
+    }
+
+    #[test]
+    fn the_full_message_settles_a_shortened_headline() {
+        let remote = "a".repeat(40);
         let mut long = published(&remote);
         long["messageHeadline"] = json!("fix(store): keep the…");
-        verify_published_commit(&long, &remote, headline, body)
-            .expect("the full message settles a shortened headline");
+        verify_published_commit(&long, &remote, HEADLINE, BODY).unwrap();
+    }
 
+    #[test]
+    fn unsigned_reparented_or_reworded_commits_are_not_adopted() {
+        let remote = "a".repeat(40);
         let mut unsigned = published(&remote);
         unsigned["signature"] = Value::Null;
         let mut missing = published(&remote);
@@ -860,13 +1060,17 @@ mod tests {
             ("no parent", orphan),
             ("headline mismatch", message),
             ("body mismatch", body_changed),
+            ("no commit", Value::Null),
         ] {
             assert!(
-                verify_published_commit(&commit, &remote, headline, body).is_err(),
+                verify_published_commit(&commit, &remote, HEADLINE, BODY).is_err(),
                 "{name}"
             );
         }
-        assert!(verify_published_commit(&Value::Null, &remote, headline, body).is_err());
+    }
+
+    #[test]
+    fn the_api_joins_headline_and_body_with_a_blank_line() {
         assert_eq!(expected_message("h", ""), "h");
         assert_eq!(expected_message("h", "b"), "h\n\nb");
     }
@@ -906,6 +1110,93 @@ mod tests {
         }
     }
 
+    fn target() -> Target {
+        Target {
+            hostname: "github.com".into(),
+            repo: "owner/name".into(),
+        }
+    }
+
+    fn state(hostname: &str, base: Option<&str>) -> Vec<u8> {
+        let mut state = json!({
+            "hostname": hostname,
+            "repo": "owner/name",
+            "branch": "main",
+            "source": "c".repeat(40),
+            "published": "b".repeat(40),
+        });
+        if let Some(base) = base {
+            state["base"] = json!(base);
+        }
+        serde_json::to_vec(&state).unwrap()
+    }
+
+    #[test]
+    fn recovery_state_records_the_publication_and_its_parent() {
+        let recovery = Recovery::parse(
+            &state("github.com", Some(&"a".repeat(40))),
+            &target(),
+            "main",
+            "state",
+        )
+        .unwrap();
+        assert_eq!(
+            recovery,
+            Recovery {
+                source: "c".repeat(40),
+                published: "b".repeat(40),
+                base: "a".repeat(40),
+            }
+        );
+    }
+
+    #[test]
+    fn recovery_state_for_another_target_or_without_a_parent_is_refused() {
+        let base = "a".repeat(40);
+        assert!(
+            Recovery::parse(&state("ghe.example", Some(&base)), &target(), "main", "s").is_err()
+        );
+        assert!(
+            Recovery::parse(&state("github.com", Some(&base)), &target(), "other", "s").is_err()
+        );
+        assert!(Recovery::parse(&state("github.com", None), &target(), "main", "s").is_err());
+    }
+
+    #[test]
+    fn a_dry_run_reports_each_plan_without_acting() {
+        let target = target();
+        let recover = Plan::Recover {
+            path: PathBuf::from("recovery.json"),
+            recovery: Recovery {
+                source: "c".repeat(40),
+                published: "b".repeat(40),
+                base: "a".repeat(40),
+            },
+        };
+        assert!(
+            recover
+                .describe(&target, "main")
+                .starts_with("would recover published commit bbbb")
+        );
+        let adopt = Plan::AdoptExisting {
+            remote_oid: "a".repeat(40),
+        };
+        assert!(
+            adopt
+                .describe(&target, "main")
+                .starts_with("would adopt existing signed commit aaaa")
+        );
+        let publish = Plan::Publish {
+            remote_oid: "a".repeat(40),
+            additions: vec![json!({})],
+            deletions: Vec::new(),
+        };
+        assert_eq!(
+            publish.describe(&target, "main"),
+            "github.com owner/name main: 1 additions, 0 deletions on top of aaaaaaaaaaaa"
+        );
+    }
+
     #[test]
     fn rejects_tree_modes_the_commit_api_cannot_preserve() {
         for (mode, kind) in [("120000", "blob"), ("100755", "blob"), ("160000", "commit")] {
@@ -915,7 +1206,7 @@ mod tests {
     }
 
     #[test]
-    fn reads_the_regular_file_blob_without_following_the_worktree() {
+    fn regular_blob_oid_returns_the_named_path_blob() {
         assert_eq!(
             regular_blob_oid("100644 blob fixtureoid\tfile\0", "file").unwrap(),
             "fixtureoid"
@@ -925,33 +1216,35 @@ mod tests {
 
     #[test]
     fn reads_host_owner_and_name_from_github_urls() {
+        let expected = |hostname: &str| {
+            Some(Target {
+                hostname: hostname.into(),
+                repo: "owner/name".into(),
+            })
+        };
         assert_eq!(
             target_from_url("https://github.com/owner/name.git"),
-            Some(Target {
-                hostname: "github.com".into(),
-                repo: "owner/name".into()
-            })
+            expected("github.com")
         );
         assert_eq!(
             target_from_url("git@ghe.example:owner/name.git\n"),
-            Some(Target {
-                hostname: "ghe.example".into(),
-                repo: "owner/name".into()
-            })
+            expected("ghe.example")
         );
         assert_eq!(
             target_from_url("ssh://git@ghe.example/owner/name.git"),
-            Some(Target {
-                hostname: "ghe.example".into(),
-                repo: "owner/name".into()
-            })
+            expected("ghe.example")
         );
-        assert_eq!(target_from_url("/tmp/name"), None);
-        assert_eq!(
-            target_from_url("https://gitlab.example/owner/name/extra"),
-            None
-        );
-        assert_eq!(repo_from_url("name"), None);
+    }
+
+    #[test]
+    fn urls_without_exactly_owner_and_name_name_no_target() {
+        for url in [
+            "/tmp/name",
+            "https://gitlab.example/owner/name/extra",
+            "name",
+        ] {
+            assert_eq!(target_from_url(url), None, "{url}");
+        }
     }
 
     #[test]
@@ -961,9 +1254,21 @@ mod tests {
         assert!(validate_repo("owner/re po").is_err());
         assert!(validate_hostname("ghe.example").is_ok());
         assert!(validate_hostname("https://ghe.example").is_err());
+    }
+
+    #[test]
+    fn object_ids_are_forty_or_sixty_four_hex_digits() {
         assert!(valid_oid(&"a".repeat(40)));
         assert!(valid_oid(&"B".repeat(64)));
         assert!(!valid_oid(&"g".repeat(40)));
         assert!(!valid_oid(&"a".repeat(39)));
+    }
+
+    #[test]
+    fn remote_text_is_escaped_for_the_terminal() {
+        assert_eq!(
+            remote_text(b"remote: \x1b[31mred\x1b[0m\n"),
+            "remote: \\u{1b}[31mred\\u{1b}[0m"
+        );
     }
 }

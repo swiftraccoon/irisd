@@ -1,19 +1,28 @@
 //! Integration tests over a temporary database file.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::Barrier;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
+use rusqlite::Connection;
+use rusqlite::types::Value;
 use tempfile::TempDir;
 
 use iris_catalog::{
-    CatalogError, CatalogHandle, Change, EventCursor, EventId, EventProtectionCursor, NewSegment,
-    OPEN_SEGMENT_GRACE, TimeRange,
+    CatalogError, CatalogHandle, Change, DeleteMarkResult, EventCursor, EventId, NewSegment,
+    OPEN_SEGMENT_GRACE, SegmentRow, TimeRange,
 };
 use iris_core::event::{Event, EventKind, EventSource, EventState};
-use iris_core::id::{CameraId, StreamKey, StreamKind};
+use iris_core::id::{CameraId, RootIdentity, StreamKey, StreamKind};
 use iris_core::time::WallUs;
 use iris_mp4::init::SampleEntry;
+
+/// A limit above any row count these tests create, for whole-stream listings.
+const ALL_ROWS: usize = 10_000;
 
 fn open() -> (TempDir, CatalogHandle) {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -64,15 +73,32 @@ fn progress(path: &str, fragments: u32, wall_end: WallUs) -> Change {
     }
 }
 
-async fn listed(
-    catalog: &CatalogHandle,
-    from: WallUs,
-    to: WallUs,
-) -> Vec<iris_catalog::SegmentRow> {
+async fn listed(catalog: &CatalogHandle, from: WallUs, to: WallUs) -> Vec<SegmentRow> {
     catalog
-        .segments(&key(), TimeRange { from, to })
+        .segments_limited(&key(), TimeRange { from, to }, ALL_ROWS)
         .await
         .expect("segment listing")
+}
+
+/// Every event in `range`, oldest first, through the paged listing.
+async fn all_events(
+    catalog: &CatalogHandle,
+    camera: Option<&CameraId>,
+    range: TimeRange,
+) -> Vec<iris_catalog::EventRow> {
+    catalog
+        .events_after(camera, range, None, ALL_ROWS)
+        .await
+        .expect("event listing")
+}
+
+/// The oldest unprotected sealed rows of every root, as retention sees them.
+async fn oldest_unprotected(catalog: &CatalogHandle, limit: usize) -> Vec<SegmentRow> {
+    catalog
+        .retention_candidates(None, None, WallUs::new(i64::MAX), Duration::ZERO, limit)
+        .await
+        .expect("retention page")
+        .rows
 }
 
 fn event(camera: &str, nvr_time: i64, kind: EventKind) -> Event {
@@ -106,23 +132,34 @@ async fn sealed_pagination_preserves_equal_start_times_after_notifications() {
             media_end: 90_000,
         });
     }
-    let first = catalog.oldest_sealed(1).await.unwrap().remove(0);
-    let remaining = catalog
-        .oldest_sealed_after((first.wall_start, first.id), 2)
+    let now = WallUs::new(i64::MAX);
+    let first = catalog
+        .retention_candidates(None, None, now, Duration::ZERO, 1)
         .await
         .unwrap();
-    assert_eq!(remaining.len(), 2);
+    assert_eq!(first.rows.len(), 1, "{first:?}");
+    let remaining = catalog
+        .retention_candidates(None, first.next, now, Duration::ZERO, 2)
+        .await
+        .unwrap()
+        .rows;
+    assert_eq!(remaining.len(), 2, "{remaining:?}");
+    let first = &first.rows[0];
     assert!(
         remaining
             .iter()
-            .all(|row| row.wall_start == first.wall_start)
+            .all(|row| row.wall_start == first.wall_start),
+        "{remaining:?}"
     );
-    assert!(first.id < remaining[0].id && remaining[0].id < remaining[1].id);
+    assert!(
+        first.id < remaining[0].id && remaining[0].id < remaining[1].id,
+        "{first:?} then {remaining:?}"
+    );
     catalog.shutdown();
 }
 
 #[tokio::test]
-async fn cameras_round_trip() {
+async fn ensure_camera_replaces_name_and_vendor() {
     let (_dir, catalog) = open();
     catalog
         .ensure_camera(&camera(), "Example", Some("dahua"))
@@ -177,17 +214,8 @@ async fn segment_lifecycle_is_observed_in_order() {
 
     // An unsealed row with durable fragments extends past its last progress by
     // the listing grace, capped at the present.
-    let overlapping = catalog
-        .segments(
-            &key(),
-            TimeRange {
-                from: WallUs::new(8_000_000),
-                to: WallUs::new(9_000_000),
-            },
-        )
-        .await
-        .unwrap();
-    assert_eq!(overlapping.len(), 1);
+    let overlapping = listed(&catalog, WallUs::new(8_000_000), WallUs::new(9_000_000)).await;
+    assert_eq!(overlapping.len(), 1, "{overlapping:?}");
 
     catalog.notify(Change::SegmentSealed {
         path: PathBuf::from("/v/a.mp4"),
@@ -204,38 +232,11 @@ async fn segment_lifecycle_is_observed_in_order() {
     );
 
     // Sealed rows overlap only their own interval.
-    let before = catalog
-        .segments(
-            &key(),
-            TimeRange {
-                from: WallUs::new(0),
-                to: WallUs::new(1_000_000),
-            },
-        )
-        .await
-        .unwrap();
+    let before = listed(&catalog, WallUs::new(0), WallUs::new(1_000_000)).await;
     assert!(before.is_empty(), "range ending at the start excludes it");
-    let inside = catalog
-        .segments(
-            &key(),
-            TimeRange {
-                from: WallUs::new(8_000_000),
-                to: WallUs::new(20_000_000),
-            },
-        )
-        .await
-        .unwrap();
-    assert_eq!(inside.len(), 1);
-    let after = catalog
-        .segments(
-            &key(),
-            TimeRange {
-                from: WallUs::new(9_000_000),
-                to: WallUs::new(20_000_000),
-            },
-        )
-        .await
-        .unwrap();
+    let inside = listed(&catalog, WallUs::new(8_000_000), WallUs::new(20_000_000)).await;
+    assert_eq!(inside.len(), 1, "{inside:?}");
+    let after = listed(&catalog, WallUs::new(9_000_000), WallUs::new(20_000_000)).await;
     assert_eq!(after.len(), 0, "range starting at the end excludes it");
     catalog.shutdown();
 }
@@ -269,9 +270,8 @@ async fn segment_limit_is_applied_in_start_order() {
     catalog.shutdown();
 }
 
-#[tokio::test]
-async fn retention_queries_order_and_delete() {
-    let (_dir, catalog) = open();
+/// Three sealed rows starting at 10, 20, and 30 and one open row.
+fn seed_sealed_rows(catalog: &CatalogHandle) {
     for (path, start) in [("/v/c.mp4", 30), ("/v/a.mp4", 10), ("/v/b.mp4", 20)] {
         catalog.notify(opened(path, start));
         catalog.notify(Change::SegmentSealed {
@@ -283,7 +283,13 @@ async fn retention_queries_order_and_delete() {
         });
     }
     catalog.notify(opened("/v/open.mp4", 40));
-    let oldest = catalog.oldest_sealed(2).await.unwrap();
+}
+
+#[tokio::test]
+async fn retention_candidates_come_oldest_first_and_skip_open_rows() {
+    let (_dir, catalog) = open();
+    seed_sealed_rows(&catalog);
+    let oldest = oldest_unprotected(&catalog, 2).await;
     assert_eq!(
         oldest
             .iter()
@@ -291,12 +297,38 @@ async fn retention_queries_order_and_delete() {
             .collect::<Vec<_>>(),
         vec!["/v/a.mp4", "/v/b.mp4"]
     );
-    let writing = catalog.writing_segments().await.unwrap();
-    assert_eq!(writing.len(), 1);
-    assert_eq!(writing[0].path, PathBuf::from("/v/open.mp4"));
+    let writing = catalog.writing_segments_page(None, 512).await.unwrap();
+    assert_eq!(writing.len(), 1, "{writing:?}");
+    assert_eq!(writing[0].row.path, PathBuf::from("/v/open.mp4"));
+    assert_eq!(writing[0].root, None, "no root was configured");
+    catalog.shutdown();
+}
 
-    catalog.delete_segment(oldest[0].id).await.unwrap();
-    assert!(catalog.segment(oldest[0].id).await.unwrap().is_none());
+#[tokio::test]
+async fn a_marked_row_is_hidden_and_its_deletion_removes_it() {
+    let (_dir, catalog) = open();
+    seed_sealed_rows(&catalog);
+    let oldest = oldest_unprotected(&catalog, 1).await.remove(0);
+    assert_eq!(
+        catalog
+            .mark_deleting_if_unprotected(oldest.id, WallUs::new(i64::MAX), Duration::ZERO)
+            .await
+            .unwrap(),
+        DeleteMarkResult::Marked
+    );
+    assert!(catalog.segment(oldest.id).await.unwrap().is_none());
+    assert!(
+        catalog.contains_segment_path(&oldest.path).await.unwrap(),
+        "a marked row still owns its path"
+    );
+    let deleting = catalog.deleting_segments_page(None, 512).await.unwrap();
+    assert_eq!(deleting.len(), 1, "{deleting:?}");
+    assert_eq!(deleting[0].row.id, oldest.id);
+    let stats = catalog.stats().await.unwrap();
+    assert_eq!((stats.deleting_segments, stats.deleting_bytes), (1, 100));
+
+    catalog.delete_segment(oldest.id).await.unwrap();
+    assert!(!catalog.contains_segment_path(&oldest.path).await.unwrap());
     let stats = catalog.stats().await.unwrap();
     assert_eq!(
         (stats.segments, stats.sealed_bytes, stats.events),
@@ -306,7 +338,112 @@ async fn retention_queries_order_and_delete() {
 }
 
 #[tokio::test]
-async fn mark_sealed_and_adopt() {
+async fn deleting_an_unmarked_row_keeps_it() {
+    let (_dir, catalog) = open();
+    seed_sealed_rows(&catalog);
+    let oldest = oldest_unprotected(&catalog, 1).await.remove(0);
+    catalog.delete_segment(oldest.id).await.unwrap();
+    assert!(
+        catalog.segment(oldest.id).await.unwrap().is_some(),
+        "only a row in deletion intent is deleted"
+    );
+    catalog.shutdown();
+}
+
+#[tokio::test]
+async fn a_retained_event_protects_its_footage_from_the_atomic_mark() {
+    let (_dir, catalog) = open();
+    seed_sealed_rows(&catalog);
+    let now = WallUs::new(1_000);
+    let oldest = oldest_unprotected(&catalog, 1).await.remove(0);
+    let id = catalog
+        .insert_event(&event("cam1", 12, EventKind::Motion))
+        .await
+        .unwrap();
+    catalog
+        .retain_event(id, Some(now.offset(3_600_000_000)))
+        .await
+        .unwrap();
+    assert_eq!(
+        catalog
+            .mark_deleting_if_unprotected(oldest.id, now, Duration::ZERO)
+            .await
+            .unwrap(),
+        DeleteMarkResult::Protected
+    );
+    let page = catalog
+        .retention_candidates(None, None, now, Duration::ZERO, 10)
+        .await
+        .unwrap();
+    assert_eq!(page.scanned, 3, "every raw row is inspected");
+    assert_eq!(
+        page.rows.iter().map(|row| row.id).collect::<Vec<_>>(),
+        oldest_unprotected(&catalog, 10)
+            .await
+            .iter()
+            .filter(|row| row.id != oldest.id)
+            .map(|row| row.id)
+            .collect::<Vec<_>>(),
+        "the protected row is left out while its neighbours stay"
+    );
+    catalog.retain_event(id, None).await.unwrap();
+    assert_eq!(
+        catalog
+            .mark_deleting_if_unprotected(oldest.id, now, Duration::ZERO)
+            .await
+            .unwrap(),
+        DeleteMarkResult::Marked
+    );
+    catalog.shutdown();
+}
+
+#[tokio::test]
+async fn root_bound_marks_and_pages_see_only_their_root() {
+    let (_dir, catalog) = open();
+    let roots = [PathBuf::from("/v"), PathBuf::from("/w")];
+    catalog.configure_video_roots(&roots).await.unwrap();
+    for (path, start) in [("/v/a.mp4", 10), ("/w/b.mp4", 20)] {
+        catalog.notify(opened(path, start));
+        catalog.notify(Change::SegmentSealed {
+            path: PathBuf::from(path),
+            len: 100,
+            fragments: 1,
+            wall_end: WallUs::new(start + 5),
+            media_end: 1,
+        });
+    }
+    let now = WallUs::new(i64::MAX);
+    let only_w = catalog
+        .retention_candidates(Some(Path::new("/w")), None, now, Duration::ZERO, 10)
+        .await
+        .unwrap();
+    assert_eq!(only_w.rows.len(), 1, "{only_w:?}");
+    assert_eq!(only_w.rows[0].path, PathBuf::from("/w/b.mp4"));
+    let b = only_w.rows[0].id;
+    assert_eq!(
+        catalog.segment_root(b).await.unwrap(),
+        Some(PathBuf::from("/w"))
+    );
+    assert_eq!(
+        catalog
+            .mark_deleting_if_unprotected_at_root(b, Path::new("/v"), now, Duration::ZERO)
+            .await
+            .unwrap(),
+        DeleteMarkResult::NotFound,
+        "another root never marks the row"
+    );
+    assert_eq!(
+        catalog
+            .mark_deleting_if_unprotected_at_root(b, Path::new("/w"), now, Duration::ZERO)
+            .await
+            .unwrap(),
+        DeleteMarkResult::Marked
+    );
+    catalog.shutdown();
+}
+
+#[tokio::test]
+async fn mark_sealed_finalizes_an_open_row() {
     let (_dir, catalog) = open();
     catalog.notify(opened("/v/crashed.mp4", 100));
     catalog
@@ -329,11 +466,25 @@ async fn mark_sealed_and_adopt() {
         (row.bytes, row.fragments, row.media_end),
         (4096, 2, 360_000)
     );
+    catalog.shutdown();
+}
+
+#[tokio::test]
+async fn mark_sealed_rejects_an_unknown_path() {
+    let (_dir, catalog) = open();
     let missing = catalog
         .mark_sealed(&PathBuf::from("/v/none.mp4"), 1, 1, WallUs::new(1), 1)
         .await;
-    assert!(matches!(missing, Err(CatalogError::NotFound(_))));
+    assert!(
+        matches!(missing, Err(CatalogError::NotFound(_))),
+        "{missing:?}"
+    );
+    catalog.shutdown();
+}
 
+#[tokio::test]
+async fn adopting_without_a_sample_entry_records_unknown_codecs() {
+    let (_dir, catalog) = open();
     let id = catalog
         .adopt_segment(NewSegment {
             key: StreamKey {
@@ -378,18 +529,16 @@ async fn events_filter_by_camera_range_and_limit() {
     catalog.notify(Change::Event(event("cam2", 3_000, EventKind::Human)));
     catalog.notify(Change::Event(event("cam1", 4_000, EventKind::TimeChange)));
 
-    let all = catalog
-        .events(
-            None,
-            TimeRange {
-                from: WallUs::new(0),
-                to: WallUs::new(10_000),
-            },
-            100,
-        )
-        .await
-        .unwrap();
-    assert_eq!(all.len(), 4);
+    let all = all_events(
+        &catalog,
+        None,
+        TimeRange {
+            from: WallUs::new(0),
+            to: WallUs::new(10_000),
+        },
+    )
+    .await;
+    assert_eq!(all.len(), 4, "{all:?}");
     assert_eq!(all[0].id, first);
     assert_eq!(
         all[1].event.kind,
@@ -402,17 +551,18 @@ async fn events_filter_by_camera_range_and_limit() {
     assert_eq!(all[0].event.data.as_deref(), Some("{\"Region\":[0]}"));
 
     let cam1 = catalog
-        .events(
+        .events_after(
             Some(&camera()),
             TimeRange {
                 from: WallUs::new(1_500),
                 to: WallUs::new(10_000),
             },
+            None,
             1,
         )
         .await
         .unwrap();
-    assert_eq!(cam1.len(), 1);
+    assert_eq!(cam1.len(), 1, "{cam1:?}");
     assert_eq!(cam1[0].event.nvr_time, WallUs::new(2_000));
 
     let stats = catalog.stats().await.unwrap();
@@ -479,17 +629,15 @@ async fn every_other_kind_round_trips_without_aliasing_builtins() {
             .await
             .unwrap();
     }
-    let rows = catalog
-        .events(
-            None,
-            TimeRange {
-                from: WallUs::new(0),
-                to: WallUs::new(100),
-            },
-            100,
-        )
-        .await
-        .unwrap();
+    let rows = all_events(
+        &catalog,
+        None,
+        TimeRange {
+            from: WallUs::new(0),
+            to: WallUs::new(100),
+        },
+    )
+    .await;
     let actual: Vec<EventKind> = rows.into_iter().map(|row| row.event.kind).collect();
     let expected: Vec<EventKind> = codes
         .iter()
@@ -524,7 +672,7 @@ async fn malformed_persisted_values_fail_closed() {
     catalog.shutdown();
 
     {
-        let conn = rusqlite::Connection::open(&path).unwrap();
+        let conn = Connection::open(&path).unwrap();
         conn.execute(
             "UPDATE segment SET init_len = -1, discontinuity = 2 WHERE id = ?1",
             [segment.id.0],
@@ -532,14 +680,15 @@ async fn malformed_persisted_values_fail_closed() {
         .unwrap();
     }
     let catalog = CatalogHandle::open(&path).unwrap();
-    assert!(matches!(
-        catalog.segment(segment.id).await,
-        Err(CatalogError::Corrupt(_))
-    ));
+    let corrupt_segment = catalog.segment(segment.id).await;
+    assert!(
+        matches!(corrupt_segment, Err(CatalogError::Corrupt(_))),
+        "{corrupt_segment:?}"
+    );
     catalog.shutdown();
 
     {
-        let conn = rusqlite::Connection::open(&path).unwrap();
+        let conn = Connection::open(&path).unwrap();
         conn.execute(
             "UPDATE segment SET init_len = 768, discontinuity = 1, deleting = 2 WHERE id = ?1",
             [segment.id.0],
@@ -552,7 +701,7 @@ async fn malformed_persisted_values_fail_closed() {
     ));
 
     {
-        let conn = rusqlite::Connection::open(&path).unwrap();
+        let conn = Connection::open(&path).unwrap();
         conn.execute(
             "UPDATE segment SET deleting = 0 WHERE id = ?1",
             [segment.id.0],
@@ -565,19 +714,21 @@ async fn malformed_persisted_values_fail_closed() {
         .unwrap();
     }
     let catalog = CatalogHandle::open(&path).unwrap();
-    assert!(matches!(
-        catalog
-            .events(
-                None,
-                TimeRange {
-                    from: WallUs::new(0),
-                    to: WallUs::new(10_000),
-                },
-                10,
-            )
-            .await,
-        Err(CatalogError::Corrupt(_))
-    ));
+    let corrupt_events = catalog
+        .events_after(
+            None,
+            TimeRange {
+                from: WallUs::new(0),
+                to: WallUs::new(10_000),
+            },
+            None,
+            10,
+        )
+        .await;
+    assert!(
+        matches!(corrupt_events, Err(CatalogError::Corrupt(_))),
+        "{corrupt_events:?}"
+    );
     catalog.shutdown();
 }
 
@@ -595,11 +746,18 @@ async fn deleting_domain_is_validated_before_state_filtered_queries() {
         wall_end: WallUs::new(3_000),
         media_end: 90_000,
     });
-    assert_eq!(catalog.writing_segments().await.unwrap().len(), 1);
-    assert_eq!(catalog.oldest_sealed(10).await.unwrap().len(), 1);
+    assert_eq!(
+        catalog
+            .writing_segments_page(None, 512)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(oldest_unprotected(&catalog, 10).await.len(), 1);
     catalog.shutdown();
 
-    let conn = rusqlite::Connection::open(&path).unwrap();
+    let conn = Connection::open(&path).unwrap();
     conn.execute("UPDATE segment SET deleting = 2", []).unwrap();
     conn.pragma_update(None, "journal_mode", "DELETE").unwrap();
     drop(conn);
@@ -607,7 +765,7 @@ async fn deleting_domain_is_validated_before_state_filtered_queries() {
         CatalogHandle::open(&path),
         Err(CatalogError::Corrupt(_))
     ));
-    let conn = rusqlite::Connection::open(&path).unwrap();
+    let conn = Connection::open(&path).unwrap();
     let journal_mode: String = conn
         .pragma_query_value(None, "journal_mode", |row| row.get(0))
         .unwrap();
@@ -618,10 +776,10 @@ async fn deleting_domain_is_validated_before_state_filtered_queries() {
 async fn sealed_domain_is_validated_before_state_filtered_queries() {
     let dir = tempfile::tempdir().unwrap();
     let invalid = [
-        ("integer", rusqlite::types::Value::Integer(2)),
-        ("real", rusqlite::types::Value::Real(0.5)),
-        ("text", rusqlite::types::Value::Text("invalid".to_owned())),
-        ("blob", rusqlite::types::Value::Blob(vec![0xff])),
+        ("integer", Value::Integer(2)),
+        ("real", Value::Real(0.5)),
+        ("text", Value::Text("invalid".to_owned())),
+        ("blob", Value::Blob(vec![0xff])),
     ];
     for (name, value) in invalid {
         let path = dir.path().join(format!("sealed-{name}.db"));
@@ -635,11 +793,18 @@ async fn sealed_domain_is_validated_before_state_filtered_queries() {
             wall_end: WallUs::new(3_000),
             media_end: 90_000,
         });
-        assert_eq!(catalog.writing_segments().await.unwrap().len(), 1);
-        assert_eq!(catalog.oldest_sealed(10).await.unwrap().len(), 1);
+        assert_eq!(
+            catalog
+                .writing_segments_page(None, 512)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(oldest_unprotected(&catalog, 10).await.len(), 1);
         catalog.shutdown();
 
-        let conn = rusqlite::Connection::open(&path).unwrap();
+        let conn = Connection::open(&path).unwrap();
         conn.execute("UPDATE segment SET sealed = ?1", [value])
             .unwrap();
         conn.pragma_update(None, "journal_mode", "DELETE").unwrap();
@@ -650,7 +815,7 @@ async fn sealed_domain_is_validated_before_state_filtered_queries() {
         ));
         let wal = PathBuf::from(format!("{}-wal", path.to_string_lossy()));
         assert!(!wal.exists(), "{name} corruption created a WAL file");
-        let conn = rusqlite::Connection::open(&path).unwrap();
+        let conn = Connection::open(&path).unwrap();
         let journal_mode: String = conn
             .pragma_query_value(None, "journal_mode", |row| row.get(0))
             .unwrap();
@@ -678,7 +843,7 @@ async fn malformed_segment_aggregate_values_are_corruption() {
         .unwrap();
     catalog.shutdown();
     {
-        let conn = rusqlite::Connection::open(&path).unwrap();
+        let conn = Connection::open(&path).unwrap();
         conn.execute_batch("PRAGMA ignore_check_constraints = ON;")
             .unwrap();
         conn.execute(
@@ -711,7 +876,7 @@ async fn malformed_catalog_state_values_are_corruption() {
     catalog.shutdown();
 
     {
-        let conn = rusqlite::Connection::open(&path).unwrap();
+        let conn = Connection::open(&path).unwrap();
         conn.execute_batch("PRAGMA ignore_check_constraints = ON;")
             .unwrap();
         conn.execute(
@@ -743,17 +908,15 @@ async fn event_data_is_bounded() {
     ));
     big.kind = EventKind::Other("温".repeat(iris_core::event::MAX_EVENT_KIND_LEN));
     catalog.insert_event(&big).await.unwrap();
-    let rows = catalog
-        .events(
-            None,
-            TimeRange {
-                from: WallUs::new(0),
-                to: WallUs::new(10),
-            },
-            10,
-        )
-        .await
-        .unwrap();
+    let rows = all_events(
+        &catalog,
+        None,
+        TimeRange {
+            from: WallUs::new(0),
+            to: WallUs::new(10),
+        },
+    )
+    .await;
     assert_eq!(rows[0].event.data.as_deref(), Some(r#"{"truncated":true}"#));
     assert!(
         serde_json::from_str::<serde_json::Value>(
@@ -777,17 +940,15 @@ async fn event_listing_enforces_an_aggregate_payload_budget() {
         value.data = Some(payload.clone());
         catalog.insert_event(&value).await.unwrap();
     }
-    let rows = catalog
-        .events(
-            None,
-            TimeRange {
-                from: WallUs::new(0),
-                to: WallUs::new(1_000),
-            },
-            10_000,
-        )
-        .await
-        .unwrap();
+    let rows = all_events(
+        &catalog,
+        None,
+        TimeRange {
+            from: WallUs::new(0),
+            to: WallUs::new(1_000),
+        },
+    )
+    .await;
     let payload_bytes: usize = rows
         .iter()
         .filter_map(|row| row.event.data.as_ref())
@@ -796,41 +957,6 @@ async fn event_listing_enforces_an_aggregate_payload_budget() {
     rows.first().expect("event budget returned no rows");
     assert!(rows.len() < 140, "aggregate byte cap must end the page");
     assert!(payload_bytes <= 8 * 1024 * 1024);
-    catalog.shutdown();
-}
-
-#[tokio::test]
-async fn retained_protection_projection_is_bounded_and_pages_equal_times() {
-    let (_dir, catalog) = open();
-    let now = WallUs::new(10_000);
-    for _ in 0..515 {
-        let mut value = event("cam1", 1_000, EventKind::Motion);
-        value.data = Some("payload that the protection projection must not clone".repeat(100));
-        let id = catalog.insert_event(&value).await.unwrap();
-        catalog
-            .retain_event(id, Some(WallUs::new(i64::MAX)))
-            .await
-            .unwrap();
-    }
-    let first = catalog
-        .event_protections(now, None, usize::MAX)
-        .await
-        .unwrap();
-    assert_eq!(first.len(), 512);
-    let last = first.last().unwrap();
-    let second = catalog
-        .event_protections(
-            now,
-            Some(EventProtectionCursor {
-                retain_until: last.retain_until,
-                id: last.id,
-            }),
-            usize::MAX,
-        )
-        .await
-        .unwrap();
-    assert_eq!(second.len(), 3);
-    assert!(first.last().unwrap().id < second[0].id);
     catalog.shutdown();
 }
 
@@ -846,7 +972,7 @@ async fn shutdown_is_idempotent_and_closes_clones() {
 }
 
 #[tokio::test]
-async fn reopening_keeps_data_and_schema() {
+async fn reopening_keeps_camera_rows() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("irisd.db");
     let catalog = CatalogHandle::open(&path).unwrap();
@@ -864,8 +990,8 @@ async fn reopening_keeps_data_and_schema() {
 async fn metrics_count_batches_queries_and_waits() {
     let (_dir, catalog) = open();
     catalog.notify(opened("/v/m.mp4", 10));
-    let rows = catalog.writing_segments().await.unwrap();
-    assert_eq!(rows.len(), 1);
+    let rows = catalog.writing_segments_page(None, 512).await.unwrap();
+    assert_eq!(rows.len(), 1, "{rows:?}");
     let metrics = catalog.metrics();
     assert_eq!(metrics.batches(), 1);
     assert_eq!(metrics.changes(), 1);
@@ -885,13 +1011,13 @@ async fn stalled_sqlite_consumer_has_bounded_ingress_and_query_overload() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("catalog.db");
     let catalog = CatalogHandle::open(&path).unwrap();
-    let lock = rusqlite::Connection::open(&path).unwrap();
+    let lock = Connection::open(&path).unwrap();
     lock.execute_batch("BEGIN IMMEDIATE").unwrap();
     let metrics = catalog.metrics();
     let payload = Arc::new("x".repeat(iris_core::event::MAX_EVENT_DATA_LEN - 2));
-    let start = Arc::new(std::sync::Barrier::new(PRODUCERS + 1));
-    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let submitted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let start = Arc::new(Barrier::new(PRODUCERS + 1));
+    let stop = Arc::new(AtomicBool::new(false));
+    let submitted = Arc::new(AtomicUsize::new(0));
     let producers: Vec<_> = (0..PRODUCERS)
         .map(|_| {
             let catalog = catalog.clone();
@@ -899,10 +1025,10 @@ async fn stalled_sqlite_consumer_has_bounded_ingress_and_query_overload() {
             let start = Arc::clone(&start);
             let stop = Arc::clone(&stop);
             let submitted = Arc::clone(&submitted);
-            std::thread::spawn(move || {
+            thread::spawn(move || {
                 start.wait();
-                while !stop.load(std::sync::atomic::Ordering::Acquire) {
-                    let at = submitted.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                while !stop.load(Ordering::Acquire) {
+                    let at = submitted.fetch_add(1, Ordering::Relaxed);
                     let mut value = event(
                         "cam1",
                         i64::try_from(at).unwrap_or(i64::MAX),
@@ -915,22 +1041,33 @@ async fn stalled_sqlite_consumer_has_bounded_ingress_and_query_overload() {
         })
         .collect();
     start.wait();
-    let overload_deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    while metrics.rejected_events() == 0 && std::time::Instant::now() < overload_deadline {
-        std::thread::yield_now();
+    let overload_deadline = Instant::now() + Duration::from_secs(10);
+    while metrics.rejected_events() == 0 && Instant::now() < overload_deadline {
+        thread::yield_now();
     }
     let overloaded_query = catalog.stats().await;
-    stop.store(true, std::sync::atomic::Ordering::Release);
+    stop.store(true, Ordering::Release);
     for producer in producers {
         producer.join().unwrap();
     }
-    assert!(metrics.queue_depth() <= 2_048);
-    assert!(metrics.queue_bytes() <= 16 * 1024 * 1024);
-    assert!(metrics.rejected_events() > 0);
-    assert!(matches!(overloaded_query, Err(CatalogError::Overloaded)));
+    assert!(
+        metrics.queue_depth() <= 2_048,
+        "queue depth {}",
+        metrics.queue_depth()
+    );
+    assert!(
+        metrics.queue_bytes() <= 16 * 1024 * 1024,
+        "queue bytes {}",
+        metrics.queue_bytes()
+    );
+    assert!(metrics.rejected_events() > 0, "no event was rejected");
+    assert!(
+        matches!(overloaded_query, Err(CatalogError::Overloaded)),
+        "query under a stalled consumer returned {overloaded_query:?}"
+    );
 
     lock.execute_batch("COMMIT").unwrap();
-    let stats = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+    let stats = tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             match catalog.stats().await {
                 Err(CatalogError::Overloaded) => tokio::task::yield_now().await,
@@ -941,9 +1078,12 @@ async fn stalled_sqlite_consumer_has_bounded_ingress_and_query_overload() {
     .await
     .expect("bounded backlog did not drain")
     .unwrap();
-    assert!(stats.events > 0);
+    assert!(stats.events > 0, "no event was committed");
+    let submitted = u64::try_from(submitted.load(Ordering::Relaxed)).unwrap();
     assert!(
-        stats.events < u64::try_from(submitted.load(std::sync::atomic::Ordering::Relaxed)).unwrap()
+        stats.events < submitted,
+        "{} events committed of {submitted} submitted",
+        stats.events
     );
     catalog.shutdown();
 }
@@ -957,7 +1097,7 @@ async fn event_commit_latency_is_recorded() {
     assert_eq!(stats.events, 1);
     let commit = catalog.metrics().event_commit().snapshot();
     assert_eq!(commit.count(), 1);
-    assert!(commit.max() >= std::time::Duration::from_millis(1));
+    assert!(commit.max() >= Duration::from_millis(1), "{commit:?}");
     catalog.shutdown();
 }
 
@@ -1008,32 +1148,65 @@ async fn retained_events_are_marked_listed_and_cleared() {
         .await
         .unwrap();
     let now = WallUs::new(1_700_000_100_000_000);
-    assert_eq!(catalog.retained_events(now).await.unwrap().len(), 0);
+    let listed = || {
+        catalog.events_after(
+            None,
+            TimeRange {
+                from: WallUs::new(0),
+                to: WallUs::new(i64::MAX),
+            },
+            None,
+            16,
+        )
+    };
+    assert_eq!(listed().await.unwrap()[0].retain_until, None);
     let row = catalog
         .retain_event(id, Some(now.offset(3_600_000_000)))
         .await
         .unwrap();
     assert_eq!(row.id, id);
     assert_eq!(row.retain_until, Some(now.offset(3_600_000_000)));
-    let retained = catalog.retained_events(now).await.unwrap();
-    assert_eq!(retained.len(), 1);
-    assert_eq!(retained[0].id, id);
-    // Past its time it no longer counts; cleared, it is gone for good.
-    assert_eq!(
-        catalog
-            .retained_events(now.offset(7_200_000_000))
-            .await
-            .unwrap()
-            .len(),
-        0
-    );
+    let rows = listed().await.unwrap();
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].id, id);
+    assert_eq!(rows[0].retain_until, Some(now.offset(3_600_000_000)));
+    // Cleared, the mark is gone for good.
     let cleared = catalog.retain_event(id, None).await.unwrap();
     assert_eq!(cleared.retain_until, None);
-    assert_eq!(catalog.retained_events(now).await.unwrap().len(), 0);
+    assert_eq!(listed().await.unwrap()[0].retain_until, None);
     assert!(matches!(
         catalog.retain_event(EventId(999), None).await,
-        Err(CatalogError::UnknownEvent(999))
+        Err(CatalogError::UnknownEvent(EventId(999)))
     ));
+    catalog.shutdown();
+}
+
+#[tokio::test]
+async fn root_registration_is_idempotent_and_rejects_conflicts() {
+    let (_dir, catalog) = open();
+    let identity: RootIdentity = "0123456789abcdef0123456789abcdef".parse().unwrap();
+    let other: RootIdentity = "fedcba9876543210fedcba9876543210".parse().unwrap();
+    let root = Path::new("/srv/video");
+    catalog
+        .register_recording_root(root, identity)
+        .await
+        .unwrap();
+    catalog
+        .register_recording_root(root, identity)
+        .await
+        .unwrap();
+    let mismatch = catalog.register_recording_root(root, other).await;
+    assert!(
+        matches!(&mismatch, Err(CatalogError::RootIdentityMismatch(path)) if path == root),
+        "{mismatch:?}"
+    );
+    let in_use = catalog
+        .register_recording_root(Path::new("/srv/other"), identity)
+        .await;
+    assert!(
+        matches!(&in_use, Err(CatalogError::RootIdentityInUse(path)) if path == root),
+        "{in_use:?}"
+    );
     catalog.shutdown();
 }
 
@@ -1118,16 +1291,13 @@ async fn a_progressing_open_row_reaches_the_present() {
 /// Holds SQLite's write lock from a second connection for `hold`, as an operator
 /// shell, a checkpoint, or a backup tool would, and returns the instant just
 /// before the lock was released.
-fn hold_write_lock(
-    path: &std::path::Path,
-    hold: std::time::Duration,
-) -> std::thread::JoinHandle<std::time::Instant> {
-    let lock = rusqlite::Connection::open(path).expect("second connection");
+fn hold_write_lock(path: &Path, hold: Duration) -> JoinHandle<Instant> {
+    let lock = Connection::open(path).expect("second connection");
     lock.execute_batch("BEGIN IMMEDIATE")
         .expect("external write lock");
-    std::thread::spawn(move || {
-        std::thread::sleep(hold);
-        let released = std::time::Instant::now();
+    thread::spawn(move || {
+        thread::sleep(hold);
+        let released = Instant::now();
         lock.execute_batch("COMMIT")
             .expect("release the external write lock");
         released
@@ -1138,19 +1308,19 @@ fn hold_write_lock(
 /// checks that it waited for the lock instead of failing.
 async fn waits_for_the_write_lock<T>(
     name: &str,
-    path: &std::path::Path,
+    path: &Path,
     operation: impl Future<Output = Result<T, CatalogError>>,
 ) -> T {
-    const HOLD: std::time::Duration = std::time::Duration::from_millis(250);
-    const MIN_WAIT: std::time::Duration = std::time::Duration::from_millis(150);
+    const HOLD: Duration = Duration::from_millis(250);
+    const MIN_WAIT: Duration = Duration::from_millis(150);
 
     let holder = hold_write_lock(path, HOLD);
-    let started = std::time::Instant::now();
+    let started = Instant::now();
     let value = match operation.await {
         Ok(value) => value,
         Err(error) => panic!("{name} failed under an external write lock: {error}"),
     };
-    let completed = std::time::Instant::now();
+    let completed = Instant::now();
     let released = holder.join().expect("lock holder thread");
     assert!(
         completed >= released,
@@ -1187,15 +1357,39 @@ async fn write_paths_wait_for_an_external_write_lock() {
     )
     .await;
     assert_eq!(row.retain_until, Some(WallUs::new(i64::MAX)));
+    let identity: RootIdentity = "0123456789abcdef0123456789abcdef".parse().unwrap();
     waits_for_the_write_lock(
         "register_recording_root",
         &path,
-        catalog.register_recording_root(
-            std::path::Path::new("/srv/video"),
-            "0123456789abcdef0123456789abcdef",
-        ),
+        catalog.register_recording_root(Path::new("/srv/video"), identity),
     )
     .await;
+    waits_for_the_write_lock(
+        "ensure_camera",
+        &path,
+        catalog.ensure_camera(&camera(), "front", None),
+    )
+    .await;
+    catalog.notify(opened("/v/locked.mp4", 1_000));
+    let open_row = catalog
+        .segment_by_path(Path::new("/v/locked.mp4"))
+        .await
+        .unwrap()
+        .unwrap();
+    waits_for_the_write_lock(
+        "mark_sealed",
+        &path,
+        catalog.mark_sealed(Path::new("/v/locked.mp4"), 100, 1, WallUs::new(2_000), 1),
+    )
+    .await;
+    let marked = waits_for_the_write_lock(
+        "mark_deleting_if_unprotected",
+        &path,
+        catalog.mark_deleting_if_unprotected(open_row.id, WallUs::new(i64::MAX), Duration::ZERO),
+    )
+    .await;
+    assert_eq!(marked, DeleteMarkResult::Marked);
+    waits_for_the_write_lock("delete_segment", &path, catalog.delete_segment(open_row.id)).await;
 
     let failures = catalog.metrics().failures();
     let stats = waits_for_the_write_lock("an event-first batch", &path, async {

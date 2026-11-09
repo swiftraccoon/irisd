@@ -1,5 +1,6 @@
-# Formatting follows the Rust Style Guide (docs/standards/rust-style-guide/) as implemented
-# by rustfmt, plus the stable options the Google Rust style guide recommends.
+# Formatting follows the Rust Style Guide
+# (.rust-reference/references/rust-style-guide/src/doc/style-guide/src/) as implemented by
+# rustfmt; STANDARDS.md §2 lists these options.
 style_edition = "2024"
 max_width = 100
 newline_style = "Unix"

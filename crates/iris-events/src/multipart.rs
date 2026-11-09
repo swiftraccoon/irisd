@@ -13,22 +13,26 @@ pub const MAX_PART_LEN: usize = 256 * 1024;
 const MAX_SYNTAX_LEN: usize = 16 * 1024;
 /// Longest line ending that separates a body from its following boundary.
 const MAX_BODY_SEPARATOR_LEN: usize = 2;
-/// Longest accepted MIME boundary parameter.
-const MAX_BOUNDARY_LEN: usize = 256;
+/// Longest MIME boundary parameter [`boundary_from_content_type`] accepts.
+pub const MAX_BOUNDARY_LEN: usize = 256;
 
 /// Boundary used when the response does not name one.
 pub const DEFAULT_BOUNDARY: &str = "myboundary";
 
 /// Errors that end a feed session.
 #[derive(Clone, Debug, PartialEq, Eq, Error)]
+#[non_exhaustive]
 pub enum MultipartError {
-    /// A part grew past [`MAX_PART_LEN`] without completing.
-    #[error("multipart part exceeds {MAX_PART_LEN} bytes")]
+    /// A part passed the reader's bound: its body grew past [`MAX_PART_LEN`]
+    /// without completing, its `Content-Length` declared more, or the headers
+    /// and boundary lines around it filled the syntax allowance.
+    #[error("multipart part or its framing exceeds the {MAX_PART_LEN}-byte bound")]
     PartTooLarge,
 }
 
 /// Extracts the boundary from a `Content-Type` header value such as
-/// `multipart/x-mixed-replace; boundary=myboundary`.
+/// `multipart/x-mixed-replace; boundary=myboundary`; `None` without one, or
+/// for a boundary longer than [`MAX_BOUNDARY_LEN`] bytes.
 #[must_use]
 pub fn boundary_from_content_type(content_type: &str) -> Option<String> {
     content_type.split(';').map(str::trim).find_map(|param| {
@@ -92,12 +96,17 @@ pub struct MultipartReader {
     max_part: usize,
     consumed: usize,
     state: ParseState,
+    /// The error that ended the stream; every later push repeats it.
+    failed: Option<MultipartError>,
     #[cfg(any(test, feature = "fuzzing"))]
     examined: usize,
 }
 
 impl MultipartReader {
     /// Creates a reader for the given boundary (without the leading `--`).
+    /// The boundary is expected as [`boundary_from_content_type`] returns it,
+    /// at most [`MAX_BOUNDARY_LEN`] bytes: the reader's buffer bound grows
+    /// with its length.
     #[must_use]
     pub fn new(boundary: &str) -> Self {
         let mut delimiter = Vec::with_capacity(boundary.len() + 2);
@@ -109,14 +118,39 @@ impl MultipartReader {
             max_part: MAX_PART_LEN,
             consumed: 0,
             state: ParseState::SeekingBoundary { scan: 0 },
+            failed: None,
             #[cfg(any(test, feature = "fuzzing"))]
             examined: 0,
         }
     }
 
     /// Feeds bytes and returns the bodies of every part completed so far.
+    ///
+    /// # Errors
+    ///
+    /// [`MultipartError::PartTooLarge`] once a part or its framing passes the
+    /// bound. Parts completed before that are not lost: the push that hits the
+    /// bound returns them when there are any, and that push otherwise, and
+    /// every later push, returns the error.
     pub fn push(&mut self, chunk: &[u8]) -> Result<Vec<Vec<u8>>, MultipartError> {
+        if let Some(error) = &self.failed {
+            return Err(error.clone());
+        }
         let mut parts = Vec::new();
+        match self.push_parts(chunk, &mut parts) {
+            Ok(()) => Ok(parts),
+            Err(error) => {
+                self.failed = Some(error.clone());
+                if parts.is_empty() {
+                    Err(error)
+                } else {
+                    Ok(parts)
+                }
+            }
+        }
+    }
+
+    fn push_parts(&mut self, chunk: &[u8], parts: &mut Vec<Vec<u8>>) -> Result<(), MultipartError> {
         let mut offset = 0;
         loop {
             while let Some(body) = self.next_part()? {
@@ -124,7 +158,7 @@ impl MultipartReader {
             }
             self.compact();
             if offset == chunk.len() {
-                return Ok(parts);
+                return Ok(());
             }
             let maximum = self.maximum_buffer_len();
             let available = maximum.saturating_sub(self.buf.len());
@@ -441,6 +475,15 @@ mod tests {
         assert_eq!(texts.len(), 4);
         assert_eq!(texts[1], "Code=VideoMotion;action=Start;index=0");
         assert_eq!(texts[3], "Code=VideoLoss;action=Stop;index=0");
+    }
+
+    #[test]
+    fn completed_parts_are_delivered_before_a_later_failure() {
+        let mut reader = MultipartReader::new("myboundary");
+        let feed = b"--myboundary\r\nContent-Length: 9\r\n\r\nHeartbeat\r\n--myboundary\r\nContent-Length: 999999999\r\n\r\nx";
+        assert_eq!(reader.push(feed).unwrap(), [b"Heartbeat".to_vec()]);
+        assert_eq!(reader.push(b"more"), Err(MultipartError::PartTooLarge));
+        assert_eq!(reader.push(b""), Err(MultipartError::PartTooLarge));
     }
 
     #[test]

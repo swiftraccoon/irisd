@@ -34,6 +34,10 @@ const WSD_MULTICAST: &str = "239.255.255.250:3702";
 const WSD_MULTICAST_ADDR: std::net::Ipv4Addr = std::net::Ipv4Addr::new(239, 255, 255, 250);
 /// Maximum UDP datagram size (IPv4 theoretical maximum).
 const UDP_MAX_SIZE: usize = 65_535;
+/// Most probe answers one multicast probe keeps; later datagrams are dropped.
+pub const MAX_PROBE_DATAGRAMS: usize = 256;
+/// Most bytes of probe answers one multicast probe keeps, over every listener.
+pub const MAX_PROBE_BYTES: usize = 4 * 1024 * 1024;
 
 // ── DiscoveredDevice ──────────────────────────────────────────────────────────
 
@@ -502,10 +506,12 @@ async fn probe_once_on(
                     Ok(Ok((len, _))) => {
                         // Recover from mutex poison (another listener task panicked)
                         // rather than propagating the panic across all listeners.
-                        received
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .push(buf[..len].to_vec());
+                        let mut kept = received.lock().unwrap_or_else(|e| e.into_inner());
+                        // Any host that sees the probe can flood its source port with
+                        // answers; keep the retained datagrams bounded by count and bytes.
+                        if !retain_datagram(&mut kept, &buf[..len]) {
+                            break;
+                        }
                     }
                     Ok(Err(_)) => continue, // WSAECONNRESET / transient error — keep waiting
                     Err(_) => break,        // timeout elapsed
@@ -532,6 +538,17 @@ async fn probe_once_on(
         .unwrap_or_else(|e| e.into_inner());
 
     Ok(raw)
+}
+
+/// Appends `datagram` to `kept` unless that would pass `MAX_PROBE_DATAGRAMS`
+/// datagrams or `MAX_PROBE_BYTES` bytes in all; returns whether it was kept.
+fn retain_datagram(kept: &mut Vec<Vec<u8>>, datagram: &[u8]) -> bool {
+    let bytes: usize = kept.iter().map(Vec::len).sum();
+    if kept.len() >= MAX_PROBE_DATAGRAMS || bytes.saturating_add(datagram.len()) > MAX_PROBE_BYTES {
+        return false;
+    }
+    kept.push(datagram.to_vec());
+    true
 }
 
 /// Returns all non-loopback IPv4 addresses assigned to local interfaces.
@@ -1297,6 +1314,27 @@ mod tests {
         let stream = vec![hello_xml(ep, "http://x"), bye_xml(ep)];
         let events = replay(&stream);
         assert_eq!(events.len(), 2);
+    }
+
+    #[test]
+    fn test_retain_datagram_caps_the_count() {
+        let mut kept = Vec::new();
+        for _ in 0..MAX_PROBE_DATAGRAMS {
+            assert!(retain_datagram(&mut kept, b"<ProbeMatch/>"));
+        }
+        assert!(!retain_datagram(&mut kept, b"<ProbeMatch/>"));
+        assert_eq!(kept.len(), MAX_PROBE_DATAGRAMS);
+    }
+
+    #[test]
+    fn test_retain_datagram_caps_the_bytes() {
+        let mut kept = Vec::new();
+        let large = vec![b'x'; MAX_PROBE_BYTES / 4];
+        for _ in 0..4 {
+            assert!(retain_datagram(&mut kept, &large));
+        }
+        assert!(!retain_datagram(&mut kept, b"x"));
+        assert_eq!(kept.len(), 4);
     }
 
     // ── End-to-end UDP probe test ─────────────────────────────────────────────

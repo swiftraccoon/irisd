@@ -21,17 +21,30 @@ pub const PRFT_FLAGS: u32 = 0x18;
 pub const TRAILER_LEN: usize = 24;
 /// Magic inside the `free` trailer.
 pub const TRAILER_MAGIC: [u8; 4] = *b"IRX1";
-/// Largest `moof` irisd writes or accepts (a fragment of 65 535 samples).
+/// Largest `moof` irisd writes or accepts, in both readers (a fragment of
+/// 65 535 samples).
 pub const MAX_MOOF_LEN: usize = 1 << 20;
-/// Largest `mdat` payload irisd writes or accepts.
+/// Largest `mdat` payload irisd writes or accepts, in both readers.
 pub const MAX_PAYLOAD_LEN: u64 = 1 << 30;
+/// Smallest `prft` box the readers accept: version 0 with a 32-bit media time.
+pub(crate) const MIN_PRFT_LEN: u64 = 24;
+/// Largest `prft` box the readers accept.
+pub(crate) const MAX_PRFT_LEN: u64 = 64;
 
-const TFHD_DEFAULT_BASE_IS_MOOF: u32 = 0x02_0000;
-const TFHD_DEFAULT_SAMPLE_FLAGS_PRESENT: u32 = 0x20;
-const TRUN_DATA_OFFSET_PRESENT: u32 = 0x1;
-const TRUN_FIRST_SAMPLE_FLAGS_PRESENT: u32 = 0x4;
-const TRUN_SAMPLE_DURATION_PRESENT: u32 = 0x100;
-const TRUN_SAMPLE_SIZE_PRESENT: u32 = 0x200;
+pub(crate) const TFHD_BASE_DATA_OFFSET_PRESENT: u32 = 0x1;
+pub(crate) const TFHD_SAMPLE_DESCRIPTION_INDEX_PRESENT: u32 = 0x2;
+pub(crate) const TFHD_DEFAULT_SAMPLE_DURATION_PRESENT: u32 = 0x8;
+pub(crate) const TFHD_DEFAULT_SAMPLE_SIZE_PRESENT: u32 = 0x10;
+pub(crate) const TFHD_DEFAULT_SAMPLE_FLAGS_PRESENT: u32 = 0x20;
+pub(crate) const TFHD_DEFAULT_BASE_IS_MOOF: u32 = 0x02_0000;
+pub(crate) const TRUN_DATA_OFFSET_PRESENT: u32 = 0x1;
+pub(crate) const TRUN_FIRST_SAMPLE_FLAGS_PRESENT: u32 = 0x4;
+pub(crate) const TRUN_SAMPLE_DURATION_PRESENT: u32 = 0x100;
+pub(crate) const TRUN_SAMPLE_SIZE_PRESENT: u32 = 0x200;
+pub(crate) const TRUN_SAMPLE_FLAGS_PRESENT: u32 = 0x400;
+pub(crate) const TRUN_COMPOSITION_OFFSETS_PRESENT: u32 = 0x800;
+/// The `sample_is_non_sync_sample` bit of a `sample_flags` field.
+pub(crate) const SAMPLE_IS_NON_SYNC: u32 = 0x0001_0000;
 
 /// One access unit ready to be written: length-prefixed NAL units without
 /// parameter sets, its duration in media ticks, and whether it is a sync
@@ -75,7 +88,9 @@ pub struct Fragment {
     pub raw_rtp: u32,
     /// Whether a timing discontinuity precedes this fragment (a new run).
     pub new_run: bool,
-    /// The codec configuration in force for these samples.
+    /// The codec configuration in force for these samples, shared by every
+    /// fragment of a parameter-set epoch; the store compares entries with
+    /// `Arc::ptr_eq` before comparing bytes.
     pub sample_entry: Arc<SampleEntry>,
 }
 
@@ -101,6 +116,7 @@ impl Fragment {
 
 /// Errors from encoding a fragment.
 #[derive(Clone, Debug, PartialEq, Eq, Error)]
+#[non_exhaustive]
 pub enum FragmentError {
     /// A fragment needs at least one sample.
     #[error("fragment has no samples")]
@@ -116,7 +132,8 @@ pub enum FragmentError {
 /// The serialized parts of a fragment that surround the sample payloads:
 /// `prft` + `moof` + the `mdat` header before them and the trailer after.
 /// [`EncodedFragment::io_slices`] yields the exact on-disk order for one
-/// vectored write.
+/// vectored write. The trailer's length and CRC cover the samples the
+/// fragment was encoded from, so only those samples may be written with it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EncodedFragment {
     /// `prft` + `moof` + `mdat` header.
@@ -134,7 +151,8 @@ impl EncodedFragment {
         self.prefix.len() as u64 + self.payload_len + TRAILER_LEN as u64
     }
 
-    /// Returns the vectored-write view: prefix, each sample, trailer.
+    /// Returns the vectored-write view: prefix, each sample, trailer. `samples`
+    /// are the samples passed to [`encode_fragment`], in the same order.
     #[must_use]
     pub fn io_slices<'a>(&'a self, samples: &'a [Sample]) -> Vec<IoSlice<'a>> {
         let mut slices = Vec::with_capacity(samples.len() + 2);
@@ -145,7 +163,21 @@ impl EncodedFragment {
     }
 }
 
-/// Encodes the boxes around `samples`.
+/// Encodes the boxes around `samples`: `prft`, `moof`, and the `mdat` header
+/// as the prefix, and the trailer over the prefix and the sample bytes. Only
+/// the first sample's sync flag is encoded (as `first_sample_flags`); every
+/// later sample carries the `tfhd` non-sync default, so a fragment holds at
+/// most one random access point, at its start.
+///
+/// # Errors
+///
+/// [`FragmentError::Empty`] without samples, [`FragmentError::TooManySamples`]
+/// above 65,535 samples, and [`FragmentError::PayloadTooLarge`] above
+/// [`MAX_PAYLOAD_LEN`] bytes of payload.
+#[expect(
+    clippy::missing_panics_doc,
+    reason = "the conversions follow the sample-count and payload-size checks"
+)]
 pub fn encode_fragment(
     header: &FragmentHeader,
     samples: &[Sample],
@@ -213,11 +245,11 @@ pub fn encode_fragment(
     // data_offset is relative to the start of moof and points at the first
     // sample byte: moof length + mdat header.
     let moof_len = w.len() - moof_start;
-    let data_offset = i32::try_from(moof_len + 8).expect("moof under 2 GiB");
+    let data_offset = i32::try_from(moof_len + 8).expect("moof of at most 65 535 samples");
     let mut prefix = w.into_vec();
     prefix[data_offset_pos..data_offset_pos + 4].copy_from_slice(&data_offset.to_be_bytes());
 
-    let mdat_size = u32::try_from(payload_len + 8).expect("payload bounded above");
+    let mdat_size = u32::try_from(payload_len + 8).expect("payload at most MAX_PAYLOAD_LEN");
     prefix.extend_from_slice(&mdat_size.to_be_bytes());
     prefix.extend_from_slice(b"mdat");
 
@@ -227,8 +259,8 @@ pub fn encode_fragment(
         crc.update(&s.data);
     }
     let crc = crc.finish();
-    let fragment_len =
-        u32::try_from(prefix.len() as u64 + payload_len + TRAILER_LEN as u64).expect("bounded");
+    let fragment_len = u32::try_from(prefix.len() as u64 + payload_len + TRAILER_LEN as u64)
+        .expect("payload at most MAX_PAYLOAD_LEN and moof at most MAX_MOOF_LEN");
     let trailer = encode_trailer(crc, fragment_len);
 
     Ok(EncodedFragment {
@@ -328,13 +360,73 @@ mod tests {
         assert_eq!(trailer.crc, crc.finish());
     }
 
-    #[test]
-    fn rejects_empty() {
-        let h = FragmentHeader {
+    fn header() -> FragmentHeader {
+        FragmentHeader {
             sequence: 1,
             decode_time: 0,
             wall: WallUs::new(0),
-        };
-        assert_eq!(encode_fragment(&h, &[]).unwrap_err(), FragmentError::Empty);
+        }
+    }
+
+    #[test]
+    fn rejects_empty() {
+        assert_eq!(
+            encode_fragment(&header(), &[]).unwrap_err(),
+            FragmentError::Empty
+        );
+    }
+
+    #[test]
+    fn rejects_more_than_65535_samples() {
+        let samples: Vec<Sample> = (0..=usize::from(u16::MAX))
+            .map(|_| Sample {
+                data: Bytes::new(),
+                duration: 1,
+                is_sync: false,
+            })
+            .collect();
+        assert_eq!(
+            encode_fragment(&header(), &samples).unwrap_err(),
+            FragmentError::TooManySamples(65_536)
+        );
+    }
+
+    #[test]
+    fn rejects_payload_over_the_maximum() {
+        static ZEROS: [u8; 1 << 20] = [0; 1 << 20];
+        let samples: Vec<Sample> = (0..1_025)
+            .map(|_| Sample {
+                data: Bytes::from_static(&ZEROS),
+                duration: 1,
+                is_sync: false,
+            })
+            .collect();
+        assert_eq!(
+            encode_fragment(&header(), &samples).unwrap_err(),
+            FragmentError::PayloadTooLarge(1_025 << 20)
+        );
+    }
+
+    #[test]
+    fn decode_trailer_rejects_wrong_size_type_and_magic() {
+        let good = encode_trailer(1, 2);
+        assert_eq!(
+            decode_trailer(&good),
+            Some(Trailer {
+                crc: 1,
+                fragment_len: 2,
+                flags: 0
+            })
+        );
+        assert!(decode_trailer(&good[..TRAILER_LEN - 1]).is_none());
+        let mut wrong_size = good;
+        wrong_size[3] = 25;
+        assert!(decode_trailer(&wrong_size).is_none());
+        let mut wrong_type = good;
+        wrong_type[4..8].copy_from_slice(b"skip");
+        assert!(decode_trailer(&wrong_type).is_none());
+        let mut wrong_magic = good;
+        wrong_magic[8] = b'J';
+        assert!(decode_trailer(&wrong_magic).is_none());
     }
 }

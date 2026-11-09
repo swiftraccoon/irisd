@@ -4,135 +4,213 @@ version = "0.0.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 publish = false
+repository = "https://github.com/swiftraccoon/irisd"
+description = "cargo-fuzz targets for irisd's network-facing parsers"
 
 [package.metadata]
 cargo-fuzz = true
 
 [dependencies]
-bytes = "1"
-libfuzzer-sys = "0.4"
-iris-h265 = { path = "../crates/iris-h265" }
-iris-mp4 = { path = "../crates/iris-mp4" }
+anyhow = "1"
 iris-core = { path = "../crates/iris-core" }
 iris-events = { path = "../crates/iris-events", features = ["fuzzing"] }
+iris-h265 = { path = "../crates/iris-h265" }
+iris-mp4 = { path = "../crates/iris-mp4" }
 iris-replay = { path = "../crates/iris-replay" }
-iris-tools = { path = "../crates/iris-tools" }
+libfuzzer-sys = "0.4"
 log = "0.4"
 oxvif = "0.17"
 retina = { version = "0.4.21", features = ["h265"] }
+serde_json = "1"
+url = "2"
 
 [patch.crates-io]
 oxvif = { path = "../third_party/oxvif" }
 retina = { path = "../third_party/retina" }
 
+# The workspace's lint tables, repeated because this crate is not a member.
+[lints.rust]
+missing_docs = "warn"
+unsafe_code = "forbid"
+unused_qualifications = "warn"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+cast_possible_truncation = "allow"
+cast_possible_wrap = "allow"
+cast_precision_loss = "allow"
+cast_sign_loss = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+pedantic = { level = "warn", priority = -1 }
+struct_excessive_bools = "allow"
+
 [[bin]]
+bench = false
+doc = false
 name = "api_time"
 path = "fuzz_targets/api_time.rs"
 test = false
-doc = false
-bench = false
 
 [[bin]]
+bench = false
+doc = false
+name = "api_range"
+path = "fuzz_targets/api_range.rs"
+test = false
+
+[[bin]]
+bench = false
+doc = false
+name = "api_auth"
+path = "fuzz_targets/api_auth.rs"
+test = false
+
+[[bin]]
+bench = false
+doc = false
 name = "scan"
 path = "fuzz_targets/scan.rs"
 test = false
-doc = false
-bench = false
 
 [[bin]]
+bench = false
+doc = false
 name = "access_unit"
 path = "fuzz_targets/access_unit.rs"
 test = false
-doc = false
-bench = false
 
 [[bin]]
+bench = false
+doc = false
 name = "index"
 path = "fuzz_targets/index.rs"
 test = false
-doc = false
-bench = false
 
 [[bin]]
+bench = false
+doc = false
 name = "box_header"
 path = "fuzz_targets/box_header.rs"
 test = false
-doc = false
-bench = false
 
 [[bin]]
+bench = false
+doc = false
 name = "multipart"
 path = "fuzz_targets/multipart.rs"
 test = false
-doc = false
-bench = false
 
 [[bin]]
+bench = false
+doc = false
 name = "digest_challenge"
 path = "fuzz_targets/digest_challenge.rs"
 test = false
-doc = false
-bench = false
 
 [[bin]]
+bench = false
+doc = false
 name = "dahua_part"
 path = "fuzz_targets/dahua_part.rs"
 test = false
-doc = false
-bench = false
 
 [[bin]]
+bench = false
+doc = false
 name = "onvif_utc"
 path = "fuzz_targets/onvif_utc.rs"
 test = false
-doc = false
-bench = false
 
 [[bin]]
+bench = false
+doc = false
+name = "onvif_notification"
+path = "fuzz_targets/onvif_notification.rs"
+test = false
+
+[[bin]]
+bench = false
+doc = false
 name = "onvif_soap"
 path = "fuzz_targets/onvif_soap.rs"
 test = false
-doc = false
-bench = false
 
 [[bin]]
+bench = false
+doc = false
 name = "trailer"
 path = "fuzz_targets/trailer.rs"
 test = false
-doc = false
-bench = false
 
 [[bin]]
+bench = false
+doc = false
 name = "rtsp_request"
 path = "fuzz_targets/rtsp_request.rs"
 test = false
-doc = false
-bench = false
 
 [[bin]]
+bench = false
+doc = false
 name = "rtsp_message"
 path = "fuzz_targets/rtsp_message.rs"
 test = false
-doc = false
-bench = false
 
 [[bin]]
+bench = false
+doc = false
 name = "export_rebase"
 path = "fuzz_targets/export_rebase.rs"
 test = false
-doc = false
-bench = false
 
 [[bin]]
+bench = false
+doc = false
 name = "tools_protocol"
 path = "fuzz_targets/tools_protocol.rs"
 test = false
-doc = false
-bench = false
 
 [[bin]]
+bench = false
+doc = false
+name = "tools_logs"
+path = "fuzz_targets/tools_logs.rs"
+test = false
+
+[[bin]]
+bench = false
+doc = false
 name = "describe_diagnostics"
 path = "fuzz_targets/describe_diagnostics.rs"
 test = false
-doc = false
+
+[[bin]]
 bench = false
+doc = false
+name = "depacketize_h265"
+path = "fuzz_targets/depacketize_h265.rs"
+test = false
+
+[[bin]]
+bench = false
+doc = false
+name = "rtp_packet"
+path = "fuzz_targets/rtp_packet.rs"
+test = false
+
+[[bin]]
+bench = false
+doc = false
+name = "discovery_parts"
+path = "fuzz_targets/discovery_parts.rs"
+test = false
+
+[[bin]]
+bench = false
+doc = false
+name = "vod_playlist"
+path = "fuzz_targets/vod_playlist.rs"
+test = false

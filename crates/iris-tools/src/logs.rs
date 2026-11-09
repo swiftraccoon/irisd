@@ -1,11 +1,22 @@
 //! Parsing of the daemon's log lines: terminal controls removed, the
-//! timestamp and level split off, and `key=value` pairs read.
+//! timestamp and level split off, `key=value` pairs read, and the periodic
+//! statistics rows (`docs/research/07-architecture.md §9`) classified by series.
+//!
+//! The `tools_logs` fuzz target includes this file by path, so it uses nothing
+//! outside the standard library.
 
 use std::collections::BTreeMap;
-use std::io::{BufRead, Read as _};
+use std::fmt::Write as _;
+use std::io::{self, BufRead, ErrorKind, Read as _};
 
 /// Longest input line the report tools accept; the daemon's lines are far shorter.
 pub const MAX_LINE_BYTES: usize = 1 << 20;
+
+/// Longest escape string [`strip_ansi`] removes; a longer one is escaped instead.
+const MAX_ESCAPE_BYTES: usize = 4_096;
+
+/// The `key=value` fields of one line.
+pub type Fields = BTreeMap<String, String>;
 
 /// One line from a [`LineReader`].
 #[derive(Debug, PartialEq, Eq)]
@@ -20,6 +31,7 @@ pub struct InputLine<'a> {
 
 /// Reads input one line at a time into one reused buffer, so a report holds
 /// only what it keeps from each line rather than the whole file.
+#[derive(Debug)]
 pub struct LineReader<R> {
     reader: R,
     buffer: Vec<u8>,
@@ -38,7 +50,7 @@ impl<R: BufRead> LineReader<R> {
 
     /// The next line, `None` at the end of the input. A line longer than
     /// [`MAX_LINE_BYTES`] is an `InvalidData` error.
-    pub fn next_line(&mut self) -> std::io::Result<Option<InputLine<'_>>> {
+    pub fn next_line(&mut self) -> io::Result<Option<InputLine<'_>>> {
         self.buffer.clear();
         let limit = MAX_LINE_BYTES as u64 + 1;
         let read = (&mut self.reader)
@@ -55,8 +67,8 @@ impl<R: BufRead> LineReader<R> {
                 self.buffer.pop();
             }
         } else if read > MAX_LINE_BYTES {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
+            return Err(io::Error::new(
+                ErrorKind::InvalidData,
                 format!("line {} exceeds {MAX_LINE_BYTES} bytes", self.number),
             ));
         }
@@ -69,73 +81,67 @@ impl<R: BufRead> LineReader<R> {
 }
 
 /// Removes complete ECMA-48 escape strings and makes the remaining text safe
-/// to print to a terminal.  In particular, an unterminated control string can
-/// never consume printable text that follows it.
+/// to print to a terminal: every other control character and every bidirectional
+/// formatting character is written as a `\u{..}` escape. An unterminated control
+/// string never consumes the printable text that follows it.
 pub fn strip_ansi(line: &str) -> String {
     let mut out = String::with_capacity(line.len());
     let bytes = line.as_bytes();
     let mut index = 0usize;
-    while index < bytes.len() {
-        let c = line[index..]
-            .chars()
-            .next()
-            .expect("index is on a character boundary");
-        if c == '\x1b' {
-            let next = index + 1;
-            let complete = match bytes.get(next).copied() {
-                Some(b'[') => bytes[next + 1..]
-                    .iter()
-                    .take(4_096)
-                    .position(|byte| (b'@'..=b'~').contains(byte))
-                    .map(|offset| next + 2 + offset),
-                Some(b']' | b'P' | b'X' | b'^' | b'_') => {
-                    let end = (next + 1)..bytes.len().min(next + 1 + 4_096);
-                    let mut cursor = end.start;
-                    let mut complete = None;
-                    while cursor < end.end {
-                        if bytes[cursor] == b'\x07' {
-                            complete = Some(cursor + 1);
-                            break;
-                        }
-                        if bytes[cursor] == b'\x1b' && bytes.get(cursor + 1) == Some(&b'\\') {
-                            complete = Some(cursor + 2);
-                            break;
-                        }
-                        cursor += 1;
-                    }
-                    complete
-                }
-                Some(_) => Some(next + 1),
-                None => None,
-            };
-            if let Some(end) = complete {
-                index = end;
-                continue;
-            }
+    while let Some(c) = line.get(index..).and_then(|rest| rest.chars().next()) {
+        if c == '\x1b'
+            && let Some(end) = escape_end(bytes, index + 1)
+        {
+            index = end;
+            continue;
         }
-        if c.is_control() || is_bidi_control(c) {
-            use std::fmt::Write as _;
-            let _ = write!(out, "\\u{{{:x}}}", c as u32);
-        } else {
-            out.push(c);
-        }
+        push_safe(&mut out, c);
         index += c.len_utf8();
     }
     out
 }
 
-/// Escapes untrusted text without interpreting any of it as terminal control.
+/// The end of the escape string whose introducer follows an ESC at
+/// `next - 1`, or `None` when no complete string starts there. Every end lies
+/// just past an ASCII byte, so it falls on a character boundary.
+fn escape_end(bytes: &[u8], next: usize) -> Option<usize> {
+    match bytes.get(next).copied()? {
+        b'[' => bytes
+            .get(next + 1..)?
+            .iter()
+            .take(MAX_ESCAPE_BYTES)
+            .position(|byte| (b'@'..=b'~').contains(byte))
+            .map(|offset| next + 2 + offset),
+        b']' | b'P' | b'X' | b'^' | b'_' => {
+            let start = next + 1;
+            let end = bytes.len().min(start + MAX_ESCAPE_BYTES);
+            (start..end).find_map(|cursor| match bytes[cursor] {
+                b'\x07' => Some(cursor + 1),
+                b'\x1b' if bytes.get(cursor + 1) == Some(&b'\\') => Some(cursor + 2),
+                _ => None,
+            })
+        }
+        byte if byte.is_ascii() => Some(next + 1),
+        _ => None,
+    }
+}
+
+/// Escapes untrusted text without interpreting any of it as terminal control:
+/// control and bidirectional formatting characters become `\u{..}` escapes.
 pub fn terminal_safe(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     for c in text.chars() {
-        if c.is_control() || is_bidi_control(c) {
-            use std::fmt::Write as _;
-            let _ = write!(out, "\\u{{{:x}}}", c as u32);
-        } else {
-            out.push(c);
-        }
+        push_safe(&mut out, c);
     }
     out
+}
+
+fn push_safe(out: &mut String, c: char) {
+    if c.is_control() || is_bidi_control(c) {
+        let _ = write!(out, "\\u{{{:x}}}", u32::from(c));
+    } else {
+        out.push(c);
+    }
 }
 
 fn is_bidi_control(c: char) -> bool {
@@ -150,34 +156,43 @@ fn is_bidi_control(c: char) -> bool {
 }
 
 /// A log line split into its timestamp, level, and the rest.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Line<'a> {
-    pub ts: &'a str,
+    /// The RFC 3339 timestamp, as written.
+    pub timestamp: &'a str,
+    /// The level: `INFO`, `WARN`, `ERROR`, `DEBUG`, or `TRACE`.
     pub level: &'a str,
+    /// The message and its fields.
     pub rest: &'a str,
 }
 
 const LEVELS: [&str; 5] = ["INFO", "WARN", "ERROR", "DEBUG", "TRACE"];
 
-/// Splits `<ts> <LEVEL> <rest>` where the timestamp is the daemon's RFC 3339
-/// form; `None` for any other line.
+/// Splits `<timestamp> <LEVEL> <rest>`, where the timestamp has the shape of
+/// the daemon's RFC 3339 form; `None` for any other line. The caller parses
+/// the timestamp itself.
 pub fn split(line: &str) -> Option<Line<'_>> {
-    let mut parts = line.splitn(3, |c: char| c.is_whitespace());
-    let ts = parts.next()?;
-    if ts.len() < 20 || ts.as_bytes()[4] != b'-' || !ts.ends_with('Z') {
+    let mut parts = line.splitn(3, char::is_whitespace);
+    let timestamp = parts.next()?;
+    if timestamp.len() < 20 || timestamp.as_bytes()[4] != b'-' || !timestamp.ends_with('Z') {
         return None;
     }
-    let after = line[ts.len()..].trim_start();
+    let after = line[timestamp.len()..].trim_start();
     let level = after.split_whitespace().next()?;
     if !LEVELS.contains(&level) {
         return None;
     }
     let rest = after[level.len()..].trim_start();
-    Some(Line { ts, level, rest })
+    Some(Line {
+        timestamp,
+        level,
+        rest,
+    })
 }
 
-/// Reads every `key=value` pair; a quoted value loses its quotes.
-pub fn kv(text: &str) -> BTreeMap<String, String> {
+/// Reads every `key=value` pair; a quoted value loses its quotes, and a later
+/// pair replaces an earlier one with the same key.
+pub fn kv(text: &str) -> Fields {
     let mut out = BTreeMap::new();
     let mut rest = text;
     while let Some(eq) = rest.find('=') {
@@ -187,9 +202,9 @@ pub fn kv(text: &str) -> BTreeMap<String, String> {
             .map_or(0, |(i, c)| i + c.len_utf8());
         let key = &rest[key_start..eq];
         let after = &rest[eq + 1..];
-        let (value, consumed) = if let Some(q) = after.strip_prefix('"') {
-            let end = q.find('"').unwrap_or(q.len());
-            (&q[..end], end + 2)
+        let (value, consumed) = if let Some(quoted) = after.strip_prefix('"') {
+            let end = quoted.find('"').unwrap_or(quoted.len());
+            (&quoted[..end], end + 2)
         } else {
             let end = after.find(char::is_whitespace).unwrap_or(after.len());
             (&after[..end], end)
@@ -203,7 +218,7 @@ pub fn kv(text: &str) -> BTreeMap<String, String> {
 }
 
 /// Reads the root identity from the daemon's root statistics row. Paths may
-/// contain whitespace, so the following fixed field delimits the value.
+/// contain whitespace, so the last ` free_gib=` field delimits the value.
 pub fn root_identity(text: &str) -> Option<String> {
     let value = text.strip_prefix("root root=")?;
     value
@@ -212,80 +227,87 @@ pub fn root_identity(text: &str) -> Option<String> {
         .filter(|root| !root.is_empty())
 }
 
-/// A numeric field, if present and numeric.
-pub fn number(fields: &BTreeMap<String, String>, key: &str) -> Option<f64> {
+/// A numeric field, if present and finite.
+pub fn number(fields: &Fields, key: &str) -> Option<f64> {
     fields
         .get(key)
-        .and_then(|v| v.parse::<f64>().ok())
-        .filter(|v| v.is_finite())
+        .and_then(|value| value.parse::<f64>().ok())
+        .filter(|value| value.is_finite())
 }
 
-/// `-` for a missing value, else the value to `digits` decimals.
-pub fn fmt(value: Option<f64>, digits: usize) -> String {
-    value.map_or_else(|| "-".to_owned(), |v| format!("{v:.digits$}"))
+/// The daemon's periodic statistics kinds, the first word of each row.
+const STATISTICS_KINDS: [&str; 6] = ["stream", "events", "writer", "catalog", "root", "process"];
+
+/// The series a statistics row belongs to.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Series {
+    /// One stream's `stream` rows, by its `camera/kind` name.
+    Stream(String),
+    /// One event feed's `events` rows; feeds are independent per camera and source.
+    Events {
+        /// The camera id.
+        camera: String,
+        /// The event source, as the daemon writes it.
+        source: String,
+    },
+    /// One recording root's `root` rows.
+    Root(String),
+    /// The writer's rows.
+    Writer,
+    /// The catalog's rows.
+    Catalog,
+    /// The process rows.
+    Process,
 }
 
-/// The largest numeric value of `key` over the rows.
-pub fn col_max(rows: &[(f64, BTreeMap<String, String>)], key: &str) -> Option<f64> {
-    rows.iter()
-        .filter_map(|(_, d)| number(d, key))
-        .fold(None, |m, v| Some(m.map_or(v, |m: f64| m.max(v))))
+/// A line that has the shape of a statistics row.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Statistics<'a> {
+    /// A row of its series, with its fields; a root row's fields carry the
+    /// whole `root` path.
+    Row(Series, Fields),
+    /// An `INFO` line of a statistics kind, with fields, that lacks what its
+    /// series needs: a stream, camera, source, or root name, the writer's
+    /// `fragments`, or the catalog's `segments` and `gib`.
+    Malformed(&'a str),
 }
 
-/// The numeric values of `key` over the rows.
-pub fn col(rows: &[(f64, BTreeMap<String, String>)], key: &str) -> Vec<f64> {
-    rows.iter().filter_map(|(_, d)| number(d, key)).collect()
-}
-
-/// The arithmetic mean, `None` of an empty list.
-pub fn mean(values: &[f64]) -> Option<f64> {
-    if values.is_empty() {
-        None
-    } else {
-        Some(values.iter().sum::<f64>() / values.len() as f64)
-    }
-}
-
-/// The median (the mean of the two middle values for an even count).
-pub fn median(values: &[f64]) -> Option<f64> {
-    if values.is_empty() {
+/// Classifies an `INFO` line whose first word is a statistics kind and that
+/// carries `key=value` fields; `None` for every other line.
+pub fn statistics<'a>(line: &Line<'a>) -> Option<Statistics<'a>> {
+    let kind = line.rest.split(' ').next()?;
+    if line.level != "INFO" || !STATISTICS_KINDS.contains(&kind) || !line.rest.contains('=') {
         return None;
     }
-    let mut v = values.to_vec();
-    v.sort_by(f64::total_cmp);
-    let n = v.len();
-    Some(if n % 2 == 1 {
-        v[n / 2]
-    } else {
-        f64::midpoint(v[n / 2 - 1], v[n / 2])
+    let mut fields = kv(line.rest);
+    let named =
+        |fields: &Fields, key: &str| fields.get(key).filter(|value| !value.is_empty()).cloned();
+    let series = match kind {
+        "stream" => named(&fields, "stream").map(Series::Stream),
+        "events" => named(&fields, "camera")
+            .zip(named(&fields, "source"))
+            .map(|(camera, source)| Series::Events { camera, source }),
+        "root" => root_identity(line.rest).map(|root| {
+            fields.insert("root".to_owned(), root.clone());
+            Series::Root(root)
+        }),
+        "writer" => fields.contains_key("fragments").then_some(Series::Writer),
+        "catalog" => (fields.contains_key("segments") && fields.contains_key("gib"))
+            .then_some(Series::Catalog),
+        // The one kind left in `STATISTICS_KINDS`.
+        _ => Some(Series::Process),
+    };
+    Some(match series {
+        Some(series) => Statistics::Row(series, fields),
+        None => Statistics::Malformed(kind),
     })
-}
-
-/// Sum of the positive steps: a counter's growth across resets.
-pub fn growth(values: &[f64]) -> f64 {
-    values.windows(2).map(|w| (w[1] - w[0]).max(0.0)).sum()
-}
-
-/// Frames per second between consecutive samples of one stream.
-pub fn rates(rows: &[(f64, BTreeMap<String, String>)]) -> Vec<f64> {
-    rows.windows(2)
-        .filter_map(|w| {
-            let (t0, a) = &w[0];
-            let (t1, b) = &w[1];
-            let fa = number(a, "frames")?;
-            let fb = number(b, "frames")?;
-            (t1 > t0 && fb >= fa).then(|| (fb - fa) / (t1 - t0))
-        })
-        .collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn line_reader_matches_str_lines_and_bounds_each_line() {
-        let text = "a\nb\r\n\nc\r";
+    fn read_all(text: &str) -> Vec<(usize, String, bool)> {
         let mut reader = LineReader::new(text.as_bytes());
         let mut lines = Vec::new();
         while let Some(line) = reader.next_line().unwrap() {
@@ -295,6 +317,13 @@ mod tests {
                 line.terminated,
             ));
         }
+        lines
+    }
+
+    #[test]
+    fn line_reader_splits_like_str_lines() {
+        let text = "a\nb\r\n\nc\r";
+        let lines = read_all(text);
         assert_eq!(
             lines,
             [
@@ -311,7 +340,10 @@ mod tests {
                 .collect::<Vec<_>>(),
             text.lines().collect::<Vec<_>>()
         );
+    }
 
+    #[test]
+    fn line_reader_refuses_a_line_over_the_limit() {
         let mut exact = vec![b'x'; MAX_LINE_BYTES];
         exact.push(b'\n');
         exact.resize(exact.len() + MAX_LINE_BYTES + 1, b'y');
@@ -321,49 +353,73 @@ mod tests {
             MAX_LINE_BYTES
         );
         let error = reader.next_line().unwrap_err();
-        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(error.kind(), ErrorKind::InvalidData);
         assert!(error.to_string().contains("line 2"), "{error}");
     }
 
     #[test]
-    fn splits_lines_and_reads_pairs() {
+    fn splits_the_timestamp_and_level_off_a_coloured_line() {
         let line = strip_ansi(
-            "\x1b[2m2026-11-02T01:45:23.123456Z\x1b[0m  INFO stream stream=cam1/main connected=true fps=29.97 name=\"a b\"",
+            "\x1b[2m2026-11-02T01:45:23.123456Z\x1b[0m \x1b[32m INFO\x1b[0m stream \
+             \x1b[3mstream\x1b[0m\x1b[2m=\x1b[0mcam/main",
         );
-        let l = split(&line).unwrap();
-        assert_eq!(l.ts, "2026-11-02T01:45:23.123456Z");
-        assert_eq!(l.level, "INFO");
-        assert!(l.rest.starts_with("stream stream=cam1/main"));
-        let d = kv(l.rest);
-        assert_eq!(d["stream"], "cam1/main");
-        assert_eq!(d["connected"], "true");
-        assert_eq!(number(&d, "fps"), Some(29.97));
-        assert_eq!(d["name"], "a b");
+        let split = split(&line).unwrap();
+        assert_eq!(split.timestamp, "2026-11-02T01:45:23.123456Z");
+        assert_eq!(split.level, "INFO");
+        assert_eq!(split.rest, "stream stream=cam/main");
+    }
+
+    #[test]
+    fn a_line_without_the_daemon_prefix_does_not_split() {
         assert!(split("irisd.service: Deactivated successfully.").is_none());
     }
 
     #[test]
-    fn statistics_helpers() {
-        assert_eq!(median(&[3.0, 1.0, 2.0]), Some(2.0));
-        assert_eq!(median(&[1.0, 2.0, 3.0, 4.0]), Some(2.5));
-        assert_eq!(growth(&[1.0, 3.0, 2.0, 5.0]), 5.0);
-        assert_eq!(mean(&[]), None);
+    fn reads_plain_and_quoted_pairs() {
+        let fields = kv("stream stream=cam/main connected=true fps=29.97 name=\"a b\"");
+        assert_eq!(fields["stream"], "cam/main");
+        assert_eq!(fields["connected"], "true");
+        assert_eq!(number(&fields, "fps"), Some(29.97));
+        assert_eq!(fields["name"], "a b");
     }
 
     #[test]
-    fn terminal_controls_and_unicode_delimiters_are_safe() {
-        let cleaned =
-            strip_ansi("\x1b[2m2026-11-02T01:45:23Z\x1b[0m INFO x note=ok\x1b]52;c;bad\x07 tail");
-        assert_eq!(cleaned, "2026-11-02T01:45:23Z INFO x note=ok tail");
+    fn a_key_ends_at_a_non_ascii_character() {
+        assert_eq!(kv("x 🦀key=value")["key"], "value");
+    }
+
+    #[test]
+    fn complete_escape_strings_are_removed() {
+        assert_eq!(
+            strip_ansi("\x1b[2m2026-11-02T01:45:23Z\x1b[0m INFO x note=ok\x1b]52;c;bad\x07 tail"),
+            "2026-11-02T01:45:23Z INFO x note=ok tail"
+        );
+    }
+
+    #[test]
+    fn an_unterminated_control_string_keeps_the_text_after_it() {
         assert_eq!(
             strip_ansi("left\x1b]unterminated right"),
             "left\\u{1b}]unterminated right"
         );
+    }
+
+    #[test]
+    fn an_escape_before_a_multibyte_character_keeps_the_character() {
+        assert_eq!(strip_ansi("\x1bé"), "\\u{1b}é");
+        assert_eq!(strip_ansi("a\x1b\u{202e}b"), "a\\u{1b}\\u{202e}b");
+    }
+
+    #[test]
+    fn terminal_safe_escapes_controls_and_bidi_formatting() {
         assert_eq!(
             terminal_safe("a\r\x1b[31m\u{202e}b"),
             "a\\u{d}\\u{1b}[31m\\u{202e}b"
         );
-        assert_eq!(kv("x 🦀key=value")["key"], "value");
+    }
+
+    #[test]
+    fn root_identity_ends_at_the_last_free_gib_field() {
         assert_eq!(
             root_identity("root root=/srv/camera archive free_gib=10 free_pct=20"),
             Some("/srv/camera archive".into())
@@ -372,9 +428,70 @@ mod tests {
             root_identity("root root=/srv/\"camera\" free_gib=old free_gib=10 free_pct=20"),
             Some("/srv/\"camera\" free_gib=old".into())
         );
+    }
+
+    #[test]
+    fn number_rejects_non_finite_values() {
         assert_eq!(
             number(&BTreeMap::from([("x".into(), "NaN".into())]), "x"),
             None
         );
+    }
+
+    fn classify(line: &str) -> Option<Statistics<'_>> {
+        statistics(&split(line).unwrap())
+    }
+
+    #[test]
+    fn statistics_rows_are_classified_by_series() {
+        let Some(Statistics::Row(series, fields)) = classify(
+            "2026-11-07T20:06:14.396879Z  INFO events camera=cam source=DahuaCgi connected=true \
+             events=2",
+        ) else {
+            panic!("an events row")
+        };
+        assert_eq!(
+            series,
+            Series::Events {
+                camera: "cam".into(),
+                source: "DahuaCgi".into()
+            }
+        );
+        assert_eq!(fields["events"], "2");
+    }
+
+    #[test]
+    fn a_root_row_carries_its_whole_path() {
+        let Some(Statistics::Row(series, fields)) = classify(
+            "2026-11-07T20:05:14.397731Z  INFO root root=/srv/camera archive free_gib=10.0 \
+             free_pct=69.6",
+        ) else {
+            panic!("a root row")
+        };
+        assert_eq!(series, Series::Root("/srv/camera archive".into()));
+        assert_eq!(fields["root"], "/srv/camera archive");
+    }
+
+    #[test]
+    fn a_statistics_kind_without_its_identity_is_malformed() {
+        assert_eq!(
+            classify("2026-11-01T00:00:00Z INFO stream connected=true"),
+            Some(Statistics::Malformed("stream"))
+        );
+        assert_eq!(
+            classify("2026-11-01T00:00:00Z INFO catalog open path=/srv/state/irisd.db"),
+            Some(Statistics::Malformed("catalog"))
+        );
+    }
+
+    #[test]
+    fn other_lines_are_not_statistics() {
+        for line in [
+            "2026-11-01T00:00:00Z WARN stream stream=cam/main frames=1",
+            "2026-11-01T00:00:00Z INFO catalog thread exiting",
+            "2026-11-01T00:00:00Z INFO gap stream=cam/main secs=1.0",
+        ] {
+            assert_eq!(classify(line), None, "{line}");
+        }
     }
 }

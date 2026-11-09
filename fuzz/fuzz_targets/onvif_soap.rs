@@ -11,13 +11,13 @@ fn assert_resource_invariants(root: &XmlNode) {
     let mut attributes = 0usize;
     let mut text_bytes = 0usize;
     while let Some((node, depth)) = stack.pop() {
-        assert!(depth <= MAX_XML_DEPTH);
+        assert!(depth <= MAX_XML_DEPTH, "depth {depth}");
         nodes += 1;
         attributes += node.attrs.len();
         text_bytes += node.text.as_deref().map_or(0, str::len);
-        assert!(nodes <= MAX_XML_NODES);
-        assert!(attributes <= MAX_XML_ATTRIBUTES);
-        assert!(text_bytes <= MAX_XML_TEXT_BYTES);
+        assert!(nodes <= MAX_XML_NODES, "{nodes} nodes");
+        assert!(attributes <= MAX_XML_ATTRIBUTES, "{attributes} attributes");
+        assert!(text_bytes <= MAX_XML_TEXT_BYTES, "{text_bytes} text bytes");
         stack.extend(node.children.iter().map(|child| (child, depth + 1)));
     }
 }

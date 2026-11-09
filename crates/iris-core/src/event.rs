@@ -1,6 +1,10 @@
 //! Normalised camera events shared by the event sources, the catalog, and the API.
 
+use std::fmt;
+use std::str::FromStr;
+
 use serde::{Deserialize, Serialize};
+use thiserror::Error;
 
 use crate::id::CameraId;
 use crate::time::WallUs;
@@ -10,7 +14,9 @@ pub const MAX_EVENT_DATA_LEN: usize = 64 * 1024;
 /// Largest unmapped vendor event code kept in [`EventKind::Other`], in bytes.
 pub const MAX_EVENT_KIND_LEN: usize = 1024;
 
-/// Where an event came from.
+/// Where an event came from. The names (`dahua_cgi`, `onvif_pull_point`,
+/// `onvif_metadata`, `manual`) are shared by serde, [`fmt::Display`], and
+/// [`FromStr`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EventSource {
@@ -18,10 +24,52 @@ pub enum EventSource {
     DahuaCgi,
     /// An ONVIF `PullPoint` subscription.
     OnvifPullPoint,
-    /// The ONVIF metadata RTP track.
+    /// The ONVIF metadata RTP track. Reserved: no event source produces it,
+    /// and configuration rejects subscribing to it.
     OnvifMetadata,
-    /// Entered by a person through the API.
+    /// An event entered by a person. Reserved: no API route creates one, and
+    /// configuration rejects subscribing to it.
     Manual,
+}
+
+/// Error returned when an event source name is unknown.
+#[derive(Clone, Debug, PartialEq, Eq, Error)]
+#[error(
+    "unknown event source {0:?}; expected dahua_cgi, onvif_pull_point, onvif_metadata, or manual"
+)]
+pub struct UnknownEventSource(String);
+
+impl EventSource {
+    /// The name serde, logs, and the catalog use.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::DahuaCgi => "dahua_cgi",
+            Self::OnvifPullPoint => "onvif_pull_point",
+            Self::OnvifMetadata => "onvif_metadata",
+            Self::Manual => "manual",
+        }
+    }
+}
+
+impl fmt::Display for EventSource {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for EventSource {
+    type Err = UnknownEventSource;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "dahua_cgi" => Ok(Self::DahuaCgi),
+            "onvif_pull_point" => Ok(Self::OnvifPullPoint),
+            "onvif_metadata" => Ok(Self::OnvifMetadata),
+            "manual" => Ok(Self::Manual),
+            other => Err(UnknownEventSource(other.to_owned())),
+        }
+    }
 }
 
 /// What an event reports. Vendor codes without a mapping keep their name.
@@ -50,11 +98,76 @@ pub enum EventKind {
     TimeChange,
     /// A client session ended abnormally.
     Disconnect,
-    /// Any other vendor code, kept up to [`MAX_EVENT_KIND_LEN`] bytes.
+    /// Any other vendor code; [`Event::bounded`] cuts it to
+    /// [`MAX_EVENT_KIND_LEN`] bytes on a UTF-8 boundary.
     Other(String),
 }
 
-/// The phase of an event.
+/// Error returned when a name is not a built-in event kind.
+#[derive(Clone, Debug, PartialEq, Eq, Error)]
+#[error("unknown event kind {0:?}; vendor codes travel as EventKind::Other")]
+pub struct UnknownEventKind(String);
+
+impl EventKind {
+    /// The built-in kinds, in the order of their definition; `Other` carries
+    /// everything else.
+    pub const BUILT_IN: [Self; 11] = [
+        Self::Motion,
+        Self::Human,
+        Self::Vehicle,
+        Self::LineCross,
+        Self::Intrusion,
+        Self::Tamper,
+        Self::Audio,
+        Self::Face,
+        Self::VideoLoss,
+        Self::TimeChange,
+        Self::Disconnect,
+    ];
+
+    /// The serde name of a built-in kind (`motion`, `line_cross`, …), or the
+    /// vendor code of [`EventKind::Other`].
+    #[must_use]
+    pub fn name(&self) -> &str {
+        match self {
+            Self::Motion => "motion",
+            Self::Human => "human",
+            Self::Vehicle => "vehicle",
+            Self::LineCross => "line_cross",
+            Self::Intrusion => "intrusion",
+            Self::Tamper => "tamper",
+            Self::Audio => "audio",
+            Self::Face => "face",
+            Self::VideoLoss => "video_loss",
+            Self::TimeChange => "time_change",
+            Self::Disconnect => "disconnect",
+            Self::Other(code) => code,
+        }
+    }
+}
+
+impl fmt::Display for EventKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.name())
+    }
+}
+
+/// Parses a built-in kind by its serde name; a vendor code is not one and
+/// belongs in [`EventKind::Other`].
+impl FromStr for EventKind {
+    type Err = UnknownEventKind;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Self::BUILT_IN
+            .iter()
+            .find(|kind| kind.name() == s)
+            .cloned()
+            .ok_or_else(|| UnknownEventKind(s.to_owned()))
+    }
+}
+
+/// The phase of an event. The names (`start`, `stop`, `pulse`) are shared by
+/// serde, [`fmt::Display`], and [`FromStr`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EventState {
@@ -64,6 +177,42 @@ pub enum EventState {
     Stop,
     /// A momentary occurrence or a state report.
     Pulse,
+}
+
+/// Error returned when an event state name is unknown.
+#[derive(Clone, Debug, PartialEq, Eq, Error)]
+#[error("unknown event state {0:?}; expected start, stop, or pulse")]
+pub struct UnknownEventState(String);
+
+impl EventState {
+    /// The name serde, logs, and the catalog use.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Start => "start",
+            Self::Stop => "stop",
+            Self::Pulse => "pulse",
+        }
+    }
+}
+
+impl fmt::Display for EventState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for EventState {
+    type Err = UnknownEventState;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "start" => Ok(Self::Start),
+            "stop" => Ok(Self::Stop),
+            "pulse" => Ok(Self::Pulse),
+            other => Err(UnknownEventState(other.to_owned())),
+        }
+    }
 }
 
 /// One normalised event.
@@ -81,10 +230,10 @@ pub struct Event {
     pub nvr_time: WallUs,
     /// The camera's own timestamp when it supplied one (diagnostic only).
     pub camera_time: Option<WallUs>,
-    /// Vendor payload as valid JSON text bounded to [`MAX_EVENT_DATA_LEN`].
-    ///
-    /// Invalid input is represented as a JSON string. An encoding beyond the
-    /// limit is replaced by `{"truncated":true}` rather than sliced.
+    /// Vendor payload. [`Event::bounded`] makes it valid JSON text of at most
+    /// [`MAX_EVENT_DATA_LEN`] bytes: invalid input becomes a JSON string, and
+    /// an encoding beyond the limit becomes `{"truncated":true}` rather than
+    /// a slice.
     pub data: Option<String>,
 }
 
@@ -157,8 +306,8 @@ mod tests {
         let EventKind::Other(code) = event.kind else {
             panic!("other kind changed variant");
         };
-        assert!(code.len() <= MAX_EVENT_KIND_LEN);
-        assert!(code.is_char_boundary(code.len()));
+        // 1,024 bytes is not a boundary of three-byte characters: 341 fit.
+        assert_eq!(code, "温".repeat(341));
         let data = event.data.unwrap();
         assert_eq!(data, r#"{"truncated":true}"#);
         assert!(serde_json::from_str::<serde_json::Value>(&data).is_ok());
@@ -185,6 +334,56 @@ mod tests {
         };
         assert!(code.capacity() <= MAX_EVENT_KIND_LEN);
         assert!(event.data.unwrap().capacity() <= MAX_EVENT_DATA_LEN);
+    }
+
+    #[test]
+    fn source_and_state_names_round_trip_and_match_serde() {
+        for source in [
+            EventSource::DahuaCgi,
+            EventSource::OnvifPullPoint,
+            EventSource::OnvifMetadata,
+            EventSource::Manual,
+        ] {
+            assert_eq!(source.to_string().parse::<EventSource>().unwrap(), source);
+            assert_eq!(
+                serde_json::to_string(&source).unwrap(),
+                format!("\"{source}\"")
+            );
+        }
+        for state in [EventState::Start, EventState::Stop, EventState::Pulse] {
+            assert_eq!(state.to_string().parse::<EventState>().unwrap(), state);
+            assert_eq!(
+                serde_json::to_string(&state).unwrap(),
+                format!("\"{state}\"")
+            );
+        }
+        assert!("cgi".parse::<EventSource>().is_err());
+        assert!("begin".parse::<EventState>().is_err());
+    }
+
+    #[test]
+    fn kind_names_match_serde_and_other_shows_its_code() {
+        assert_eq!(EventKind::LineCross.to_string(), "line_cross");
+        assert_eq!(
+            serde_json::to_string(&EventKind::LineCross).unwrap(),
+            "\"line_cross\""
+        );
+        assert_eq!(EventKind::Other("Vendor/Code".into()).name(), "Vendor/Code");
+    }
+
+    #[test]
+    fn built_in_kinds_round_trip_through_their_names_and_vendor_codes_do_not() {
+        for kind in &EventKind::BUILT_IN {
+            assert_eq!(kind.name().parse::<EventKind>().as_ref(), Ok(kind));
+            assert_eq!(
+                serde_json::to_string(kind).unwrap(),
+                format!("\"{}\"", kind.name())
+            );
+        }
+        assert_eq!(EventKind::BUILT_IN.len(), 11);
+        for code in ["other", "Vendor/Code", ""] {
+            assert!(code.parse::<EventKind>().is_err(), "{code:?}");
+        }
     }
 
     #[test]

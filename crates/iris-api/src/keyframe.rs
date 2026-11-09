@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use axum::body::Bytes;
 use axum::extract::{Path, Query, State};
-use axum::http::header;
+use axum::http::header::{self, HeaderName};
 use axum::response::{IntoResponse, Response};
 use iris_catalog::TimeRange;
 use iris_core::time::WallUs;
@@ -23,11 +23,15 @@ use crate::hls::{
 use crate::media_admission;
 use crate::query::parse_time;
 use crate::segments::stream_key;
-use crate::state::{ApiState, MediaClass, admitted_media_bytes};
+use crate::state::{ApiState, MediaClass};
 
-/// How far back from `t` the sync sample may lie: longer than any fragment
-/// the store writes, so a sync sample inside a recording is always found.
+/// How far back from `t` the sync sample may lie. Fragments are short but
+/// GOPs are unbounded: a sync sample more than two minutes before `t` is not
+/// found, and the request answers 404.
 const LOOKBACK_US: i64 = 120 * 1_000_000;
+/// An explicit `t` this close to the present names a sample that later
+/// fragments may still replace, so its answer is not cached.
+const MUTABLE_HORIZON_US: i64 = 30 * 1_000_000;
 
 /// `t` as it arrives on the query string.
 #[derive(Debug, Default, Deserialize)]
@@ -45,13 +49,16 @@ pub(crate) async fn keyframe(
 ) -> Result<Response, ApiError> {
     let permit = state.stats.admit_media(MediaClass::Bounded)?;
     let key = stream_key(&camera, &kind)?;
-    let implicit_newest = params.t.is_none();
+    let now = WallUs::now();
     let t = match &params.t {
         Some(raw) => {
             parse_time(raw).ok_or_else(|| ApiError::BadRequest(format!("bad 't' {raw:?}")))?
         }
-        None => WallUs::now(),
+        None => now,
     };
+    // An omitted `t`, or one within the horizon, may name a different sample
+    // on the next request.
+    let mutable = params.t.is_none() || t.get() > now.get().saturating_sub(MUTABLE_HORIZON_US);
     let (Some(from), Some(to)) = (t.get().checked_sub(LOOKBACK_US), t.get().checked_add(1)) else {
         return Err(ApiError::BadRequest(
             "'t' is outside the supported keyframe lookup range".into(),
@@ -84,8 +91,8 @@ pub(crate) async fn keyframe(
     )
     .await
     .map_err(io::Error::other)??;
-    let body = admitted_media_bytes(body, permit);
-    let cache_control = if implicit_newest {
+    let body = media_admission::attach(body, &permit);
+    let cache_control = if mutable {
         "private, no-store"
     } else {
         "private, max-age=3600"
@@ -95,7 +102,7 @@ pub(crate) async fn keyframe(
             (header::CONTENT_TYPE, "video/mp4".to_owned()),
             (header::CACHE_CONTROL, cache_control.to_owned()),
             (
-                "x-iris-wall-us".parse().expect("static header name"),
+                HeaderName::from_static("x-iris-wall-us"),
                 record.wall.get().to_string(),
             ),
         ],
@@ -143,7 +150,8 @@ async fn build(
     else {
         return Err(ApiError::Io(io::Error::other("fragment without samples")));
     };
-    let start = usize::try_from(info.payload_offset).map_err(|_| ApiError::NotFound)?;
+    let start = usize::try_from(info.payload_offset)
+        .map_err(|_| ApiError::Io(io::Error::other("payload offset does not fit in memory")))?;
     let end = start
         .checked_add(size as usize)
         .filter(|&end| end <= fragment.len())
@@ -159,7 +167,7 @@ async fn build(
         wall: record.wall,
     };
     let encoded = encode_fragment(&header, std::slice::from_ref(&sample))
-        .map_err(|e| ApiError::Io(io::Error::other(e.to_string())))?;
+        .map_err(|error| ApiError::Io(io::Error::other(error)))?;
     init.try_reserve(
         encoded
             .prefix

@@ -10,7 +10,8 @@ Scope: this crate only. Read the root `AGENTS.md` first.
   (`fuzz/fuzz_targets/access_unit.rs`); a crash reproducer becomes a unit test here.
 - `NalType` is `#[non_exhaustive]`; an added variant keeps `code` exact and breaks no caller.
 - Classification treats every type code below 32 as VCL, including reserved types 24..=31.
-- Framing errors report the prefix-start offset even when the prefix itself is incomplete.
+- Framing errors report the prefix-start offset; an incomplete prefix is its own variant
+  (`FramingError::IncompletePrefix`), never a zero-length truncation.
 - The crate stays decode-free: no bitstream parsing beyond the NAL header. Dimensions and
   profiles come from the RTSP client's parameters, not from here.
 
@@ -26,7 +27,7 @@ cargo fmt -p iris-h265
 cargo clippy -p iris-h265 --all-targets -- -D warnings
 cargo test -p iris-h265
 RUSTDOCFLAGS="-D warnings" cargo doc -p iris-h265 --no-deps
-cd fuzz && cargo +nightly fuzz run access_unit -- -max_total_time=60   # after a parser change
+cd fuzz && cargo fuzz run access_unit -- -max_total_time=60   # pinned nightly; after a parser change
 ```
 
 ## Pitfalls
@@ -41,4 +42,4 @@ cd fuzz && cargo +nightly fuzz run access_unit -- -max_total_time=60   # after a
 ## Related documents
 
 - `docs/research/01-camera-probe.md` §3, `04-storage-format.md` §4, `05-ingest-events.md` §2
-- Dependents: `iris-ingest`, `iris-replay`, `irisd`.
+- Dependents: `iris-ingest`, `iris-replay`.

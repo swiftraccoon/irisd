@@ -8,16 +8,20 @@
 //! and leave as [`iris_mp4::fragment::Fragment`]s. Every frame is also
 //! published to the stream's [`LiveRing`] before its fragment closes.
 //!
-//! # Modules
+//! # Contents
 //!
 //! - [`run_stream`] records one [`StreamSource`] under [`IngestOptions`] until a
 //!   shutdown token is cancelled, reconnecting after every failure.
 //! - [`regularize`] assigns frame durations: the nominal rate, slow lock to the
 //!   camera's timeline, holds for dropped frames, snaps when the error exceeds
 //!   the tolerance.
-//! - [`assembler`] groups frames into fragments and keeps the payload checksum.
+//! - [`assembler`] groups frames into fragments within the frame and payload
+//!   bounds and places each sealed fragment on the run's wall-clock anchor.
 //! - [`live`] fans frames out to live viewers without copying.
 //! - [`StreamStats`] exposes the per-stream counters the daemon logs.
+//! - [`ReadTicker`] is the read clock every timer-driven session shares.
+//! - [`background_teardowns`] counts the background `TEARDOWN` tasks in the
+//!   process, at most [`MAX_BACKGROUND_TEARDOWNS`].
 //!
 //! # Invariants
 //!
@@ -46,7 +50,11 @@
 //! use iris_core::time::MediaTicks;
 //! use iris_ingest::regularize::Regularizer;
 //!
-//! let mut regularizer = Regularizer::new(TimestampMode::Regularize, Some(3000), MediaTicks::from_millis(150));
+//! let mut regularizer = Regularizer::new(
+//!     TimestampMode::Regularize,
+//!     Some(3000),
+//!     MediaTicks::from_millis(150),
+//! );
 //! let raw = [0, 2700, 6300, 9000];
 //! let assignment = regularizer.assign(&raw, 12_000);
 //! assert_eq!(assignment.durations.iter().sum::<u32>(), 12_000);
@@ -61,6 +69,16 @@ mod source;
 mod stats;
 
 pub use live::{LiveError, LiveFrame, LiveRing, LiveSubscription};
+/// The most background `TEARDOWN` tasks retina runs at once in a process; a
+/// session dropped beyond it is not torn down (see [`background_teardowns`]).
+pub use retina::client::MAX_BACKGROUND_TEARDOWNS;
+/// How many background `TEARDOWN` tasks are running in this process, at most
+/// [`MAX_BACKGROUND_TEARDOWNS`]. Every session this crate ends (cancelled,
+/// failed, or timed out) sends its `TEARDOWN` from such a task: first on the
+/// session's own connection, then on fresh connections to the same peer, until
+/// it succeeds or min(session timeout, 60 s) passes. The daemon reports the
+/// count on its `process` statistics line as `teardowns`.
+pub use retina::client::background_teardowns;
 pub use session::{ReadTicker, deliver_fragment, run_stream};
 pub use sink::{FragmentSink, SinkError};
 pub use source::{IngestOptions, StreamSource};

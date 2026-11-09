@@ -1,16 +1,19 @@
 //! A retina client receives exactly the frames a synthetic recording holds.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
 use futures::StreamExt;
 use iris_h265::strip_parameter_sets;
 use iris_replay::media::Media;
-use iris_replay::server::{Options, Server};
+use iris_replay::rtsp::MountName;
+use iris_replay::server::{Mounts, Options, Server};
 use iris_replay::synth::{self, Plan};
-use retina::client::{PlayOptions, SessionOptions, SetupOptions, TcpTransportOptions, Transport};
+use retina::client::{
+    PlayOptions, Session, SessionOptions, SetupOptions, TcpTransportOptions, Transport,
+};
 use retina::codec::{CodecItem, FrameFormat};
+use url::Url;
 
 #[tokio::test]
 async fn frames_round_trip_through_a_retina_client() {
@@ -22,16 +25,15 @@ async fn frames_round_trip_through_a_retina_client() {
         ..Plan::default()
     };
     let media = Arc::new(Media::from_bytes(synth::recording(plan).unwrap()).unwrap());
-    let mut mounts = HashMap::new();
-    mounts.insert("cam".to_owned(), Arc::clone(&media));
+    let mounts = Mounts::from([(MountName::try_new("cam").unwrap(), Arc::clone(&media))]);
     let server = Server::bind("127.0.0.1:0".parse().unwrap(), mounts, Options::default())
         .await
         .unwrap();
     let addr = server.local_addr().unwrap();
     tokio::spawn(server.run());
 
-    let url = url::Url::parse(&format!("rtsp://{addr}/cam")).unwrap();
-    let mut session = retina::client::Session::describe(url, SessionOptions::default())
+    let url = Url::parse(&format!("rtsp://{addr}/cam")).unwrap();
+    let mut session = Session::describe(url, SessionOptions::default())
         .await
         .unwrap();
     let index = session
@@ -70,16 +72,16 @@ async fn frames_round_trip_through_a_retina_client() {
     }
     let first_ts = received[0].1;
     for (i, (is_sync, timestamp, data)) in received.iter().enumerate() {
-        let frame = &media.frames[i % media.frames.len()];
+        let frame = &media.frames()[i % media.frames().len()];
         assert_eq!(*is_sync, frame.is_sync, "frame {i}");
         assert_eq!(
             timestamp - first_ts,
-            i as i64 * 3_000,
+            i64::try_from(i).unwrap() * 3_000,
             "frame {i} timestamp"
         );
         let payload = strip_parameter_sets(data)
             .unwrap()
             .unwrap_or_else(|| data.clone());
-        assert_eq!(payload, media.sample(frame), "frame {i} bytes");
+        assert_eq!(Some(&payload[..]), media.sample(frame), "frame {i} bytes");
     }
 }

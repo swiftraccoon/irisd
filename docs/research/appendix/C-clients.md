@@ -1,53 +1,228 @@
-# Appendix C — Client playback research notes (unedited, 2026-10-31)
+# Appendix C — Client playback research notes (2026-10-31)
+
+Edited on 2026-11-07: the WebRTC sentence names the 0.1 alpha instead of v1.
 
 Research notes produced by the client-playback thread. Tags: **[P]** verified-primary,
 **[S]** secondary, **[I]** inferred. Summarised in `../06-clients.md`.
 
 ## A. iOS native app
 
-**A1. HLS/HEVC authoring is well specified; use `hvc1` + fMP4 + CODECS.** Apple's authoring spec: HEVC container MUST be fMP4 (1.5); profile/level MUST be ≤ Main10 L5.1 High Tier (1.6b), SHOULD be ≤ Main10 L4.0 Main Tier for compatibility (1.6a); parameter sets in sample descriptions, i.e. `hvc1` not `hev1` (1.10); IDR every 2 s SHOULD (1.13); segments MUST start with IDR (7.4); target/segment duration SHOULD be 6 s (7.5/7.6); `EXT-X-MAP` MUST be present with fMP4 (8.20); `CODECS` MUST be on `EXT-X-STREAM-INF` (9.1); `EXT-X-INDEPENDENT-SEGMENTS` SHOULD be in the multivariant playlist when segments start with IDR (9.11/9.12). CODECS format is `Codec.Profile.Flags.TierLevel.Constraints`, e.g. `hvc1.1.4.L126.B0` = Main L4.2, `hvc1.2.4.L123.B0` = Main10 L4.1, `hvc1.2.4.L150.B0` = Main10 L5.0; `hvc1.2.4.L153.B0` (L5.1) appears only in the Dolby Vision SUPPLEMENTAL-CODECS table. https://developer.apple.com/documentation/http-live-streaming/hls-authoring-specification-for-apple-devices **[P]**. HEVC-in-HLS playback arrived with iOS 11 / macOS High Sierra. https://bitmovin.com/blog/ios-11-release-hlshevc-support-will-help-save-storage-cdn-costs/ **[S]**
+**A1. HLS/HEVC authoring is well specified; use `hvc1` + fMP4 + CODECS.** Apple's authoring spec:
+HEVC container MUST be fMP4 (1.5); profile/level MUST be ≤ Main10 L5.1 High Tier (1.6b), SHOULD be
+≤ Main10 L4.0 Main Tier for compatibility (1.6a); parameter sets in sample descriptions, i.e.
+`hvc1` not `hev1` (1.10); IDR every 2 s SHOULD (1.13); segments MUST start with IDR (7.4);
+target/segment duration SHOULD be 6 s (7.5/7.6); `EXT-X-MAP` MUST be present with fMP4 (8.20);
+`CODECS` MUST be on `EXT-X-STREAM-INF` (9.1); `EXT-X-INDEPENDENT-SEGMENTS` SHOULD be in the
+multivariant playlist when segments start with IDR (9.11/9.12). CODECS format is
+`Codec.Profile.Flags.TierLevel.Constraints`, e.g. `hvc1.1.4.L126.B0` = Main L4.2, `hvc1.2.4.L123.B0`
+= Main10 L4.1, `hvc1.2.4.L150.B0` = Main10 L5.0; `hvc1.2.4.L153.B0` (L5.1) appears only in the Dolby
+Vision SUPPLEMENTAL-CODECS table.
+https://developer.apple.com/documentation/http-live-streaming/hls-authoring-specification-for-apple-devices
+**[P]**. HEVC-in-HLS playback arrived with iOS 11 / macOS High Sierra.
+https://bitmovin.com/blog/ios-11-release-hlshevc-support-will-help-save-storage-cdn-costs/ **[S]**
 
-**A2. LL-HLS: ~1–2 s is the design target; rules are precise.** Apple: part target RECOMMENDED 1 s, MUST be ≥ P95 RTT, SHOULD be ≥ 3× P95 RTT (14.2); `PART-HOLD-BACK` MUST be ≥ 3× part target (14.3); delta updates if window > 2 min (14.4). Apple's example uses 4 s segments, `PART-TARGET=0.33334`, `PART-HOLD-BACK=1.0`, `CAN-BLOCK-RELOAD=YES`; blocking reload via `_HLS_msn`/`_HLS_part`/`_HLS_skip`, `EXT-X-PRELOAD-HINT` for the next part, mandatory `EXT-X-RENDITION-REPORT`. https://developer.apple.com/documentation/http-live-streaming/enabling-low-latency-http-live-streaming-hls **[P]**. draft-pantos-hls-rfc8216bis-22 (May 2026): `PART-HOLD-BACK` MUST ≥ 2×, SHOULD ≥ 3× part target; `HOLD-BACK` ≥ 3× target duration; server SHOULD return 503 if a blocking request can't be answered within 3 target durations; Appendix B profile requires HTTP/2 or HTTP/3, priorities, gzip playlists, Age headers, recommends 6 s target duration and 1–2 s GOP. https://datatracker.ietf.org/doc/html/draft-pantos-hls-rfc8216bis **[P]**. WWDC19-502 states "less than two seconds over public networks"; WWDC20-10228: LL-HLS left beta in iOS 14/tvOS 14/macOS 11, no entitlement needed. https://developer.apple.com/videos/play/wwdc2019/502 , https://developer.apple.com/videos/play/wwdc2020/10228/ **[P]**. On a LAN with 1 s parts and 3× hold-back expect ~3–4 s glass-to-glass; with 0.33 s parts and `PART-HOLD-BACK=1.0` roughly 1.5–2.5 s. AVPlayer does the fetching, so decode is VideoToolbox hardware; the battery advantage of AVPlayer/HLS over app-driven paths is the reason Apple created Managed Media Source ("MSE uses a lot of power"). https://webkit.org/blog/14735/managed-media-source/ **[P for the quote, I for AVPlayer vs. custom path]**
+**A2. LL-HLS: ~1–2 s is the design target; rules are precise.** Apple: part target RECOMMENDED 1
+s, MUST be ≥ P95 RTT, SHOULD be ≥ 3× P95 RTT (14.2); `PART-HOLD-BACK` MUST be ≥ 3× part
+target (14.3); delta updates if window > 2 min (14.4). Apple's example uses 4 s segments,
+`PART-TARGET=0.33334`, `PART-HOLD-BACK=1.0`, `CAN-BLOCK-RELOAD=YES`; blocking reload via
+`_HLS_msn`/`_HLS_part`/`_HLS_skip`, `EXT-X-PRELOAD-HINT` for the next part, mandatory
+`EXT-X-RENDITION-REPORT`.
+https://developer.apple.com/documentation/http-live-streaming/enabling-low-latency-http-live-streaming-hls
+**[P]**. draft-pantos-hls-rfc8216bis-22 (May 2026): `PART-HOLD-BACK` MUST ≥ 2×, SHOULD ≥ 3×
+part target; `HOLD-BACK` ≥ 3× target duration; server SHOULD return 503 if a blocking request
+can't be answered within 3 target durations; Appendix B profile requires HTTP/2 or HTTP/3,
+priorities, gzip playlists, Age headers, recommends 6 s target duration and 1–2 s GOP.
+https://datatracker.ietf.org/doc/html/draft-pantos-hls-rfc8216bis **[P]**. WWDC19-502 states "less
+than two seconds over public networks"; WWDC20-10228: LL-HLS left beta in iOS 14/tvOS 14/macOS 11,
+no entitlement needed. https://developer.apple.com/videos/play/wwdc2019/502 ,
+https://developer.apple.com/videos/play/wwdc2020/10228/ **[P]**. On a LAN with 1 s parts and 3×
+hold-back expect ~3–4 s glass-to-glass; with 0.33 s parts and `PART-HOLD-BACK=1.0` roughly
+1.5–2.5 s. AVPlayer does the fetching, so decode is VideoToolbox hardware; the battery advantage
+of AVPlayer/HLS over app-driven paths is the reason Apple created Managed Media Source ("MSE uses a
+lot of power"). https://webkit.org/blog/14735/managed-media-source/ **[P for the quote, I for
+AVPlayer vs. custom path]**
 
-**A3. WebRTC H.265 in Safari is on by default since Safari 18 (2024); Chrome 136 (2025).** WebKit PR #23573 (merged 2024-01-31, bug 242921 "[Cocoa] Enable WebRTC HEVC"): "we can thus enable HEVC support by default" (UnifiedWebPreferences.yaml). https://github.com/WebKit/WebKit/pull/23573 **[P]**. Safari 18.0 notes add RFC 7798 RTP payload format for WebRTC HEVC (previously generic packetization). https://webkit.org/blog/15865/webkit-features-in-safari-18-0/ **[P]**. draft-ietf-avtcore-hevc-webrtc-10 (Oct 2026) cites Safari 18.0 and Chrome as shipping; receive is MUST, send MAY. https://datatracker.ietf.org/doc/html/draft-ietf-avtcore-hevc-webrtc **[P]**. go2rtc: "WebRTC H265 - supported in Chrome 136+, supported in Safari 18+". https://github.com/AlexxIT/go2rtc **[S]**. Chrome Intent to Ship (2025-03-03): Chrome 136, all six platforms, no software fallback, Finch flags `WebRtcAllowH265Send/Receive`. https://www.mail-archive.com/blink-dev@chromium.org/msg12906.html **[P]**. Whether send and receive are both default-on in Safari was not visible in the PR text **[flag]**.
+**A3. WebRTC H.265 in Safari is on by default since Safari 18 (2024); Chrome 136 (2025).** WebKit PR
+#23573 (merged 2024-01-31, bug 242921 "[Cocoa] Enable WebRTC HEVC"): "we can thus enable HEVC
+support by default" (UnifiedWebPreferences.yaml). https://github.com/WebKit/WebKit/pull/23573
+**[P]**. Safari 18.0 notes add RFC 7798 RTP payload format for WebRTC HEVC (previously generic
+packetization). https://webkit.org/blog/15865/webkit-features-in-safari-18-0/ **[P]**.
+draft-ietf-avtcore-hevc-webrtc-10 (Oct 2026) cites Safari 18.0 and Chrome as shipping; receive is
+MUST, send MAY. https://datatracker.ietf.org/doc/html/draft-ietf-avtcore-hevc-webrtc **[P]**.
+go2rtc: "WebRTC H265 - supported in Chrome 136+, supported in Safari 18+".
+https://github.com/AlexxIT/go2rtc **[S]**. Chrome Intent to Ship (2025-03-03): Chrome 136, all six
+platforms, no software fallback, Finch flags `WebRtcAllowH265Send/Receive`.
+https://www.mail-archive.com/blink-dev@chromium.org/msg12906.html **[P]**. Whether send and receive
+are both default-on in Safari was not visible in the PR text **[flag]**.
 
-**A4. Upstream libwebrtc has H.265 RTP support but no iOS H.265 codec implementation.** `modules/rtp_rtcp/source/` contains `rtp_packetizer_h265.*` and `video_rtp_depacketizer_h265.*`; `webrtc.gni` has `rtc_use_h265` (= `proprietary_codecs` in standalone builds). `sdk/objc/components/video_codec/` contains only H264 encoder/decoder files, and `RTCDefaultVideoDecoderFactory.m` lists H264/VP8/VP9/AV1 only. https://webrtc.googlesource.com/src/+/refs/heads/main/modules/rtp_rtcp/source/ , https://webrtc.googlesource.com/src/+/refs/heads/main/sdk/objc/components/video_codec/ **[P]**. A native iOS app therefore must supply its own VideoToolbox H.265 `RTCVideoDecoderFactory` (forks such as AWS KVS and OWT have done this). https://aws.amazon.com/cn/blogs/china/add-h265-codec-support-in-amazon-kinesis-video-streams-webrtc **[S]**
+**A4. Upstream libwebrtc has H.265 RTP support but no iOS H.265 codec implementation.**
+`modules/rtp_rtcp/source/` contains `rtp_packetizer_h265.*` and `video_rtp_depacketizer_h265.*`;
+`webrtc.gni` has `rtc_use_h265` (= `proprietary_codecs` in standalone builds).
+`sdk/objc/components/video_codec/` contains only H264 encoder/decoder files, and
+`RTCDefaultVideoDecoderFactory.m` lists H264/VP8/VP9/AV1 only.
+https://webrtc.googlesource.com/src/+/refs/heads/main/modules/rtp_rtcp/source/ ,
+https://webrtc.googlesource.com/src/+/refs/heads/main/sdk/objc/components/video_codec/ **[P]**. A
+native iOS app therefore must supply its own VideoToolbox H.265 `RTCVideoDecoderFactory` (forks such
+as AWS KVS and OWT have done this).
+https://aws.amazon.com/cn/blogs/china/add-h265-codec-support-in-amazon-kinesis-video-streams-webrtc
+**[S]**
 
-**A5. The raw path is fully supported API-wise and is the lowest-latency option.** `CMVideoFormatDescriptionCreateFromHEVCParameterSets` (iOS 11+) builds the format description from VPS/SPS/PPS; feed length-prefixed (AVCC/HVCC-style) NALs in `CMSampleBuffer`s to `VTDecompressionSession` or directly to `AVSampleBufferDisplayLayer`. https://developer.apple.com/documentation/coremedia/cmvideoformatdescriptioncreatefromhevcparametersets(allocator:parametersetcount:parametersetpointers:parametersetsizes:nalunitheaderlength:extensions:formatdescriptionout:) **[P]**. Transports: `URLSessionWebSocketTask` (iOS 13+) **[S]**, `NWProtocolQUIC` (iOS 15+). https://developer.apple.com/documentation/network/nwprotocolquic **[P]**. PiP works from `AVSampleBufferDisplayLayer` via `AVPictureInPictureController.ContentSource(sampleBufferDisplayLayer:playbackDelegate:)` (iOS 15+). https://developer.apple.com/documentation/avkit/avpictureinpicturecontroller/contentsource-swift.class/init(samplebufferdisplaylayer:playbackdelegate:) **[P]**. Background: VT sessions are invalidated when the app is backgrounded (`kVTInvalidSessionErr` -12903 on return; recreate the session). https://gitlab.freedesktop.org/gstreamer/gst-plugins-bad/-/issues/288 **[S]**. Concurrency: Apple gives no numeric limit for `VTDecompressionSession`s; an Apple engineer (June 2026) says many are valid, limits "should be high enough", errors not crashes at the ceiling. https://developer.apple.com/forums/thread/831532 **[P]**. For AVPlayer the observed ceiling is ~16 hardware pipelines (`-11839`/`-12913` "decoder busy"), paused players still hold a decoder. https://developer.apple.com/forums/thread/67382 , https://bugs.webkit.org/show_bug.cgi?id=193449 **[S]**. Latency: on LAN, with Dahua streams (no B-frames) decode delay is ~1 frame; glass-to-glass ~150–300 ms dominated by camera encode + network, versus ~0.5–1 s for WebRTC jitter buffers and 1.5–4 s for LL-HLS **[I]**. Apps: UniFi Protect's controller "livestream API" is fMP4 over WebSocket (H.264/HEVC/AV1) per the reverse-engineered `unifi-protect` library; whether Ubiquiti's iOS app uses it is not documented. https://github.com/hjdhjd/unifi-protect **[S]**. Frigate/go2rtc: MSE default, iPhone needs iOS 17.1+ (Managed Media Source), WebRTC fallback, H.265 "not supported in some browsers". https://docs.frigate.video/configuration/live **[P]**. Home Assistant uses go2rtc/WebRTC/HLS in its frontend (the macOS app row is HLS-only). **[S]**. Reolink iOS: HEVC needs iOS 11.1+; hardware-decode toggle is Android-only. https://support.reolink.com/hc/en-us/articles/16772268498329 **[S]**. Scrypted, Blue Iris, Camect, tinyCam (Android-only product): no verifiable statement found **[flag]**.
+**A5. The raw path is fully supported API-wise and is the lowest-latency option.**
+`CMVideoFormatDescriptionCreateFromHEVCParameterSets` (iOS 11+) builds the format description from
+VPS/SPS/PPS; feed length-prefixed (AVCC/HVCC-style) NALs in `CMSampleBuffer`s to
+`VTDecompressionSession` or directly to `AVSampleBufferDisplayLayer`.
+https://developer.apple.com/documentation/coremedia/cmvideoformatdescriptioncreatefromhevcparametersets(allocator:parametersetcount:parametersetpointers:parametersetsizes:nalunitheaderlength:extensions:formatdescriptionout:)
+**[P]**. Transports: `URLSessionWebSocketTask` (iOS 13+) **[S]**, `NWProtocolQUIC` (iOS 15+).
+https://developer.apple.com/documentation/network/nwprotocolquic **[P]**. PiP works from
+`AVSampleBufferDisplayLayer` via
+`AVPictureInPictureController.ContentSource(sampleBufferDisplayLayer:playbackDelegate:)` (iOS 15+).
+https://developer.apple.com/documentation/avkit/avpictureinpicturecontroller/contentsource-swift.class/init(samplebufferdisplaylayer:playbackdelegate:)
+**[P]**. Background: VT sessions are invalidated when the app is backgrounded
+(`kVTInvalidSessionErr` -12903 on return; recreate the session).
+https://gitlab.freedesktop.org/gstreamer/gst-plugins-bad/-/issues/288 **[S]**. Concurrency: Apple
+gives no numeric limit for `VTDecompressionSession`s; an Apple engineer (June 2026) says many are
+valid, limits "should be high enough", errors not crashes at the ceiling.
+https://developer.apple.com/forums/thread/831532 **[P]**. For AVPlayer the observed ceiling is ~16
+hardware pipelines (`-11839`/`-12913` "decoder busy"), paused players still hold a decoder.
+https://developer.apple.com/forums/thread/67382 , https://bugs.webkit.org/show_bug.cgi?id=193449
+**[S]**. Latency: on LAN, with Dahua streams (no B-frames) decode delay is ~1 frame; glass-to-glass
+~150–300 ms dominated by camera encode + network, versus ~0.5–1 s for WebRTC jitter buffers and
+1.5–4 s for LL-HLS **[I]**. Apps: UniFi Protect's controller "livestream API" is fMP4 over
+WebSocket (H.264/HEVC/AV1) per the reverse-engineered `unifi-protect` library; whether Ubiquiti's
+iOS app uses it is not documented. https://github.com/hjdhjd/unifi-protect **[S]**. Frigate/go2rtc:
+MSE default, iPhone needs iOS 17.1+ (Managed Media Source), WebRTC fallback, H.265 "not supported in
+some browsers". https://docs.frigate.video/configuration/live **[P]**. Home Assistant uses
+go2rtc/WebRTC/HLS in its frontend (the macOS app row is HLS-only). **[S]**. Reolink iOS: HEVC needs
+iOS 11.1+; hardware-decode toggle is Android-only.
+https://support.reolink.com/hc/en-us/articles/16772268498329 **[S]**. Scrypted, Blue Iris, Camect,
+tinyCam (Android-only product): no verifiable statement found **[flag]**.
 
-**A6. Grid guidance.** Use sub-streams (D1/720p) for the 6-tile grid and switch the selected tile to the main stream; keep one `VTDecompressionSession` per visible tile, tear down off-screen tiles, prefer `AVSampleBufferDisplayLayer` (gets PiP for free, avoids a Metal copy), set `kVTDecompressionPropertyKey_RealTime`, drop to the latest IDR on stall. A-series decoders comfortably exceed 6×720p30 + 1×4K30 in aggregate; Apple publishes no per-device numbers **[I]**. Budget memory as ~1.5× the decoded frame pool per tile (NV12 720p ≈ 1.4 MB/frame) **[I]**.
+**A6. Grid guidance.** Use sub-streams (D1/720p) for the 6-tile grid and switch the selected tile to
+the main stream; keep one `VTDecompressionSession` per visible tile, tear down off-screen tiles,
+prefer `AVSampleBufferDisplayLayer` (gets PiP for free, avoids a Metal copy), set
+`kVTDecompressionPropertyKey_RealTime`, drop to the latest IDR on stall. A-series decoders
+comfortably exceed 6×720p30 + 1×4K30 in aggregate; Apple publishes no per-device numbers **[I]**.
+Budget memory as ~1.5× the decoded frame pool per tile (NV12 720p ≈ 1.4 MB/frame) **[I]**.
 
 ## B. Linux desktop GUI (Rust)
 
-**B1. GStreamer: NVDEC→GL is a GPU-side copy, VA→DMA-BUF is true zero-copy; GTK4 is the clean integration.** `nvh265dec` outputs `CUDAMemory` (NV12/P010…), `GLMemory`, or system memory. https://gstreamer.freedesktop.org/documentation/nvcodec/nvh265dec.html **[P]**. In the source (`gstnvdecoder.cpp`), GL output registers the GL PBO with CUDA and does `cuMemcpy2DAsync` device-to-device, then flags PBO→texture upload (desktop GL ≥3.0 only, not GLES); CUDA output is zero-copy ("Exporting output surface without copy") when `num-output-surfaces != 1`. https://raw.githubusercontent.com/GStreamer/gstreamer/main/subprojects/gst-plugins-bad/sys/nvcodec/gstnvdecoder.cpp **[P]**. GStreamer devs: CUDA↔GL is the only real GPU-API interop; `vulkanupload` has no zero-copy (Nov 2023). https://discourse.gstreamer.org/t/graphics-api-interoperability-and-zero-copy-memory/464 **[P]**. 1.24 added DRM-modifier `DMA_DRM` negotiation across `va` decoders, `glupload`, `waylandsink`; `vah265dec` rank PRIMARY+1. https://gstreamer.freedesktop.org/releases/1.24/ **[P]**. `gtk4paintablesink` accepts `DMABuf (DMA_DRM)` (feature `dmabuf`, GTK ≥4.14), `GLMemory` RGBA/RGB (features `wayland`/`x11egl`/`x11glx`), or system memory. https://gstreamer.freedesktop.org/documentation/gtk4/index.html **[P]**. Hence: NVIDIA `nvh265dec ! glcolorconvert ! gtk4paintablesink` (one GPU copy, no CPU); Intel/AMD `vah265dec ! gtk4paintablesink` (DMA-BUF, zero-copy; 10-bit P010 DMA-BUF had sink bugs, https://gitlab.freedesktop.org/gstreamer/gstreamer/-/issues/2935 **[P]**). Toolkits: gtk4-rs + `gtk4paintablesink` is the only one with a maintained upstream sink; Slint ships a `gstreamer-player` example with EGL import on Linux **[S]**; `iced_video_player` copies frames into a wgpu texture (CPU upload) **[S]**; egui has no maintained zero-copy path **[I]**.
+**B1. GStreamer: NVDEC→GL is a GPU-side copy, VA→DMA-BUF is true zero-copy; GTK4 is the clean
+integration.** `nvh265dec` outputs `CUDAMemory` (NV12/P010…), `GLMemory`, or system memory.
+https://gstreamer.freedesktop.org/documentation/nvcodec/nvh265dec.html **[P]**. In the source
+(`gstnvdecoder.cpp`), GL output registers the GL PBO with CUDA and does `cuMemcpy2DAsync`
+device-to-device, then flags PBO→texture upload (desktop GL ≥3.0 only, not GLES); CUDA output is
+zero-copy ("Exporting output surface without copy") when `num-output-surfaces != 1`.
+https://raw.githubusercontent.com/GStreamer/gstreamer/main/subprojects/gst-plugins-bad/sys/nvcodec/gstnvdecoder.cpp
+**[P]**. GStreamer devs: CUDA↔GL is the only real GPU-API interop; `vulkanupload` has no zero-copy
+(Nov 2023). https://discourse.gstreamer.org/t/graphics-api-interoperability-and-zero-copy-memory/464
+**[P]**. 1.24 added DRM-modifier `DMA_DRM` negotiation across `va` decoders, `glupload`,
+`waylandsink`; `vah265dec` rank PRIMARY+1. https://gstreamer.freedesktop.org/releases/1.24/ **[P]**.
+`gtk4paintablesink` accepts `DMABuf (DMA_DRM)` (feature `dmabuf`, GTK ≥4.14), `GLMemory` RGBA/RGB
+(features `wayland`/`x11egl`/`x11glx`), or system memory.
+https://gstreamer.freedesktop.org/documentation/gtk4/index.html **[P]**. Hence: NVIDIA `nvh265dec !
+glcolorconvert ! gtk4paintablesink` (one GPU copy, no CPU); Intel/AMD `vah265dec !
+gtk4paintablesink` (DMA-BUF, zero-copy; 10-bit P010 DMA-BUF had sink bugs,
+https://gitlab.freedesktop.org/gstreamer/gstreamer/-/issues/2935 **[P]**). Toolkits: gtk4-rs +
+`gtk4paintablesink` is the only one with a maintained upstream sink; Slint ships a
+`gstreamer-player` example with EGL import on Linux **[S]**; `iced_video_player` copies frames into
+a wgpu texture (CPU upload) **[S]**; egui has no maintained zero-copy path **[I]**.
 
-**B2. FFmpeg from Rust: workable but you own the interop.** `ffmpeg-next`/`video-rs` expose `AVHWDeviceType` (CUDA/VAAPI/Vulkan). https://docs.rs/crate/video-rs/0.7.2/source/src/hwaccel.rs **[S]**. For zero-copy into wgpu: export VAAPI frames as DRM PRIME dmabuf and import with `wgpu::Features::VULKAN_EXTERNAL_MEMORY_DMA_BUF` (requires `VK_EXT_image_drm_format_modifier`; wgpu 30). https://docs.rs/wgpu/latest/wgpu/struct.Features.html **[P]**. `ez-ffmpeg` has an experimental dmabuf→wgpu path. https://docs.rs/crate/ez-ffmpeg/latest **[S]**. NVIDIA: no dmabuf export from CUDA; needs CUDA↔Vulkan external-memory interop by hand (unsafe `ash` + wgpu-hal) **[I]**. Expect weeks of unsafe plumbing; GStreamer gives this for free.
+**B2. FFmpeg from Rust: workable but you own the interop.** `ffmpeg-next`/`video-rs` expose
+`AVHWDeviceType` (CUDA/VAAPI/Vulkan). https://docs.rs/crate/video-rs/0.7.2/source/src/hwaccel.rs
+**[S]**. For zero-copy into wgpu: export VAAPI frames as DRM PRIME dmabuf and import with
+`wgpu::Features::VULKAN_EXTERNAL_MEMORY_DMA_BUF` (requires `VK_EXT_image_drm_format_modifier`; wgpu
+30). https://docs.rs/wgpu/latest/wgpu/struct.Features.html **[P]**. `ez-ffmpeg` has an experimental
+dmabuf→wgpu path. https://docs.rs/crate/ez-ffmpeg/latest **[S]**. NVIDIA: no dmabuf export from
+CUDA; needs CUDA↔Vulkan external-memory interop by hand (unsafe `ash` + wgpu-hal) **[I]**. Expect
+weeks of unsafe plumbing; GStreamer gives this for free.
 
-**B3. libmpv embed works, one render context per core, N cores for N tiles.** `libmpv2` 7.0.0 (2026-10-30) wraps the render API (OpenGL `RenderContext`, `update`, `set_update_callback`, FBO). https://docs.rs/libmpv2/latest/libmpv2/render/struct.RenderContext.html **[P]**. `render.h`: "only 1 mpv_render_context at a time per mpv core", render on a separate thread, API types opengl/sw/d3d11. `client.h`: API "fully thread-safe". https://raw.githubusercontent.com/mpv-player/mpv/master/include/mpv/render.h **[P]**. Manual: `nvdec` is "newest and recommended" for NVIDIA; `vaapi` needs EGL (GL) or DRM-modifier support; `vulkan` hwdec only with `gpu-next`; `--vd-lavc-dr` has optional render-API support. https://mpv.io/manual/master/ **[P]**. Six cores = six demuxers, decoder sessions and GL render passes; CPU ~1–3 % per sub-stream, GPU trivial **[I]**; vaapi under the render API needs the X11/Wayland display param (https://github.com/mpv-player/mpv/issues/10424 **[S]**).
+**B3. libmpv embed works, one render context per core, N cores for N tiles.** `libmpv2` 7.0.0
+(2026-10-30) wraps the render API (OpenGL `RenderContext`, `update`, `set_update_callback`, FBO).
+https://docs.rs/libmpv2/latest/libmpv2/render/struct.RenderContext.html **[P]**. `render.h`: "only 1
+mpv_render_context at a time per mpv core", render on a separate thread, API types opengl/sw/d3d11.
+`client.h`: API "fully thread-safe".
+https://raw.githubusercontent.com/mpv-player/mpv/master/include/mpv/render.h **[P]**. Manual:
+`nvdec` is "newest and recommended" for NVIDIA; `vaapi` needs EGL (GL) or DRM-modifier support;
+`vulkan` hwdec only with `gpu-next`; `--vd-lavc-dr` has optional render-API support.
+https://mpv.io/manual/master/ **[P]**. Six cores = six demuxers, decoder sessions and GL render
+passes; CPU ~1–3 % per sub-stream, GPU trivial **[I]**; vaapi under the render API needs the
+X11/Wayland display param (https://github.com/mpv-player/mpv/issues/10424 **[S]**).
 
-**B4. Consumer NVIDIA GPUs (single NVDEC): HEVC Main/Main10/Main12 4:2:0, no 4:4:4 on older generations, 700–1,600 fps of 1080p HEVC per engine depending on generation, no session cap.** Support matrix: HEVC 4:2:0 8/10/12-bit YES, 4:4:4 NO, VP9 YES, AV1 NO, 1 NVDEC; NVENC "max concurrent sessions" column shows 12, NVDEC has no such column. https://developer.nvidia.com/video-encode-and-decode-gpu-support-matrix-new **[P]**. SDK 13 app note: "All GeForce products consist of a single NVDEC"; per-NVDEC 1080p rates by generation: Pascal H.264 694 / HEVC 810 / HEVC Main10 789 fps, Turing 1316, Ada 1641; "subject to the hardware performance limit and available memory, an application can decode multiple videos simultaneously". https://docs.nvidia.com/video-technologies/video-codec-sdk/13.0/nvdec-application-note/index.html **[P]**. Intel: Flex 140 (4 Xe media engines) claims 30+ 1080p60 or 8 4Kp60 transcode streams per card (product brief) **[S]**; per engine that is roughly 8–9 1080p60 transcodes, so a UHD 7xx iGPU (1–2 engines) should decode ≥10–15 1080p30 HEVC streams **[I]**. Firefox/Chrome on Linux use the same VA-API engine.
+**B4. Consumer NVIDIA GPUs (single NVDEC): HEVC Main/Main10/Main12 4:2:0, no 4:4:4 on older
+generations, 700–1,600 fps of 1080p HEVC per engine depending on generation, no session cap.**
+Support matrix: HEVC 4:2:0 8/10/12-bit YES, 4:4:4 NO, VP9 YES, AV1 NO, 1 NVDEC; NVENC "max
+concurrent sessions" column shows 12, NVDEC has no such column.
+https://developer.nvidia.com/video-encode-and-decode-gpu-support-matrix-new **[P]**. SDK 13 app
+note: "All GeForce products consist of a single NVDEC"; per-NVDEC 1080p rates by generation: Pascal
+H.264 694 / HEVC 810 / HEVC Main10 789 fps, Turing 1316, Ada 1641; "subject to the hardware
+performance limit and available memory, an application can decode multiple videos simultaneously".
+https://docs.nvidia.com/video-technologies/video-codec-sdk/13.0/nvdec-application-note/index.html
+**[P]**. Intel: Flex 140 (4 Xe media engines) claims 30+ 1080p60 or 8 4Kp60 transcode streams per
+card (product brief) **[S]**; per engine that is roughly 8–9 1080p60 transcodes, so a UHD 7xx iGPU
+(1–2 engines) should decode ≥10–15 1080p30 HEVC streams **[I]**. Firefox/Chrome on Linux use
+the same VA-API engine.
 
-**B5. Load estimate.** 6×720p30 sub-streams (~80 "1080p-equivalent" fps) + 1×4K30 main (120) ≈ 200 of 810 fps → ~25 % of that NVDEC; CPU: RTSP/fMP4 demux + `h265parse` only, ≈ 5–15 % of one core total; GPU 3D: colour-convert + composite 7 textures, negligible **[I]**.
+**B5. Load estimate.** 6×720p30 sub-streams (~80 "1080p-equivalent" fps) + 1×4K30 main (120) ≈
+200 of 810 fps → ~25 % of that NVDEC; CPU: RTSP/fMP4 demux + `h265parse` only, ≈ 5–15 % of one
+core total; GPU 3D: colour-convert + composite 7 textures, negligible **[I]**.
 
 ## C. Browsers (2026)
 
-**C1. Chrome/Edge: HEVC via `<video>`/MSE/WebCodecs is hardware-only.** Windows ≥107 (D3D11), macOS ≥107, Android ≥112, Linux ≥108 "only GPUs that support VAAPI interface, eg: Intel"; WebCodecs decode since 107 (8-bit)/108 (10-bit); encode 130; WebRTC 136. https://github.com/StaZhu/enable-chromium-hevc-hardware-decoding **[S]**. Linux hardware decode has historically been flag-gated (`VaapiVideoDecodeLinuxGL`); a user report says Chromium 151 enables it by default — unverified **[flag]**. NVIDIA on Linux needs the third-party `nvidia-vaapi-driver` — unverified for Chrome **[flag]**.
-**C2. Safari: HEVC in HLS and MSE works; MSE on iPhone needs iOS 17.1 (Managed Media Source) and an AirPlay/HLS source alternative.** https://webkit.org/blog/14735/managed-media-source/ **[P]**; go2rtc table: iPhone Safari 17.1+ MSE H264/H265, HLS H264/H265, no progressive HTTP **[S]**. WebCodecs HEVC in Safari: 16.4 shipped video WebCodecs, but HEVC `isConfigSupported` rejected in 16.4 and had decode bugs in STP (Dec 2023); current status unverified. https://developer.apple.com/forums/thread/729464 , https://bugs.webkit.org/show_bug.cgi?id=262950 **[P, status flag]**. WebTransport shipped in Safari 26.4. https://webkit.org/blog/17862/webkit-features-for-safari-26-4/ **[P]**.
-**C3. Firefox: HEVC decode is hardware-only; Windows ≥134 (MFT), macOS ≥136, Linux ≥137 via VA-API.** "Support HEVC playback on Linux" (137.0, 2025-04-01). https://www.firefox.com/en-US/firefox/137.0/releasenotes/ **[P]**; https://www.phoronix.com/news/Firefox-137-Available **[S]**. No HEVC in WebRTC; WebCodecs HEVC appears pref-gated (`dom.media.webcodecs.h265.enabled`), not default **[flag]**.
-**Verdict:** a transcode-free web UI is viable for Chrome/Edge/Safari (MSE/`ManagedMediaSource` with `hvc1` fMP4 over WebSocket or HTTP, HLS for iPhone Safari <17.1) and Firefox ≥137 on VA-API hardware; it is never viable on machines without a hardware HEVC decoder, and WebCodecs-based players should be Chrome-only today.
+**C1. Chrome/Edge: HEVC via `<video>`/MSE/WebCodecs is hardware-only.** Windows ≥107 (D3D11),
+macOS ≥107, Android ≥112, Linux ≥108 "only GPUs that support VAAPI interface, eg: Intel";
+WebCodecs decode since 107 (8-bit)/108 (10-bit); encode 130; WebRTC 136.
+https://github.com/StaZhu/enable-chromium-hevc-hardware-decoding **[S]**. Linux hardware decode has
+historically been flag-gated (`VaapiVideoDecodeLinuxGL`); a user report says Chromium 151 enables it
+by default — unverified **[flag]**. NVIDIA on Linux needs the third-party `nvidia-vaapi-driver`
+— unverified for Chrome **[flag]**. **C2. Safari: HEVC in HLS and MSE works; MSE on iPhone needs
+iOS 17.1 (Managed Media Source) and an AirPlay/HLS source alternative.**
+https://webkit.org/blog/14735/managed-media-source/ **[P]**; go2rtc table: iPhone Safari 17.1+ MSE
+H264/H265, HLS H264/H265, no progressive HTTP **[S]**. WebCodecs HEVC in Safari: 16.4 shipped video
+WebCodecs, but HEVC `isConfigSupported` rejected in 16.4 and had decode bugs in STP (Dec 2023);
+current status unverified. https://developer.apple.com/forums/thread/729464 ,
+https://bugs.webkit.org/show_bug.cgi?id=262950 **[P, status flag]**. WebTransport shipped in Safari
+26.4. https://webkit.org/blog/17862/webkit-features-for-safari-26-4/ **[P]**. **C3. Firefox: HEVC
+decode is hardware-only; Windows ≥134 (MFT), macOS ≥136, Linux ≥137 via VA-API.** "Support
+HEVC playback on Linux" (137.0, 2025-04-01).
+https://www.firefox.com/en-US/firefox/137.0/releasenotes/ **[P]**;
+https://www.phoronix.com/news/Firefox-137-Available **[S]**. No HEVC in WebRTC; WebCodecs HEVC
+appears pref-gated (`dom.media.webcodecs.h265.enabled`), not default **[flag]**. **Verdict:** a
+transcode-free web UI is viable for Chrome/Edge/Safari (MSE/`ManagedMediaSource` with `hvc1` fMP4
+over WebSocket or HTTP, HLS for iPhone Safari <17.1) and Firefox ≥137 on VA-API hardware; it is
+never viable on machines without a hardware HEVC decoder, and WebCodecs-based players should be
+Chrome-only today.
 
 ## Recommended client architecture for irisd (as proposed by this thread)
 
-- **Daemon output (common):** `hvc1` fMP4 (CMAF) with per-GOP fragments plus the same bytes exposed as (1) LL-HLS (6 s segments, 0.33–1 s parts, `PART-HOLD-BACK` 3× part, blocking reload, HTTP/2), (2) a WebSocket/HTTP stream of init + fragments, (3) raw length-prefixed NAL access units over WebSocket (and later QUIC). Ask cameras for 1–2 s GOP, no B-frames. WebRTC is outside the 0.1 alpha (it needs its own stack and buys nothing on a LAN; revisit for remote access).
-- **iOS (Swift):** grid = 6 sub-streams over one WebSocket → `CMSampleBuffer` → `AVSampleBufferDisplayLayer` per tile (~150–300 ms, PiP via ContentSource, recreate sessions on foreground); full-res view = same path with main stream; fallback/background-friendly path = AVPlayer + LL-HLS (~2–4 s). CPU: demux only, decoder hardware. Keep LL-HLS for AirPlay/CarPlay-type contexts.
-- **Linux GUI (Rust):** gtk4-rs + gstreamer-rs, one pipeline per tile: `appsrc(fMP4/NAL from WS) ! h265parse ! {nvh265dec ! glcolorconvert | vah265dec} ! gtk4paintablesink` with `dmabuf` + GL features; auto-select decoder by rank; ~25 % NVDEC, <15 % of one CPU core for 6 sub + 1 main; latency ~100–250 ms. libmpv is the fallback if GStreamer's CUDA/GL path misbehaves on a given driver.
-- **Web UI (optional):** MSE/ManagedMediaSource player fed by the WebSocket fMP4 stream (~0.5–1 s), `<source>` HLS alternative for iPhone/AirPlay; detect `hvc1` support via `MediaCapabilities`/`isTypeSupported` and show "hardware HEVC required" otherwise.
+- **Daemon output (common):** `hvc1` fMP4 (CMAF) with per-GOP fragments plus the same bytes exposed
+  as (1) LL-HLS (6 s segments, 0.33–1 s parts, `PART-HOLD-BACK` 3× part, blocking reload,
+  HTTP/2), (2) a WebSocket/HTTP stream of init + fragments, (3) raw length-prefixed NAL access units
+  over WebSocket (and later QUIC). Ask cameras for 1–2 s GOP, no B-frames. WebRTC is outside the
+  0.1 alpha (it needs its own stack and buys nothing on a LAN; revisit for remote access).
+- **iOS (Swift):** grid = 6 sub-streams over one WebSocket → `CMSampleBuffer` →
+  `AVSampleBufferDisplayLayer` per tile (~150–300 ms, PiP via ContentSource, recreate sessions on
+  foreground); full-res view = same path with main stream; fallback/background-friendly path =
+  AVPlayer + LL-HLS (~2–4 s). CPU: demux only, decoder hardware. Keep LL-HLS for
+  AirPlay/CarPlay-type contexts.
+- **Linux GUI (Rust):** gtk4-rs + gstreamer-rs, one pipeline per tile: `appsrc(fMP4/NAL from WS) !
+  h265parse ! {nvh265dec ! glcolorconvert | vah265dec} ! gtk4paintablesink` with `dmabuf` + GL
+  features; auto-select decoder by rank; ~25 % NVDEC, <15 % of one CPU core for 6 sub + 1 main;
+  latency ~100–250 ms. libmpv is the fallback if GStreamer's CUDA/GL path misbehaves on a given
+  driver.
+- **Web UI (optional):** MSE/ManagedMediaSource player fed by the WebSocket fMP4 stream (~0.5–1
+  s), `<source>` HLS alternative for iPhone/AirPlay; detect `hvc1` support via
+  `MediaCapabilities`/`isTypeSupported` and show "hardware HEVC required" otherwise.
 
 ## Open questions
-1. Does Safari 18+ enable both send and receive of H.265 by default, and does WKWebView inherit it? (PR diff not inspected.)
+1. Does Safari 18+ enable both send and receive of H.265 by default, and does WKWebView inherit it?
+   (PR diff not inspected.)
 2. Current Safari WebCodecs HEVC status (bug 262950 was reopened in Dec 2023).
-3. Is Chrome-on-Linux hardware decode on by default in 2026 (Chromium 151 claim), and does it work via `nvidia-vaapi-driver`?
-4. Real iPhone per-device concurrent `VTDecompressionSession` ceiling and 4K-tile count (needs measurement; Apple publishes none).
-5. gtk4paintablesink + NVIDIA proprietary driver on Wayland vs X11/EGL: which GL path is stable on the dev host's distribution and GTK version (needs a spike).
+3. Is Chrome-on-Linux hardware decode on by default in 2026 (Chromium 151 claim), and does it work
+   via `nvidia-vaapi-driver`?
+4. Real iPhone per-device concurrent `VTDecompressionSession` ceiling and 4K-tile count (needs
+   measurement; Apple publishes none).
+5. gtk4paintablesink + NVIDIA proprietary driver on Wayland vs X11/EGL: which GL path is stable on
+   the dev host's distribution and GTK version (needs a spike).
 6. Measured Intel iGPU HEVC decode fps per media engine (only Flex-series marketing numbers found).
-7. Whether UniFi Protect/Scrypted iOS apps use fMP4-over-WebSocket or WebRTC (no public documentation found).
+7. Whether UniFi Protect/Scrypted iOS apps use fMP4-over-WebSocket or WebRTC (no public
+   documentation found).

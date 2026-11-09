@@ -4,7 +4,7 @@ Scope: this crate only. Read the root `AGENTS.md` first.
 
 ## Invariants
 
-- The on-disk layout (`src/layout.rs`), the one-`pwritev`-per-fragment write, the
+- The on-disk layout (`src/layout.rs`), the one-vectored-write-per-fragment rule, the
   preallocation and truncate-at-seal rule, the sync cadence, and the durability order
   implement `docs/research/04-storage-format.md §3–§6 and §8`; change them only with that
   document and `tests/store.rs`.
@@ -17,15 +17,19 @@ Scope: this crate only. Read the root `AGENTS.md` first.
   no logical shortening, before catalog seal. The rebuilt header keeps each nonzero run id and
   sample-entry hash of the prior header, else the caller's `IndexBinding`, else zero. A file over
   `MAX_PERSISTED_INDEX_RECORDS` fragments is refused before any byte changes.
-- Every open of a marker, media file, or sidecar beneath a root goes through `fs::open_regular_beneath`:
-  nonblocking, no-follow, beneath, no-cross-mount, regular files only. Removal never opens a
-  special file, and a missing layout directory under a verified root is absence, not an error.
+- Every open of an existing marker, media file, or sidecar beneath an approved root goes
+  through `fs::open_regular_beneath`: nonblocking, no-follow, beneath, no-cross-mount, regular
+  files only. Every creation beneath an approved root goes through `fs::create_file_beneath`
+  (`O_CREAT | O_EXCL` with the same resolution) or `openat` on the root descriptor for the
+  marker. Standalone writers resolve roots and layout directories by name. Removal never opens
+  a special file, and a missing layout directory under a verified root is absence, not an
+  error.
 - The writer never appends a fragment to a file that holds `MAX_PERSISTED_INDEX_RECORDS`
   fragments, and rotates at the next sync sample once a file holds 4,096 fewer. A sample entry
   whose bytes differ always rotates; its CRC-32C alone never decides.
 - A free-space probe error for lack of a process resource (`EMFILE`, `ENFILE`, `ENOMEM`,
   `EAGAIN`, `EINTR`) never abandons files; every other probe error does.
-- Created files are 0600 and created directories 0700, independent of the umask.
+- Created files are 0600 and created directories 0700; the umask can only narrow them.
 - Initialization claims media and sidecar exclusively, makes their bytes and directory entries
   durable before `SegmentOpened`, and rolls back only the attempt-owned pair on failure. An
   approved writer pins its verified root before layout creation and performs every component and
@@ -49,8 +53,11 @@ Scope: this crate only. Read the root `AGENTS.md` first.
 
 ## Where things are
 
-- `src/writer.rs` — `WriterHandle`, `WriterStats`, the channel, the thread body (write,
-  sync sweep, seal on shutdown), slow-I/O warnings.
+- `src/writer.rs` — `WriterHandle`, `WriterStats`, `QueueFull`, the queue commands, and the
+  sync-phase and slow-I/O thresholds.
+- `src/root_worker.rs` — one root's disk worker: the thread body (write, sync sweep, seal on
+  shutdown), slow-I/O warnings, free-space checks, ordered failover, terminal-root retries, and
+  cascading shutdown.
 - `src/writer/worker.rs` — one root's disk worker, free-space checks, ordered failover,
   terminal-root retries, and cascading shutdown.
 - `src/stream.rs` — `StreamWriter`: one stream's open file, rotation decisions, abandon on

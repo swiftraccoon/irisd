@@ -1,9 +1,13 @@
 //! Sidecar index: a 64-byte header and fixed 40-byte records, one per fragment.
 //!
-//! The index is a cache of what the fragments' own boxes say; it can be
-//! rebuilt with [`crate::reader::scan`].
+//! The index caches what the fragment boxes say plus facts only the writer
+//! knows: `raw_rtp`, `run_id`, and the discontinuity and new-parameter flags.
+//! [`crate::reader::scan`] rebuilds the box-derived fields
+//! ([`IndexRecord::from_scan`]); a rebuild leaves `raw_rtp` zero and keeps the
+//! writer-only facts only from a prior sidecar whose records match.
 
-use std::fs::{File, OpenOptions};
+use std::collections::TryReserveError;
+use std::fs::File;
 use std::io::{self, Read, Write};
 use std::path::Path;
 
@@ -76,14 +80,31 @@ impl IndexHeader {
     }
 
     /// Parses a header.
+    ///
+    /// # Errors
+    ///
+    /// [`IndexError::Truncated`] for fewer than [`HEADER_LEN`] bytes,
+    /// [`IndexError::BadMagic`] without the `IRIX` magic,
+    /// [`IndexError::UnsupportedVersion`] for another version, and
+    /// [`IndexError::UnsupportedRecordLen`] for another record length.
+    #[expect(
+        clippy::missing_panics_doc,
+        reason = "the expects read fields the length check covers"
+    )]
     pub fn decode(b: &[u8]) -> Result<Self, IndexError> {
-        if b.len() < HEADER_LEN || b[0..4] != INDEX_MAGIC {
+        if b.len() < HEADER_LEN {
+            return Err(IndexError::Truncated);
+        }
+        if b[0..4] != INDEX_MAGIC {
             return Err(IndexError::BadMagic);
         }
         let version = u16::from_be_bytes([b[4], b[5]]);
-        let record_len = u16::from_be_bytes([b[6], b[7]]);
-        if version != INDEX_VERSION || usize::from(record_len) != RECORD_LEN {
+        if version != INDEX_VERSION {
             return Err(IndexError::UnsupportedVersion(version));
+        }
+        let record_len = u16::from_be_bytes([b[6], b[7]]);
+        if usize::from(record_len) != RECORD_LEN {
+            return Err(IndexError::UnsupportedRecordLen(record_len));
         }
         Ok(Self {
             timescale: be_u32(b, 8).expect("header long enough"),
@@ -150,6 +171,10 @@ impl IndexRecord {
 
     /// Parses a record from exactly [`RECORD_LEN`] bytes.
     #[must_use]
+    #[expect(
+        clippy::missing_panics_doc,
+        reason = "the expects read fields inside the fixed-size array"
+    )]
     pub fn decode(b: &[u8; RECORD_LEN]) -> Self {
         Self {
             offset: be_u64(b, 0).expect("fixed size"),
@@ -163,8 +188,10 @@ impl IndexRecord {
         }
     }
 
-    /// Builds a record from scanned fragment facts; `raw_rtp` is unknown
-    /// after a scan and left zero.
+    /// Builds a record from scanned fragment facts. A scan does not know
+    /// `raw_rtp`, which is left zero, nor the discontinuity and new-parameter
+    /// flags, which are left clear; a fragment without a `prft` gets a zero
+    /// wall time.
     #[must_use]
     pub fn from_scan(info: &FragmentInfo) -> Self {
         Self {
@@ -189,33 +216,51 @@ impl IndexRecord {
         self.flags & FLAG_STARTS_WITH_SYNC != 0
     }
 
-    /// End offset of the fragment (exclusive).
+    /// End offset of the fragment (exclusive). Saturates for a record built
+    /// by hand whose range overflows; every index reader rejects such a
+    /// record with [`IndexError::InvalidByteRange`].
     #[must_use]
     pub fn end(&self) -> u64 {
-        self.offset + u64::from(self.len)
+        self.offset.saturating_add(u64::from(self.len))
+    }
+}
+
+impl From<&FragmentInfo> for IndexRecord {
+    fn from(info: &FragmentInfo) -> Self {
+        Self::from_scan(info)
     }
 }
 
 /// Errors reading an index.
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum IndexError {
+    /// Shorter than a header.
+    #[error("index is shorter than its {HEADER_LEN}-byte header")]
+    Truncated,
     /// Not an index file.
     #[error("not an irisd index file")]
     BadMagic,
     /// A version this build does not read.
     #[error("unsupported index version {0}")]
     UnsupportedVersion(u16),
+    /// A record length other than [`RECORD_LEN`].
+    #[error("unsupported index record length {0}")]
+    UnsupportedRecordLen(u16),
     /// A complete record has an impossible, overflowing or noncontiguous media range.
     #[error("invalid fragment byte range in index")]
     InvalidByteRange,
-    /// The index exceeds a caller-supplied serving budget.
-    #[error("index is {bytes} bytes; serving limit is {max_bytes} bytes")]
+    /// The index exceeds the caller's record budget.
+    #[error("index is {bytes} bytes; the limit is {max_bytes} bytes")]
     TooLarge {
         /// Observed bytes, or one past the limit when the file grew while being read.
         bytes: u64,
         /// Maximum accepted bytes.
         max_bytes: u64,
     },
+    /// Memory for the records could not be reserved.
+    #[error("cannot reserve memory for the index: {0}")]
+    Allocation(#[from] TryReserveError),
     /// I/O failure.
     #[error(transparent)]
     Io(#[from] io::Error),
@@ -228,44 +273,37 @@ pub struct IndexWriter {
 }
 
 impl IndexWriter {
-    /// Creates (truncating) an index file and writes its header.
-    pub fn create(path: &Path, header: &IndexHeader) -> io::Result<Self> {
-        let file = OpenOptions::new()
-            .create(true)
-            .truncate(true)
-            .write(true)
-            .open(path)?;
-        Self::from_claimed_file(file, header)
-    }
-
     /// Initializes an empty file that the caller has already claimed for this
     /// index and writes its header.
     ///
     /// This entry point lets a caller claim a media/index pair exclusively and
     /// retain exact ownership for rollback if initialization fails.
+    ///
+    /// # Errors
+    ///
+    /// The error of writing the header.
     pub fn from_claimed_file(mut file: File, header: &IndexHeader) -> io::Result<Self> {
         file.write_all(&header.encode())?;
         Ok(Self { file })
     }
 
     /// Appends one record.
+    ///
+    /// # Errors
+    ///
+    /// The error of the write.
     pub fn append(&mut self, record: &IndexRecord) -> io::Result<()> {
         self.file.write_all(&record.encode())
     }
 
     /// Flushes data to the device.
+    ///
+    /// # Errors
+    ///
+    /// The error of `fdatasync`.
     pub fn sync(&self) -> io::Result<()> {
         self.file.sync_data()
     }
-}
-
-/// Reads an index file, ignoring a trailing partial record.
-/// Complete fragment ranges must exceed the trailer length and be contiguous
-/// from the initialization segment, with non-overflowing ends.
-pub fn read_index(path: &Path) -> Result<(IndexHeader, Vec<IndexRecord>), IndexError> {
-    let mut bytes = Vec::new();
-    File::open(path)?.read_to_end(&mut bytes)?;
-    decode_index(&bytes, usize::MAX)
 }
 
 /// Reads an index while accepting at most `max_records` complete records.
@@ -279,6 +317,11 @@ pub fn read_index(path: &Path) -> Result<(IndexHeader, Vec<IndexRecord>), IndexE
 /// suits offline tools and tests. Daemon code opens the sidecar itself,
 /// without following links and without blocking, and passes the descriptor to
 /// [`read_index_file_bounded`] or [`read_index_file_bound_to_media`].
+///
+/// # Errors
+///
+/// [`IndexError::Io`] when the file cannot be opened, then the errors of
+/// [`read_index_file_bounded`].
 pub fn read_index_bounded(
     path: &Path,
     max_records: usize,
@@ -289,6 +332,13 @@ pub fn read_index_bounded(
 /// Reads an already-opened sidecar under the same ceiling as
 /// [`read_index_bounded`]. This lets descriptor-relative callers bind path
 /// authorization and I/O without reopening a pathname.
+///
+/// # Errors
+///
+/// [`IndexError::TooLarge`] when the file's length, or what it grew to while
+/// being read, exceeds the header plus `max_records` records and a partial
+/// tail; [`IndexError::Io`] for a metadata or read failure; then the errors
+/// of [`decode_index`].
 pub fn read_index_file_bounded(
     file: File,
     max_records: usize,
@@ -301,20 +351,11 @@ fn read_index_file_bounded_with(
     max_records: usize,
     after_metadata: impl FnOnce(&File) -> io::Result<()>,
 ) -> Result<(IndexHeader, Vec<IndexRecord>), IndexError> {
+    // A budget beyond the address space saturates: the file length check
+    // below then admits any file the host can hold.
     let max_bytes = HEADER_LEN
-        .checked_add(
-            max_records
-                .checked_mul(RECORD_LEN)
-                .ok_or(IndexError::TooLarge {
-                    bytes: u64::MAX,
-                    max_bytes: u64::MAX,
-                })?,
-        )
-        .and_then(|bytes| bytes.checked_add(RECORD_LEN - 1))
-        .ok_or(IndexError::TooLarge {
-            bytes: u64::MAX,
-            max_bytes: u64::MAX,
-        })?;
+        .saturating_add(max_records.saturating_mul(RECORD_LEN))
+        .saturating_add(RECORD_LEN - 1);
     let max_bytes_u64 = u64::try_from(max_bytes).unwrap_or(u64::MAX);
     let file_len = file.metadata()?.len();
     if file_len > max_bytes_u64 {
@@ -324,19 +365,14 @@ fn read_index_file_bounded_with(
         });
     }
     after_metadata(&file)?;
-    let read_limit = max_bytes.checked_add(1).ok_or(IndexError::TooLarge {
-        bytes: u64::MAX,
-        max_bytes: max_bytes_u64,
-    })?;
+    let read_limit = max_bytes.saturating_add(1);
     let allocation = usize::try_from(file_len)
         .unwrap_or(max_bytes)
         .min(max_bytes)
         .saturating_add(1)
         .min(read_limit);
     let mut bytes = Vec::new();
-    bytes
-        .try_reserve_exact(allocation)
-        .map_err(|error| IndexError::Io(io::Error::other(error.to_string())))?;
+    bytes.try_reserve_exact(allocation)?;
     file.take(u64::try_from(read_limit).unwrap_or(u64::MAX))
         .read_to_end(&mut bytes)?;
     if bytes.len() > max_bytes {
@@ -355,6 +391,10 @@ fn read_index_file_bounded_with(
 /// `media_len` must be the length of that same already-open media file. A scan
 /// that stopped early, an incomplete extent, a header mismatch, or any record
 /// mismatch returns `Ok(None)`, allowing callers to use the scan as fallback.
+///
+/// # Errors
+///
+/// The errors of [`read_index_file_bounded`].
 pub fn read_index_file_bound_to_media(
     file: File,
     max_records: usize,
@@ -391,7 +431,21 @@ fn index_record_matches_fragment(record: &IndexRecord, fragment: &FragmentInfo) 
         && record.starts_with_sync() == fragment.starts_with_sync
 }
 
-fn decode_index(
+/// Decodes a whole index file image: the header, then every complete record,
+/// ignoring a trailing partial record. At most `max_records` records are
+/// accepted, and the records must describe contiguous byte ranges from the
+/// header's `init_len`, each longer than a trailer with a non-overflowing
+/// end. The file readers call this after bounding what they read; it is
+/// public for the `index` fuzz target and for callers that hold a bounded
+/// image of their own.
+///
+/// # Errors
+///
+/// The header errors of [`IndexHeader::decode`]; [`IndexError::TooLarge`]
+/// beyond `max_records`; [`IndexError::InvalidByteRange`] for a record that
+/// does not continue the previous one or whose end overflows;
+/// [`IndexError::Allocation`] when the record storage cannot be reserved.
+pub fn decode_index(
     bytes: &[u8],
     max_records: usize,
 ) -> Result<(IndexHeader, Vec<IndexRecord>), IndexError> {
@@ -407,9 +461,7 @@ fn decode_index(
         });
     }
     let mut records = Vec::new();
-    records
-        .try_reserve_exact(chunks.len())
-        .map_err(|error| IndexError::Io(io::Error::other(error.to_string())))?;
+    records.try_reserve_exact(chunks.len())?;
     let mut next_offset = u64::from(header.init_len);
     for chunk in chunks {
         let record = IndexRecord::decode(chunk);
@@ -564,9 +616,49 @@ mod tests {
                 bytes.extend(record.encode());
             }
             std::fs::write(&path, bytes).unwrap();
-            assert!(read_index(&path).is_err());
+            assert!(matches!(
+                read_index_bounded(&path, MAX_PERSISTED_INDEX_RECORDS),
+                Err(IndexError::InvalidByteRange)
+            ));
         }
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn header_decode_rejects_short_bad_magic_and_other_versions() {
+        let header = IndexHeader::default().encode();
+        assert!(matches!(
+            IndexHeader::decode(&header[..HEADER_LEN - 1]),
+            Err(IndexError::Truncated)
+        ));
+        let mut magic = header;
+        magic[0] = b'X';
+        assert!(matches!(
+            IndexHeader::decode(&magic),
+            Err(IndexError::BadMagic)
+        ));
+        let mut version = header;
+        version[4..6].copy_from_slice(&2u16.to_be_bytes());
+        assert!(matches!(
+            IndexHeader::decode(&version),
+            Err(IndexError::UnsupportedVersion(2))
+        ));
+        let mut record_len = header;
+        record_len[6..8].copy_from_slice(&48u16.to_be_bytes());
+        assert!(matches!(
+            IndexHeader::decode(&record_len),
+            Err(IndexError::UnsupportedRecordLen(48))
+        ));
+    }
+
+    #[test]
+    fn a_hand_built_record_end_saturates() {
+        let record = IndexRecord {
+            offset: u64::MAX - 1,
+            len: 100,
+            ..IndexRecord::default()
+        };
+        assert_eq!(record.end(), u64::MAX);
     }
 
     #[test]
@@ -578,7 +670,7 @@ mod tests {
             run_id: 1,
             ..IndexHeader::default()
         };
-        let mut w = IndexWriter::create(&path, &header).unwrap();
+        let mut w = IndexWriter::from_claimed_file(File::create(&path).unwrap(), &header).unwrap();
         for i in 0..3u64 {
             w.append(&IndexRecord {
                 offset: i * 100,
@@ -589,9 +681,9 @@ mod tests {
         }
         w.sync().unwrap();
         drop(w);
-        let mut f = OpenOptions::new().append(true).open(&path).unwrap();
+        let mut f = File::options().append(true).open(&path).unwrap();
         f.write_all(&[1, 2, 3]).unwrap();
-        let (h, records) = read_index(&path).unwrap();
+        let (h, records) = read_index_bounded(&path, MAX_PERSISTED_INDEX_RECORDS).unwrap();
         assert_eq!(h, header);
         assert_eq!(
             records.iter().map(|r| r.offset).collect::<Vec<_>>(),
@@ -665,11 +757,7 @@ mod tests {
         ));
 
         write_index(&path, header, &[record], &[]);
-        let growing = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&path)
-            .unwrap();
+        let growing = File::options().read(true).write(true).open(&path).unwrap();
         let grown_len = HEADER_LEN + RECORD_LEN + RECORD_LEN;
         assert!(matches!(
             read_index_file_bounded_with(growing, 1, |file| {

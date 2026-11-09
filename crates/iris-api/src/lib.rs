@@ -17,9 +17,13 @@
 //! |---|---|
 //! | `GET /api/health` | liveness: status, uptime, version |
 //! | `GET /metrics` | Prometheus text: requests, clients, admission rejections, event lag, and catalog queue/failure/state/storage metrics |
-//! | `GET /api/cameras` | the configured cameras |
+//! | `GET /api/cameras` | the running cameras, configured or added through the API |
+//! | `POST /api/cameras` | adds a camera described like a `[[camera]]` table; `[provisioning] enabled` and the root token |
+//! | `DELETE /api/cameras/{camera}` | stops and forgets a camera the API added |
+//! | `GET /api/onvif/devices` | the cameras a bounded WS-Discovery probe finds; same gating |
+//! | `POST /api/onvif/streams` | the RTSP URLs of one camera's ONVIF profiles, moved onto the given host; same gating |
 //! | `GET /api/cameras/{camera}` | one camera and the health of its recorded streams |
-//! | `GET /api/cameras/{camera}/snapshot.jpg` | a JPEG proxied from the camera |
+//! | `GET /api/cameras/{camera}/snapshot.jpg` | a JPEG proxied from the camera (Dahua CGI or the ONVIF Media service) |
 //! | `GET /api/streams/{camera}/{kind}/segments` | catalog rows in a time range |
 //! | `GET /api/streams/{camera}/{kind}/hls/vod.m3u8` | a byte-range VOD playlist |
 //! | `GET /api/streams/{camera}/{kind}/export.mp4` | init segment plus the fragments in range |
@@ -43,10 +47,13 @@
 //! # State
 //!
 //! [`ApiState`] holds the catalog handle, the [`LiveRegistry`] the daemon fills
-//! as streams start, the event broadcast channel, tokens, the approved
-//! recording roots, active configured cameras, [`SnapshotSource`]s,
-//! [`ApiStats`], a monotonic start instant, and the shutdown token. Failures
-//! are [`ApiError`]s rendered as JSON bodies with the matching status.
+//! as streams start, the event broadcast channel, tokens, the
+//! [`CapabilitySecret`] that signs media capabilities, the approved recording
+//! roots, the public-metrics switch, the running cameras, [`SnapshotSource`]s,
+//! the optional [`CameraControl`], [`ApiStats`], a monotonic start instant, and
+//! the shutdown token. A handler failure is rendered as a JSON
+//! `{"error": …}` body with the matching status; HTTP 500 bodies carry only
+//! `"internal error"` and a `request_id`.
 //!
 //! ```no_run
 //! use std::sync::Arc;
@@ -70,6 +77,8 @@ mod live;
 mod llhls;
 mod media_admission;
 mod metrics;
+mod onvif;
+mod provision;
 mod query;
 mod segments;
 mod server;
@@ -82,27 +91,35 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use axum::Router;
+use axum::extract::DefaultBodyLimit;
 use axum::middleware;
 use axum::routing::get;
+use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
 
-pub use error::ApiError;
+pub use auth::{CAPABILITY_SECRET_BYTES, CapabilitySecret};
 pub use live::{MAX_LIVE_MESSAGE_BYTES, MSG_FRAGMENT, MSG_INIT};
+pub use provision::{CameraControl, ControlRequest, ProvisionError};
 pub use server::{ServeLimits, serve_listener};
 pub use state::{ActiveCamera, ApiState, ApiStats, LiveRegistry, SnapshotSource};
 
 /// Builds the router. Routes under `/api` other than `/api/health` require a
 /// bearer token when [`ApiState::tokens`] is not empty; so does `/metrics`
-/// unless [`ApiState::public_metrics`] is set. Media capabilities never
-/// authorize `/metrics`.
+/// unless [`ApiState::public_metrics`] is set. Media capabilities, signed with
+/// [`ApiState::capability_secret`], never authorize `/metrics`.
 pub fn router(state: Arc<ApiState>) -> Router {
     if state.tokens.is_empty() {
         tracing::warn!("API tokens are empty: every endpoint is unauthenticated");
     }
     let mut public = Router::new().route("/api/health", get(health::health));
     let mut protected = Router::new()
-        .route("/api/cameras", get(cameras::list))
-        .route("/api/cameras/{camera}", get(cameras::detail))
+        .route("/api/cameras", get(cameras::list).post(provision::add))
+        .route(
+            "/api/cameras/{camera}",
+            get(cameras::detail).delete(provision::remove),
+        )
+        .route("/api/onvif/devices", get(onvif::devices))
+        .route("/api/onvif/streams", axum::routing::post(onvif::streams))
         .route(
             "/api/cameras/{camera}/snapshot.jpg",
             get(snapshot::snapshot),
@@ -145,14 +162,21 @@ pub fn router(state: Arc<ApiState>) -> Router {
     } else {
         protected = protected.route("/metrics", get(metrics::metrics));
     }
-    let protected = protected.route_layer(middleware::from_fn_with_state(
-        Arc::clone(&state),
-        auth::require_token,
-    ));
+    let protected = protected
+        .route_layer(middleware::from_fn_with_state(
+            Arc::clone(&state),
+            auth::require_token,
+        ))
+        .layer(DefaultBodyLimit::max(provision::MAX_PROTECTED_BODY_BYTES));
     public.merge(protected).with_state(state)
 }
 
 /// Serves `router` on `listen` under `limits` until `shutdown` is cancelled.
+///
+/// # Errors
+///
+/// The error of binding `listen` ([`bind`]), or the one [`serve_listener`]
+/// returns.
 pub async fn serve(
     listen: SocketAddr,
     router: Router,
@@ -165,6 +189,10 @@ pub async fn serve(
 
 /// Binds the API listener so an orchestrator can prove admission before
 /// reporting service readiness.
-pub async fn bind(listen: SocketAddr) -> io::Result<tokio::net::TcpListener> {
-    tokio::net::TcpListener::bind(listen).await
+///
+/// # Errors
+///
+/// The error of binding `listen`, such as `AddrInUse` or `PermissionDenied`.
+pub async fn bind(listen: SocketAddr) -> io::Result<TcpListener> {
+    TcpListener::bind(listen).await
 }

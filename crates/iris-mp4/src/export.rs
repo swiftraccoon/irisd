@@ -13,27 +13,44 @@ use bytes::Bytes;
 use crate::boxes::{BoxHeader, BoxWriter, be_u32};
 use crate::crc::Crc32c;
 use crate::fragment::{
-    FragmentHeader, Sample, TRAILER_LEN, decode_trailer, encode_fragment, encode_trailer,
+    FragmentError, FragmentHeader, Sample, TRAILER_LEN, decode_trailer, encode_fragment,
+    encode_trailer,
 };
+pub use crate::init::MOVIE_TIMESCALE;
 use crate::reader::FragmentInfo;
 use iris_core::time::MediaTicks;
 
-/// Movie timescale written by [`crate::init::build_init_segment`] (`mvhd`).
-pub const MOVIE_TIMESCALE: u32 = 1000;
-
 /// Why a fragment or init segment could not be rewritten.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
 pub enum ExportError {
-    /// A box the rewrite needs is missing or malformed.
+    /// A box the rewrite needs is missing or malformed, or the checksum does
+    /// not match.
     #[error("malformed {0}")]
     Malformed(&'static str),
+    /// The requested duration is zero or negative.
+    #[error("export duration must be positive")]
+    InvalidDuration,
+    /// The edit list's media time does not fit the signed 64-bit field.
+    #[error("edit list media time must fit a signed 64-bit field")]
+    InvalidMediaTime,
+    /// The trimmed prefix cannot be encoded as a recording fragment.
+    #[error("encoding the trimmed fragment: {0}")]
+    Encode(#[from] FragmentError),
 }
 
 /// Rewrites one complete fragment in place (`prft`, `moof`, `mdat`, trailer):
 /// the `mfhd` sequence number becomes `sequence`, the `tfdt` decode time and
-/// the `prft` media time become `decode_time`, and the trailer is recomputed
-/// over the rewritten bytes. The original checksum is verified before any
-/// bytes are changed; corrupt input is rejected.
+/// the `prft` media time become `decode_time` (90 kHz ticks, the `tfdt`
+/// value), and the trailer is recomputed over the rewritten bytes. The
+/// original checksum is verified before any bytes are changed; corrupt input
+/// is rejected.
+///
+/// # Errors
+///
+/// [`ExportError::Malformed`] when the fragment does not parse, its checksum
+/// does not match, or a box the rewrite needs is missing; a version-0 `tfdt`
+/// that cannot hold `decode_time` is malformed too.
 pub fn rebase_fragment(
     fragment: &mut [u8],
     sequence: u32,
@@ -100,18 +117,20 @@ fn validated_fragment(fragment: &[u8]) -> Result<FragmentInfo, ExportError> {
 /// sample count and payload remain bounded by the fragment parser and encoder.
 ///
 /// # Errors
-/// Returns an error for invalid structure or CRC, a nonpositive duration, or
-/// a prefix that the recording fragment encoder cannot represent.
+///
+/// [`ExportError::Malformed`] for invalid structure or a checksum mismatch,
+/// [`ExportError::InvalidDuration`] for a duration that is not positive, and
+/// [`ExportError::Encode`] for a prefix the recording fragment encoder cannot
+/// represent.
 pub fn trim_fragment_end(
     fragment: Vec<u8>,
     header: FragmentHeader,
     duration: MediaTicks,
 ) -> Result<Vec<u8>, ExportError> {
     let info = validated_fragment(&fragment)?;
-    let mut remaining =
-        u64::try_from(duration.get()).map_err(|_| ExportError::Malformed("duration"))?;
+    let mut remaining = u64::try_from(duration.get()).map_err(|_| ExportError::InvalidDuration)?;
     if remaining == 0 {
-        return Err(ExportError::Malformed("duration"));
+        return Err(ExportError::InvalidDuration);
     }
     let data = Bytes::from(fragment);
     let mut offset = usize::try_from(info.payload_offset)
@@ -142,8 +161,7 @@ pub fn trim_fragment_end(
         offset = end;
         remaining -= u64::from(duration);
     }
-    let encoded =
-        encode_fragment(&header, &samples).map_err(|_| ExportError::Malformed("export prefix"))?;
+    let encoded = encode_fragment(&header, &samples)?;
     let mut out = Vec::with_capacity(
         usize::try_from(encoded.total_len()).map_err(|_| ExportError::Malformed("length"))?,
     );
@@ -189,14 +207,26 @@ fn rebase_traf(body: &mut [u8], decode_time: u64) -> Result<(), ExportError> {
 }
 
 /// Inserts an `edts`/`elst` (version 1, one entry) into the init segment's
-/// `trak`: presentation starts `media_time` ticks into the media and lasts
-/// `duration_ms` in the movie timescale. Returns the rewritten init segment.
-/// Extended-size `moov` or `trak` parents are rejected.
+/// `trak`: presentation starts `media_time` ticks (90 kHz) into the media and
+/// lasts `duration_ms` milliseconds, the movie timescale irisd writes
+/// ([`MOVIE_TIMESCALE`]). Returns the rewritten init segment. The init segment
+/// must be one [`crate::init::build_init_segment`] produced: its `mvhd`
+/// timescale is not read. Extended-size `moov` or `trak` parents are rejected.
+///
+/// # Errors
+///
+/// [`ExportError::InvalidMediaTime`] when `media_time` does not fit the
+/// signed `elst` field; [`ExportError::Malformed`] when `moov`, `trak`, or
+/// `tkhd` is missing, a parent has an extended size, or a size would
+/// overflow.
 pub fn with_edit_list(
     init: &[u8],
     media_time: u64,
     duration_ms: u64,
 ) -> Result<Vec<u8>, ExportError> {
+    if i64::try_from(media_time).is_err() {
+        return Err(ExportError::InvalidMediaTime);
+    }
     let mut w = BoxWriter::with_capacity(48);
     let edts = w.begin(b"edts");
     let elst = w.begin_full(b"elst", 1, 0);
@@ -329,16 +359,21 @@ mod tests {
         assert_eq!(bytes, original, "a failed rewrite leaves the input intact");
     }
 
+    /// The rebased header every trimming test uses.
+    fn trimmed_header(original: &FragmentInfo) -> FragmentHeader {
+        FragmentHeader {
+            sequence: 1,
+            decode_time: 0,
+            wall: original.wall.unwrap(),
+        }
+    }
+
     #[test]
     fn tail_trimming_preserves_sample_bytes_and_shortens_only_the_crossing_duration() {
         let bytes = fragment(7, 90_000);
         let original = parse_fragment(&bytes).unwrap();
         let payload = &bytes[original.payload_offset as usize..bytes.len() - TRAILER_LEN];
-        let header = FragmentHeader {
-            sequence: 1,
-            decode_time: 0,
-            wall: original.wall.unwrap(),
-        };
+        let header = trimmed_header(&original);
         for (limit, sizes, durations) in [
             (3000, vec![6], vec![3000]),
             (4500, vec![6, 7], vec![3000, 1500]),
@@ -367,11 +402,30 @@ mod tests {
             .unwrap();
             assert_eq!(scan.stop, None);
         }
-        assert!(trim_fragment_end(bytes.clone(), header, MediaTicks::new(0)).is_err());
-        assert!(trim_fragment_end(bytes.clone(), header, MediaTicks::new(-1)).is_err());
-        let mut corrupt = bytes;
-        corrupt[original.payload_offset as usize] ^= 1;
-        assert!(trim_fragment_end(corrupt, header, MediaTicks::new(3000)).is_err());
+    }
+
+    #[test]
+    fn tail_trimming_rejects_a_duration_that_is_not_positive() {
+        let bytes = fragment(7, 90_000);
+        let header = trimmed_header(&parse_fragment(&bytes).unwrap());
+        for limit in [0, -1] {
+            assert_eq!(
+                trim_fragment_end(bytes.clone(), header, MediaTicks::new(limit)),
+                Err(ExportError::InvalidDuration),
+                "limit {limit}"
+            );
+        }
+    }
+
+    #[test]
+    fn tail_trimming_rejects_payload_corruption() {
+        let mut bytes = fragment(7, 90_000);
+        let original = parse_fragment(&bytes).unwrap();
+        bytes[original.payload_offset as usize] ^= 1;
+        assert_eq!(
+            trim_fragment_end(bytes, trimmed_header(&original), MediaTicks::new(3000)),
+            Err(ExportError::Malformed("checksum"))
+        );
     }
 
     #[test]
@@ -396,6 +450,11 @@ mod tests {
         assert_eq!(report.fragments.len(), 1);
         assert_eq!(report.stop, None);
         assert_eq!(report.fragments[0].decode_time, 6000);
+    }
+
+    #[test]
+    fn rebasing_rejects_a_fragment_missing_its_last_byte() {
+        let bytes = fragment(900, 90_000 * 3_600);
         let mut short = bytes[..bytes.len() - 1].to_vec();
         assert_eq!(
             rebase_fragment(&mut short, 1, 0),
@@ -403,12 +462,16 @@ mod tests {
         );
     }
 
+    /// An `edts` box holding a version-1 `elst` with one entry: the two
+    /// headers (8 + 8), version and flags (4), entry count (4), duration (8),
+    /// media time (8), and rate (4).
+    const EDIT_LIST_LEN: usize = 44;
+
     #[test]
     fn the_edit_list_lands_after_tkhd_and_the_sizes_grow() {
         let init = build_init_segment(&crate::init::tests::fake_sample_entry());
         let out = with_edit_list(&init, 45_000, 5_500).unwrap();
-        // edts header 8 + elst header 8 + version/flags 4 + count 4 + duration 8 + media time 8 + rate 4.
-        assert_eq!(out.len(), init.len() + 44);
+        assert_eq!(out.len(), init.len() + EDIT_LIST_LEN);
         let before = find_box(&init, 0, init.len(), *b"moov", "moov").unwrap();
         let before_trak = find_box(&init, before.body, before.end, *b"trak", "trak").unwrap();
         let moov = find_box(&out, 0, out.len(), *b"moov", "moov").unwrap();
@@ -423,10 +486,13 @@ mod tests {
         assert_eq!(u64::from_be_bytes(body[8..16].try_into().unwrap()), 5_500);
         assert_eq!(u64::from_be_bytes(body[16..24].try_into().unwrap()), 45_000);
         assert_eq!(moov.end, out.len());
-        assert_eq!(moov.end - moov.start, before.end - before.start + 44);
+        assert_eq!(
+            moov.end - moov.start,
+            before.end - before.start + EDIT_LIST_LEN
+        );
         assert_eq!(
             trak.end - trak.start,
-            before_trak.end - before_trak.start + 44
+            before_trak.end - before_trak.start + EDIT_LIST_LEN
         );
         // The result still scans as an init segment.
         let report = scan(
@@ -478,6 +544,16 @@ mod tests {
             out[moov.start..moov.start + 4].copy_from_slice(&size.to_be_bytes());
         }
         out
+    }
+
+    #[test]
+    fn edit_insertion_rejects_a_media_time_beyond_the_signed_field() {
+        let init = build_init_segment(&crate::init::tests::fake_sample_entry());
+        assert_eq!(
+            with_edit_list(&init, u64::MAX, 33),
+            Err(ExportError::InvalidMediaTime)
+        );
+        assert!(with_edit_list(&init, i64::MAX as u64, 33).is_ok());
     }
 
     #[test]

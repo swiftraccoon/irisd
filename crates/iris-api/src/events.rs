@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use axum::Json;
+use axum::body::Bytes;
 use axum::extract::ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade, close_code};
 use axum::extract::{FromRequestParts, Path, Query, Request, State};
 use axum::response::{IntoResponse, Response};
@@ -14,11 +15,11 @@ use iris_core::time::WallUs;
 use serde::{Deserialize, Serialize};
 use tokio::sync::OwnedSemaphorePermit;
 use tokio::sync::broadcast::error::RecvError;
+use tokio_util::sync::CancellationToken;
 
 use crate::error::ApiError;
 use crate::query::{TimeParams, resolve_range};
-use crate::state::ApiState;
-use crate::state::ApiStats;
+use crate::state::{ApiState, ApiStats};
 use crate::websocket::{self, Inbound};
 
 /// Default and maximum number of events returned by a listing.
@@ -60,8 +61,10 @@ impl From<EventRow> for EventDto {
     }
 }
 
-/// The body of a retain request.
+/// The body of a retain request. An unknown field is an error, so a
+/// misspelled `until` cannot clear a mark by accident.
 #[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct RetainBody {
     /// Keep the footage around the event until this time (Unix microseconds
     /// or RFC 3339); `null` or absent clears the mark.
@@ -69,13 +72,21 @@ pub(crate) struct RetainBody {
 }
 
 /// `POST /api/events/{id}/retain`: keeps the footage around an event from
-/// retention until `until`, or clears the mark.
+/// retention until `until`, or clears the mark. The body is read as JSON
+/// whatever its `Content-Type`; an empty body clears the mark, and a body
+/// that is not a [`RetainBody`] answers HTTP 400.
 pub(crate) async fn retain(
     State(state): State<Arc<ApiState>>,
     Path(id): Path<i64>,
-    body: Option<Json<RetainBody>>,
+    body: Bytes,
 ) -> Result<Json<EventDto>, ApiError> {
-    let until = match body.and_then(|Json(b)| b.until) {
+    let body: RetainBody = if body.iter().all(u8::is_ascii_whitespace) {
+        RetainBody::default()
+    } else {
+        serde_json::from_slice(&body)
+            .map_err(|error| ApiError::BadRequest(format!("bad retain body: {error}")))?
+    };
+    let until = match body.until {
         Some(raw) => Some(
             crate::query::parse_time(&raw)
                 .ok_or_else(|| ApiError::BadRequest(format!("bad 'until' {raw:?}")))?,
@@ -109,9 +120,12 @@ pub(crate) async fn list_or_subscribe(
         .is_some_and(|v| v.eq_ignore_ascii_case("websocket"));
     if is_upgrade {
         let (mut parts, _) = req.into_parts();
-        let upgrade = WebSocketUpgrade::from_request_parts(&mut parts, &())
-            .await
-            .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+        // axum answers a request that cannot be upgraded with its own status
+        // (426 for a missing upgrade header), as the live route does.
+        let upgrade = match WebSocketUpgrade::from_request_parts(&mut parts, &()).await {
+            Ok(upgrade) => upgrade,
+            Err(rejection) => return Ok(rejection.into_response()),
+        };
         let admission = state.stats.admit_event_socket()?;
         return Ok(websocket::limit(upgrade, MAX_EVENT_MESSAGE_BYTES)
             .on_upgrade(move |socket| push(socket, state, admission)));
@@ -167,7 +181,17 @@ async fn push(mut socket: WebSocket, state: Arc<ApiState>, _admission: OwnedSema
             },
             received = rx.recv() => match received {
                 Ok(event) => {
-                    let Ok(text) = serde_json::to_string(&*event) else { continue };
+                    let text = match serde_json::to_string(&*event) {
+                        Ok(text) => text,
+                        Err(error) => {
+                            tracing::warn!(
+                                %error,
+                                camera = %event.camera,
+                                "event could not be encoded; skipped"
+                            );
+                            continue;
+                        }
+                    };
                     if !send(&mut socket, Message::Text(text.into()), &state.shutdown).await {
                         break;
                     }
@@ -187,11 +211,7 @@ async fn push(mut socket: WebSocket, state: Arc<ApiState>, _admission: OwnedSema
     }
 }
 
-async fn send(
-    socket: &mut WebSocket,
-    message: Message,
-    shutdown: &tokio_util::sync::CancellationToken,
-) -> bool {
+async fn send(socket: &mut WebSocket, message: Message, shutdown: &CancellationToken) -> bool {
     tokio::select! {
         biased;
         () = shutdown.cancelled() => false,

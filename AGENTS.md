@@ -26,17 +26,25 @@ crates/iris-store    segment files, preallocation, sync policy, writer thread, r
 crates/iris-catalog  SQLite catalog, bounded admission, retention queries, migrations
 crates/iris-events   bounded Dahua CGI and ONVIF PullPoint event subscriptions
 crates/iris-api      authenticated HTTP/WebSocket serving, HLS, export, metrics
-crates/irisd         the binary: record, inspect, recover, hls, serve
-crates/iris-replay   RTSP replay server: recordings as synthetic cameras for benchmarks and fault injection
+crates/irisd         the binary: run (the daemon), record, inspect, recover, hls, serve
+crates/iris-replay   RTSP replay server: recordings as synthetic cameras, for benchmarks and
+                     fault injection
+crates/iris-tls      shared TLS client trust: the platform's roots plus an optional CA file
 crates/iris-gui      Linux viewer: GTK 4 live grid, focus, playback, timeline, export
-crates/iris-tools    the tools binary: log summaries, soak sampler and report, benchmark driver, camera probes, gh-commit
-config/              cameras.example.toml (committed), cameras.local.toml (gitignored secrets)
+crates/iris-tools    the tools binary: log summaries, soak sampler and report, benchmark driver,
+                     camera probes, gh-commit
+fuzz/                cargo-fuzz targets for the parsers (rule 8), with their own workspace,
+                     lockfile, and pinned nightly
+config/              cameras.example.toml (committed); *.local.toml copies (gitignored secrets)
+packaging/           systemd unit, sysusers file, and the install guide
 docs/research/       research and design, including every dated measurement
+docs/design/         the cross-crate interfaces of the phase-2 crates
 .rust-reference/     the Rust project reference pack (policies, vendored guides, its own Rust CLI)
 docs/standards/ietf/ the RTSP, RTP, HEVC payload, HLS, and codecs documents, as published
 third_party/         vendored dependencies with local patches (retina, oxvif); see its README
-.github/workflows/   CI: check (format, clippy, tests, rustdoc, vendored tests), MSRV, audit, fuzz build,
-                     references; docs (rustdoc to GitHub Pages); dependabot.yml (weekly action updates)
+.github/             workflows/check.yml (format, clippy, tests, rustdoc, vendored tests, MSRV,
+                     audit, fuzz build, aarch64 clippy, references), workflows/docs.yml
+                     (rustdoc to GitHub Pages), dependabot.yml (weekly action updates)
 ```
 
 ## Commands
@@ -45,7 +53,8 @@ third_party/         vendored dependencies with local patches (retina, oxvif); s
   crates' tests. Run before finishing any change.
 - `just fmt`, `just test`, `just clippy`, `just doc`, `just vendor-test` (the vendored crates'
   own test suites, offline), `just audit` (cargo-audit over every lockfile and cargo-deny),
-  `just fuzz-build` (every fuzz target on the pinned nightly).
+  `just fuzz-build` (every fuzz target on the pinned nightly), `just cross-check` (type-check
+  for 64-bit ARM; needs the target and a C cross compiler).
 - `just record 2m` — record the configured cameras for two minutes into the default root.
 - `cargo run -p irisd -- inspect <file.mp4>` — list fragments and timing of a recording.
 
@@ -56,7 +65,7 @@ third_party/         vendored dependencies with local patches (retina, oxvif); s
    glob imports outside tests; every public item documented; timeless prose (no
    *currently, now, new, soon, latest, existing, eventually*).
 2. Never put credentials in URLs, logs, docs, commits, or test fixtures. Camera secrets
-   live only in `config/cameras.local.toml`.
+   live only in gitignored `config/*.local.toml` files.
 3. Performance claims need numbers from the benchmark harness or `irisd record` stats,
    recorded in `docs/` with the date and the command used.
 4. A behaviour change updates the affected design document in the same change.
@@ -76,9 +85,10 @@ third_party/         vendored dependencies with local patches (retina, oxvif); s
    Specifics that work needs go in gitignored files: `AGENTS.override.md`,
    `config/*.local.toml`, and `docs/local/`. Example addresses use RFC 5737 ranges
    (`192.0.2.0/24`). Exceptions are the repository's own address in the badge and workflow
-   links of `README.md` and `.github/`, and legally required attribution, provenance, and
-   synthetic fixtures retained from published third-party source. Vendored material must
-   never contain locally captured identifiers or secrets.
+   links of `README.md` and `.github/` and in the `repository` key of the Cargo manifests, and
+   legally required attribution, provenance, and synthetic fixtures retained from published
+   third-party source. Vendored material must never contain locally captured identifiers or
+   secrets.
 10. Documentation is part of every change: rustdoc on every public item (intra-doc links,
     an example where cheap), the crate's `README.md` and `AGENTS.md` when its surface or
     invariants move, and the design document that fixes the behaviour. CI builds rustdoc

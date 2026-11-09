@@ -1,5 +1,4 @@
 [workspace]
-resolver = "3"
 exclude = ["fuzz", "third_party/retina", "third_party/oxvif"]
 members = [
     "crates/iris-core",
@@ -12,107 +11,115 @@ members = [
     "crates/iris-api",
     "crates/irisd",
     "crates/iris-replay",
+    "crates/iris-tls",
     "crates/iris-gui",
     "crates/iris-tools",
 ]
+resolver = "3"
 
 [workspace.package]
-version = "0.1.0"
 edition = "2024"
-rust-version = "1.92"
 license = "MIT OR Apache-2.0"
 publish = false
+repository = "https://github.com/swiftraccoon/irisd"
+rust-version = "1.92"
+version = "0.1.0"
 
 [workspace.dependencies]
-iris-core = { path = "crates/iris-core" }
-iris-h265 = { path = "crates/iris-h265" }
-iris-mp4 = { path = "crates/iris-mp4" }
-iris-ingest = { path = "crates/iris-ingest" }
-iris-store = { path = "crates/iris-store" }
-iris-catalog = { path = "crates/iris-catalog" }
-iris-events = { path = "crates/iris-events" }
-iris-api = { path = "crates/iris-api" }
-iris-replay = { path = "crates/iris-replay" }
-
 anyhow = "1"
+async-channel = "2"
 async-trait = "0.1"
+axum = { version = "0.8", features = ["ws", "json", "query", "http2"] }
 bytes = "1.12"
 clap = { version = "4.6", features = ["derive"] }
 crc32c = "0.6"
 crc-fast = { version = "1.10", default-features = false, features = ["std"] }
 diqwest = "3.2"
 futures = "0.3"
+futures-util = "0.3"
+getrandom = "0.4"
+hex = "0.4"
+humantime = "2"
+humantime-serde = "1"
+hyper = { version = "1", features = ["http1", "server"] }
+hyper-util = { version = "0.1", features = ["tokio", "service"] }
+iris-api = { path = "crates/iris-api" }
+iris-catalog = { path = "crates/iris-catalog" }
+iris-core = { path = "crates/iris-core" }
+iris-events = { path = "crates/iris-events" }
+iris-h265 = { path = "crates/iris-h265" }
+iris-ingest = { path = "crates/iris-ingest" }
+iris-mp4 = { path = "crates/iris-mp4" }
+iris-replay = { path = "crates/iris-replay" }
+iris-store = { path = "crates/iris-store" }
+iris-tls = { path = "crates/iris-tls" }
+landlock = "0.4"
+md-5 = "0.11"
+oxvif = "0.17"
+rcgen = "0.14"
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "stream", "http2"] }
 retina = { version = "0.4.21", features = ["h265"] }
+rusqlite = { version = "0.41", features = ["bundled"] }
 rustix = { version = "1.1", features = ["fs"] }
+rustls = "0.23"
+rustls-platform-verifier = "0.7"
+sd-notify = "0.5"
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+socket2 = { version = "0.6", features = ["all"] }
+tempfile = "3"
 thiserror = "2"
-tokio = { version = "1.54", features = ["rt", "macros", "net", "time", "sync", "signal", "fs", "io-util"] }
+tokio-rustls = "0.26"
+tokio-stream = "0.1"
+tokio-tungstenite = "0.30"
+tokio-util = { version = "0.7", features = ["io", "rt"] }
 toml = "1.1"
+tower = "0.5"
+tower-http = { version = "0.7", features = ["fs"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 url = "2"
-axum = { version = "0.8", features = ["ws", "json", "query", "http2"] }
-tower-http = { version = "0.7", features = ["fs"] }
-tokio-util = { version = "0.7", features = ["io", "rt"] }
-tempfile = "3"
-humantime = "2"
-humantime-serde = "1"
-mime_guess = "2"
-rusqlite = { version = "0.41", features = ["bundled"] }
-reqwest = { version = "0.13", default-features = false, features = ["rustls", "stream", "http2"] }
-rcgen = "0.14"
-md-5 = "0.11"
-hex = "0.4"
-serde_json = "1"
-sha2 = "0.10"
-tokio-tungstenite = "0.30"
-async-channel = "2"
-sd-notify = "0.5"
-landlock = "0.4"
-tokio-stream = "0.1"
-tokio-rustls = "0.26"
-http-body-util = "0.1"
-hyper = { version = "1", features = ["http1", "server"] }
-hyper-util = { version = "0.1", features = ["tokio", "service"] }
-tower = "0.5"
-futures-util = "0.3"
-getrandom = "0.4"
-oxvif = "0.17"
-socket2 = { version = "0.6", features = ["all"] }
+
+[workspace.dependencies.tokio]
+features = ["rt", "macros", "net", "time", "sync", "signal", "fs", "io-util"]
+version = "1.54"
 
 [workspace.lints.rust]
-unsafe_code = "forbid"
 missing_docs = "warn"
+unsafe_code = "forbid"
 unused_qualifications = "warn"
 
 [workspace.lints.clippy]
+# The two groups carry priority -1, so the named lints override them wherever they sort.
 all = { level = "warn", priority = -1 }
-pedantic = { level = "warn", priority = -1 }
-# Pedantic lints that fight the API guidelines or this codebase's conventions.
-module_name_repetitions = "allow"
-must_use_candidate = "allow"
-missing_errors_doc = "allow"
-missing_panics_doc = "allow"
+# Media-time, box-field, and statistics arithmetic casts between integer widths; a value that
+# comes from input is bounds-checked before its cast (scanner sizes against their maxima,
+# frame rates against 1..=240).
 cast_possible_truncation = "allow"
-cast_sign_loss = "allow"
 cast_possible_wrap = "allow"
+# Rates and means convert counters to f64, and the counters stay far below 2^53.
 cast_precision_loss = "allow"
-struct_excessive_bools = "allow"
+cast_sign_loss = "allow"
+# Types are imported unqualified (STANDARDS.md §4), so `config::StorageConfig` keeps its
+# module's word.
+module_name_repetitions = "allow"
+pedantic = { level = "warn", priority = -1 }
 
 [profile.release]
-lto = "fat"
 codegen-units = 1
+debug = false
+lto = "fat"
 panic = "abort"
 strip = true
-debug = false
 
 [profile.bench]
-inherits = "release"
 debug = true
+inherits = "release"
 strip = false
 
 [patch.crates-io]
-# oxvif 0.17.0 plus bounded SOAP/XML event parsing (third_party/README.md).
+# oxvif 0.17.0 with the local changes listed in third_party/README.md.
 oxvif = { path = "third_party/oxvif" }
-# retina 0.4.21 plus PlayOptions::recv_low_water (third_party/README.md).
+# retina 0.4.21 with the local changes listed in third_party/README.md.
 retina = { path = "third_party/retina" }

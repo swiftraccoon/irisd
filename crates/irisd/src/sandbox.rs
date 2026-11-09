@@ -1,24 +1,31 @@
-//! Landlock sandbox: the daemon may read its configuration, read and write
-//! its recording roots and state directory, connect to camera ports, and
-//! bind its API port, and nothing else.
+//! Landlock sandbox. The daemon may read its configuration directory, `/etc`,
+//! and `/proc`; read, create, write, rename, truncate, and remove regular
+//! files and directories beneath its recording roots and state directory;
+//! connect over TCP to the camera and provisioning ports; and bind its API
+//! port. Executing files, creating device nodes, sockets, FIFOs, or symbolic
+//! links beneath the writable paths, and `ioctl` on devices are denied. UDP
+//! (the WS-Discovery probe), pathname Unix sockets (`sd_notify`), and signals
+//! are outside the ruleset; on a kernel with Landlock ABI 6 the daemon is also
+//! scoped away from abstract Unix sockets and from signalling processes outside
+//! its domain. The systemd unit's `IPAddressDeny=` and `IPAddressAllow=`
+//! restrict peers.
 //!
 //! The ruleset is applied before any thread is spawned, because Landlock
 //! restricts the calling thread and threads created afterwards inherit it.
 //!
 //! Filesystem access control (Landlock ABI 1) and TCP bind and connect control
 //! (ABI 4) are required: when the kernel lacks either, [`apply`] fails and the
-//! daemon starts only with `--no-sandbox`. Rights from later ABIs up to
-//! [`TARGET_ABI`] are applied when the kernel has them; a kernel without them
-//! leaves the ruleset partially enforced, with a warning naming the missing
-//! rights. Network rules name TCP ports for any destination address; the
-//! systemd unit's `IPAddressDeny=` and `IPAddressAllow=` restrict peers.
+//! daemon starts only with `--no-sandbox`. Rights and scopes from later ABIs
+//! up to [`TARGET_ABI`] are applied when the kernel has them; a kernel without
+//! them leaves the ruleset partially enforced, with a warning naming the
+//! missing rights. Network rules name TCP ports for any destination address.
 
 use std::path::PathBuf;
 
 use anyhow::Context;
 use landlock::{
-    ABI, Access, AccessFs, AccessNet, CompatLevel, Compatible, LandlockStatus, NetPort, Ruleset,
-    RulesetAttr, RulesetCreatedAttr, RulesetStatus, path_beneath_rules,
+    ABI, Access, AccessFs, AccessNet, BitFlags, CompatLevel, Compatible, LandlockStatus, NetPort,
+    Ruleset, RulesetAttr, RulesetCreatedAttr, RulesetStatus, Scope, path_beneath_rules,
 };
 use tracing::{info, warn};
 
@@ -51,8 +58,8 @@ pub struct SandboxSpec {
 pub enum SandboxEnforcement {
     /// `--no-sandbox`: no Landlock ruleset.
     Disabled,
-    /// The required rights are enforced; rights newer than the kernel's
-    /// Landlock ABI are not.
+    /// The required rights are enforced; rights beyond the kernel's Landlock
+    /// ABI are not.
     Partial,
     /// Every requested right is enforced.
     Full,
@@ -82,7 +89,8 @@ enum KernelOutcome {
     },
 }
 
-/// Applies the sandbox to the calling thread and its future children.
+/// Applies the sandbox to the calling thread and the threads it creates
+/// afterwards.
 ///
 /// # Errors
 ///
@@ -90,6 +98,26 @@ enum KernelOutcome {
 /// cannot be created, added, or enforced.
 pub fn apply(spec: &SandboxSpec) -> anyhow::Result<SandboxEnforcement> {
     decide(restrict(spec)?)
+}
+
+/// The rights granted beneath the recording roots and the state directory:
+/// everything `abi` offers except executing files, creating device nodes,
+/// sockets, FIFOs, and symbolic links, and `ioctl` on devices.
+fn read_write_rights(abi: ABI) -> BitFlags<AccessFs> {
+    AccessFs::from_all(abi)
+        & !(AccessFs::Execute
+            | AccessFs::MakeChar
+            | AccessFs::MakeBlock
+            | AccessFs::MakeSock
+            | AccessFs::MakeFifo
+            | AccessFs::MakeSym
+            | AccessFs::IoctlDev)
+}
+
+/// The rights granted on the read-only paths: reading files and listing
+/// directories, never executing.
+fn read_only_rights(abi: ABI) -> BitFlags<AccessFs> {
+    AccessFs::from_read(abi) & !AccessFs::Execute
 }
 
 fn restrict(spec: &SandboxSpec) -> anyhow::Result<KernelOutcome> {
@@ -108,19 +136,15 @@ fn restrict(spec: &SandboxSpec) -> anyhow::Result<KernelOutcome> {
         .context("declaring filesystem access")?
         .handle_access(AccessNet::from_all(abi))
         .context("declaring network access")?
+        .scope(Scope::from_all(abi))
+        .context("declaring scopes")?
         .create()
         .context("creating the Landlock ruleset")?;
     ruleset = ruleset
-        .add_rules(path_beneath_rules(
-            &spec.read_only,
-            AccessFs::from_read(abi),
-        ))
+        .add_rules(path_beneath_rules(&spec.read_only, read_only_rights(abi)))
         .context("adding read-only rules")?;
     ruleset = ruleset
-        .add_rules(path_beneath_rules(
-            &spec.read_write,
-            AccessFs::from_all(abi),
-        ))
+        .add_rules(path_beneath_rules(&spec.read_write, read_write_rights(abi)))
         .context("adding read-write rules")?;
     for &port in &spec.connect_ports {
         ruleset = ruleset
@@ -166,7 +190,7 @@ fn decide(outcome: KernelOutcome) -> anyhow::Result<SandboxEnforcement> {
             warn!(
                 kernel_abi = %abi.unwrap_or(ABI::Unsupported),
                 missing = %missing_optional_rights(abi),
-                "sandbox partially enforced: the kernel lacks newer Landlock rights"
+                "sandbox partially enforced: the kernel lacks later Landlock rights"
             );
             Ok(SandboxEnforcement::Partial)
         }
@@ -180,16 +204,23 @@ fn decide(outcome: KernelOutcome) -> anyhow::Result<SandboxEnforcement> {
     }
 }
 
-/// The requested rights a kernel offering `abi` cannot enforce.
+/// The requested rights and scopes a kernel offering `abi` cannot enforce.
 fn missing_optional_rights(abi: Option<ABI>) -> String {
     let abi = abi.unwrap_or(ABI::Unsupported);
     let filesystem = AccessFs::from_all(TARGET_ABI) & !AccessFs::from_all(abi);
     let network = AccessNet::from_all(TARGET_ABI) & !AccessNet::from_all(abi);
-    format!("filesystem {filesystem:?}; network {network:?}")
+    let scopes = Scope::from_all(TARGET_ABI) & !Scope::from_all(abi);
+    format!("filesystem {filesystem:?}; network {network:?}; scopes {scopes:?}")
 }
 
 #[cfg(test)]
 mod tests {
+    use std::fs::File;
+    use std::io::Write as _;
+
+    use iris_catalog::CatalogHandle;
+    use iris_core::id::CameraId;
+
     use super::*;
 
     #[test]
@@ -225,6 +256,7 @@ mod tests {
         );
         let missing = missing_optional_rights(Some(ABI::V4));
         assert!(missing.contains("IoctlDev"), "{missing}");
+        assert!(missing.contains("Signal"), "{missing}");
         assert!(!missing.contains("ConnectTcp"), "{missing}");
     }
 
@@ -240,7 +272,9 @@ mod tests {
         );
         let missing = missing_optional_rights(Some(TARGET_ABI));
         assert!(
-            !missing.contains("IoctlDev") && !missing.contains("Tcp"),
+            !missing.contains("IoctlDev")
+                && !missing.contains("Tcp")
+                && !missing.contains("Signal"),
             "{missing}"
         );
     }
@@ -250,6 +284,39 @@ mod tests {
         assert!(AccessFs::from_all(TARGET_ABI).contains(AccessFs::from_all(REQUIRED_FS_ABI)));
         assert!(AccessNet::from_all(TARGET_ABI).contains(AccessNet::from_all(REQUIRED_NET_ABI)));
         assert!(!AccessNet::from_all(REQUIRED_NET_ABI).is_empty());
+    }
+
+    #[test]
+    fn granted_rights_leave_out_execution_and_special_files() {
+        let writable = read_write_rights(TARGET_ABI);
+        for needed in [
+            AccessFs::ReadFile,
+            AccessFs::WriteFile,
+            AccessFs::ReadDir,
+            AccessFs::MakeDir,
+            AccessFs::MakeReg,
+            AccessFs::RemoveFile,
+            AccessFs::RemoveDir,
+            AccessFs::Refer,
+            AccessFs::Truncate,
+        ] {
+            assert!(writable.contains(needed), "{needed:?}");
+        }
+        for denied in [
+            AccessFs::Execute,
+            AccessFs::MakeSym,
+            AccessFs::MakeFifo,
+            AccessFs::MakeSock,
+            AccessFs::MakeChar,
+            AccessFs::MakeBlock,
+            AccessFs::IoctlDev,
+        ] {
+            assert!(!writable.contains(denied), "{denied:?}");
+        }
+        let readable = read_only_rights(TARGET_ABI);
+        assert!(readable.contains(AccessFs::ReadFile | AccessFs::ReadDir));
+        assert!(!readable.contains(AccessFs::Execute));
+        assert!(!readable.contains(AccessFs::WriteFile));
     }
 
     #[test]
@@ -263,5 +330,84 @@ mod tests {
             .map(SandboxEnforcement::level),
             [0, 1, 2]
         );
+    }
+
+    /// Applies a sandbox whose writable tree is `dir` on a thread of its own
+    /// and runs `check` inside it. Landlock restricts that thread and its
+    /// children only. Skipped on a kernel without Landlock.
+    fn sandboxed(dir: PathBuf, check: impl FnOnce() + Send + 'static) {
+        std::thread::Builder::new()
+            .name("irisd-sandbox-test".into())
+            .spawn(move || {
+                let spec = SandboxSpec {
+                    read_only: vec![PathBuf::from("/proc"), PathBuf::from("/etc")],
+                    read_write: vec![dir],
+                    connect_ports: Vec::new(),
+                    bind_ports: Vec::new(),
+                };
+                match apply(&spec) {
+                    Ok(_) => check(),
+                    Err(error) if error.to_string() == REQUIRED_MESSAGE => {
+                        // The test kernel offers no Landlock; nothing to verify.
+                    }
+                    Err(error) => panic!("{error:#}"),
+                }
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[test]
+    fn a_sandboxed_thread_keeps_the_filesystem_rights_the_daemon_needs() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let outside = tempfile::tempdir().unwrap();
+        let elsewhere = outside.path().join("denied");
+        sandboxed(root.clone(), move || {
+            let nested = root.join("cam/main/2026-01-01");
+            std::fs::create_dir_all(&nested).unwrap();
+            let file = nested.join("a.mp4");
+            let mut created = File::create(&file).unwrap();
+            created.write_all(b"recorded").unwrap();
+            created.set_len(4).unwrap();
+            created.sync_all().unwrap();
+            drop(created);
+            std::fs::rename(&file, nested.join("b.mp4")).unwrap();
+            assert_eq!(std::fs::read(nested.join("b.mp4")).unwrap(), b"reco");
+            File::open(&nested).unwrap().sync_all().unwrap();
+            std::fs::remove_file(nested.join("b.mp4")).unwrap();
+            std::fs::remove_dir(&nested).unwrap();
+            assert!(std::fs::read_to_string("/proc/self/status").is_ok());
+            assert!(
+                std::os::unix::fs::symlink("target", root.join("link")).is_err(),
+                "symbolic links are denied beneath the writable tree"
+            );
+            assert!(
+                File::create(&elsewhere).is_err(),
+                "writes outside the allowed trees are denied"
+            );
+        });
+    }
+
+    #[test]
+    fn a_sandboxed_thread_can_run_the_catalog() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        sandboxed(root.clone(), move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap();
+            runtime.block_on(async {
+                let catalog = CatalogHandle::open(&root.join("irisd.db")).unwrap();
+                let camera = CameraId::try_new("cam1").unwrap();
+                catalog
+                    .ensure_camera(&camera, "Sandboxed", None)
+                    .await
+                    .unwrap();
+                assert_eq!(catalog.cameras().await.unwrap().len(), 1);
+                catalog.shutdown();
+            });
+        });
     }
 }

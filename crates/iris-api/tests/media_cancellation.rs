@@ -13,7 +13,7 @@ use iris_catalog::{CatalogHandle, Change};
 use iris_core::id::{CameraId, StreamKey, StreamKind};
 use iris_core::time::WallUs;
 use iris_mp4::fragment::{Fragment, Sample};
-use iris_mp4::index::read_index;
+use iris_mp4::index::{MAX_PERSISTED_INDEX_RECORDS, read_index_bounded};
 use iris_mp4::init::SampleEntry;
 use iris_store::{ApprovedRoot, RootExpectation, StoragePolicy, WriterHandle};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
@@ -85,7 +85,7 @@ async fn record(
             sync_interval: Duration::from_secs(5),
             preallocate_bytes: 1 << 20,
             rotate_bytes: 1 << 30,
-            rotate_secs: 3600,
+            rotate_age: Duration::from_secs(3600),
         },
         64,
     )
@@ -100,8 +100,11 @@ async fn record(
         .expect("writer join")
         .expect("writer shutdown");
     let path = only_recording(root.path());
-    let (header, records) =
-        read_index(&iris_store::layout::index_path(&path)).expect("written sidecar");
+    let (header, records) = read_index_bounded(
+        &iris_store::layout::index_path(&path),
+        MAX_PERSISTED_INDEX_RECORDS,
+    )
+    .expect("written sidecar");
     let last = *records.last().expect("records");
     catalog.notify(Change::SegmentOpened {
         key: key(),
@@ -154,10 +157,12 @@ fn state(root: ApprovedRoot, catalog: CatalogHandle, stats: ApiStats) -> Arc<Api
         live: Arc::new(LiveRegistry::new()),
         events,
         tokens: vec![TOKEN.to_owned()],
+        capability_secret: iris_api::CapabilitySecret::new([1; 32]),
         recording_roots: vec![root],
         public_metrics: false,
-        snapshot_sources: HashMap::new(),
-        active_cameras: HashMap::new(),
+        snapshot_sources: std::sync::RwLock::new(HashMap::new()),
+        active_cameras: std::sync::RwLock::new(HashMap::new()),
+        control: None,
         stats: Arc::new(stats),
         started: WallUs::now(),
         started_monotonic: Instant::now(),
@@ -248,7 +253,7 @@ async fn a_stalled_reader_keeps_its_streaming_slot_only_until_the_write_deadline
         write_stall_timeout: deadline,
         ..ServeLimits::default()
     };
-    let state = state(root, catalog.clone(), ApiStats::with_media_limits(1, 4));
+    let state = state(root, catalog.clone(), ApiStats::new_with_media_limits(1, 4));
     let address = serve(Arc::clone(&state), limits);
     let file = format!("/api/segments/{id}/file.mp4");
 
@@ -306,7 +311,7 @@ async fn a_slow_reader_that_keeps_reading_is_served_to_the_end() {
         write_stall_timeout: Duration::from_millis(500),
         ..ServeLimits::default()
     };
-    let state = state(root, catalog.clone(), ApiStats::with_media_limits(1, 4));
+    let state = state(root, catalog.clone(), ApiStats::new_with_media_limits(1, 4));
     let address = serve(state, limits);
     let (mut stream, head) = request_head(
         address,
@@ -339,7 +344,7 @@ async fn a_disconnected_reader_returns_its_streaming_slot() {
     let dir = tempfile::tempdir().expect("temporary directory");
     let catalog = CatalogHandle::open(&dir.path().join("catalog.db")).expect("catalog");
     let (root, id, _) = record(dir.path(), &catalog, 8, 1 << 20).await;
-    let state = state(root, catalog.clone(), ApiStats::with_media_limits(1, 4));
+    let state = state(root, catalog.clone(), ApiStats::new_with_media_limits(1, 4));
     let address = serve(state, ServeLimits::default());
     let file = format!("/api/segments/{id}/file.mp4");
 

@@ -1,6 +1,7 @@
 //! `irisd serve`: a static file server with range support for playback tests.
 
 use std::future::IntoFuture;
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -11,6 +12,7 @@ use axum::http::{HeaderValue, header};
 use axum::middleware::{self, Next};
 use axum::response::Response;
 use clap::Args as ClapArgs;
+use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 use tower_http::services::ServeDir;
@@ -25,15 +27,15 @@ pub struct Args {
     /// Directory to serve (for example the output of `irisd hls`).
     #[arg(long, value_name = "DIR")]
     dir: PathBuf,
-    /// Address to listen on.
+    /// Address to listen on; the default accepts connections on every interface.
     #[arg(long, default_value = "0.0.0.0:8080")]
-    listen: String,
+    listen: SocketAddr,
 }
 
-/// Runs the subcommand until Ctrl-C.
+/// Runs the subcommand until SIGINT (Ctrl-C) or SIGTERM.
 pub async fn run(args: Args) -> anyhow::Result<()> {
-    let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
-        .context("installing the SIGINT handler")?;
+    let mut sigint = signal(SignalKind::interrupt()).context("installing the SIGINT handler")?;
+    let mut sigterm = signal(SignalKind::terminate()).context("installing the SIGTERM handler")?;
     let dir = args
         .dir
         .canonicalize()
@@ -41,17 +43,25 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
     let app = Router::new()
         .fallback_service(ServeDir::new(&dir))
         .layer(middleware::from_fn(log_and_fix_types));
-    let listener = tokio::net::TcpListener::bind(&args.listen)
+    let listener = tokio::net::TcpListener::bind(args.listen)
         .await
         .with_context(|| format!("binding {}", args.listen))?;
-    let addr = listener.local_addr()?;
-    info!(dir = %dir.display(), %addr, "serving; open http://<this-host>:{}/master.m3u8", addr.port());
-    let listener = listener.into_std()?;
+    let addr = listener.local_addr().context("reading the bound address")?;
+    info!(
+        dir = %dir.display(),
+        %addr,
+        "serving; open http://<this-host>:{}/master.m3u8",
+        addr.port()
+    );
+    let listener = listener
+        .into_std()
+        .context("detaching the listener from the runtime")?;
     let shutdown = CancellationToken::new();
     let mut server = spawn_server(listener, app, shutdown.clone(), DRAIN_GRACE)?;
     tokio::select! {
         result = &mut server => return receive_server_result(result),
         _ = sigint.recv() => shutdown.cancel(),
+        _ = sigterm.recv() => shutdown.cancel(),
     }
     match tokio::time::timeout(DRAIN_GRACE + Duration::from_secs(1), server).await {
         Ok(result) => receive_server_result(result),
@@ -94,8 +104,9 @@ fn spawn_server(
                                 match tokio::time::timeout(drain_grace, &mut server).await {
                                     Ok(result) => result,
                                     Err(_) => {
-                                        // Returning drops this runtime after the server task,
-                                        // which aborts all connection tasks and closes their sockets.
+                                        // Returning drops this runtime after the server
+                                        // task, which aborts every connection task and
+                                        // closes its socket.
                                         Ok(())
                                     }
                                 }
@@ -132,7 +143,13 @@ async fn log_and_fix_types(req: Request, next: Next) -> Response {
         res.headers_mut()
             .insert(header::CONTENT_TYPE, HeaderValue::from_static(content_type));
     }
-    info!(%method, %path, status = res.status().as_u16(), range = range.as_deref().unwrap_or("-"), "request");
+    info!(
+        %method,
+        %path,
+        status = res.status().as_u16(),
+        range = range.as_deref().unwrap_or("-"),
+        "request"
+    );
     res
 }
 

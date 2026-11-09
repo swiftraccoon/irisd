@@ -24,8 +24,9 @@ const MAX_RECENT_PAYLOAD_BYTES: usize = 64 * 1_024 * 1_024;
 /// Most payload retained for slow live subscribers by one stream.
 const MAX_FANOUT_PAYLOAD_BYTES: usize = 64 * 1_024 * 1_024;
 
-/// One frame as published to live viewers.
-#[derive(Clone, Debug)]
+/// One frame as published to live viewers. `Debug` prints the payload's
+/// length, not its bytes.
+#[derive(Clone)]
 pub struct LiveFrame {
     /// The stream it belongs to.
     pub key: StreamKey,
@@ -44,6 +45,20 @@ pub struct LiveFrame {
     pub wall: WallUs,
 }
 
+impl fmt::Debug for LiveFrame {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("LiveFrame")
+            .field("key", &self.key)
+            .field("sample_entry", &self.sample_entry)
+            .field("data", &format_args!("<{} bytes>", self.data.len()))
+            .field("duration", &self.duration)
+            .field("is_sync", &self.is_sync)
+            .field("decode_time", &self.decode_time)
+            .field("wall", &self.wall)
+            .finish()
+    }
+}
+
 /// Why a subscription produced no frame.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Error)]
 pub enum LiveError {
@@ -56,13 +71,11 @@ pub enum LiveError {
     Closed,
 }
 
-#[derive(Debug)]
 struct QueuedFrame {
     sequence: u64,
     frame: Arc<LiveFrame>,
 }
 
-#[derive(Debug)]
 struct Shared {
     init: Option<Bytes>,
     recent: Vec<Arc<LiveFrame>>,
@@ -88,16 +101,34 @@ impl Shared {
     }
 }
 
-#[derive(Debug)]
 struct Inner {
     shared: Mutex<Shared>,
     notify: Notify,
 }
 
-/// Fan-out point for one stream's frames. Cloning shares the ring.
-#[derive(Debug)]
+/// Fan-out point for one stream's frames. Cloning shares the ring. `Debug`
+/// summarises the windows (frame and byte counts) without their payload and
+/// without waiting for the lock.
 pub struct LiveRing {
     inner: Arc<Inner>,
+}
+
+impl fmt::Debug for LiveRing {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut ring = f.debug_struct("LiveRing");
+        match self.inner.shared.try_lock() {
+            Ok(shared) => ring
+                .field("rings", &shared.rings)
+                .field("subscribers", &shared.subscribers)
+                .field("recent_frames", &shared.recent.len())
+                .field("recent_payload_bytes", &shared.recent_payload_bytes)
+                .field("fanout_frames", &shared.fanout.len())
+                .field("fanout_payload_bytes", &shared.fanout_payload_bytes)
+                .field("closed", &shared.closed)
+                .finish_non_exhaustive(),
+            Err(_) => ring.finish_non_exhaustive(),
+        }
+    }
 }
 
 impl Clone for LiveRing {
@@ -199,20 +230,25 @@ impl LiveRing {
     }
 
     /// Publishes a frame to every subscriber and to the fast-start buffer.
+    #[expect(
+        clippy::missing_panics_doc,
+        reason = "the expect pops only while the queue holds an earlier frame"
+    )]
     pub fn publish(&self, frame: Arc<LiveFrame>) {
         if let Ok(mut shared) = self.inner.shared.lock() {
             if frame.is_sync {
                 shared.clear_recent();
             }
             if frame.is_sync || !shared.recent.is_empty() {
-                let projected = shared.recent_payload_bytes.checked_add(frame.data.len());
-                if shared.recent.len() >= MAX_RECENT_FRAMES
-                    || projected.is_none_or(|bytes| bytes > MAX_RECENT_PAYLOAD_BYTES)
-                {
-                    shared.clear_recent();
-                } else {
-                    shared.recent_payload_bytes = projected.expect("checked above");
-                    shared.recent.push(Arc::clone(&frame));
+                match shared.recent_payload_bytes.checked_add(frame.data.len()) {
+                    Some(bytes)
+                        if shared.recent.len() < MAX_RECENT_FRAMES
+                            && bytes <= MAX_RECENT_PAYLOAD_BYTES =>
+                    {
+                        shared.recent_payload_bytes = bytes;
+                        shared.recent.push(Arc::clone(&frame));
+                    }
+                    _ => shared.clear_recent(),
                 }
             }
 

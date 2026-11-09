@@ -1,4 +1,6 @@
-//! Startup readiness is emitted only after the API listener is usable.
+//! Start-up and shutdown of the binary: readiness only once the API listener
+//! accepts, failures before roots, workers, or readiness, `irisd record`
+//! argument checks before its output root, and ordered shutdown on SIGTERM.
 
 use std::fs;
 use std::net::{SocketAddr, TcpListener, TcpStream};
@@ -34,20 +36,24 @@ fn notification_socket(dir: &Path) -> (UnixDatagram, PathBuf) {
 }
 
 fn spawn_daemon(config: &Path, notify_socket: &Path, log: &Path) -> Child {
-    spawn_daemon_with_args(config, notify_socket, log, &[])
+    spawn_daemon_with(config, notify_socket, log, &[], &[])
 }
 
-fn spawn_daemon_with_args(
+/// Starts the daemon with `extra_args` and `extra_env` beside the standard
+/// test arguments, logging both output streams to `log`.
+fn spawn_daemon_with(
     config: &Path,
     notify_socket: &Path,
     log: &Path,
     extra_args: &[&str],
+    extra_env: &[(&str, &str)],
 ) -> Child {
     Command::new(env!("CARGO_BIN_EXE_irisd"))
         .args(["run", "--no-sandbox", "--config"])
         .arg(config)
         .args(extra_args)
         .env("NOTIFY_SOCKET", notify_socket)
+        .envs(extra_env.iter().copied())
         .stdout(fs::File::create(log).unwrap())
         .stderr(Stdio::from(
             fs::OpenOptions::new().append(true).open(log).unwrap(),
@@ -59,20 +65,6 @@ fn spawn_daemon_with_args(
 fn send_sigterm(child: &Child) {
     let pid = rustix::process::Pid::from_raw(i32::try_from(child.id()).unwrap()).unwrap();
     rustix::process::kill_process(pid, rustix::process::Signal::TERM).unwrap();
-}
-
-fn spawn_daemon_with_zero_watchdog(config: &Path, notify_socket: &Path, log: &Path) -> Child {
-    Command::new(env!("CARGO_BIN_EXE_irisd"))
-        .args(["run", "--no-sandbox", "--config"])
-        .arg(config)
-        .env("NOTIFY_SOCKET", notify_socket)
-        .env("WATCHDOG_USEC", "0")
-        .stdout(fs::File::create(log).unwrap())
-        .stderr(Stdio::from(
-            fs::OpenOptions::new().append(true).open(log).unwrap(),
-        ))
-        .spawn()
-        .unwrap()
 }
 
 fn wait_for_exit(child: &mut Child) -> std::process::ExitStatus {
@@ -90,11 +82,20 @@ fn wait_for_exit(child: &mut Child) -> std::process::ExitStatus {
     }
 }
 
+/// When `receive_until` stops collecting notifications.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Until {
+    /// The first `READY=1`, or the daemon's exit, which fails the test.
+    Ready,
+    /// The deadline or the daemon's exit.
+    Deadline,
+}
+
 fn receive_until(
     socket: &UnixDatagram,
     child: &mut Child,
     deadline: Instant,
-    stop_at_ready: bool,
+    until: Until,
 ) -> Vec<String> {
     let mut messages = Vec::new();
     let mut buffer = [0_u8; 512];
@@ -104,7 +105,7 @@ fn receive_until(
                 let message = String::from_utf8_lossy(&buffer[..len]).into_owned();
                 let ready = message.lines().any(|line| line == "READY=1");
                 messages.push(message);
-                if ready && stop_at_ready {
+                if ready && until == Until::Ready {
                     return messages;
                 }
             }
@@ -117,7 +118,7 @@ fn receive_until(
         }
         if let Some(status) = child.try_wait().unwrap() {
             assert!(
-                !stop_at_ready,
+                until == Until::Deadline,
                 "daemon exited before readiness with {status}"
             );
             return messages;
@@ -173,7 +174,7 @@ fn occupied_api_port_emits_no_ready_and_exits_without_recording_tasks() {
         &notify,
         &mut child,
         Instant::now() + Duration::from_millis(100),
-        false,
+        Until::Deadline,
     );
 
     assert!(!status.success());
@@ -185,7 +186,7 @@ fn occupied_api_port_emits_no_ready_and_exits_without_recording_tasks() {
 }
 
 #[test]
-fn available_api_port_accepts_by_the_single_ready_notification() {
+fn the_api_accepts_connections_by_the_only_ready_notification() {
     let dir = tempfile::tempdir().unwrap();
     let reserved = TcpListener::bind("127.0.0.1:0").unwrap();
     let listen = reserved.local_addr().unwrap();
@@ -197,7 +198,12 @@ fn available_api_port_accepts_by_the_single_ready_notification() {
     let log = dir.path().join("daemon.log");
     let mut child = spawn_daemon(&config, &notify_path, &log);
 
-    let mut messages = receive_until(&notify, &mut child, Instant::now() + STARTUP_TIMEOUT, true);
+    let mut messages = receive_until(
+        &notify,
+        &mut child,
+        Instant::now() + STARTUP_TIMEOUT,
+        Until::Ready,
+    );
     assert_eq!(ready_count(&messages), 1, "{messages:?}");
     TcpStream::connect_timeout(&listen, Duration::from_secs(1))
         .expect("API listener must accept connections by READY=1");
@@ -206,13 +212,14 @@ fn available_api_port_accepts_by_the_single_ready_notification() {
         &notify,
         &mut child,
         Instant::now() + Duration::from_millis(250),
-        false,
+        Until::Deadline,
     ));
     assert_eq!(ready_count(&messages), 1, "{messages:?}");
 
+    // Clean-up only; `signal_immediately_after_ready_enters_ordered_shutdown`
+    // asserts the stop itself.
     send_sigterm(&child);
-    let status = wait_for_exit(&mut child);
-    assert!(status.success(), "{}", fs::read_to_string(log).unwrap());
+    wait_for_exit(&mut child);
 }
 
 #[test]
@@ -243,13 +250,13 @@ fn invalid_daemon_periods_fail_before_roots_workers_or_readiness() {
         }
         let (notify, notify_path) = notification_socket(dir.path());
         let log = dir.path().join(format!("invalid-{index}.log"));
-        let mut child = spawn_daemon_with_args(&config, &notify_path, &log, arguments);
+        let mut child = spawn_daemon_with(&config, &notify_path, &log, arguments, &[]);
         let status = wait_for_exit(&mut child);
         let messages = receive_until(
             &notify,
             &mut child,
             Instant::now() + Duration::from_millis(100),
-            false,
+            Until::Deadline,
         );
         assert!(!status.success());
         assert_eq!(ready_count(&messages), 0, "{messages:?}");
@@ -284,7 +291,7 @@ fn daemon_with_no_recorded_sources_fails_before_roots_workers_or_readiness() {
         &notify,
         &mut child,
         Instant::now() + Duration::from_millis(100),
-        false,
+        Until::Deadline,
     );
     assert!(!status.success());
     assert_eq!(ready_count(&messages), 0, "{messages:?}");
@@ -385,8 +392,10 @@ fn standalone_with_no_resolved_sources_fails_before_the_output_root() {
     assert!(!text.contains("panicked"), "{text}");
 }
 
+/// `WATCHDOG_USEC=0` disables the watchdog ping, the path the packaged unit
+/// does not take, so the test covers the signal handling on its own.
 #[test]
-fn signal_immediately_after_ready_enters_ordered_shutdown() {
+fn signal_immediately_after_ready_enters_ordered_shutdown_without_a_watchdog() {
     let dir = tempfile::tempdir().unwrap();
     let reserved = TcpListener::bind("127.0.0.1:0").unwrap();
     let listen = reserved.local_addr().unwrap();
@@ -396,8 +405,13 @@ fn signal_immediately_after_ready_enters_ordered_shutdown() {
     drop(unavailable_rtsp);
     let (notify, notify_path) = notification_socket(dir.path());
     let log = dir.path().join("signal.log");
-    let mut child = spawn_daemon_with_zero_watchdog(&config, &notify_path, &log);
-    let messages = receive_until(&notify, &mut child, Instant::now() + STARTUP_TIMEOUT, true);
+    let mut child = spawn_daemon_with(&config, &notify_path, &log, &[], &[("WATCHDOG_USEC", "0")]);
+    let messages = receive_until(
+        &notify,
+        &mut child,
+        Instant::now() + STARTUP_TIMEOUT,
+        Until::Ready,
+    );
     assert_eq!(ready_count(&messages), 1, "{messages:?}");
     send_sigterm(&child);
     let status = wait_for_exit(&mut child);

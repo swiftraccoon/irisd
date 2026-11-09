@@ -1,18 +1,26 @@
 //! Low-latency HLS from the live ring: a live playlist with partial segments
 //! built in memory, blocking playlist reload, and preload hints
-//! (`docs/standards/ietf/draft-pantos-hls-rfc8216bis-22.txt` §4.4.3.7–8,
-//! §4.4.4.9, §4.4.5.3, §6.2.5.2).
+//! (`docs/standards/ietf/draft-pantos-hls-rfc8216bis-22.txt` §4.4.3.1,
+//! §4.4.3.7–8, §4.4.4.9, §4.4.5.3, §6.2.1–6.2.2, §6.2.5.2).
 //!
 //! One feeder task per requested stream subscribes to the stream's
-//! [`LiveRing`] and keeps the frames of the last few groups of pictures: each
-//! GOP is one media segment (its media sequence number is assigned when its
-//! sync frame arrives), and each segment is cut into partial segments of
-//! about [`PART_TARGET_TICKS`] by frame count, so a part's content never
-//! changes once published. Segments and parts are served from memory as
-//! sequences of single-sample fragments, exactly what the WebSocket feed
-//! sends; their URIs end in `.m4s` because `ffmpeg` accepts no other
-//! extension. The feeder stops when nobody has asked for the stream for
-//! [`IDLE_TIMEOUT`], and a later request starts a fresh one.
+//! [`LiveRing`], starts from the frames since the ring's last sync frame, and
+//! keeps the frames of the last groups of pictures: each GOP is one media
+//! segment (its media sequence number is assigned when its sync frame
+//! arrives), and each segment is cut into partial segments of a fixed frame
+//! count pinned from the first frame's duration, so a part's content never
+//! changes once published and every non-final part lasts the declared part
+//! target. The target duration is pinned when the first GOP completes and
+//! never changes for that feeder; a later GOP that would outlast it is cut
+//! with a discontinuity, as a GOP over the payload or frame budget is.
+//! Complete segments stay listed until the complete segments after them
+//! cover three target durations, so a player always has that much to choose
+//! from and an unlisted part stays downloadable for as long. Segments and
+//! parts are served from memory as sequences of single-sample fragments,
+//! exactly what the WebSocket feed sends; their URIs end in `.m4s`, an
+//! extension `ffmpeg`'s HLS demuxer allows for segments. The feeder stops when
+//! nobody has asked for the stream for [`IDLE_TIMEOUT`], and a later request
+//! starts a fresh one.
 
 use std::collections::{HashMap, VecDeque};
 use std::fmt::Write as _;
@@ -23,7 +31,7 @@ use axum::extract::{Extension, Path, Query, State};
 use axum::http::header;
 use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
-use iris_core::id::StreamKey;
+use iris_core::id::{CameraId, StreamKey};
 use iris_core::time::{TIMESCALE, WallUs};
 use iris_ingest::{LiveError, LiveFrame, LiveRing};
 use iris_mp4::init::{SampleEntry, build_init_segment};
@@ -34,28 +42,44 @@ use tokio_util::sync::CancellationToken;
 
 use crate::auth::AuthContext;
 use crate::error::ApiError;
-use crate::live::{encode_live_fragment, same_sample_entry};
-use crate::media_admission;
+use crate::live::{encode_live_fragment_into, same_sample_entry};
+use crate::media_admission::{self, MediaPermit};
 use crate::segments::stream_key;
-use crate::state::{ApiState, MediaClass, admitted_media_bytes};
+use crate::state::{ApiState, MediaClass};
 
-/// Target length of a partial segment in media ticks (0.5 s).
-pub(crate) const PART_TARGET_TICKS: u64 = 45_000;
-/// Complete segments kept behind the one being filled.
-const KEEP_SEGMENTS: usize = 3;
+/// Longest partial segment in media ticks (0.5 s): a part holds as many
+/// whole frames as fit, at least one.
+const PART_TARGET_TICKS: u64 = 45_000;
+/// Complete segments a feeder keeps at most, whatever the target duration:
+/// the memory bound of one watched stream is this many GOPs.
+const MAX_KEPT_GOPS: usize = 12;
+/// Target durations of complete segments a feeder keeps behind the newest
+/// (§6.2.2: a segment is removed only when at least this much remains).
+const WINDOW_TARGET_DURATIONS: u64 = 3;
+/// Added to the first complete GOP's duration when the target duration is
+/// pinned, so a GOP one frame longer than the first is not cut.
+const TARGET_HEADROOM_TICKS: u64 = TIMESCALE as u64;
 /// Segments that list their partial segments: the last ones, as the
 /// specification asks for parts within three target durations of the end.
 const SEGMENTS_WITH_PARTS: usize = 3;
-/// Most payload retained by one GOP. Four bounded GOPs may be retained.
+/// Most payload retained by one GOP.
 const MAX_GOP_PAYLOAD_BYTES: usize = 16 * 1_024 * 1_024;
 /// Most frames retained by one GOP.
 const MAX_GOP_FRAMES: usize = 600;
-/// Longest media duration retained by one GOP (ten seconds at 90 kHz).
+/// Longest media duration retained by one GOP (ten seconds at 90 kHz), and
+/// the longest target duration a feeder pins.
 const MAX_GOP_DURATION_TICKS: u64 = 10 * TIMESCALE as u64;
 /// A feeder with no request for this long stops.
 const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
-/// Longest a blocking request waits before answering 503.
-const BLOCK_TIMEOUT: Duration = Duration::from_secs(6);
+/// Longest a blocking request waits before the first GOP completes: the GOP
+/// budget plus slack, since a feeder seeded from the ring's last sync frame
+/// completes its first GOP within one GOP length. Once the target duration is
+/// pinned, requests wait three target durations (§6.2.5.2).
+const INITIAL_BLOCK_TIMEOUT: Duration = Duration::from_secs(12);
+/// A reload may ask for a part this many seconds past the newest one before
+/// the request is an error (§6.2.5.2, the Advance Part Limit of three
+/// seconds divided by the part target).
+const ADVANCE_PART_LIMIT_SECS: u64 = 3;
 
 /// The frames of one group of pictures, one media segment.
 #[derive(Clone, Debug)]
@@ -71,21 +95,10 @@ struct Gop {
 }
 
 impl Gop {
-    /// Frames per partial segment: the target length over the first frame's
-    /// provisional duration, at least one.
-    fn frames_per_part(&self) -> usize {
-        let duration = self
-            .frames
-            .first()
-            .map_or(1, |(f, _)| u64::from(f.duration.max(1)));
-        usize::try_from(PART_TARGET_TICKS / duration)
-            .unwrap_or(1)
-            .max(1)
-    }
-
-    /// Partial segments available so far: `(index, frame range, complete)`.
-    fn parts(&self) -> Vec<Part> {
-        let n = self.frames_per_part();
+    /// Partial segments available so far, `frames_per_part` frames each:
+    /// `(index, frame range, complete)`.
+    fn parts(&self, frames_per_part: usize) -> Vec<Part> {
+        let n = frames_per_part.max(1);
         let mut parts = Vec::new();
         let mut start = 0usize;
         while start < self.frames.len() {
@@ -105,7 +118,9 @@ impl Gop {
         self.duration_ticks
     }
 
-    fn would_exceed_budget(&self, frame: &LiveFrame) -> bool {
+    /// Whether `frame` would take this GOP past the frame or payload budget
+    /// or past `max_duration_ticks` of media.
+    fn would_exceed_budget(&self, frame: &LiveFrame, max_duration_ticks: u64) -> bool {
         self.frames.len() >= MAX_GOP_FRAMES
             || self
                 .payload_bytes
@@ -114,7 +129,7 @@ impl Gop {
             || self
                 .duration_ticks
                 .checked_add(u64::from(frame.duration))
-                .is_none_or(|ticks| ticks > MAX_GOP_DURATION_TICKS)
+                .is_none_or(|ticks| ticks > max_duration_ticks)
     }
 
     fn push(&mut self, frame: Arc<LiveFrame>, sequence: u32) {
@@ -141,21 +156,135 @@ struct Inner {
     init_entry: Option<Arc<SampleEntry>>,
     last_decode_time: Option<u64>,
     discontinuity_sequence: u64,
+    /// The declared target duration in ticks, pinned when the first GOP
+    /// completes; `None` before.
+    target_ticks: Option<u64>,
+    /// Frames per partial segment, pinned from the first accepted frame.
+    part_frames: Option<usize>,
+    /// The declared part target in ticks: `part_frames` times the first
+    /// frame's duration.
+    part_target_ticks: Option<u64>,
     last_access: Option<Instant>,
     closed: bool,
 }
 
 impl Inner {
-    fn on_lag(&mut self, waiting_for_sync: &mut bool) {
-        *waiting_for_sync = true;
-        self.gops.clear();
+    /// Frames per partial segment: the pinned count, or one.
+    fn frames_per_part(&self) -> usize {
+        self.part_frames.unwrap_or(1)
+    }
+
+    /// The declared part target in ticks: the pinned value, or the default.
+    fn part_target_ticks(&self) -> u64 {
+        self.part_target_ticks.unwrap_or(PART_TARGET_TICKS)
+    }
+
+    /// The declared target duration in whole seconds, at least one.
+    fn target_secs(&self) -> u64 {
+        self.target_ticks
+            .unwrap_or(2 * u64::from(TIMESCALE))
+            .div_ceil(u64::from(TIMESCALE))
+            .max(1)
+    }
+
+    /// The most media a GOP may hold before it is cut: the pinned target, or
+    /// the GOP budget before any GOP completed.
+    fn max_gop_ticks(&self) -> u64 {
+        self.target_ticks.unwrap_or(MAX_GOP_DURATION_TICKS)
+    }
+
+    /// How long a blocking request waits: three target durations once the
+    /// target is pinned.
+    fn block_timeout(&self) -> Duration {
+        match self.target_ticks {
+            Some(_) => Duration::from_secs(3 * self.target_secs()),
+            None => INITIAL_BLOCK_TIMEOUT,
+        }
+    }
+
+    /// Pins the part size from the first frame: as many frames as fit the
+    /// part target, at least one, and the target they add up to.
+    fn pin_part_target(&mut self, frame: &LiveFrame) {
+        if self.part_frames.is_some() {
+            return;
+        }
+        let duration = u64::from(frame.duration.max(1));
+        let frames = usize::try_from(PART_TARGET_TICKS / duration)
+            .unwrap_or(1)
+            .max(1);
+        self.part_frames = Some(frames);
+        self.part_target_ticks = Some(frames as u64 * duration);
+    }
+
+    /// Marks the open GOP complete, pinning the target duration from the
+    /// first one: its duration rounded up to whole seconds plus one second of
+    /// headroom, capped at the GOP budget. An open GOP without frames is
+    /// dropped instead.
+    fn complete_current(&mut self) {
+        let Some(current) = self.gops.back_mut() else {
+            return;
+        };
+        if current.complete {
+            return;
+        }
+        if current.frames.is_empty() {
+            self.gops.pop_back();
+            return;
+        }
+        current.complete = true;
+        if self.target_ticks.is_none() {
+            let ticks = u64::from(TIMESCALE);
+            let rounded = current.duration_ticks.div_ceil(ticks) * ticks;
+            self.target_ticks = Some((rounded + TARGET_HEADROOM_TICKS).min(MAX_GOP_DURATION_TICKS));
+        }
+    }
+
+    /// Drops the oldest complete GOPs while the complete GOPs after them
+    /// cover at least three target durations, and never keeps more than
+    /// [`MAX_KEPT_GOPS`] complete GOPs.
+    fn evict(&mut self) {
+        let window = WINDOW_TARGET_DURATIONS * self.target_secs() * u64::from(TIMESCALE);
+        loop {
+            let complete = self.gops.iter().filter(|g| g.complete).count();
+            let Some(oldest) = self.gops.front() else {
+                return;
+            };
+            if !oldest.complete {
+                return;
+            }
+            let newer: u64 = self
+                .gops
+                .iter()
+                .skip(1)
+                .filter(|g| g.complete)
+                .map(Gop::duration_ticks)
+                .sum();
+            if newer >= window || complete > MAX_KEPT_GOPS {
+                self.gops.pop_front();
+            } else {
+                return;
+            }
+        }
+    }
+
+    /// Ends the open GOP where it is and starts a discontinuity epoch, so
+    /// dependent frames are ignored until the next sync frame.
+    fn cut(&mut self, waiting_for_sync: &mut bool) {
+        self.complete_current();
         if self.last_decode_time.take().is_some() {
             self.discontinuity_sequence = self.discontinuity_sequence.saturating_add(1);
         }
+        *waiting_for_sync = true;
+    }
+
+    fn on_lag(&mut self, waiting_for_sync: &mut bool) {
+        self.cut(waiting_for_sync);
     }
 
     fn accept_frame(&mut self, frame: Arc<LiveFrame>, waiting_for_sync: &mut bool) {
         if !same_sample_entry(self.init_entry.as_ref(), &frame.sample_entry) {
+            // Every listed segment refers to the one `EXT-X-MAP`, so a new
+            // sample entry starts the window over.
             if self.init_entry.is_some() {
                 self.discontinuity_sequence = self.discontinuity_sequence.saturating_add(1);
             }
@@ -170,17 +299,12 @@ impl Inner {
                 .last_decode_time
                 .is_some_and(|previous| frame.decode_time <= previous)
         {
-            self.discontinuity_sequence = self.discontinuity_sequence.saturating_add(1);
-            if let Some(current) = self.gops.back_mut() {
-                current.complete = true;
-            }
-            *waiting_for_sync = true;
+            self.cut(waiting_for_sync);
         }
         self.last_decode_time = Some(frame.decode_time);
         if frame.is_sync {
-            if let Some(current) = self.gops.back_mut() {
-                current.complete = true;
-            }
+            self.pin_part_target(&frame);
+            self.complete_current();
             let msn = self.next_msn;
             self.next_msn = self.next_msn.saturating_add(1);
             self.gops.push_back(Gop {
@@ -191,9 +315,7 @@ impl Inner {
                 duration_ticks: 0,
                 complete: false,
             });
-            while self.gops.len() > KEEP_SEGMENTS + 1 {
-                self.gops.pop_front();
-            }
+            self.evict();
             *waiting_for_sync = false;
         }
         if *waiting_for_sync {
@@ -202,14 +324,11 @@ impl Inner {
         if self
             .gops
             .back()
-            .is_some_and(|current| current.would_exceed_budget(&frame))
+            .is_some_and(|current| current.would_exceed_budget(&frame, self.max_gop_ticks()))
         {
-            // Drop the whole over-budget epoch exactly once, then ignore
+            // Cut the over-budget GOP where it is exactly once, then ignore
             // dependent frames until a later sync starts a bounded GOP.
-            self.gops.clear();
-            self.last_decode_time = None;
-            self.discontinuity_sequence = self.discontinuity_sequence.saturating_add(1);
-            *waiting_for_sync = true;
+            self.cut(waiting_for_sync);
             return;
         }
         let sequence = self.next_seq.wrapping_add(1);
@@ -230,7 +349,7 @@ impl Inner {
 
 /// The live playlist state of one stream.
 #[derive(Debug)]
-pub struct LiveHls {
+struct LiveHls {
     inner: Mutex<Inner>,
     notify: Notify,
     touched: Notify,
@@ -252,11 +371,27 @@ impl LiveHls {
         self.touched.notify_one();
     }
 
+    /// How long a blocking request on this stream waits.
+    fn block_timeout(&self) -> Duration {
+        self.inner
+            .lock()
+            .map_or(INITIAL_BLOCK_TIMEOUT, |inner| inner.block_timeout())
+    }
+
     /// Feeds frames from `ring` until the ring closes or nobody asks for the
-    /// stream for [`IDLE_TIMEOUT`].
+    /// stream for [`IDLE_TIMEOUT`]. The frames since the ring's last sync
+    /// frame come first, so the first GOP completes within one GOP length.
     async fn feed(self: Arc<Self>, ring: LiveRing, shutdown: CancellationToken) {
         let mut subscription = ring.subscribe();
         let mut waiting_for_sync = true;
+        // The daemon runs one thread, so no frame is published between the
+        // subscription and this snapshot; a frame in both would repeat.
+        for frame in ring.recent_from_sync() {
+            let Ok(mut inner) = self.inner.lock() else {
+                return;
+            };
+            inner.accept_frame(frame, &mut waiting_for_sync);
+        }
         loop {
             let touched = self.touched.notified();
             tokio::pin!(touched);
@@ -339,11 +474,20 @@ impl LiveHls {
 
 /// Live playlist states by stream, started on demand.
 #[derive(Debug, Default)]
-pub struct LiveHlsRegistry {
+pub(crate) struct LiveHlsRegistry {
     streams: Mutex<HashMap<StreamKey, Arc<LiveHls>>>,
 }
 
 impl LiveHlsRegistry {
+    /// Forgets the states of `camera`'s streams. A feeder whose state is
+    /// forgotten stops once its ring ends or its idle time runs out.
+    pub(crate) fn remove_camera(&self, camera: &CameraId) {
+        self.streams
+            .lock()
+            .expect("live hls lock")
+            .retain(|key, _| key.camera != *camera);
+    }
+
     /// The state for `key`, starting a feeder on `ring` when there is none
     /// or the previous one stopped.
     fn get_or_start(
@@ -397,26 +541,31 @@ pub(crate) async fn playlist(
     if params.part.is_some() && params.msn.is_none() {
         return Err(ApiError::BadRequest("_HLS_part without _HLS_msn".into()));
     }
-    // A client may ask for a segment up to two beyond the newest; further is an error.
+    // A client may ask for a segment up to two beyond the newest, and for a
+    // part up to the advance part limit beyond a segment's newest; further is
+    // an error (§6.2.5.2).
     if let Some(msn) = params.msn {
-        let last = hls
-            .inner
-            .lock()
-            .map_err(|_| ApiError::NotFound)?
-            .gops
-            .back()
-            .map(|g| g.msn);
+        let inner = hls.inner.lock().map_err(|_| ApiError::NotFound)?;
+        let last = inner.gops.back().map(|g| g.msn);
         if last.is_some_and(|last| msn > last + 2) {
             return Err(ApiError::BadRequest(format!(
                 "_HLS_msn {msn} is too far ahead"
             )));
         }
+        if let (Some(part), Some(gop)) = (params.part, inner.gops.iter().find(|g| g.msn == msn))
+            && part > gop.parts(inner.frames_per_part()).len() + advance_part_limit(&inner)
+        {
+            return Err(ApiError::BadRequest(format!(
+                "_HLS_part {part} is too far ahead"
+            )));
+        }
     }
     // A playlist needs a segment to play from: the first request waits for
-    // the first complete GOP (at most one GOP length), later ones answer at
-    // once unless a directive asks for more.
+    // the first complete GOP (within one GOP length, the feeder being seeded
+    // from the ring's last sync frame), later ones answer at once unless a
+    // directive asks for more.
     let ready = hls
-        .wait_until(BLOCK_TIMEOUT, |inner| {
+        .wait_until(hls.block_timeout(), |inner| {
             inner.gops.iter().any(|g| g.complete)
                 && params
                     .msn
@@ -441,6 +590,13 @@ pub(crate) async fn playlist(
         .into_response())
 }
 
+/// How many parts past a segment's newest a reload may ask for: three
+/// seconds of parts (§6.2.5.2).
+fn advance_part_limit(inner: &Inner) -> usize {
+    let per_second = u64::from(TIMESCALE).div_ceil(inner.part_target_ticks().max(1));
+    usize::try_from(ADVANCE_PART_LIMIT_SECS * per_second.max(1)).unwrap_or(usize::MAX)
+}
+
 /// Whether the playlist holds segment `msn` (complete, or with part `part`
 /// complete). A part index past the segment's last part means part 0 of
 /// the next segment (§6.2.5.2).
@@ -449,16 +605,16 @@ fn reload_satisfied(inner: &Inner, msn: u64, part: Option<usize>) -> bool {
         // Already gone from the playlist, or not yet started: served when newer exists.
         return inner.gops.back().is_some_and(|g| g.msn > msn);
     };
+    let frames_per_part = inner.frames_per_part();
     match part {
         None => gop.complete,
         Some(index) => {
-            let parts = gop.parts();
+            let parts = gop.parts(frames_per_part);
             match parts.get(index) {
                 Some(p) => p.complete,
-                None if gop.complete => inner
-                    .gops
-                    .iter()
-                    .any(|g| g.msn == msn + 1 && g.parts().first().is_some_and(|p| p.complete)),
+                None if gop.complete => inner.gops.iter().any(|g| {
+                    g.msn == msn + 1 && g.parts(frames_per_part).first().is_some_and(|p| p.complete)
+                }),
                 None => false,
             }
         }
@@ -478,24 +634,19 @@ fn seconds(ticks: u64) -> f64 {
 
 /// Renders the live playlist. URIs are relative to the playlist's own path.
 fn render(inner: &Inner, auth: &AuthContext, base_path: &str) -> String {
-    let target_ticks = inner
-        .gops
-        .iter()
-        .filter(|g| g.complete)
-        .map(Gop::duration_ticks)
-        .max()
-        .unwrap_or(2 * u64::from(TIMESCALE));
-    let target = target_ticks.div_ceil(u64::from(TIMESCALE)).max(1);
-    let part_target = seconds(PART_TARGET_TICKS);
+    let target = inner.target_secs();
+    let part_target = seconds(inner.part_target_ticks());
+    let frames_per_part = inner.frames_per_part();
     let first_msn = inner.gops.front().map_or(0, |g| g.msn);
     let first_discontinuity = inner
         .gops
         .front()
         .map_or(inner.discontinuity_sequence, |g| g.discontinuity_sequence);
     let mut out = String::new();
+    // Version 6 is what EXT-X-MAP without I-frame playlists needs (§8).
     let _ = writeln!(
         out,
-        "#EXTM3U\n#EXT-X-VERSION:9\n#EXT-X-TARGETDURATION:{target}"
+        "#EXTM3U\n#EXT-X-VERSION:6\n#EXT-X-TARGETDURATION:{target}"
     );
     let _ = writeln!(
         out,
@@ -515,17 +666,24 @@ fn render(inner: &Inner, auth: &AuthContext, base_path: &str) -> String {
     let with_parts_from = inner.gops.len().saturating_sub(SEGMENTS_WITH_PARTS);
     let mut discontinuity_sequence = first_discontinuity;
     for (i, gop) in inner.gops.iter().enumerate() {
-        if gop.discontinuity_sequence != discontinuity_sequence {
+        let after_discontinuity = gop.discontinuity_sequence != discontinuity_sequence;
+        if after_discontinuity {
             out.push_str("#EXT-X-DISCONTINUITY\n");
             discontinuity_sequence = gop.discontinuity_sequence;
         }
+        // The first segment and every segment after a discontinuity carry
+        // their wall time (§6.2.1).
         if let Some((first, _)) = gop.frames.first()
-            && i == 0
+            && (i == 0 || after_discontinuity)
         {
             let _ = writeln!(out, "#EXT-X-PROGRAM-DATE-TIME:{}", rfc3339(first.wall));
         }
         if i >= with_parts_from {
-            for part in gop.parts().into_iter().filter(|p| p.complete) {
+            for part in gop
+                .parts(frames_per_part)
+                .into_iter()
+                .filter(|p| p.complete)
+            {
                 let frames = &gop.frames[part.range.clone()];
                 let duration: u64 = frames.iter().map(|(f, _)| u64::from(f.duration)).sum();
                 let independent = frames.first().is_some_and(|(f, _)| f.is_sync);
@@ -553,7 +711,11 @@ fn render(inner: &Inner, auth: &AuthContext, base_path: &str) -> String {
                 uri(&format!("seg/{}/media.m4s", gop.msn), auth, base_path)
             );
         } else {
-            let next = gop.parts().into_iter().filter(|p| p.complete).count();
+            let next = gop
+                .parts(frames_per_part)
+                .into_iter()
+                .filter(|p| p.complete)
+                .count();
             let _ = writeln!(
                 out,
                 "#EXT-X-PRELOAD-HINT:TYPE=PART,URI=\"{}\"",
@@ -568,6 +730,8 @@ fn render(inner: &Inner, auth: &AuthContext, base_path: &str) -> String {
     out
 }
 
+/// The wall time of a frame as `EXT-X-PROGRAM-DATE-TIME` carries it, to the
+/// millisecond.
 fn rfc3339(wall: WallUs) -> String {
     let c = wall.to_civil();
     format!(
@@ -589,7 +753,7 @@ pub(crate) async fn init(
 ) -> Result<Response, ApiError> {
     let hls = lookup(&state, &camera, &kind)?;
     let ready = hls
-        .wait_until(BLOCK_TIMEOUT, |inner| inner.init.is_some())
+        .wait_until(hls.block_timeout(), |inner| inner.init.is_some())
         .await?;
     if !ready {
         return Err(ApiError::Unavailable("no frames yet".into()));
@@ -602,7 +766,7 @@ pub(crate) async fn init(
         .init
         .clone()
         .ok_or(ApiError::NotFound)?;
-    Ok(media(init, permit))
+    Ok(media(init, &permit))
 }
 
 /// `GET .../hls/seg/{msn}`: a complete media segment, waiting for it to
@@ -613,7 +777,7 @@ pub(crate) async fn segment(
 ) -> Result<Response, ApiError> {
     let hls = lookup(&state, &camera, &kind)?;
     let ready = hls
-        .wait_until(BLOCK_TIMEOUT, |inner| {
+        .wait_until(hls.block_timeout(), |inner| {
             inner.gops.iter().any(|g| g.msn == msn && g.complete)
                 || inner.gops.front().is_some_and(|g| g.msn > msn)
         })
@@ -634,7 +798,7 @@ pub(crate) async fn segment(
     let bytes = media_admission::blocking(&permit, move || encode(&frames))
         .await
         .map_err(|error| ApiError::Io(std::io::Error::other(error)))??;
-    Ok(media(bytes, permit))
+    Ok(media(bytes, &permit))
 }
 
 /// `GET .../hls/part/{msn}/{index}`: a partial segment, waiting for it to
@@ -645,12 +809,12 @@ pub(crate) async fn part(
 ) -> Result<Response, ApiError> {
     let hls = lookup(&state, &camera, &kind)?;
     let ready = hls
-        .wait_until(BLOCK_TIMEOUT, |inner| {
+        .wait_until(hls.block_timeout(), |inner| {
             let Some(gop) = inner.gops.iter().find(|g| g.msn == msn) else {
                 return inner.gops.front().is_some_and(|g| g.msn > msn);
             };
-            gop.parts().get(index).is_some_and(|p| p.complete)
-                || (gop.complete && gop.parts().len() <= index)
+            let parts = gop.parts(inner.frames_per_part());
+            parts.get(index).is_some_and(|p| p.complete) || (gop.complete && parts.len() <= index)
         })
         .await?;
     if !ready {
@@ -665,7 +829,7 @@ pub(crate) async fn part(
             .find(|g| g.msn == msn)
             .ok_or(ApiError::NotFound)?;
         let part = gop
-            .parts()
+            .parts(inner.frames_per_part())
             .into_iter()
             .nth(index)
             .ok_or(ApiError::NotFound)?;
@@ -674,7 +838,7 @@ pub(crate) async fn part(
     let bytes = media_admission::blocking(&permit, move || encode(&frames))
         .await
         .map_err(|error| ApiError::Io(std::io::Error::other(error)))??;
-    Ok(media(bytes, permit))
+    Ok(media(bytes, &permit))
 }
 
 fn encode(frames: &[(Arc<LiveFrame>, u32)]) -> Result<Bytes, ApiError> {
@@ -686,20 +850,19 @@ fn encode(frames: &[(Arc<LiveFrame>, u32)]) -> Result<Bytes, ApiError> {
     out.try_reserve_exact(estimated)
         .map_err(|_| ApiError::Unavailable("media allocation unavailable".into()))?;
     for (frame, seq) in frames {
-        let fragment = encode_live_fragment(frame, *seq)
-            .map_err(|e| ApiError::Io(std::io::Error::other(e.to_string())))?;
-        out.extend_from_slice(&fragment);
+        encode_live_fragment_into(&mut out, frame, *seq)
+            .map_err(|error| ApiError::Io(std::io::Error::other(error)))?;
     }
     Ok(Bytes::from(out))
 }
 
-fn media(bytes: Bytes, permit: Arc<tokio::sync::OwnedSemaphorePermit>) -> Response {
+fn media(bytes: Bytes, permit: &MediaPermit) -> Response {
     (
         [
             (header::CONTENT_TYPE, "video/iso.segment"),
             (header::CACHE_CONTROL, "private, no-store"),
         ],
-        admitted_media_bytes(bytes, permit),
+        media_admission::attach(bytes, permit),
     )
         .into_response()
 }
@@ -740,7 +903,10 @@ mod tests {
         })
     }
 
-    async fn assert_feed_budget_breach(frames: Vec<Arc<LiveFrame>>) {
+    /// Feeds `frames`, expects the budget breach to cut the open GOP (kept
+    /// complete when it has frames, `kept` of them in all), then a dependent
+    /// frame to be ignored and a sync frame to start a GOP in the next epoch.
+    async fn assert_feed_budget_breach(frames: Vec<Arc<LiveFrame>>, kept: usize) {
         let ring = LiveRing::new(MAX_GOP_FRAMES + 8);
         let hls = LiveHls::new();
         let shutdown = CancellationToken::new();
@@ -762,7 +928,8 @@ mod tests {
         {
             let inner = hls.inner.lock().unwrap();
             assert_eq!(inner.discontinuity_sequence, 1);
-            assert!(inner.gops.is_empty());
+            assert_eq!(inner.gops.len(), kept);
+            assert!(inner.gops.iter().all(|g| g.complete));
         }
 
         hls.touch();
@@ -771,22 +938,23 @@ mod tests {
         {
             let inner = hls.inner.lock().unwrap();
             assert_eq!(inner.discontinuity_sequence, 1);
-            assert!(inner.gops.is_empty());
+            assert_eq!(inner.gops.len(), kept, "a dependent frame starts nothing");
         }
 
         hls.touch();
         ring.publish(frame(20_003_000, true));
         for _ in 0..100 {
-            if !hls.inner.lock().unwrap().gops.is_empty() {
+            if hls.inner.lock().unwrap().gops.len() > kept {
                 break;
             }
             tokio::task::yield_now().await;
         }
         {
             let inner = hls.inner.lock().unwrap();
-            assert_eq!(inner.gops.len(), 1);
-            assert_eq!(inner.gops[0].discontinuity_sequence, 1);
-            assert!(inner.gops[0].frames[0].0.is_sync);
+            assert_eq!(inner.gops.len(), kept + 1);
+            let started = inner.gops.back().unwrap();
+            assert_eq!(started.discontinuity_sequence, 1);
+            assert!(started.frames[0].0.is_sync);
         }
 
         shutdown.cancel();
@@ -818,27 +986,179 @@ mod tests {
     #[test]
     fn parts_are_cut_by_frame_count_and_the_tail_waits_for_completion() {
         let g = gop(5, 40, false);
-        let parts = g.parts();
-        assert_eq!(g.frames_per_part(), 15);
+        let parts = g.parts(15);
         assert_eq!(parts.len(), 3);
         assert_eq!(parts[0].range, 0..15);
         assert!(parts[0].complete && parts[1].complete && !parts[2].complete);
         let done = gop(5, 40, true);
-        assert!(done.parts()[2].complete);
-        assert_eq!(done.parts()[2].range, 30..40);
+        assert!(done.parts(15)[2].complete);
+        assert_eq!(done.parts(15)[2].range, 30..40);
+    }
+
+    /// The part size follows the first frame's duration: as many whole
+    /// frames as fit half a second, at least one, and the declared part
+    /// target is exactly what they add up to (§4.4.4.9).
+    #[test]
+    fn the_part_target_is_pinned_from_the_first_frame_duration() {
+        for (duration, frames, target) in [
+            (3_000, 15, 45_000),
+            (90_000, 1, 90_000),
+            (30_000, 1, 30_000),
+            (18_000, 2, 36_000),
+        ] {
+            let mut inner = Inner::default();
+            inner.pin_part_target(&frame_with(0, true, Bytes::new(), duration));
+            assert_eq!(inner.frames_per_part(), frames, "{duration}");
+            assert_eq!(inner.part_target_ticks(), target, "{duration}");
+            // Pinned once: a later frame of another duration changes nothing.
+            inner.pin_part_target(&frame_with(0, true, Bytes::new(), 1));
+            assert_eq!(inner.frames_per_part(), frames, "{duration}");
+        }
+    }
+
+    /// The first complete GOP pins the target duration (its length rounded
+    /// up to whole seconds plus one second, at most the GOP budget), and a
+    /// later GOP that would outlast it is cut with a discontinuity.
+    #[test]
+    fn the_target_duration_is_pinned_by_the_first_complete_gop() {
+        let mut inner = Inner::default();
+        let mut waiting = true;
+        for index in 0..60u64 {
+            inner.accept_frame(frame(index * 3000, index == 0), &mut waiting);
+        }
+        assert_eq!(inner.target_ticks, None, "an open GOP pins nothing");
+        assert_eq!(inner.block_timeout(), INITIAL_BLOCK_TIMEOUT);
+        inner.accept_frame(frame(60 * 3000, true), &mut waiting);
+        assert_eq!(
+            inner.target_ticks,
+            Some(3 * 90_000),
+            "2 s rounded up plus 1 s"
+        );
+        assert_eq!(inner.target_secs(), 3);
+        assert_eq!(inner.block_timeout(), Duration::from_secs(9));
+
+        // The second GOP runs for 3 s and is cut before its 91st frame.
+        for index in 61..150u64 {
+            inner.accept_frame(frame(index * 3000, false), &mut waiting);
+        }
+        assert_eq!(inner.gops.len(), 2);
+        assert_eq!(inner.gops[1].frames.len(), 90);
+        assert!(!waiting);
+        inner.accept_frame(frame(151 * 3000, false), &mut waiting);
+        assert!(waiting, "the frame past the target cuts the GOP");
+        assert!(inner.gops[1].complete);
+        assert_eq!(inner.gops[1].frames.len(), 90);
+        assert_eq!(inner.discontinuity_sequence, 1);
+        assert_eq!(
+            inner.target_ticks,
+            Some(3 * 90_000),
+            "the target never changes"
+        );
+
+        let mut long = Inner::default();
+        long.gops.push_back(gop(0, 600, false));
+        long.complete_current();
+        assert_eq!(
+            long.target_ticks,
+            Some(MAX_GOP_DURATION_TICKS),
+            "capped at the GOP budget"
+        );
+    }
+
+    /// A complete segment stays listed until the complete segments after it
+    /// cover three target durations (§6.2.2), and never more than the cap.
+    #[test]
+    fn complete_segments_stay_until_three_target_durations_follow() {
+        let mut inner = Inner {
+            target_ticks: Some(3 * 90_000),
+            ..Inner::default()
+        };
+        for msn in 0..5 {
+            inner.gops.push_back(gop(msn, 60, true));
+            inner.evict();
+        }
+        assert_eq!(inner.gops.len(), 5, "8 s of newer segments is under 9 s");
+        inner.gops.push_back(gop(5, 60, true));
+        inner.evict();
+        assert_eq!(
+            inner.gops.front().map(|g| g.msn),
+            Some(1),
+            "10 s of newer segments"
+        );
+        assert_eq!(inner.gops.len(), 5);
+
+        let mut capped = Inner {
+            target_ticks: Some(MAX_GOP_DURATION_TICKS),
+            ..Inner::default()
+        };
+        for msn in 0..20 {
+            capped.gops.push_back(gop(msn, 60, true));
+            capped.evict();
+        }
+        assert_eq!(capped.gops.len(), MAX_KEPT_GOPS);
+    }
+
+    /// Ring lag ends the open segment where it is and starts a discontinuity
+    /// epoch; complete segments stay listed.
+    #[test]
+    fn lag_ends_the_open_segment_and_keeps_the_complete_ones() {
+        let mut inner = Inner::default();
+        let mut waiting = true;
+        for index in 0..=60u64 {
+            inner.accept_frame(frame(index * 3000, index % 60 == 0), &mut waiting);
+        }
+        inner.accept_frame(frame(61 * 3000, false), &mut waiting);
+        assert_eq!(inner.gops.len(), 2);
+        inner.on_lag(&mut waiting);
+        assert!(waiting);
+        assert_eq!(inner.gops.len(), 2);
+        assert!(inner.gops[1].complete);
+        assert_eq!(inner.gops[1].frames.len(), 2);
+        assert_eq!(inner.discontinuity_sequence, 1);
+        inner.accept_frame(frame(70 * 3000, false), &mut waiting);
+        assert_eq!(
+            inner.gops.len(),
+            2,
+            "dependent frames are ignored until sync"
+        );
+        inner.accept_frame(frame(71 * 3000, true), &mut waiting);
+        assert_eq!(inner.gops.len(), 3);
+        assert_eq!(inner.gops[2].discontinuity_sequence, 1);
+    }
+
+    #[test]
+    fn the_advance_part_limit_is_three_seconds_of_parts() {
+        let mut inner = Inner {
+            part_target_ticks: Some(45_000),
+            ..Inner::default()
+        };
+        assert_eq!(advance_part_limit(&inner), 6);
+        inner.part_target_ticks = Some(90_000);
+        assert_eq!(advance_part_limit(&inner), 3);
+        inner.part_target_ticks = Some(30_000);
+        assert_eq!(advance_part_limit(&inner), 9);
+    }
+
+    /// An `Inner` as a feeder leaves it after 2 s GOPs at 30 fps.
+    fn pinned(mut inner: Inner) -> Inner {
+        inner.target_ticks = Some(3 * 90_000);
+        inner.part_frames = Some(15);
+        inner.part_target_ticks = Some(45_000);
+        inner
     }
 
     #[test]
     fn the_playlist_lists_segments_parts_and_a_preload_hint() {
-        let mut inner = Inner::default();
+        let mut inner = pinned(Inner::default());
         inner.gops.push_back(gop(7, 60, true));
         inner.gops.push_back(gop(8, 60, true));
         inner.gops.push_back(gop(9, 20, false));
         inner.next_msn = 10;
-        let auth = AuthContext::for_test("root bearer", 1_234_567);
+        let auth = AuthContext::for_test(&crate::auth::test_secret(), 1_234_567);
         let base = "/api/streams/cam1/main/hls";
         let text = render(&inner, &auth, base);
-        assert!(text.contains("#EXT-X-TARGETDURATION:2\n"), "{text}");
+        assert!(text.starts_with("#EXTM3U\n#EXT-X-VERSION:6\n"), "{text}");
+        assert!(text.contains("#EXT-X-TARGETDURATION:3\n"), "{text}");
         assert!(text.contains("#EXT-X-SERVER-CONTROL:CAN-BLOCK-RELOAD=YES,PART-HOLD-BACK=1.500\n"));
         assert!(text.contains("#EXT-X-PART-INF:PART-TARGET=0.500\n"));
         assert!(text.contains("#EXT-X-MEDIA-SEQUENCE:7\n"));
@@ -877,7 +1197,7 @@ mod tests {
 
     #[test]
     fn blocking_reload_conditions_follow_the_specification() {
-        let mut inner = Inner::default();
+        let mut inner = pinned(Inner::default());
         inner.gops.push_back(gop(3, 60, true));
         inner.gops.push_back(gop(4, 20, false));
         assert!(reload_satisfied(&inner, 3, None));
@@ -893,7 +1213,7 @@ mod tests {
 
     #[test]
     fn discontinuity_sequence_survives_window_eviction() {
-        let mut inner = Inner::default();
+        let mut inner = pinned(Inner::default());
         inner.gops.push_back(gop(7, 60, true));
         let mut restarted = gop(8, 60, true);
         restarted.discontinuity_sequence = 1;
@@ -902,7 +1222,11 @@ mod tests {
         let text = render(&inner, &auth, "/api/streams/cam1/main/hls");
         assert!(text.contains("#EXT-X-DISCONTINUITY-SEQUENCE:0\n"));
         assert_eq!(text.matches("#EXT-X-DISCONTINUITY\n").count(), 1);
-        assert!(text.contains("seg/7/media.m4s\n#EXT-X-DISCONTINUITY\n"));
+        assert!(
+            text.contains("seg/7/media.m4s\n#EXT-X-DISCONTINUITY\n#EXT-X-PROGRAM-DATE-TIME:"),
+            "a segment after a discontinuity carries its wall time: {text}"
+        );
+        assert_eq!(text.matches("#EXT-X-PROGRAM-DATE-TIME:").count(), 2);
         inner.gops.pop_front();
         let text = render(&inner, &auth, "/api/streams/cam1/main/hls");
         assert!(text.contains("#EXT-X-DISCONTINUITY-SEQUENCE:1\n"));
@@ -914,20 +1238,22 @@ mod tests {
         let incoming = frame(0, false);
         let mut payload = gop(0, 0, false);
         payload.payload_bytes = MAX_GOP_PAYLOAD_BYTES;
-        assert!(payload.would_exceed_budget(&incoming));
+        assert!(payload.would_exceed_budget(&incoming, MAX_GOP_DURATION_TICKS));
 
         let frames = gop(0, MAX_GOP_FRAMES, false);
-        assert!(frames.would_exceed_budget(&incoming));
+        assert!(frames.would_exceed_budget(&incoming, MAX_GOP_DURATION_TICKS));
 
         let mut duration = gop(0, 0, false);
         duration.duration_ticks = MAX_GOP_DURATION_TICKS;
-        assert!(duration.would_exceed_budget(&incoming));
+        assert!(duration.would_exceed_budget(&incoming, MAX_GOP_DURATION_TICKS));
+        assert!(!gop(0, 0, false).would_exceed_budget(&incoming, MAX_GOP_DURATION_TICKS));
+        assert!(gop(0, 0, false).would_exceed_budget(&incoming, 2_999));
     }
 
     #[tokio::test]
     async fn payload_budget_caps_a_continuously_touched_feeder() {
         let oversized = Bytes::from(vec![0_u8; MAX_GOP_PAYLOAD_BYTES + 1]);
-        assert_feed_budget_breach(vec![frame_with(0, true, oversized, 3000)]).await;
+        assert_feed_budget_breach(vec![frame_with(0, true, oversized, 3000)], 0).await;
     }
 
     #[tokio::test]
@@ -935,22 +1261,25 @@ mod tests {
         let frames = (0..=MAX_GOP_FRAMES)
             .map(|index| frame(index as u64 * 3000, index == 0))
             .collect();
-        assert_feed_budget_breach(frames).await;
+        assert_feed_budget_breach(frames, 1).await;
     }
 
     #[tokio::test]
     async fn duration_budget_caps_a_continuously_touched_feeder() {
         let duration = u32::try_from(MAX_GOP_DURATION_TICKS + 1).unwrap();
-        assert_feed_budget_breach(vec![frame_with(
+        assert_feed_budget_breach(
+            vec![frame_with(
+                0,
+                true,
+                Bytes::from_static(&[0, 0, 0, 2, 0x26, 1]),
+                duration,
+            )],
             0,
-            true,
-            Bytes::from_static(&[0, 0, 0, 2, 0x26, 1]),
-            duration,
-        )])
+        )
         .await;
     }
 
-    /// CRC-32C (Castagnoli, reflected polynomial 0x82F63B78) lookup table.
+    /// CRC-32C (Castagnoli, reflected polynomial 0x82f63b78) lookup table.
     fn crc32c_table() -> [u32; 256] {
         let mut table = [0u32; 256];
         for (index, slot) in table.iter_mut().enumerate() {
@@ -1039,17 +1368,18 @@ mod tests {
         inner.gops.back_mut().unwrap().payload_bytes = MAX_GOP_PAYLOAD_BYTES;
         inner.accept_frame(frame(3000, false), &mut waiting_for_sync);
         assert!(waiting_for_sync);
-        assert!(inner.gops.is_empty());
+        assert_eq!(inner.gops.len(), 1, "the cut GOP stays, complete");
+        assert!(inner.gops[0].complete);
         assert_eq!(inner.discontinuity_sequence, 1);
 
         inner.accept_frame(frame(6000, false), &mut waiting_for_sync);
         assert_eq!(inner.discontinuity_sequence, 1);
-        assert!(inner.gops.is_empty());
+        assert_eq!(inner.gops.len(), 1);
 
         inner.accept_frame(frame(9000, true), &mut waiting_for_sync);
         assert!(!waiting_for_sync);
-        assert_eq!(inner.gops.len(), 1);
-        assert_eq!(inner.gops[0].discontinuity_sequence, 1);
+        assert_eq!(inner.gops.len(), 2);
+        assert_eq!(inner.gops[1].discontinuity_sequence, 1);
     }
 
     #[tokio::test(start_paused = true)]

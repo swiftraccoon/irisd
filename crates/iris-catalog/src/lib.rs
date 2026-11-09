@@ -13,21 +13,26 @@
 //!
 //! - [`CatalogHandle`]: open, notify, query, mutate, read [`CatalogMetrics`],
 //!   shut down. Clones share one thread.
+//! - [`CatalogRootRegistry`] and [`CatalogRootExpectation`]: the synchronous
+//!   preflight that migrates the schema and tells the daemon, before any
+//!   thread or sandbox exists, what the catalog knows about each configured
+//!   recording root.
 //! - [`Change`]: what the store's observer and the event feeds report,
 //!   batched into one transaction per 100 ms (or 1,000 changes, or the next
 //!   query).
-//! - [`SegmentRow`], [`EventRow`], [`EventProtection`], [`RetentionPage`],
-//!   [`CameraRow`], [`NewSegment`]: rows and retention projections;
-//!   [`SegmentId`] and [`EventId`] their keys; [`EventCursor`] and
-//!   [`EventProtectionCursor`] the listing and active-protection
-//!   continuations; [`DeleteMarkResult`] the conditional-deletion outcome;
-//!   [`TimeRange`] a half-open wall range.
+//! - [`SegmentRow`], [`EventRow`], [`RetentionPage`], [`StartupRow`],
+//!   [`CameraRow`], [`NewSegment`]: rows and retention pages; [`SegmentId`],
+//!   [`EventId`], and [`SampleEntryId`] their keys; [`SegmentCursor`] and
+//!   [`EventCursor`] the page continuations; [`DeleteMarkResult`] the
+//!   conditional-deletion outcome; [`TimeRange`] a half-open wall range.
 //! - [`CatalogStats`] and [`CatalogMetrics`]: aggregate counts and the thread's
 //!   latency, queue, overload, event-state, database, and WAL measurements.
-//! - [`CatalogError`]: SQLite, I/O, corruption, unsupported schema, overload,
-//!   capacity, not found, and closed errors.
-//! - [`OPEN_SEGMENT_GRACE`]: how far past its last durable progress an
-//!   unsealed segment extends in range listings.
+//! - [`CatalogError`]: SQLite, I/O, corruption, unsupported schema, journal
+//!   mode, root identity, path encoding, overload, capacity, not found, and
+//!   closed errors.
+//! - [`OPEN_SEGMENT_GRACE`]: the default of how far past its last durable
+//!   progress an unsealed segment extends in range listings;
+//!   [`CatalogHandle::open_with_grace`] takes another.
 //!
 //! # Invariants
 //!
@@ -39,7 +44,8 @@
 //! - Conditional deletion checks active retained-event overlap and updates
 //!   deletion intent in one FULL-synchronous transaction.
 //! - Event listings have aggregate row and owned-byte limits and use stable
-//!   `(time, id)` cursors. Protection pages use `(retain_until, id)`. Event
+//!   `(time, id)` cursors. Event protection is checked in SQL: candidate pages
+//!   exclude protected rows and the deletion mark rechecks them. Event
 //!   lifecycle maintenance scans bounded inactive batches by recording horizon,
 //!   age, row count, and logical string bytes and carries its scan cursor even
 //!   when a page deletes nothing;
@@ -56,30 +62,37 @@
 //!   query state stays in memory so the catalog needs no sandbox-external temp
 //!   directory.
 //! - A failed batch is counted and dropped; the next batch starts clean.
-//!   Write transactions begin `IMMEDIATE`, so another connection briefly
-//!   holding the write lock delays a batch (up to the 5 s busy timeout)
-//!   instead of failing it.
+//!   Every write runs in a transaction that begins `IMMEDIATE`, so another
+//!   connection briefly holding the write lock delays it (up to the 5 s busy
+//!   timeout) instead of failing it.
 //! - Range listings list an unsealed segment only once it has a durable
-//!   fragment and end it at the earlier of now and [`OPEN_SEGMENT_GRACE`] past
-//!   its last progress, so an open file whose writer stopped reporting does not
-//!   claim later windows.
+//!   fragment and end it at the earlier of now and the open-segment grace
+//!   ([`OPEN_SEGMENT_GRACE`] by default) past its last progress, so an open
+//!   file whose writer stopped reporting does not claim later windows.
 //! - Opening creates missing parent directories 0700 and a missing database
-//!   file 0600; SQLite gives the WAL and shared-memory files the database's mode.
+//!   file 0600; SQLite gives the WAL and shared-memory files the database's
+//!   mode. Open confirms WAL mode and fails otherwise.
+//! - Paths are stored as text; a path that is not UTF-8 is refused rather
+//!   than converted lossily.
 //!
 //! # Example
 //!
-//! ```no_run
+//! ```
 //! use iris_catalog::CatalogHandle;
 //! use iris_core::id::CameraId;
 //!
-//! # async fn example() -> Result<(), iris_catalog::CatalogError> {
-//! let catalog = CatalogHandle::open(std::path::Path::new("irisd.db"))?;
-//! let camera = CameraId::try_new("cam1").expect("valid id");
-//! catalog.ensure_camera(&camera, "Example", Some("dahua")).await?;
-//! assert_eq!(catalog.cameras().await?.len(), 1);
-//! catalog.shutdown();
-//! # Ok(())
-//! # }
+//! fn main() -> Result<(), Box<dyn std::error::Error>> {
+//!     let dir = tempfile::tempdir()?;
+//!     let runtime = tokio::runtime::Builder::new_current_thread().build()?;
+//!     runtime.block_on(async {
+//!         let catalog = CatalogHandle::open(&dir.path().join("irisd.db"))?;
+//!         let camera = CameraId::try_new("cam1")?;
+//!         catalog.ensure_camera(&camera, "Example", Some("dahua")).await?;
+//!         assert_eq!(catalog.cameras().await?.len(), 1);
+//!         catalog.shutdown();
+//!         Ok(())
+//!     })
+//! }
 //! ```
 
 mod db;
@@ -92,6 +105,11 @@ pub use handle::CatalogHandle;
 pub use metrics::CatalogMetrics;
 pub use types::{
     CameraRow, CatalogError, CatalogStats, Change, DeleteMarkResult, EventCursor, EventId,
-    EventProtection, EventProtectionCursor, EventRow, NewSegment, RetentionPage, SegmentId,
-    SegmentRow, TimeRange,
+    EventRow, NewSegment, RetentionPage, SampleEntryId, SegmentCursor, SegmentId, SegmentRow,
+    StartupRow, TimeRange,
 };
+
+/// Compiles the README's example as a doctest.
+#[cfg(doctest)]
+#[doc = include_str!("../README.md")]
+struct ReadmeDoctests;

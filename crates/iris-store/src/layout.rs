@@ -25,6 +25,21 @@ pub fn index_path(mp4: &Path) -> PathBuf {
     mp4.with_extension("idx")
 }
 
+/// Largest `n` of a numbered sibling: a name taken by that many recordings
+/// of the same microsecond is refused.
+pub const MAX_NUMBERED_SIBLING: u32 = 99;
+
+/// Returns `<stem>-<n>.mp4` beside `path`: the name a recording takes when
+/// `path` is already claimed, for `n` from 1 to [`MAX_NUMBERED_SIBLING`].
+#[must_use]
+pub fn numbered_segment_path(path: &Path, n: u32) -> PathBuf {
+    let stem = path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or("segment");
+    path.with_file_name(format!("{stem}-{n}.mp4"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -45,6 +60,19 @@ mod tests {
         assert_eq!(
             index_path(&path),
             PathBuf::from("/r/cam1/main/2026-10-31/153558.000000Z.idx")
+        );
+    }
+
+    #[test]
+    fn numbers_a_sibling_beside_the_taken_name() {
+        let path = PathBuf::from("/r/cam1/main/2026-10-31/153558.000000Z.mp4");
+        assert_eq!(
+            numbered_segment_path(&path, 1),
+            PathBuf::from("/r/cam1/main/2026-10-31/153558.000000Z-1.mp4")
+        );
+        assert_eq!(
+            index_path(&numbered_segment_path(&path, 99)),
+            PathBuf::from("/r/cam1/main/2026-10-31/153558.000000Z-99.idx")
         );
     }
 

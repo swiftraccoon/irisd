@@ -12,11 +12,8 @@ trim_trailing_whitespace = true
 indent_size = 2
 trim_trailing_whitespace = false
 
-[{*.yml,*.yaml,*.toml,justfile}]
+[{*.yml,*.yaml}]
 indent_size = 2
-
-[justfile]
-indent_size = 4
 
 # Vendored material keeps its upstream bytes.
 [{.rust-reference/**,docs/standards/ietf/**,third_party/**}]

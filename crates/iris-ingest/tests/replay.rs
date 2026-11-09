@@ -9,20 +9,18 @@
 use iris_core::config::TimestampMode;
 use iris_core::time::MediaTicks;
 use iris_ingest::regularize::Regularizer;
-
-const RECORD_LEN: usize = 40;
-const HEADER_LEN: usize = 64;
+use iris_mp4::index::{HEADER_LEN, IndexHeader, IndexRecord, RECORD_LEN};
 
 /// (frames, camera span in ticks to the next fragment) per fragment.
 fn camera_timeline() -> Vec<(usize, i64)> {
     let bytes = include_bytes!("data/cam1-main-10min.idx");
+    IndexHeader::decode(&bytes[..HEADER_LEN]).expect("the fixture carries a sidecar header");
     let (chunks, _tail) = bytes[HEADER_LEN..].as_chunks::<RECORD_LEN>();
     let records: Vec<(u16, u32)> = chunks
         .iter()
-        .map(|r| {
-            let n = u16::from_be_bytes([r[32], r[33]]);
-            let raw = u32::from_be_bytes([r[36], r[37], r[38], r[39]]);
-            (n, raw)
+        .map(|chunk| {
+            let record = IndexRecord::decode(chunk);
+            (record.sample_count, record.raw_rtp)
         })
         .collect();
     records
@@ -51,7 +49,7 @@ fn real_camera_timeline_stays_locked_without_snaps() {
     for (i, &(n, span)) in timeline.iter().enumerate() {
         let raw: Vec<i64> = (0..n as i64).map(|k| raw_start + k * 3000).collect();
         let a = r.assign(&raw, raw_start + span);
-        assert_eq!(a.durations.len(), n);
+        assert_eq!(a.durations.len(), n, "fragment {i}");
         let (last, body) = a.durations.split_last().expect("n >= 1");
         // Body durations sit within 1 % of the nominal in use, which follows the
         // camera's delivered rate when its encoder runs uniformly slow (up to
@@ -86,8 +84,8 @@ fn real_camera_timeline_stays_locked_without_snaps() {
         snaps, 0,
         "no camera gap in this recording exceeds the tolerance"
     );
-    // Bursty drops stay holds; the minutes in which the encoder runs uniformly
-    // slow are re-timed instead, which takes some former holds away.
+    // Bursty drops stay holds; minutes in which the encoder runs uniformly slow
+    // are re-timed, so their frames carry nominal durations instead of holds.
     assert!(
         (20..=200).contains(&holds),
         "expected the camera's dropped frames as holds, got {holds}"

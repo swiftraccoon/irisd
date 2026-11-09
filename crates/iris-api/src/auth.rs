@@ -1,5 +1,7 @@
 //! Bearer-token authentication and scoped media capabilities.
 
+mod token;
+
 use std::fmt;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -10,6 +12,7 @@ use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use sha2::{Digest as _, Sha256};
 
+use crate::auth::token::{CAPABILITY_TAG_BYTES, CAPABILITY_VERSION, parse_capability, query_token};
 use crate::query::MAX_RANGE_US;
 use crate::state::ApiState;
 
@@ -18,9 +21,55 @@ const ROLLING_CAPABILITY_TTL: Duration = Duration::from_mins(15);
 /// An immutable VOD playlist cannot renew child capabilities. Its longest
 /// capability therefore matches the API's maximum selectable playback span.
 pub(crate) const MAX_VOD_CAPABILITY_TTL: Duration = Duration::from_micros(MAX_RANGE_US as u64);
-const CAPABILITY_VERSION: &str = "v1";
-const CAPABILITY_TAG_BYTES: usize = 32;
-const MAX_ENCODED_CAPABILITY_BYTES: usize = 96;
+/// Rolling capability expiries are rounded down to this step, so every
+/// playlist reload within one step mints identical child URIs.
+const ROLLING_EXPIRY_STEP_SECS: u64 = 60;
+/// Length of a [`CapabilitySecret`].
+pub const CAPABILITY_SECRET_BYTES: usize = 32;
+
+/// The secret that signs media capabilities.
+///
+/// The daemon draws it from the kernel's random source once, keeps it in its
+/// state directory with mode 0600, and reuses it across restarts, so a
+/// capability outlives a restart. The root tokens take no part in a
+/// capability: a captured capability URL reveals nothing about any token, and
+/// every token issues interchangeable capabilities. The `Debug` output is
+/// redacted.
+///
+/// ```
+/// use iris_api::CapabilitySecret;
+///
+/// let secret = CapabilitySecret::new([7; 32]);
+/// assert_eq!(format!("{secret:?}"), "CapabilitySecret([redacted])");
+/// ```
+#[derive(Clone)]
+pub struct CapabilitySecret([u8; CAPABILITY_SECRET_BYTES]);
+
+impl CapabilitySecret {
+    /// Wraps secret bytes drawn from a cryptographic random source.
+    #[must_use]
+    pub const fn new(bytes: [u8; CAPABILITY_SECRET_BYTES]) -> Self {
+        Self(bytes)
+    }
+
+    /// The secret bytes, for persisting them.
+    #[must_use]
+    pub const fn as_bytes(&self) -> &[u8; CAPABILITY_SECRET_BYTES] {
+        &self.0
+    }
+}
+
+impl fmt::Debug for CapabilitySecret {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("CapabilitySecret([redacted])")
+    }
+}
+
+/// A fixed secret for tests of capability issuance.
+#[cfg(test)]
+pub(crate) fn test_secret() -> CapabilitySecret {
+    CapabilitySecret::new([7; CAPABILITY_SECRET_BYTES])
+}
 
 /// Authentication context kept as a request extension so playlists can issue
 /// path-specific media capabilities without retaining or emitting a root token.
@@ -49,10 +98,10 @@ impl AuthContext {
     }
 
     #[cfg(test)]
-    pub(crate) fn for_test(root_token: &str, expires_at: u64) -> Self {
+    pub(crate) fn for_test(secret: &CapabilitySecret, expires_at: u64) -> Self {
         Self {
             issuer: Some(CapabilityIssuer {
-                key: CapabilityKey::from_root_token(root_token),
+                key: CapabilityKey::from_secret(secret),
                 issued_at: expires_at.saturating_sub(ROLLING_CAPABILITY_TTL.as_secs()),
                 default_expires_at: expires_at,
                 max_expires_at: expires_at,
@@ -61,10 +110,10 @@ impl AuthContext {
     }
 
     #[cfg(test)]
-    pub(crate) fn for_test_at(root_token: &str, issued_at: u64) -> Self {
+    pub(crate) fn for_test_at(secret: &CapabilitySecret, issued_at: u64) -> Self {
         Self {
             issuer: Some(CapabilityIssuer {
-                key: CapabilityKey::from_root_token(root_token),
+                key: CapabilityKey::from_secret(secret),
                 issued_at,
                 default_expires_at: issued_at.saturating_add(ROLLING_CAPABILITY_TTL.as_secs()),
                 max_expires_at: issued_at.saturating_add(MAX_VOD_CAPABILITY_TTL.as_secs()),
@@ -83,10 +132,10 @@ impl fmt::Debug for CapabilityKey {
 }
 
 impl CapabilityKey {
-    fn from_root_token(token: &str) -> Self {
+    fn from_secret(secret: &CapabilitySecret) -> Self {
         let mut digest = Sha256::new();
-        digest.update(b"irisd media capability key v1\0");
-        digest.update(token.as_bytes());
+        digest.update(b"irisd media capability key v2\0");
+        digest.update(secret.as_bytes());
         Self(digest.finalize().into())
     }
 
@@ -160,8 +209,8 @@ pub(crate) async fn require_token(
 
     let now = unix_seconds();
     let issuer = bearer(req.headers())
-        .and_then(|presented| root_issuer(&state.tokens, presented, now))
-        .or_else(|| capability_issuer(&state.tokens, &req, now));
+        .and_then(|presented| root_issuer(&state.tokens, &state.capability_secret, presented, now))
+        .or_else(|| capability_issuer(&state.capability_secret, &req, now));
     let Some(issuer) = issuer else {
         return unauthorized();
     };
@@ -180,18 +229,32 @@ fn unauthorized() -> Response {
         .into_response()
 }
 
-fn root_issuer(tokens: &[String], presented: &str, now: Option<u64>) -> Option<CapabilityIssuer> {
+fn root_issuer(
+    tokens: &[String],
+    secret: &CapabilitySecret,
+    presented: &str,
+    now: Option<u64>,
+) -> Option<CapabilityIssuer> {
     if presented.trim().is_empty() {
         return None;
     }
-    let token = tokens
-        .iter()
-        .find(|token| constant_time_eq(token.as_bytes(), presented.as_bytes()))?;
+    // Every configured token is compared so the timing does not reveal which
+    // one matched or how many there are.
+    let mut matched = false;
+    for token in tokens {
+        matched |= constant_time_eq(token.as_bytes(), presented.as_bytes());
+    }
+    if !matched {
+        return None;
+    }
     let now = now?;
+    // Rounded down to the minute so every playlist reload within it mints the
+    // same child URIs: a preload hint then matches the part listed next.
     let default_expires_at = now.checked_add(ROLLING_CAPABILITY_TTL.as_secs())?;
+    let default_expires_at = default_expires_at - default_expires_at % ROLLING_EXPIRY_STEP_SECS;
     let max_expires_at = now.checked_add(MAX_VOD_CAPABILITY_TTL.as_secs())?;
     Some(CapabilityIssuer {
-        key: CapabilityKey::from_root_token(token),
+        key: CapabilityKey::from_secret(secret),
         issued_at: now,
         default_expires_at,
         max_expires_at,
@@ -199,7 +262,7 @@ fn root_issuer(tokens: &[String], presented: &str, now: Option<u64>) -> Option<C
 }
 
 fn capability_issuer(
-    tokens: &[String],
+    secret: &CapabilitySecret,
     req: &Request,
     now: Option<u64>,
 ) -> Option<CapabilityIssuer> {
@@ -215,17 +278,9 @@ fn capability_issuer(
         return None;
     }
 
-    // Check every configured key so the comparison does not expose which root
-    // token issued the capability.
-    let mut matched = None;
-    for token in tokens {
-        let key = CapabilityKey::from_root_token(token);
-        let expected = key.tag(path, expires_at);
-        if constant_time_eq(&expected, &supplied_tag) {
-            matched = Some(key);
-        }
-    }
-    matched.map(|key| CapabilityIssuer {
+    let key = CapabilityKey::from_secret(secret);
+    let expected = key.tag(path, expires_at);
+    constant_time_eq(&expected, &supplied_tag).then_some(CapabilityIssuer {
         key,
         issued_at: now,
         default_expires_at: expires_at,
@@ -233,46 +288,29 @@ fn capability_issuer(
     })
 }
 
-fn parse_capability(encoded: &str) -> Option<(u64, [u8; CAPABILITY_TAG_BYTES])> {
-    if encoded.is_empty() || encoded.len() > MAX_ENCODED_CAPABILITY_BYTES {
-        return None;
-    }
-    let mut fields = encoded.split('.');
-    if fields.next()? != CAPABILITY_VERSION {
-        return None;
-    }
-    let expires_at = fields.next()?.parse().ok()?;
-    let tag = hex::decode(fields.next()?).ok()?;
-    if fields.next().is_some() || tag.len() != CAPABILITY_TAG_BYTES {
-        return None;
-    }
-    let mut out = [0; CAPABILITY_TAG_BYTES];
-    out.copy_from_slice(&tag);
-    Some((expires_at, out))
-}
-
-/// Capability paths are deliberately enumerated. A valid signature for one of
-/// them cannot become authority for JSON, snapshots, exports, or mutations.
 #[cfg(test)]
 fn is_capability_path(path: &str) -> bool {
     capability_ttl_limit(path).is_some()
 }
 
+/// The longest lifetime a capability for `path` may carry, or `None` for a
+/// path no capability authorizes. The paths are the ones playlists issue
+/// capabilities for, and nothing else: a VOD playlist's recording files
+/// (`hls::file_uri`) and the live playlist's init, segment, and part
+/// resources (`llhls::uri`). A valid signature for one of them cannot become
+/// authority for playlists, the live WebSocket, JSON, snapshots, exports, or
+/// mutations.
 fn capability_ttl_limit(path: &str) -> Option<Duration> {
     let fields: Vec<&str> = path.split('/').filter(|field| !field.is_empty()).collect();
     match fields.as_slice() {
         ["api", "segments", id, "file.mp4"] if id.parse::<i64>().is_ok() => {
             Some(MAX_VOD_CAPABILITY_TTL)
         }
-        ["api", "streams", camera, kind, "live"]
-        | [
-            "api",
-            "streams",
-            camera,
-            kind,
-            "hls",
-            "vod.m3u8" | "live.m3u8" | "init.mp4",
-        ] if valid_stream_fields(camera, kind) => Some(ROLLING_CAPABILITY_TTL),
+        ["api", "streams", camera, kind, "hls", "init.mp4"]
+            if valid_stream_fields(camera, kind) =>
+        {
+            Some(ROLLING_CAPABILITY_TTL)
+        }
         [
             "api",
             "streams",
@@ -315,44 +353,6 @@ fn bearer(headers: &HeaderMap) -> Option<&str> {
     (!token.is_empty()).then_some(token)
 }
 
-/// Extracts `token=` from a raw query string, decoding percent escapes and
-/// rejecting blank or excessively long credentials before allocation.
-pub(crate) fn query_token(query: Option<&str>) -> Option<String> {
-    let raw = query?
-        .split('&')
-        .find_map(|pair| pair.strip_prefix("token="))?;
-    if raw.is_empty() || raw.len() > MAX_ENCODED_CAPABILITY_BYTES {
-        return None;
-    }
-    let decoded = percent_decode(raw)?;
-    (!decoded.trim().is_empty()).then_some(decoded)
-}
-
-fn percent_decode(raw: &str) -> Option<String> {
-    let bytes = raw.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'%' => {
-                let hex = bytes.get(i + 1..i + 3)?;
-                let value = u8::from_str_radix(std::str::from_utf8(hex).ok()?, 16).ok()?;
-                out.push(value);
-                i += 3;
-            }
-            b'+' => {
-                out.push(b' ');
-                i += 1;
-            }
-            byte => {
-                out.push(byte);
-                i += 1;
-            }
-        }
-    }
-    String::from_utf8(out).ok()
-}
-
 fn unix_seconds() -> Option<u64> {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -381,7 +381,7 @@ fn hmac_sha256(key: &[u8; 32], fields: &[&[u8]]) -> [u8; 32] {
 }
 
 /// Compares two byte strings without short-circuiting on the first difference.
-pub(crate) fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;
     }
@@ -393,10 +393,50 @@ mod tests {
     use super::*;
 
     #[test]
-    fn compares_in_constant_time_shape() {
+    fn constant_time_eq_matches_only_identical_bytes() {
         assert!(constant_time_eq(b"abc", b"abc"));
         assert!(!constant_time_eq(b"abc", b"abd"));
         assert!(!constant_time_eq(b"abc", b"ab"));
+    }
+
+    /// RFC 4231 test case 1: a 20-byte key of `0x0b`, zero-padded to the
+    /// 32-byte key this function takes (HMAC pads keys to the block size
+    /// with zeros, so the tag is unchanged), over `"Hi There"`.
+    #[test]
+    fn hmac_sha256_matches_rfc_4231_case_1() {
+        let mut key = [0u8; 32];
+        key[..20].fill(0x0b);
+        assert_eq!(
+            hex::encode(hmac_sha256(&key, &[b"Hi There"])),
+            "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7"
+        );
+        assert_eq!(
+            hmac_sha256(&key, &[b"Hi ", b"There"]),
+            hmac_sha256(&key, &[b"Hi There"]),
+            "fields are concatenated"
+        );
+    }
+
+    #[test]
+    fn rolling_capabilities_share_an_expiry_within_the_minute() {
+        let tokens = vec!["root secret".to_owned()];
+        let secret = test_secret();
+        let path = "/api/streams/cam1/main/hls/init.mp4";
+        let at = |now: u64| {
+            root_issuer(&tokens, &secret, "root secret", Some(now))
+                .unwrap()
+                .issue(path)
+        };
+        // The step applies to the expiry, so issuers whose default expiries
+        // fall in the same minute agree.
+        assert_eq!(at(10_020), at(10_079));
+        assert_ne!(at(10_020), at(10_080));
+        let (expires_at, _) = parse_capability(&at(10_020)).unwrap();
+        assert_eq!(expires_at % ROLLING_EXPIRY_STEP_SECS, 0);
+        assert!(
+            expires_at > 10_020 + ROLLING_CAPABILITY_TTL.as_secs() - ROLLING_EXPIRY_STEP_SECS
+                && expires_at <= 10_020 + ROLLING_CAPABILITY_TTL.as_secs()
+        );
     }
 
     #[test]
@@ -414,7 +454,7 @@ mod tests {
 
     #[test]
     fn capabilities_are_exact_path_and_tamper_resistant() {
-        let key = CapabilityKey::from_root_token("root secret");
+        let key = CapabilityKey::from_secret(&test_secret());
         let issuer = CapabilityIssuer {
             key: key.clone(),
             issued_at: 1_000_000,
@@ -444,15 +484,12 @@ mod tests {
     }
 
     #[test]
-    fn only_media_and_live_paths_accept_capabilities() {
+    fn only_issued_media_paths_accept_capabilities() {
         for path in [
             "/api/segments/7/file.mp4",
-            "/api/streams/cam1/main/hls/vod.m3u8",
-            "/api/streams/cam1/sub/hls/live.m3u8",
             "/api/streams/cam1/main/hls/init.mp4",
             "/api/streams/cam1/main/hls/seg/1/media.m4s",
             "/api/streams/cam1/main/hls/part/1/2/part.m4s",
-            "/api/streams/cam1/main/live",
         ] {
             assert!(is_capability_path(path), "{path}");
         }
@@ -462,6 +499,9 @@ mod tests {
             "/api/streams/cam1/main/segments",
             "/api/streams/cam1/main/export.mp4",
             "/api/streams/cam1/main/keyframe",
+            "/api/streams/cam1/main/hls/vod.m3u8",
+            "/api/streams/cam1/sub/hls/live.m3u8",
+            "/api/streams/cam1/main/live",
             "/api/events/1/retain",
         ] {
             assert!(!is_capability_path(path), "{path}");
@@ -471,9 +511,10 @@ mod tests {
     #[test]
     fn capability_verification_enforces_method_path_expiry_and_integrity() {
         let tokens = vec!["root secret".to_owned()];
+        let secret = test_secret();
         let now = 10_000;
-        let live_path = "/api/streams/cam1/main/live";
-        let issuer = root_issuer(&tokens, "root secret", Some(now)).unwrap();
+        let live_path = "/api/streams/cam1/main/hls/seg/1/media.m4s";
+        let issuer = root_issuer(&tokens, &secret, "root secret", Some(now)).unwrap();
         let capability = issuer.issue(live_path);
         let request = |method: Method, path: &str, capability: &str| {
             Request::builder()
@@ -485,34 +526,36 @@ mod tests {
 
         for method in [Method::GET, Method::HEAD] {
             assert!(
-                capability_issuer(&tokens, &request(method, live_path, &capability), Some(now))
+                capability_issuer(&secret, &request(method, live_path, &capability), Some(now))
                     .is_some()
             );
         }
         assert!(
             capability_issuer(
-                &tokens,
+                &secret,
                 &request(Method::POST, live_path, &capability),
                 Some(now)
             )
             .is_none()
         );
         for path in [
-            "/api/streams/cam1/sub/live",
+            "/api/streams/cam1/sub/hls/seg/1/media.m4s",
+            "/api/streams/cam1/main/hls/seg/2/media.m4s",
+            "/api/streams/cam1/main/live",
             "/api/cameras",
             "/api/cameras/cam1/snapshot.jpg",
             "/api/streams/cam1/main/export.mp4",
             "/api/events/1/retain",
         ] {
             assert!(
-                capability_issuer(&tokens, &request(Method::GET, path, &capability), Some(now))
+                capability_issuer(&secret, &request(Method::GET, path, &capability), Some(now))
                     .is_none(),
                 "capability escaped to {path}"
             );
         }
 
         let expired = CapabilityIssuer {
-            key: CapabilityKey::from_root_token("root secret"),
+            key: CapabilityKey::from_secret(&secret),
             issued_at: now - 2,
             default_expires_at: now - 1,
             max_expires_at: now - 1,
@@ -520,7 +563,7 @@ mod tests {
         .issue(live_path);
         assert!(
             capability_issuer(
-                &tokens,
+                &secret,
                 &request(Method::GET, live_path, &expired),
                 Some(now)
             )
@@ -533,7 +576,7 @@ mod tests {
         let tampered = String::from_utf8(tampered).unwrap();
         assert!(
             capability_issuer(
-                &tokens,
+                &secret,
                 &request(Method::GET, live_path, &tampered),
                 Some(now)
             )
@@ -544,9 +587,10 @@ mod tests {
     #[test]
     fn immutable_vod_capabilities_cover_the_selected_horizon_and_remain_bounded() {
         let tokens = vec!["root secret".to_owned()];
+        let secret = test_secret();
         let issued_at = 10_000;
         let path = "/api/segments/7/file.mp4";
-        let issuer = root_issuer(&tokens, "root secret", Some(issued_at)).unwrap();
+        let issuer = root_issuer(&tokens, &secret, "root secret", Some(issued_at)).unwrap();
         let default_playback = Duration::from_hours(1);
         let lifetime = default_playback + ROLLING_CAPABILITY_TTL;
         let capability = issuer.issue_for(path, lifetime);
@@ -561,7 +605,7 @@ mod tests {
         };
         assert!(
             capability_issuer(
-                &tokens,
+                &secret,
                 &request(path, &capability),
                 Some(issued_at + default_playback.as_secs()),
             )
@@ -569,7 +613,7 @@ mod tests {
             "the final URI in the default one-hour playback must remain authorized"
         );
         assert!(
-            capability_issuer(&tokens, &request(path, &capability), Some(expires_at + 1),)
+            capability_issuer(&secret, &request(path, &capability), Some(expires_at + 1),)
                 .is_none(),
             "the VOD capability must expire after its transport margin"
         );
@@ -589,5 +633,32 @@ mod tests {
             issued_at + ROLLING_CAPABILITY_TTL.as_secs(),
             "rolling LL-HLS children retain the short lifetime"
         );
+    }
+
+    #[test]
+    fn capabilities_depend_on_the_secret_and_not_on_the_issuing_token() {
+        let tokens = vec![
+            "first root token".to_owned(),
+            "second root token".to_owned(),
+        ];
+        let secret = test_secret();
+        let now = 10_000;
+        let path = "/api/streams/cam1/main/hls/init.mp4";
+        let capability = root_issuer(&tokens, &secret, "second root token", Some(now))
+            .unwrap()
+            .issue(path);
+        assert!(!capability.contains("root token"));
+        let request = Request::builder()
+            .uri(format!("{path}?token={capability}"))
+            .body(axum::body::Body::empty())
+            .unwrap();
+        assert!(capability_issuer(&secret, &request, Some(now)).is_some());
+        let other_secret = CapabilitySecret::new([8; CAPABILITY_SECRET_BYTES]);
+        assert!(
+            capability_issuer(&other_secret, &request, Some(now)).is_none(),
+            "a tag under one secret never verifies under another"
+        );
+        assert!(root_issuer(&tokens, &secret, "third root token", Some(now)).is_none());
+        assert!(root_issuer(&tokens, &secret, " ", Some(now)).is_none());
     }
 }

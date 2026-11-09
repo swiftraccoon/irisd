@@ -54,7 +54,7 @@ fn catalog_counters(out: &mut String, metrics: &CatalogMetrics) {
         (
             "irisd_catalog_lifecycle_rejected_total",
             "Catalog lifecycle notifications rejected after exhausting reserved capacity.",
-            metrics.rejected_critical(),
+            metrics.rejected_lifecycle(),
         ),
         (
             "irisd_catalog_batch_failures_total",
@@ -161,7 +161,7 @@ pub(crate) async fn metrics(State(state): State<Arc<ApiState>>) -> Response {
     counter(
         &mut out,
         "irisd_api_requests_total",
-        "Authenticated API requests served.",
+        "API requests admitted by the authentication layer (every protected request when authentication is disabled).",
         state.stats.requests(),
     );
     let catalog_metrics = state.catalog.metrics();

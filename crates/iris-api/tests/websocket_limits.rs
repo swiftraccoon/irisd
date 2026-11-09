@@ -94,10 +94,12 @@ async fn server() -> Server {
         live,
         events,
         tokens: Vec::new(),
+        capability_secret: iris_api::CapabilitySecret::new([1; 32]),
         recording_roots: Vec::new(),
         public_metrics: false,
-        snapshot_sources: HashMap::new(),
-        active_cameras: HashMap::new(),
+        snapshot_sources: std::sync::RwLock::new(HashMap::new()),
+        active_cameras: std::sync::RwLock::new(HashMap::new()),
+        control: None,
         stats: Arc::new(ApiStats::default()),
         started: WallUs::now(),
         started_monotonic: Instant::now(),
@@ -365,7 +367,7 @@ async fn a_frame_at_the_message_limit_is_delivered() {
     assert_eq!(1 + fragment.len(), MAX_LIVE_MESSAGE_BYTES);
 }
 
-/// CRC-32C (Castagnoli, reflected polynomial 0x82F63B78) lookup table.
+/// CRC-32C (Castagnoli, reflected polynomial 0x82f63b78) lookup table.
 fn crc32c_table() -> [u32; 256] {
     let mut table = [0_u32; 256];
     for (index, slot) in table.iter_mut().enumerate() {

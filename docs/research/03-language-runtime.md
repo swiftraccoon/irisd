@@ -49,12 +49,16 @@ deny` in CI, body/XML size caps, `panic = "abort"`, per-camera task isolation, a
   maintainability loss for no gain.
 
 Allocation and wake-up rules: frames as `bytes::Bytes` slices of large read buffers (retina
-already does this), `Vec<Bytes>` → `writev`, no per-packet `Vec`; one keepalive timer per
-session, one inactivity deadline per stream (reset on data, not per packet), one rotation timer
-per stream, one watchdog ping: under 20 timers total. `current_thread` also avoids glibc
-per-thread arenas inflating RSS on ARM.
+already does this), `Vec<Bytes>` → `writev`, no per-packet `Vec`. With timer-driven reads one
+shared read ticker wakes every stream, and its tick also checks each session's inactivity; each
+session keeps a keepalive deadline, and the event feeds and HTTP connections keep their own
+deadlines. Rotation is checked when a fragment reaches the writer, not by a timer.
+`current_thread` also avoids glibc per-thread arenas inflating RSS on ARM.
 
-## 4. Crate list (verified versions and release dates)
+## 4. Crate candidates (versions and release dates checked 2026-10-31)
+
+The candidates the phase-0 research weighed; the workspace `Cargo.toml` names the crates chosen,
+and several rows here were not adopted.
 
 | Crate | Purpose | Version | Released | Notes |
 |---|---|---|---|---|
@@ -74,14 +78,14 @@ per-thread arenas inflating RSS on ARM.
 | rusqlite (`bundled`) | catalog | 0.41.1 | 2026-10-28 | |
 | oxvif | ONVIF: discovery, device/media/media2/events (PullPoint, Renew, Unsubscribe), WS-Security + Digest | 0.17.0 | 2026-09-14 | 9k downloads; keep a reqwest + quick-xml escape hatch. lumeohq/onvif-rs is git-only and lacks Renew/Unsubscribe |
 | quick-xml / yaserde | SOAP | 0.42.0 / 0.13.2 | 2026-08 / 2026-10 | cap input sizes |
-| reqwest (rustls) | Dahua CGI, snapshots | current | | digest auth via `diqwest` or hand-rolled |
+| reqwest (rustls) | Dahua CGI, snapshots | 0.13 | | digest auth via `diqwest` or hand-rolled |
 | serde / toml / clap | config, CLI | 1.0.229 / 1.1.8 / 4.6.7 | 2026 | |
 | tracing / tracing-subscriber / tracing-journald | structured logs to journald | 0.1.44 / 0.3.23 / 0.3.2 | | |
 | metrics | counters/gauges | 0.24.6 | 2026-05 | Prometheus exporter optional |
 | sd-notify | READY/WATCHDOG | 0.5.0 | 2026-03 | zero deps |
 | landlock | in-process fs/net sandbox (ABI V7 on 6.17) | 0.4.7 | 2026-07 | apply after opening dirs and binding |
 | rustix | descriptor-relative filesystem access, `openat2`, `pwritev`, `fallocate`, process control | 1.1.6 | 2026-10-27 | safe Linux syscall wrappers |
-| crc32c | fragment trailers | current | | hardware CRC32C |
+| crc-fast | fragment trailers (CRC-32C; `crc32c` is the tests' oracle) | 1.10 | | hardware CRC32C |
 | GUI: gtk4 (gtk4-rs), gstreamer / gstreamer-app / gst-plugin-gtk4 | Linux client | 0.25.4 / 0.15.2 | 2026-09 / 2026-05 | `gst-plugin-gtk4` is itself Rust and links statically |
 | libmpv2 | fallback video widget | 7.0.0 | 2026-10-30 | |
 
@@ -93,8 +97,11 @@ Do not use: `tokio-uring`, `glommio`, `monoio` (stale or incompatible), `mp4` 0.
 
 - Profile: `panic = "abort"`, `lto = "fat"`, `codegen-units = 1`, `strip = true`; expect a
   4–8 MB static-ish binary with rustls + bundled SQLite.
-- Cross-compile for ARM64 SBCs with `cargo zigbuild --target aarch64-unknown-linux-gnu.2.28`
-  (or musl for a static binary); cross-rs as fallback.
+- ARM64 SBCs: CI type-checks every crate but the GUI for `aarch64-unknown-linux-gnu` with the
+  GNU cross toolchain (`just cross-check`), so a portability break surfaces on the change that
+  makes it; release binaries for a board come from `cargo zigbuild --target
+  aarch64-unknown-linux-gnu.2.28` (or musl for a static binary), cross-rs as fallback. The GUI
+  needs a GTK sysroot for the target and is built on the board.
 - systemd unit: `Type=notify`, `WatchdogSec=60` (ping only when every ingest task reported
   progress, so a wedged runtime is killed), `Restart=always`, static `User=irisd` via
   `sysusers.d`, `StateDirectory=irisd` for the catalog, `ReadWritePaths=` for the video root,
@@ -124,14 +131,16 @@ Do not use: `tokio-uring`, `glommio`, `monoio` (stale or incompatible), `mp4` 0.
   Landlock disabled at boot, `irisd run` refuses to start unless `--no-sandbox` is given.
   Rights from later ABIs up to 7 are applied when the kernel has them; a partially enforced
   ruleset is a warning naming the missing rights, and the `process` statistics line reports
-  `sandbox_enforced`. The network rules limit TCP ports for every destination address; peer
-  addresses are limited by the unit's `IPAddressDeny=` and `IPAddressAllow=`.
+  `sandbox_enforced`. The network rules limit TCP ports for every destination address (with
+  `[provisioning] enabled`, the ports in `provisioning.connect_ports` are allowed too, so a camera
+  added at run time may use only those); peer addresses are limited by the unit's
+  `IPAddressDeny=` and `IPAddressAllow=`.
 - Startup permission checks: before SQLite opens the catalog, the daemon requires the state
-  directory and `irisd.db`, `-wal`, and `-shm` to belong to the service account (a directory,
-  or a regular file with one link; symbolic links, hard links, and special files fail
-  startup) and removes group and other permissions; SQLite copies the database file's mode
-  to new WAL and shared-memory files. The configuration file draws a warning when users other
-  than the service account and its group can read it. Startup also raises the soft descriptor
+  directory, `irisd.db`, `-wal`, `-shm`, `capability.key`, and `cameras.toml` to belong to the
+  service account (a directory, or a regular file with one link; symbolic links, hard links, and
+  special files fail startup) and removes group and other permissions; SQLite copies the database
+  file's mode to new WAL and shared-memory files. The configuration file draws a warning when users
+  other than the service account and its group can read it. Startup also raises the soft descriptor
   limit to the hard limit.
 - Linux features that matter: descriptor-relative `openat2`, `fallocate`, `fdatasync`,
   large-folio ext4 sequential-write gains,

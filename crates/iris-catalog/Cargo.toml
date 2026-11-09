@@ -1,24 +1,30 @@
 [package]
 name = "iris-catalog"
-description = "SQLite catalog of recordings and events for irisd"
 version.workspace = true
 edition.workspace = true
-rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "SQLite catalog of recordings and events for irisd"
+
+[features]
+# Whole-table listings and an unprotected deletion mark for the tests of
+# dependent crates; the daemon never enables it.
+test-support = []
 
 [dependencies]
+iris-core = { workspace = true }
+iris-mp4 = { workspace = true }
 rusqlite = { workspace = true }
 serde = { workspace = true }
-serde_json = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
-iris-core = { workspace = true }
-iris-mp4 = { workspace = true }
 
 [dev-dependencies]
 bytes = { workspace = true }
+serde_json = { workspace = true }
 tempfile = { workspace = true }
 
 [lints]

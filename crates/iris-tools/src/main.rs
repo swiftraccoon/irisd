@@ -8,18 +8,21 @@
 //! - `gh-commit` commits the difference from the remote branch through the
 //!   GitHub API, which signs the commit.
 //!
-//! Every tool is read-only towards cameras and the recording service except
-//! where its name says otherwise.
+//! No tool changes the recording service or a camera's configuration:
+//! `onvif-call` sends only `Get` operations and the PullPoint subscription
+//! operations, whose subscriptions expire.
 
 mod bench;
 mod gh_commit;
 mod logs;
 mod onvif_call;
+mod probe_parser;
 mod report;
 mod rtsp_probe;
 mod sample;
 mod secret;
 mod stats;
+mod summary;
 mod time;
 
 use clap::{Parser, Subcommand};
@@ -44,7 +47,7 @@ enum Command {
     ReplayBench(bench::Args),
     /// Speak RTSP to a camera and report its packetisation and timing.
     RtspProbe(rtsp_probe::Args),
-    /// Issue one authenticated ONVIF SOAP call.
+    /// Issue one authenticated ONVIF SOAP read or event-subscription call.
     OnvifCall(onvif_call::Args),
     /// Commit the difference from the remote branch through the GitHub API, which signs it.
     GhCommit(gh_commit::Args),

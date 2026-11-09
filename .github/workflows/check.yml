@@ -88,8 +88,33 @@ jobs:
           tool: just
       - name: Install cargo-fuzz
         run: cargo install cargo-fuzz --version 0.13.2 --locked
+      - name: just fuzz-clippy
+        run: just fuzz-clippy
       - name: just fuzz-build
         run: just fuzz-build
+
+  cross-check:
+    name: aarch64 type check
+    runs-on: ubuntu-latest
+    env:
+      CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
+      CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: The GNU cross toolchain for 64-bit ARM
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends gcc-aarch64-linux-gnu libc6-dev-arm64-cross
+      - name: Install the pinned toolchain and the target
+        run: |
+          rustup show active-toolchain || rustup toolchain install
+          rustup target add aarch64-unknown-linux-gnu
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - uses: taiki-e/install-action@c509219cf42fba86913069efd0ade2458c59337b # v2.90.1
+        with:
+          tool: just
+      - name: just cross-check
+        run: just cross-check
 
   references:
     name: Reference pack snapshots

@@ -130,7 +130,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn counters_start_empty_and_record_each_kind() {
+    fn counters_start_empty() {
         let stats = EventStats::new();
         assert_eq!(stats.last_message_wall(), None);
         assert_eq!(stats.last_event_wall(), None);
@@ -139,8 +139,26 @@ mod tests {
             (stats.messages(), stats.renewals(), stats.errors()),
             (0, 0, 0)
         );
+        assert_eq!((stats.events(), stats.reconnects()), (0, 0));
+        assert!(!stats.connected());
         assert_eq!(stats.pull_latency().snapshot().count(), 0);
+    }
 
+    #[test]
+    fn records_reconnects_and_connection_state() {
+        let stats = EventStats::new();
+        stats.record_reconnect();
+        stats.record_reconnect();
+        stats.set_connected(true);
+        assert_eq!(stats.reconnects(), 2);
+        assert!(stats.connected());
+        stats.set_connected(false);
+        assert!(!stats.connected());
+    }
+
+    #[test]
+    fn counters_record_each_kind() {
+        let stats = EventStats::new();
         stats.record_message(WallUs::new(5));
         stats.record_event(WallUs::new(7));
         stats.record_renewal();

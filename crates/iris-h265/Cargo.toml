@@ -1,11 +1,12 @@
 [package]
 name = "iris-h265"
-description = "H.265 NAL unit helpers for irisd"
 version.workspace = true
 edition.workspace = true
-rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "H.265 NAL unit helpers for irisd"
 
 [dependencies]
 thiserror = { workspace = true }

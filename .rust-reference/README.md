@@ -37,11 +37,10 @@ Start with [AGENTS.md](AGENTS.md). The working policies are:
 | Semantic Versioning 2.0.0 | [Specification](references/semver/spec/v2.0.0.md) |
 
 The Google repository includes the source for its rendered Rust guide. The Rust
-compiler repository is limited to its style-guide subtree and license notices;
-the other Git sources contain their tracked repository files. The timeless
+compiler repository is limited to its style-guide subtree and license notices,
+and the Conventional Commits and SemVer repositories to their specification text,
+README, and license; the other Git sources contain their tracked repository files. The timeless
 documentation snapshot includes the original HTML and a readable Markdown copy.
-SemVer's tracked symlink is stored as a regular copy of its target; this
-transformation is recorded in the manifest so the pack needs no symlinks.
 See [source provenance and licenses](references/README.md).
 
 ## Copy into a Rust project

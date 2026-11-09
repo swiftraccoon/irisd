@@ -1,10 +1,10 @@
 # 09 — Phase 1 results (measurement record, 2026-10-31)
 
-This file is a dated measurement record, so it names dates, commands, and the state of the
-code at the time. Host: the dev host described in the gitignored `AGENTS.override.md` (a 16-thread x86-64
-machine). Camera: cam1 as characterised in `01-camera-probe.md`. Build:
-`cargo build --release -p irisd` from the uncommitted working tree of 2026-10-31 (3.7 MB
-binary). Recording root: the configured root on an ext4 HDD.
+This file is a dated measurement record, so it names dates, commands, and the state of the code at
+the time. Host: the dev host described in the gitignored `AGENTS.override.md` (a 16-thread x86-64
+machine). Camera: cam1 as characterised in `01-camera-probe.md`. Build: `cargo build --release -p
+irisd` from the uncommitted working tree of 2026-10-31 (3.7 MB binary). Recording root: the
+configured root on an ext4 HDD.
 
 ## Procedure
 
@@ -44,8 +44,9 @@ peak RSS.
 The phase-1 exit criterion (≤ 0.5 % for both streams) was a guess made before any
 measurement; the measured 1.74 % is dominated by kernel time (TCP receive of 9.3 Mbps in
 1,440-byte RTP packets, about 800 packets/s, plus page-cache writes). User time for
-depacketising, regularising, CRC-32C, and `pwritev` is 0.75 %. Budget for six cameras:
-about 10 % of one core, within the 2 %-per-camera figure in `07-architecture.md`.
+depacketising, regularising, CRC-32C, and `pwritev` is 0.75 %. Projected for six cameras:
+about 10 % of one core, five times the `07-architecture.md` §7 budget of 2 % for six cameras
+(0.15 % per stream); `12-ingest-cost.md` records the changes that met it.
 
 Reconnects in this run were camera-side: the camera refused TCP connections for 7 s at
 start (right after an ffmpeg baseline with 5 s socket timeouts had been torn down) and four
@@ -63,6 +64,11 @@ with backoff and opened a new run file each time; the main stream recorded 593 s
 
 Per 2 s fragment the fixed cost is 32 B `prft` + 100 B `moof` + 8 B per sample + 8 B `mdat`
 header + 24 B trailer ≈ 640 B; the sub stream's 0.2 % reflects its 300 KB fragments.
+
+Checked on 2026-11-09: the sub row's byte counts give 0.1308 %, not 0.1985 %, and its file is
+larger than the 83.2 MB the run total leaves for all five sub files. The 0.1985 % agrees with
+171 fragments of about 640 B fixed cost at the sub stream's 1.3 Mbit/s, so the byte counts are
+the likely error; the row is unverified.
 Exit criterion (≤ 0.05 % on the 4K stream): met.
 
 ## Regulariser
@@ -92,8 +98,8 @@ the record; the third build's durations are nominal with holds):
 | 3003 | 535 |
 
 A separate finding closed a design gap: with `max_fragment_ms` equal to the GOP length,
-timestamp jitter split the sub stream's GOPs into 58 + 2-frame fragments; the cap now has a
-quarter of slack.
+timestamp jitter split the sub stream's GOPs into 58 + 2-frame fragments; the fix gives the
+cap a quarter of slack.
 
 ## Crash recovery (`kill -9` after 27 s, main stream)
 
@@ -129,7 +135,7 @@ No clean 120 s ffmpeg run was obtained on 2026-10-31: twice the camera stopped d
 frames mid-session and ffmpeg (even with `-timeout`) did not recover, while irisd's 10 s
 inactivity timeout reconnected within seconds in the same conditions. Per megabyte of video
 during ffmpeg's active phase, attempt 1 spent 30 ms of CPU per MiB against irisd's 16 ms per
-MiB over its ten minutes, with a sixth of the resident memory; a controlled rerun belongs in
+MiB over its ten minutes, with about a fifth of the resident memory; a controlled rerun belongs in
 the phase-2 benchmark harness with a replay server instead of the live camera.
 
 ## Verification run with the final regulariser (two minutes, both streams)
@@ -145,8 +151,8 @@ the phase-2 benchmark harness with a replay server instead of the live camera.
 | Reconnects | 2, both the sub stream's "no frames for 10 s" starvation, each resumed in a new run file within 2 s |
 
 Exit criteria for the regulariser (no zero or tiny durations, timeline locked to the camera,
-duplicate stamps and 100 ms gaps absorbed, no spurious snaps) are met; the original wording
-"constant 3000-tick durations" is superseded by the ±1 % lock described in
+duplicate stamps and 100 ms gaps absorbed, no spurious snaps) are met; the roadmap's first
+wording, "constant 3000-tick durations", is superseded by the ±1 % lock described in
 `04-storage-format.md` §7.3.
 
 ## Camera-side observation

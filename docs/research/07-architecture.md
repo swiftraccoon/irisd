@@ -5,26 +5,24 @@ Integrates 03–06 into one design. Numbers refer to cam1 measurements (01).
 ## 1. Data flow
 
 ```
-                 ┌──────── per configured camera ────────┐
- RTSP/TCP ──▶ retina session (main) ──▶ regulariser ──▶ fragment builder ──┐
- RTSP/TCP ──▶ retina session (sub)  ──▶ regulariser ──▶ fragment builder ──┤
- HTTP     ──▶ Dahua CGI event feed ─────────────────────────────┐          │
- SOAP     ──▶ ONVIF PullPoint ──────────────────────────────────┼─▶ event normaliser ──▶ catalog, WS push
-                                                                           ▼
-                                                     live ring (Bytes, 64 MiB fast-start
-                                                                + 64 MiB fan-out caps)
-                                                        │                 │
-                        WS per-frame fragments ◀────────┤                 ├──▶ bounded writer queue
-                        LL-HLS parts            ◀────────┘                 │
-                                                                           ▼
-                                                  writer thread per recording root: pwritev fragment,
-                                                  append sidecar, fallocate ahead, fdatasync/5 s
-                                                                           │
-                                                                           ▼
-                                     catalog thread (SQLite): segment/run/event rows, retention
-                                                                           │
- HTTP/1.1+2 (axum) ◀── HLS playlists (byte ranges), MP4 export, keyframes, JSON API ◀──┘
+              ┌──────── per configured camera and stream ────────┐
+ RTSP/TCP ──▶ retina session ──▶ frame ──┬──▶ fragment assembler ──▶ bounded writer queue
+                                         │    (the regulariser assigns           │
+                                         │     durations when a fragment closes) │
+                                         ▼                                       ▼
+              live ring (Bytes, 64 MiB fast-start          writer thread per recording root:
+                         + 64 MiB fan-out caps)            pwritev fragment, append sidecar,
+                    │                 │                    fallocate ahead, fdatasync/5 s
+ WS per-frame ◀─────┘                 └─────▶ LL-HLS parts               │
+ fragments                                                               ▼
+ HTTP ──▶ Dahua CGI event feed ──┐                         catalog thread (SQLite): segment
+ SOAP ──▶ ONVIF PullPoint ───────┴──▶ event normaliser ──▶ and event rows; retention queries
+                                                                         │
+ HTTP/1.1 (axum) ◀── HLS playlists (byte ranges), MP4 export, keyframes, JSON API ◀───┘
 ```
+
+Frames reach the live ring one at a time as they arrive, before the fragment they belong to
+closes; the regulariser runs inside the assembler when a fragment closes.
 
 Every byte of video is copied at most once in user space (socket read buffer → `Bytes` slice
 shared by the live ring, the writer, and the WebSocket senders). The record path never
@@ -37,14 +35,16 @@ irisd/
   Cargo.toml                 # workspace, profile release: lto=fat, codegen-units=1, panic=abort
   crates/
     iris-core/               # ids, config (TOML), time types (WallUs, MediaTicks), errors
-    iris-h265/               # NAL header + VPS/SPS/PPS/slice-header readers, hvcC builder, CODECS string
+    iris-h265/               # NAL classification, length-prefixed access units, parameter sets
     iris-mp4/                # fMP4 writer (ftyp/moov/prft/moof/mdat/trailer), reader/scanner, fragment rewrite export, mini-fragments
     iris-ingest/             # retina session supervisor, regulariser, fragment builder, live ring
-    iris-store/              # writer threads, preallocation, sync, sidecar index, recovery, retention
+    iris-store/              # writers, preallocation, sync, sidecar appends, recovery, removal
     iris-catalog/            # SQLite schema, migrations, queries (single owning thread)
-    iris-events/             # Dahua CGI feed, ONVIF PullPoint (oxvif), normalisation
+    iris-events/             # Dahua CGI feed, ONVIF PullPoint, media lookups, discovery (oxvif)
     iris-api/                # axum: JSON, HLS/LL-HLS, WebSockets, export, auth
-    irisd/                   # daemon and offline record, inspect, recover, HLS, and serve commands
+    irisd/                   # daemon with the retention policy; offline record, inspect,
+                             # recover, HLS, and serve commands
+    iris-tls/                # shared TLS client trust: platform roots plus an optional CA file
     iris-replay/             # bounded RTSP replay and synthetic-camera server
     iris-gui/                # GTK/GStreamer live, playback, thumbnails, and export client
     iris-tools/              # soak, replay-benchmark, probe, report, and commit tooling
@@ -52,24 +52,29 @@ irisd/
   docs/research/             # this research
 ```
 
-`iris-h265`, `iris-mp4`, and the event parsers in `iris-events` are pure, allocation-light
+The `hvcC` sample entry and the `CODECS` string come from retina (`mp4_sample_entry`,
+`rfc6381_codec`). `iris-h265`, `iris-mp4`, and the event parsers in `iris-events` are pure,
+allocation-light
 libraries with bounded regression fixtures. `cargo-fuzz` targets (`fuzz/README.md`) cover their
-parsers, the `iris-api` timestamp parser, the `iris-replay` RTSP request parser, the `iris-tools`
-probe parsers, the vendored oxvif SOAP/XML parser, and the vendored retina RTSP message parser.
+parsers, the ONVIF notification normaliser, and the WS-Discovery answer mapping, the `iris-api`
+timestamp, `Range`, and pre-authentication token parsers, the `iris-replay` RTSP request parser,
+the `iris-tools` probe and log parsers, the viewer's VOD playlist rules, the vendored oxvif
+SOAP/XML parser, and the vendored retina RTSP message parser, RTP
+header validation, H.265 depacketization, and `DESCRIBE` interpretation with its SDP parsing.
 `iris-store` has no fuzz target of its own; its recovery parses recordings and sidecars through
-the fuzzed `iris-mp4` scanner and index codec. Retina's SDP parsing, RTP depacketization, and
-RTSP session state have no fuzz target; retina's own test suite (`just vendor-test`) and the
-`iris-ingest` integration tests, which run sessions against loopback replay servers and
-fault-injecting peers, exercise them.
+the fuzzed `iris-mp4` scanner and index codec. Retina's RTCP compound validation and its
+`SETUP` and `PLAY` interpretation have no fuzz target; retina's own test suite
+(`just vendor-test`) and the `iris-ingest` integration tests, which run sessions against
+loopback replay servers and fault-injecting peers, exercise them.
 
 ## 3. Threads and tasks
 
 | Executor | Work | Count |
 |---|---|---|
-| tokio `current_thread` | all sockets: RTSP sessions, event feeds, HTTP/WS server, timers (≤ 20 total) | 1 thread |
+| tokio `current_thread` | all sockets: RTSP sessions, event feeds, HTTP/WS server; timers: one shared read ticker for the timer-driven reads, per-session setup and keepalive deadlines, per-feed stall, renewal, and pull deadlines, and per-connection HTTP deadlines | 1 thread |
 | `std::thread` writer per video root | `pwritev`, `fallocate`, `fdatasync`, sidecar appends | 1 per configured root |
 | `std::thread` catalog | owns the SQLite connection; batches notifications for at most 100 ms; retention scans | 1 |
-| bounded maintenance threads | root probes, retention removal, startup recovery, and self-check scans | single-flight per job type |
+| bounded maintenance threads | root probes and retention removals (counted by `RawCalls`), the self-check scan, start-up reconciliation on tokio's blocking pool, and the writer and catalog shutdown helpers | single-flight per job type; one call each |
 
 The daemon runs one such runtime, and the release profile sets `panic = "abort"`. A panic in any
 task or thread therefore ends the process, which the unit restarts (`Restart=always`), and a
@@ -114,7 +119,7 @@ limit.
 struct WallUs(i64);          // µs since Unix epoch, NVR CLOCK_REALTIME
 struct MediaTicks(i64);      // 90 kHz, continuous within a run
 struct CameraId(String); struct StreamKey { camera: CameraId, kind: StreamKind }
-struct SegmentId(i64);
+struct SegmentId(i64);       // iris_catalog
 
 struct Frame { data: Bytes /* length-prefixed NALs, no parameter sets */, raw_ts: i64,
                wall: WallUs, is_sync: bool, new_params: bool }
@@ -123,7 +128,7 @@ struct Fragment { samples: Vec<Sample>, decode_time: u64, wall: WallUs, raw_rtp:
                   new_run: bool, sample_entry: Arc<SampleEntry> }
 struct SampleEntry { bytes: Bytes /* complete hvc1 entry */, codecs: String,
                      width: u16, height: u16, hash: u32 /* CRC-32C */ }
-struct Event { camera: CameraId, source: EventSource, kind: EventKind, state: State,
+struct Event { camera: CameraId, source: EventSource, kind: EventKind, state: EventState,
                camera_time: Option<WallUs>, nvr_time: WallUs, data: Option<String> }
 ```
 
@@ -136,26 +141,45 @@ rows, and logical string bytes while preserving capacity-limited active retentio
 
 | Method | Path | Notes |
 |---|---|---|
-| GET | `/api/cameras`, `/api/cameras/{camera}` | configured cameras and per-stream health |
+| GET | `/api/cameras`, `/api/cameras/{camera}` | the running cameras (`provisioned` marks those the API added) and per-stream health |
+| POST | `/api/cameras` | adds a camera described like a `[[camera]]` table; needs `[provisioning] enabled` and the root token (201) |
+| DELETE | `/api/cameras/{camera}` | stops and forgets a camera the API added (204); a configured camera answers 409 |
+| GET | `/api/onvif/devices` | the cameras a bounded WS-Discovery probe finds, for the Add camera form; root token, `[provisioning] enabled` |
+| POST | `/api/onvif/streams` | the RTSP URLs of one camera's ONVIF profiles, moved onto the given host; same gating, port in `connect_ports` |
 | GET | `/api/streams/{camera}/{kind}/segments?from=&to=` | catalog listing (wall ranges, runs, sample entries) |
 | GET | `/api/streams/{camera}/{kind}/hls/live.m3u8` (+ `_HLS_msn/_HLS_part`) | LL-HLS playlist and in-memory child resources |
 | GET | `/api/streams/{camera}/{kind}/hls/vod.m3u8?from=&to=` | byte-range playlist across segments |
 | GET | `/api/segments/{id}/file.mp4` (Range) | one bounded snapshot of the on-disk file |
 | GET | `/api/streams/{camera}/{kind}/export.mp4?from=&to=` | assembled MP4 |
 | GET | `/api/streams/{camera}/{kind}/keyframe?t=` | init + one single-sample fragment |
-| GET | `/api/cameras/{camera}/snapshot.jpg` | proxied from the camera, one request per camera at a time |
+| GET | `/api/cameras/{camera}/snapshot.jpg` | proxied from the camera: the Dahua CGI endpoint, or the URL its ONVIF Media service names (`snapshot`, default by event source); one request per camera at a time |
 | WS | `/api/streams/{camera}/{kind}/live` | init + per-frame fragments, each message ≤ 16 MiB + 1 byte |
 | WS | `/api/events` | push of normalised events |
 | GET/POST | `/api/events?from=&to=&after_us=&after_id=`, `/api/events/{id}/retain` | bounded `(time,id)` event pages, pin |
-| GET | `/api/health`, `/metrics` | watchdog data, Prometheus text (root token unless `[api] public_metrics`) |
+| GET | `/api/health`, `/metrics` | liveness `{status, uptime_s, version}`, Prometheus text (root token unless `[api] public_metrics`) |
 
-The camera list and detail routes describe only IDs in the running configuration; catalog rows for
-removed cameras remain available through historical recording routes. `live_viewers` is the
-per-stream count of external live WebSockets and excludes the shared LL-HLS feeder. Its drop guard
-removes a viewer on close, timeout, cancellation, and send failure.
-The segments listing includes an unsealed segment only once it has a durable fragment and treats
-it as extending to the earlier of now and 30 s past its last durable progress, while each row
-reports its recorded `wall_end_us`.
+The camera list and detail routes describe the cameras the daemon runs, configured or added through
+the API; catalog rows for removed cameras remain available through historical recording routes.
+Camera provisioning is off unless `[provisioning] enabled`. An added camera is validated like a
+configured one, must use TCP ports in `provisioning.connect_ports` (the sandbox allows those at
+startup, §6), counts against `provisioning.max_cameras`, is registered in the catalog, persisted to
+`<state_dir>/cameras.toml` (mode 0600, rewritten through a temporary file) so it restarts with the
+daemon, and runs its streams and event feeds under a cancellation token of its own; its stream URLs
+must parse and its ports must be allowed before anything changes, and the store is written off the
+runtime thread. Removal rewrites the store first (a failed write changes nothing), cancels that
+token, hands the tasks to a retirement task that joins them within 5 s and aborts the rest, forgets
+the camera in the live registries, and keeps its recordings and catalog rows. Configured cameras are
+never removed through the API. Only the root bearer authorizes these routes, media capabilities
+never do, and request bodies on protected routes are limited to 64 KiB. The writer queue is sized
+for the configured streams plus two per allowed camera, so a daemon with provisioning enabled may
+start without any configured camera. The Add camera form's ONVIF lookups (discovery and stream URLs,
+`05 §5`) relay through the same control and run in tasks beside the loop, at most four at a time,
+the daemon enforcing `connect_ports` on the lookup's port; a lookup still running at shutdown is
+cancelled and answers with a lifecycle error. `live_viewers` is the per-stream count of external
+live WebSockets and excludes the shared LL-HLS feeder. Its drop guard removes a viewer on close,
+timeout, cancellation, and send failure. The segments listing includes an unsealed segment only once
+it has a durable fragment and treats it as extending to the earlier of now and 30 s past its last
+durable progress, while each row reports its recorded `wall_end_us`.
 
 Request time parameters accept Unix microseconds or ASCII RFC 3339. Non-ASCII timestamps
 are rejected before fixed-position parsing. Dates follow proleptic Gregorian month and leap-year
@@ -218,19 +242,22 @@ which also closes idle kept-alive connections, and a response write without prog
 closes its connection. HTTP 500 bodies carry only `"internal error"` and a `request_id` that
 matches the logged detail.
 
-Auth: bearer tokens protect every route except `/api/health`, and `/metrics` unless
-`[api] public_metrics` is set. The server speaks
-plain HTTP; bind it to loopback or a trusted private network and use a VPN or TLS reverse proxy
-for remote access. The Linux viewer works through such a proxy: an `https` API URL gives `wss`
-live feeds, both verified against the platform's trust store, and the viewer refuses plain
-HTTP to a host other than loopback unless started with `--allow-insecure-http`.
-Authenticated playlists place only bounded tamper-resistant capabilities in media URIs. Each
-capability is limited to its exact path, `GET`/`HEAD`, and expiry; the root bearer is never copied
-into a playlist URL. Rolling live-HLS capabilities last 15 minutes. Immutable VOD children cover
-the selected span plus a 15-minute playback margin, capped at seven days.
-Configuration admits bearer tokens of at least 32 visible ASCII characters (0x21 to 0x7e) other
-than the example placeholder; an API without tokens needs `api.allow_unauthenticated = true` and a
-loopback listener, and the switch together with tokens is rejected.
+Auth: bearer tokens protect every route except `/api/health`, and `/metrics` unless `[api]
+public_metrics` is set. The server speaks plain HTTP; bind it to loopback or a trusted private
+network and use a VPN or TLS reverse proxy for remote access. The Linux viewer works through such a
+proxy: an `https` API URL gives `wss` live feeds, both verified with one `iris-tls` configuration
+(the platform's trust store plus the authorities of an optional `--ca-file`, as the soak sampler's
+API checks use too), and the viewer refuses plain HTTP to a host other than loopback unless started
+with `--allow-insecure-http`. Authenticated playlists place only bounded tamper-resistant
+capabilities in media URIs. Each capability is limited to its exact path, `GET`/`HEAD`, and expiry;
+the root bearer is never copied into a playlist URL. A capability is an HMAC-SHA256 tag under a
+32-byte secret the daemon creates once at `<state_dir>/capability.key` (mode 0600) and reuses across
+restarts; the root tokens take no part in it, so a captured URL reveals nothing about a token, and
+every token issues interchangeable capabilities. Rolling live-HLS capabilities last 15 minutes.
+Immutable VOD children cover the selected span plus a 15-minute playback margin, capped at seven
+days. Configuration admits bearer tokens of at least 32 visible ASCII characters (0x21 to 0x7e)
+other than the example placeholder; an API without tokens needs `api.allow_unauthenticated = true`
+and a loopback listener, and the switch together with tokens is rejected.
 
 ## 6. Security model
 
@@ -240,24 +267,33 @@ loopback listener, and the switch together with tokens is rejected.
   the limits of one shared runtime. RTSP control messages are capped at 1 MiB
   for head and body together; in-progress H.265 access-unit payload and projected output are
   each capped at 64 MiB before a completed frame allocation.
-- systemd hardening set + Landlock (03 §5): the process can read/write only the video roots
-  and state dir, connect only to camera ports, bind only the API port. Landlock filesystem
-  rights (ABI 1) and TCP bind/connect rights (ABI 4) are required: on a kernel without them
-  the daemon refuses to start unless `--no-sandbox` is given, and rights from later ABIs are
-  applied when available, with a warning naming any missing ones. Landlock filters TCP ports
-  for every destination address; peers are restricted by the unit's `IPAddressDeny=any` and
+- systemd hardening set + Landlock (03 §5): the process reads its configuration directory,
+  `/etc`, and `/proc`; reads, creates, writes, renames, truncates, and removes regular files and
+  directories beneath the video roots and the state directory (no execution, device nodes,
+  sockets, FIFOs, or symbolic links there); connects over TCP to the camera and provisioning
+  ports; and binds the API port. Landlock filesystem rights (ABI 1) and TCP bind/connect rights
+  (ABI 4) are required: on a kernel without them the daemon refuses to start unless
+  `--no-sandbox` is given. The rights and scopes of later ABIs (device `ioctl` denied, abstract
+  Unix sockets and signals scoped to the daemon's domain) are applied when available, with a
+  warning naming any missing ones. UDP (the WS-Discovery probe), pathname Unix sockets
+  (`sd_notify`), and signals are outside the ruleset. Landlock filters TCP ports for every
+  destination address; peers are restricted by the unit's `IPAddressDeny=any` and
   `IPAddressAllow=`, which allows only the loopback until a drop-in adds the camera subnet
   (and the API clients' subnet when the API listens on the LAN).
 - Secrets (camera passwords, API tokens) live in the configuration file read at startup,
   never in URLs or logs. The packaging installs it 0640 root:irisd in a 0750 directory, and
-  the daemon warns when users other than its account and group can read it. `CameraConfig`'s
-  `Debug` output redacts the password.
+  the daemon warns when users other than root and its account and group can read or write it.
+  `CameraConfig`'s `Debug` output redacts the password.
   Configuration parse errors retain a generic syntax/schema description and byte span;
-  they discard source text and value-bearing parser messages before crossing the core API.
+  they discard source text and value-bearing parser messages before crossing the core API. The
+  camera store `cameras.toml` is parsed the same way, so a malformed store names the file and a
+  byte location, never its text.
 - State at rest: the unit's `StateDirectoryMode=0700` and a startup check keep the catalog
-  (camera metadata, recording paths, events) private to the service account. Before SQLite
-  opens it, the daemon requires the state directory and the `irisd.db`, `-wal`, and `-shm`
-  files to belong to its user, refuses symbolic links, hard links, and special files, and
+  (camera metadata, recording paths, events), the capability secret, and the credentials of
+  cameras added through the API (`cameras.toml`) private to the service account. Before SQLite
+  opens the catalog, the daemon requires the state directory, the `irisd.db`, `-wal`, and `-shm`
+  files, `capability.key`, and `cameras.toml` to belong to its user, refuses
+  symbolic links, hard links, and special files, and
   removes group and other permissions with a warning; SQLite copies the database file's mode
   to new WAL and shared-memory files, so repairing the database file keeps them private.
 - API clients are bounded before and after authentication: the connection cap, the 10 s
@@ -286,7 +322,7 @@ Targets for 6 cameras × (main 4K 8 Mbps + sub D1 1.3 Mbps) ≈ 56 Mbps, ≈ 5,0
 | Container overhead | ≤ 0.1 % | bytes on disk vs payload bytes |
 | Live latency | ≤ 300 ms WS, ≤ 3 s LL-HLS | camera pointed at a millisecond clock |
 | Seek | < 1 s to any time in 90 days | API timing |
-| Crash loss | ≤ 2 s daemon, ≤ 7 s power | `kill -9` and power-cycle tests, count missing frames |
+| Crash loss | ≤ 2.5 s plus the writer queue (daemon), ≤ 7.5 s (power) | `kill -9` and power-cycle tests, count missing frames |
 | Recovery | < 5 s with 12 open files | startup timing |
 
 The RSS figure is a steady-state operating target, not the sum of adversarial ceilings.
@@ -299,7 +335,8 @@ reads, 0.069 % with the 32 KiB receive low-water mark on top, and 0.064 % with t
 CRC-32C; the remaining kernel items are listed in 12 §7. Measured again on
 2026-11-02 after one shared read ticker and sockets detached from the reactor (12 §6):
 0.021 % per Mbit/s at 132 Mbit/s, under the budget, with 70 wake-ups and 930 system
-calls per second for fourteen streams.
+calls per second for fourteen streams. Measured on 2026-11-08 with the build that bounds every
+camera-supplied diagnostic (12 §6): 0.024 to 0.025 % per Mbit/s at 143 Mbit/s.
 
 Harness (`iris-replay` and `iris-tools replay-bench`):
 
@@ -321,74 +358,83 @@ Harness (`iris-replay` and `iris-tools replay-bench`):
 
 ## 8. Testing strategy
 
-- Golden tests: 30 s cam1 captures (raw NALs, RTP packet dumps) checked into a test-data
-  store (not git) with expected fragment boundaries, hashes, and timing.
-- Property tests for the regulariser (duplicate stamps, gaps, drift, wrap-around, resets).
-- Writer tests against a loop device with injected errors; recovery tests over truncated and
-  zero-filled tails.
-- Playback conformance: produced files pass `ffprobe`, `mp4dump`, Apple's `mediastreamvalidator`
-  for HLS playlists, and play in AVPlayer/mpv/GStreamer.
+- Unit tests beside the code, among them the regulariser's scenario tests (duplicate stamps,
+  gaps, drift, wrap-around, resets) and a regression test that replays a committed sidecar of
+  a real recording (`crates/iris-ingest/tests/data/`, timing only).
+- Recovery tests over truncated and zero-filled tails (`crates/iris-store/tests/store.rs`
+  and the `iris-mp4` reader's tests).
+- Integration tests that run ingest sessions against loopback replay servers and
+  fault-injecting RTSP peers (`crates/iris-ingest/tests/`), and the API's routes, limits, and
+  WebSocket lifetimes against a test catalog (`crates/iris-api/tests/`).
+- Fuzz targets for every parser that faces the network (§2, `fuzz/README.md`).
+- Recordings checked with `ffprobe`, `irisd inspect`, and GStreamer playback.
+- Not implemented: property-based tests, writer tests against a loop device with injected
+  errors, captured-camera golden tests, and `mediastreamvalidator` and AVPlayer conformance
+  (`08-roadmap.md`, phase-2 exit criteria).
 
 ## 9. Observability
 
-`tracing` with structured `key=value` fields to journald. Once per `--stats-interval`
-(default 60 s) the daemon writes one line per stream, one per event feed, one `writer`, one
-`catalog`, one `root` per video root, and one `process` line. Latency fields are per-interval
-p50/p99 upper bounds from fixed logarithmic histogram buckets (`iris_core::metrics`) plus the
-interval maximum, so the hot paths only increment atomics.
-Counts and percentile ranks come from the published bucket samples. Open-bucket
-percentiles use a cumulative maximum, published before each bucket increment and independent
-of interval maximum resets. One reporter owns those resets. Snapshots are approximate
-across concurrent updates, so interval cutoffs and means can be skewed; percentile bounds
-still cover their observed bucket samples.
+`tracing` with structured `key=value` fields to journald. Once per `--stats-interval` (default 60 s)
+the daemon writes one line per stream, one per event feed, one `writer`, one `catalog`, one `root`
+per video root, and one `process` line. The stream and event-feed lists follow cameras added or
+removed through the API from the next report on. Latency fields are per-interval p50/p99 upper
+bounds from fixed logarithmic histogram buckets (`iris_core::metrics`) plus the interval maximum, so
+the hot paths only increment atomics. Counts and percentile ranks come from the published bucket
+samples. Open-bucket percentiles use a cumulative maximum, published before each bucket increment
+and independent of interval maximum resets. One reporter owns those resets. Snapshots are
+approximate across concurrent updates, so interval cutoffs and means can be skewed; percentile
+bounds still cover their observed bucket samples.
 
 | Line | Fields |
 |---|---|
 | `stream` | connected, frames, fragments, payload MiB, reconnects, snaps, loss markers, dropped, regulariser holds and hold seconds, nominal fps, timeline error ms, peak fragment KiB and seconds, RTCP sender reports and camera-minus-NVR clock offset ms, gaps, seconds since the last frame, codec |
-| `events` | camera and source identity; connected, events, messages (heartbeats and empty pulls included), failed-session retry cycles (`reconnects`), renewals, failed sessions (`errors`), seconds since the last message, pull p99/max ms (ONVIF), last event time |
+| `events` | camera and source identity; connected, events, messages (CGI parts including heartbeats; ONVIF successful pulls, empty ones included), failed-session retry cycles (`reconnects`), renewals, failed sessions (`errors`), seconds since the last message, pull p99/max ms (ONVIF), last event time |
 | `writer` | fragments, file MiB, syncs, dropped, write errors, files, queue depth and peak, peak queued MiB, write p50/p99/max ms, sync p50/p99/max ms, slow I/O count |
-| `catalog` | segments and sealed GiB; rows and MiB in deletion intent (`deleting_segments`, `deleting_mib`); event rows, logical MiB, active marks, and pruned rows; database/WAL MiB; live/peak command count and owned MiB; coalesced and total/per-kind rejected commands; reconciliation-required flag; batches, changes, peak batch, failures; transaction, query, queue-wait, and event receipt-to-commit p99/max ms |
+| `catalog` | segments and sealed GiB; rows and MiB in deletion intent (`deleting_segments`, `deleting_mib`); event rows, logical MiB, active marks, and pruned rows; database/WAL MiB (these statistics fields read `-` when the catalog query failed, which is logged); live/peak command count and owned MiB; coalesced and total/per-kind rejected commands; reconciliation-required flag; batches, changes, peak batch, failures; transaction, query, queue-wait, and event receipt-to-commit p99/max ms |
 | `root` | free GiB and percent per video root |
-| `process` | CPU total, user, and system percent, RSS, threads, fds, uptime, loop lag max ms (how late a 250 ms timer fired on the runtime thread), watchdog pings withheld, retention pass max ms, self-check ok, failed, and skipped counts, statistics-report and retention-pass timeouts since start (`report_timeouts`, `retention_timeouts`), Landlock enforcement (`sandbox_enforced`: 0 disabled, 1 partial, 2 full) |
+| `process` | CPU total, user, and system percent, RSS, threads, fds, uptime, loop lag max ms (how late a 250 ms timer fired on the runtime thread), watchdog pings withheld, background `TEARDOWN` tasks running (`teardowns`, at most 64), retention pass max ms, self-check ok, failed, and skipped counts, statistics-report and retention-pass timeouts since start (`report_timeouts`, `retention_timeouts`), Landlock enforcement (`sandbox_enforced`: 0 disabled, 1 partial, 2 full); written before the `catalog` and `root` lines, whose queries may stall |
 
 One-off lines mark the facts a soak must explain: `gap` (`cause=reconnect` with the last
 frame time before the session ended and the first after it, `cause=camera_hold` for a
 regulariser hold of a second or more, or `cause=sink_rejected` for the first writer rejection
-in a loss epoch), `retention pass` (deleted, earlier deletion intents finished, freed,
-duration, free percent, catalogued GiB against the quota; a pass over 2 s is a warning),
+in a loss epoch), `retention pass` (deleted, earlier deletion intents finished, freed, duration,
+the smallest free percent any probe of the pass saw, catalogued GiB after the quota step against
+the quota, and `roots_unavailable`, the roots skipped after a failed probe, with `-` for a value the
+pass could not know; a pass over 2 s is a warning),
 `slow write` and `slow sync` (over 1 s),
 and `selfcheck ok` or `selfcheck failed`. The self-check visits one
 stream per `--selfcheck-cycle` (default 24 h) divided by the stream count, scans that
 stream's newest sealed file with CRC verification on a blocking thread, and compares
-fragments, bytes, init length, media span, and wall start with the catalog row.
+fragments, bytes, init length, media span, and both wall boundaries with the catalog row; a
+fragment without a `prft` fails the check. A camera
+added or removed through the API re-points it at the streams that record afterwards and
+re-times the cycle over them.
 
 `/api/health` and `/metrics` (Prometheus text: API requests, clients, skipped event-WebSocket
-messages, API admission rejections by media class, WebSocket cap, and snapshot single-flight,
-rows outside the approved roots, oversized live closes, uptime, catalog queue, rejection and
-failed-batch state, deletion intent, event capacity/pruning, and database/WAL sizes) serve pollers; `/metrics`
-requires the root bearer token unless `[api] public_metrics` is set. Uptime uses a monotonic
-process instant. Metric scrapes share one
-cache-owned catalog-aggregate refresh at most once per second; concurrent scrapes coalesce and
-request cancellation cannot abandon the refresh. A failure serves the last snapshot or omits cold
-aggregates until the next cadence. The `systemd`
-watchdog ping is withheld whenever an ingest
-task made no progress in the interval. Figures the daemon cannot see from inside its
-sandbox (disk sectors written for write amplification, pressure stall information, NIC and
-TCP counters, NTP offset, the service's cgroup CPU and memory split) come from
-`iris-tools soak-sample`, which runs from a timer beside the service. Its bounded API check also
-captures the catalog failure, rejection, and reconciliation metrics so a healthy HTTP response
-cannot hide failed persistence.
-Soak reports recognize the ordered startup prefix (root availability, sandbox setup,
-catalog open) before reconciliation as a run boundary, including after crashes without
-a `stopped` line. Reconciliation remains a fallback marker when the prefix is absent.
-Startup warnings belong to the restarted run and cannot extend the prior run's last observation.
-Without a clean stop or process identity in the exported log, the interval between runs
-remains unobserved / possible downtime; the report cannot infer the exact crash time.
-An API task whose result was consumed by the monitor is removed before shutdown; a
-bind failure therefore still drains the writer and catalog without polling it twice.
-Startup reconciles storage and then binds the API listener before recording tasks and `READY=1`.
-The already-bound listener is passed to the API task, so an occupied address cannot produce a
-false-ready daemon.
+messages, API admission rejections by media class, WebSocket cap, and snapshot single-flight, rows
+outside the approved roots, oversized live closes, uptime, catalog queue, rejection and failed-batch
+state, deletion intent, event capacity/pruning, and database/WAL sizes) serve pollers; `/metrics`
+requires the root bearer token unless `[api] public_metrics` is set. Uptime uses a monotonic process
+instant. Metric scrapes share one cache-owned catalog-aggregate refresh at most once per second;
+concurrent scrapes coalesce and request cancellation cannot abandon the refresh. A failure serves
+the last snapshot or omits cold aggregates until the next cadence. The `systemd` watchdog ping is
+withheld whenever an ingest task made no progress in the interval. Figures the daemon cannot see
+from inside its sandbox (disk sectors written for write amplification, pressure stall information,
+NIC and TCP counters, NTP offset, the service's cgroup CPU and memory split) come from `iris-tools
+soak-sample`, which runs from a timer beside the service. Its bounded API check also captures the
+catalog failure, rejection, and reconciliation metrics so a healthy HTTP response cannot hide failed
+persistence. Soak reports recognize the ordered startup prefix (the configuration-exposure and
+unauthenticated-API warnings, the descriptor limit, state-mode repairs, root availability, the
+sandbox decision, catalog open) before reconciliation as a run boundary, including after crashes
+without a `stopped` line; `iris-tools` matches those messages by their text, so a reworded message
+changes there in the same change. Reconciliation remains a fallback marker when the prefix is absent. Startup warnings belong to
+the restarted run and cannot extend the prior run's last observation. Without a clean stop or
+process identity in the exported log, the interval between runs remains unobserved / possible
+downtime; the report cannot infer the exact crash time. An API task whose result was consumed by the
+monitor is removed before shutdown; a bind failure therefore still drains the writer and catalog
+without polling it twice. Startup reconciles storage and then binds the API listener before
+recording tasks and `READY=1`. The already-bound listener is passed to the API task, so an occupied
+address cannot produce a false-ready daemon.
 
 ## 10. Configuration sketch (TOML)
 
@@ -412,10 +458,16 @@ recv_low_water_kib = 32
 listen = "127.0.0.1:8554"
 tokens = ["replace-with-a-long-random-token"]   # rejected; use `openssl rand -hex 16`
 
+[provisioning]
+enabled = false
+max_cameras = 16
+connect_ports = [554, 80, 443]
+
 [[camera]]
 id = "cam1"
 name = "Example"
 rtsp_url = "rtsp://192.0.2.10:554/cam/realmonitor?channel=1&subtype=0&unicast=true&proto=Onvif"
+# subtype=2, the third stream, on a family whose sub stream stops beside a second session (01 §5b)
 sub_url  = "rtsp://192.0.2.10:554/cam/realmonitor?channel=1&subtype=1&unicast=true&proto=Onvif"
 username = "..."
 password = "..."
@@ -437,10 +489,12 @@ break durability, stop recording, or delete every recording are bounded too:
 `60..=86,400`, `rotate_bytes` in 64 MiB..=64 GiB (at least the 64 MiB fragment cap),
 `preallocate_bytes` up to the smaller of `rotate_bytes` and 4 GiB (reserved space counts as
 used for the free-space floor), `quota_gib` at least 1 when set, and `min_free_percent` in
-`0..=50`. The API section needs a bearer token of at least 32 visible ASCII characters other
-than the example placeholder, or `allow_unauthenticated = true` with no token on a loopback
-listener (§5). Each rejection names the key and its accepted range; under the alpha policy
-(`STANDARDS.md` §9) a configuration that broke a rule stops loading. Derived queue and
+`0..=50`. `[provisioning]` needs `max_cameras` in `1..=64`, no zero port, and a nonempty
+`connect_ports` when enabled; a daemon with it enabled may have no `[[camera]]` at all. The API
+section needs a bearer token of at least 32 visible ASCII characters other than the example
+placeholder, or `allow_unauthenticated = true` with no token on a loopback listener (§5). Each
+rejection names the key and its accepted range; a configuration that breaks a rule does not load
+(`STANDARDS.md` §9 keeps no compatibility path). Derived queue and
 media-tick arithmetic is checked before roots, listeners, writers, or tasks are created.
 Repeated stream selectors in the standalone `record` command are rejected rather than
 starting two producers for one key.
@@ -448,15 +502,15 @@ starting two producers for one key.
 Before the daemon creates a worker thread, it opens the catalog synchronously, resolves durable
 legacy-registry state, and admits each recording root against the durable `.irisd-root-id` marker
 plus its process-local physical directory identity. Known or ambiguous legacy roots are never
-initialized when missing or replaced—even if a migrated catalog has no remaining segment rows—physical aliases are rejected, and subsequent reconciliation/removal remains
+initialized when missing or replaced—even if a migrated catalog has no remaining segment
+rows—physical aliases are rejected, and subsequent reconciliation/removal remains
 descriptor-relative beneath the exact approved root. A missing fresh root is created through
-directory descriptors from the deepest ancestor that exists without following a link, and
-admission continues from the created descriptor. Every open of a marker, recording, or sidecar
-beneath a root is nonblocking, no-follow, and regular-file only, so a planted FIFO or device fails
-that open at once instead of stalling admission, the writer, reconciliation, or shutdown.
-Startup catalog scans use fixed pages and
-the root walk streams no-follow entries; an elapsed heartbeat extends the service start deadline
-through all pages, enumeration, and media scans.
+directory descriptors from the deepest ancestor that exists without following a link, and admission
+continues from the created descriptor. Every open of a marker, recording, or sidecar beneath a root
+is nonblocking, no-follow, and regular-file only, so a planted FIFO or device fails that open at
+once instead of stalling admission, the writer, reconciliation, or shutdown. Startup catalog scans
+use fixed pages and the root walk streams no-follow entries; an elapsed heartbeat extends the
+service start deadline through all pages, enumeration, and media scans.
 
 The process monitor owns one reporting job, one retention job, and one self-check job. They are
 single-flight and cancellation-aware, while blocking filesystem probes/removal run outside the
@@ -470,6 +524,6 @@ one raw call per owner and never races a late removal, and it relaunches once th
 A call still in the kernel ten minutes after the timeout stops the daemon so systemd restarts it;
 a task failure or an unexpected cancellation also stops it. The thread cannot hold process exit,
 and deletion intent makes a late removal retry-safe in a later pass or at the next startup.
-SIGTERM/SIGINT shutdown shares one 25-second absolute budget
-across all producers, writer sealing, API drain, and catalog closure; aborted tasks are awaited and
-all later cleanup stages run even when an earlier one fails.
+SIGTERM/SIGINT shutdown shares one 25-second absolute budget across all producers (camera
+retirements and ONVIF lookups included), writer sealing, API drain, and catalog closure; aborted
+tasks are awaited and all later cleanup stages run even when an earlier one fails.

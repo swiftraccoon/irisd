@@ -247,3 +247,37 @@ async fn shutdown_drains_an_in_flight_response_and_stops_accepting() {
         "the listener is closed after shutdown"
     );
 }
+
+/// The listener speaks HTTP/1.1 only: a cleartext HTTP/2 preface gets an
+/// HTTP/1.1 answer or a closed connection, never an HTTP/2 `SETTINGS` frame.
+#[tokio::test]
+async fn an_http2_preface_is_not_answered_with_http2() {
+    let listener = iris_api::bind("127.0.0.1:0".parse().expect("literal address"))
+        .await
+        .expect("bind API listener");
+    let address = listener.local_addr().expect("loopback address");
+    let shutdown = CancellationToken::new();
+    let task = tokio::spawn(iris_api::serve_listener(
+        listener,
+        Router::new().route("/", get(|| async { "ok" })),
+        ServeLimits::default(),
+        shutdown.clone(),
+    ));
+    let mut client = TcpStream::connect(address).await.expect("connect");
+    client
+        .write_all(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n\x00\x00\x00\x04\x00\x00\x00\x00\x00")
+        .await
+        .expect("preface");
+    let response = read_until_closed(&mut client, Duration::from_secs(3)).await;
+    assert!(
+        response.is_empty() || response.starts_with(b"HTTP/1.1 "),
+        "{}",
+        String::from_utf8_lossy(&response)
+    );
+    assert!(
+        !response.starts_with(b"\x00\x00"),
+        "an HTTP/2 SETTINGS frame was sent"
+    );
+    shutdown.cancel();
+    task.await.expect("server task").expect("server shutdown");
+}

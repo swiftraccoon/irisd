@@ -14,8 +14,9 @@ Exit criteria:
 - CPU ≤ 0.5 % of one core for the 4K stream + sub stream over 10 min; RSS ≤ 20 MB.
 - `kill -9` during recording: recovery scan truncates at the last valid fragment; no
   corrupt output; loss ≤ one fragment.
-- Regulariser produces constant 3000-tick durations on cam1 with the assigned timeline within
-  ±100 ms of the camera RTP timeline over 1 h, and handles duplicate stamps and 100 ms gaps.
+- Regulariser locks each stream's durations within ±1 % of the camera's effective rate
+  (04 §7.3), keeps the assigned timeline within ±100 ms of the camera RTP timeline over 1 h, and
+  handles duplicate stamps and 100 ms gaps.
 - Container overhead measured ≤ 0.05 %.
 
 ## Phase 2 — Daemon v0.1: six cameras, catalog, serving, events, hardening (3–5 weeks)
@@ -36,6 +37,11 @@ Exit criteria:
 - `cargo fuzz` runs for 24 h on each parser without findings; `systemd-analyze security`
   score "safe".
 
+Soak status on 2026-11-08: the longest closed window is 134.5 h and the third ran 25.2 h
+before a build with hardware checks pending replaced it (`11-multi-camera-results.md`). A
+seven-day window runs once the change rate drops, since a ready build takes precedence over an
+open window.
+
 ## Phase 3 — Linux GUI (3–4 weeks)
 
 gtk4-rs + gstreamer-rs client: grid of sub streams with hardware decode, single-camera
@@ -51,13 +57,14 @@ six tiles, background/foreground decoder recovery.
 
 ## Phase 5 — Breadth
 
-ONVIF discovery and provisioning for non-Dahua cameras; ONVIF metadata-track events; audio
-(AAC) end to end; optional on-NVR analytics on the sub stream (hardware decode, never in the
-record path); WebRTC/QUIC for remote live view; multi-disk tiering; aarch64 SBC builds.
+ONVIF metadata-track events (discovery and ONVIF stream lookup for non-Dahua cameras ship with the
+phase 3 provisioning form); camera configuration through ONVIF under an explicit opt-in (05 §4);
+audio (AAC) end to end; optional on-NVR analytics on the sub stream
+(hardware decode, never in the record path); WebRTC/QUIC for remote live view; multi-disk tiering;
+aarch64 SBC builds.
 
 ## Decisions deferred on purpose
 
-- Fragment cap default (2 s vs 0.5 s) until phase-1 measurements of loss window vs write count.
 - ext4 vs XFS for the video roots until the phase-2 soak.
 - Audio codecs other than AAC.
 - B-frame streams (composition offsets).

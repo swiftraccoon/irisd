@@ -12,9 +12,12 @@ Scope: this crate only. Read the root `AGENTS.md` first.
   daemon, which closes with 1009 when a sync frame exceeds it. Keep it: raising it multiplies
   worst-case memory per tile. A 1009 close or an oversized message is the tile's oversized
   state with a 2 s backoff doubling to 60 s, never a 2 s reconnect loop.
-- `--api` is `http` or `https` without userinfo; plain HTTP to a host other than loopback
-  needs `--allow-insecure-http`. `wss` verifies against the platform's native roots; tests
-  inject a fixture root through `live::session`'s connector.
+- `--api` is the daemon's origin, `http` or `https`, without userinfo, path, query, or
+  fragment: the client and the feed join absolute paths (`/api/...`), which would replace a
+  path prefix and send the bearer elsewhere on the host. Plain HTTP to a host other than
+  loopback needs `--allow-insecure-http`. `wss` verifies with the shared `iris-tls`
+  configuration: the platform's store plus any `--ca-file` authorities; tests pass a fixture
+  configuration through `live::session`'s connector.
 - The grid starts at most `--max-tiles` feeds. Exports check `fstatvfs` free space before the
   first byte and every 64 MiB, and stop when it falls below the larger of 1 GiB and 2 % of
   the filesystem.
@@ -25,38 +28,54 @@ Scope: this crate only. Read the root `AGENTS.md` first.
 - `Source::push` rejects a payload before copying if queued plus incoming bytes exceed
   16 MiB. Keep `appsrc` nonblocking: a rejection fails the session, restarts the branch,
   and reconnects from init plus sync; dropping arbitrary byte chunks corrupts decoding.
-- Playback mapping uses the VOD playlist's exact `#IRIS-FRAGMENT` timing, including whole
-  boundary GOPs and intra-file gaps. Accumulate 90 kHz ticks before converting to microseconds.
-  Fetch the playlist once: the same selection feeds both the mapping and GStreamer.
-  Resolve media and init references against the API origin, preserving queries; references
-  to other origins or schemes, userinfo, `#EXT` tags outside `api::VOD_TAGS`, and redirects
-  reject the playlist. Open segment rows follow the API's overlap rule; drop those that
-  recorded nothing inside the window before deciding it is empty.
-- A playback snapshot serves only its immutable playlist on IPv4 loopback behind a
-  256-bit OS-random capability path. Its token-bearing body and capability stay out of
-  logs and temporary files. Closing, replacing, or failing playback drops the snapshot
-  listener; cancel pending loads without blocking the GTK main loop. Snapshots do not pin
-  media files against retention, so missing media can fail playback.
-  Bus errors defer cleanup until their callback returns; an error from a replaced player
-  must not close its replacement.
+- Playback mapping uses the VOD playlist's exact `#IRIS-FRAGMENT` timing, including whole boundary
+  GOPs and intra-file gaps. Accumulate 90 kHz ticks before converting to microseconds. Fetch the
+  playlist once: the same selection feeds both the mapping and GStreamer. Resolve media and init
+  references against the API origin, preserving queries; references to other origins or schemes,
+  userinfo, `#EXT` tags outside `vod::VOD_TAGS`, and redirects reject the playlist. `vod.rs` stays
+  free of GTK, GStreamer, and crate-internal items: the `vod_playlist` fuzz target includes it by
+  path, so a change there runs `just fuzz-build`. Open segment rows follow the API's overlap rule;
+  drop those that recorded nothing inside the window before deciding it is empty.
+- A playback snapshot serves only its immutable playlist on IPv4 loopback behind a 256-bit OS-random
+  capability path. Its token-bearing body and capability stay out of the viewer's logs and temporary
+  files; GStreamer's debug log at its verbose levels is the exception described under Pitfalls.
+  Closing, replacing, or failing playback drops the snapshot listener; cancel pending loads without
+  blocking the GTK main loop. Snapshots do not pin media files against retention, so missing media
+  can fail playback. Bus errors defer cleanup until their callback returns; an error from a replaced
+  player must not close its replacement.
 - Only the visible view decodes. Any new view stops the pipelines it hides (`Tile::stop`)
   and starts what it shows (`Tile::start`); a feed task outliving its tile is a bug.
+- Camera ids, stream kinds, and wall-clock times are `iris_core` types (`CameraId`,
+  `StreamKind`, `WallUs`), parsed at the boundary: options, JSON answers, and the Add camera
+  form. Playlist positions are `gst::ClockTime`; keep the two time domains apart.
+- Types that hold the token or a password redact it in `Debug` (`Args`, `api::Client`,
+  `live::Feed`, `api::NewCamera`, `api::StreamUrlsRequest`) or have no `Debug` (the form
+  values).
 - The root bearer never appears in URLs, logs, or window titles. Initial VOD and WebSocket
   requests send it in `Authorization`; playlist media references carry scoped capabilities
   bounded to the selected playback horizon instead.
+- Imports: the GTK and GStreamer preludes (`gtk::prelude::*`, `gst::prelude::*`) are the only
+  glob imports outside tests, the exception `STANDARDS.md` §4 records; everything else is
+  imported one `use` per module.
 
 ## Where things are
 
 - `src/main.rs` — options, GStreamer and plugin initialisation, the window with its grid
-  and focused views, the main-loop event handler (`show_grid`, `focus`).
-- `src/api.rs` — the HTTP client (cameras).
+  and focused views, the main-loop event handler (`show_grid`, `focus`, `start_view`), the
+  Add camera form with its Discover and Fetch streams lookups, the Remove camera
+  confirmation, and the display-dependent `gtk_lifecycle_checks`.
+- `src/api.rs` — the HTTP client: listings, the VOD playlist, keyframes, exports, retain
+  marks, camera provisioning, and the ONVIF lookups, each with its bounds and validation.
+- `src/vod.rs` — the VOD playlist rules (fragment timing, the origin-bound rewrite, the tag
+  allow-list), shared with the `vod_playlist` fuzz target.
 - `src/live.rs` — the per-tile WebSocket feed and reconnection.
 - `src/timeline.rs` — the timeline widget and the playlist-time mapping.
 - `src/playback.rs` — the playback view over `playbin3`, with the thumbnail strip.
 - `src/snapshot.rs` — the private immutable playlist endpoint, owned by a running player.
 - `src/thumbs.rs` — keyframe decoding to an image, off the main loop.
 - `src/stage.rs` — the shared live pipeline, its bus watch, branch add, restart, remove.
-- `src/tile.rs` — the widgets, the branch lifecycle (`start`, `stop`), readiness, restarts.
+- `src/tile.rs` — the widgets, the branch lifecycle (`start`, `stop`), readiness re-armed by
+  each restart, restarts.
 
 ## How to verify a change
 
@@ -64,7 +83,8 @@ Scope: this crate only. Read the root `AGENTS.md` first.
 cargo fmt -p iris-gui
 cargo clippy -p iris-gui --all-targets -- -D warnings
 cargo test -p iris-gui
-cargo test -p iris-gui --bin iris-gui -- --ignored --test-threads=1  # run under xvfb-run
+cargo test -p iris-gui --bin iris-gui -- --ignored --test-threads=1  # xvfb-run: gtk_lifecycle_checks
+just fuzz-build                                                       # after a change to src/vod.rs
 cargo test -p iris-gui --test playback_snapshot -- --ignored  # ffmpeg/libx264 + Xvfb + HLS/H.264 plugins
 cargo test -p iris-gui --test playback_origin -- --ignored  # Xvfb
 RUSTDOCFLAGS="-D warnings" cargo doc -p iris-gui --no-deps
@@ -118,6 +138,12 @@ smoke run needs a daemon with at least one camera and `xorg-x11-server-Xvfb` or 
   fails to decode otherwise.
 - The playback view holds its widgets in an `Rc`; button callbacks, the position timer,
   and the timeline's seek callback hold `Weak` references so dropping the view stops them.
+- A dialog's button callbacks hold the dialog as a `glib::WeakRef`, and the Add camera
+  form's own widgets hold the form as a `Weak`; the dialog's Add button is the form's one
+  owner. A strong clone of either in a callback leaks the dialog after it closes, which
+  `gtk_lifecycle_checks` detects.
+- GStreamer's debug log prints the snapshot's capability URL at `GST_DEBUG=4` and the whole
+  playlist, media capabilities included, at 5 and above; the viewer's own logs never do.
 - Thumbnails decode in `spawn_blocking` tasks (one short pipeline each) and reach the main
   loop as RGB images; the texture is created there. A slot whose time falls in a gap stays
   empty rather than showing a neighbouring frame.

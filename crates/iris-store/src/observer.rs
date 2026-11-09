@@ -8,7 +8,7 @@ use iris_core::time::WallUs;
 use iris_mp4::init::SampleEntry;
 
 /// A recording file was created.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SegmentOpened {
     /// The stream the file belongs to.
     pub key: StreamKey,

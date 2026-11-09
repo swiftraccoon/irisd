@@ -4,7 +4,7 @@
 use std::time::Duration;
 
 use sd_notify::NotifyState;
-use tracing::debug;
+use tracing::warn;
 
 /// Reports `READY=1`. Harmless outside systemd.
 pub fn ready() {
@@ -45,9 +45,12 @@ fn watchdog_interval_from_timeout(timeout: Option<Duration>) -> Option<Duration>
         .filter(|duration| !duration.is_zero())
 }
 
+/// Sends `state`. Without `NOTIFY_SOCKET` the library sends nothing and
+/// reports success, so a failure means a service manager expected the
+/// message and did not get it.
 fn send(state: &[NotifyState<'_>]) {
-    if let Err(err) = sd_notify::notify(state) {
-        debug!(%err, "sd_notify failed");
+    if let Err(error) = sd_notify::notify(state) {
+        warn!(%error, ?state, "systemd notification failed");
     }
 }
 

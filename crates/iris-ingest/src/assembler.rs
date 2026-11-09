@@ -1,5 +1,6 @@
 //! Groups frames into fragments and assigns their durations.
 
+use std::fmt;
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -7,7 +8,7 @@ use iris_core::time::WallUs;
 use iris_mp4::fragment::{Fragment, Sample};
 use iris_mp4::init::SampleEntry;
 
-use crate::regularize::Regularizer;
+use crate::regularize::{FALLBACK_NOMINAL, Regularizer};
 use crate::source::IngestOptions;
 
 /// Bounds independent of the camera's timestamp and declared frame rate.
@@ -44,8 +45,9 @@ fn ticks_to_micros(ticks: u64) -> i64 {
     i64::try_from(ticks.saturating_mul(100) / 9).unwrap_or(i64::MAX)
 }
 
-/// One received access unit.
-#[derive(Clone, Debug)]
+/// One received access unit. `Debug` prints the payload's length, not its
+/// bytes.
+#[derive(Clone)]
 pub struct Frame {
     /// Length-prefixed NAL units without parameter sets.
     pub data: Bytes,
@@ -57,6 +59,18 @@ pub struct Frame {
     pub is_sync: bool,
     /// Whether the frame carried new parameter sets.
     pub new_params: bool,
+}
+
+impl fmt::Debug for Frame {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Frame")
+            .field("data", &format_args!("<{} bytes>", self.data.len()))
+            .field("raw_ts", &self.raw_ts)
+            .field("wall", &self.wall)
+            .field("is_sync", &self.is_sync)
+            .field("new_params", &self.new_params)
+            .finish()
+    }
 }
 
 /// Builds fragments from frames.
@@ -155,7 +169,7 @@ impl FragmentAssembler {
     /// The nominal frame duration in ticks (30 fps until something better is known).
     #[must_use]
     pub fn nominal(&self) -> u32 {
-        self.regularizer.nominal().unwrap_or(3000)
+        self.regularizer.nominal().unwrap_or(FALLBACK_NOMINAL)
     }
 
     /// The codec configuration applied to frames pushed from now on.
@@ -178,6 +192,7 @@ impl FragmentAssembler {
     /// A frame larger than 64 MiB flushes any pending fragment and is dropped.
     /// Frames after that are ignored until the next sync frame, which starts
     /// a separate run with its decode timeline at zero.
+    #[must_use = "the completed fragment must be delivered"]
     pub fn push(&mut self, frame: Frame) -> Option<Fragment> {
         if frame.data.len() > MAX_PENDING_BYTES {
             // An oversized access unit cannot fit the assembly budget. Resume
@@ -248,11 +263,14 @@ impl FragmentAssembler {
         self.started = keep_sync;
     }
 
-    /// Closes the pending fragment with nominal durations.
+    /// Closes the pending fragment. The next fragment's first timestamp is
+    /// taken as one nominal duration after the last frame, and the regulariser
+    /// assigns durations as for any fragment: holds, the correction, or a snap
+    /// may apply.
+    #[must_use = "the completed fragment must be delivered"]
     pub fn flush(&mut self) -> Option<Fragment> {
         let last = self.pending.last()?;
-        let nominal = i64::from(self.regularizer.nominal().unwrap_or(3000));
-        let next_raw = last.raw_ts + nominal;
+        let next_raw = last.raw_ts + i64::from(self.nominal());
         Some(self.close(next_raw))
     }
 
@@ -345,41 +363,59 @@ mod tests {
         }
     }
 
-    #[test]
-    fn drops_frames_before_first_sync_and_closes_at_sync() {
-        let mut a = assembler();
+    /// Two frames before the first sync frame, then a 60-frame GOP closed by
+    /// the next sync frame.
+    fn first_gop(a: &mut FragmentAssembler) -> Fragment {
         assert!(a.push(frame(0, false)).is_none());
         assert!(a.push(frame(1, false)).is_none());
         assert!(a.push(frame(2, true)).is_none());
         for i in 3..62 {
             assert!(a.push(frame(i, false)).is_none());
         }
-        let fragment = a
-            .push(frame(62, true))
-            .expect("closes at the next sync frame");
+        a.push(frame(62, true))
+            .expect("closes at the next sync frame")
+    }
+
+    #[test]
+    fn drops_frames_before_first_sync_and_closes_at_sync() {
+        let mut a = assembler();
+        let fragment = first_gop(&mut a);
         assert_eq!(fragment.samples.len(), 60);
         assert!(fragment.new_run);
         assert!(fragment.starts_with_sync());
+        assert!(fragment.samples.iter().all(|s| s.duration == 3000));
+        assert_eq!(fragment.duration(), 60 * 3000);
+        assert_eq!(fragment.sample_entry.hash, entry().hash);
+        assert_eq!(a.snap_count(), 0);
+    }
+
+    #[test]
+    fn a_closed_fragment_carries_its_wall_anchor_and_raw_rtp_start() {
+        let mut a = assembler();
+        let fragment = first_gop(&mut a);
         assert_eq!(fragment.decode_time, 0);
         assert!(
             fragment
                 .wall
                 .micros_since(WallUs::new(1_000_000 + 2 * 33_333))
                 .abs()
-                <= 100
+                <= 100,
+            "{:?}",
+            fragment.wall
         );
         assert_eq!(fragment.raw_rtp, (5_000 + 2 * 3000) as u32);
-        assert!(fragment.samples.iter().all(|s| s.duration == 3000));
-        assert_eq!(fragment.duration(), 60 * 3000);
-        assert_eq!(fragment.sample_entry.hash, entry().hash);
+    }
 
+    #[test]
+    fn decode_time_continues_across_fragments_of_one_run() {
+        let mut a = assembler();
+        let _ = first_gop(&mut a);
         for i in 63..122 {
             assert!(a.push(frame(i, false)).is_none());
         }
         let second = a.push(frame(122, true)).expect("second fragment");
         assert!(!second.new_run);
         assert_eq!(second.decode_time, 60 * 3000);
-        assert_eq!(a.snap_count(), 0);
     }
 
     #[test]
@@ -553,8 +589,8 @@ mod tests {
     #[test]
     fn flush_and_discontinuity_restart_the_timeline() {
         let mut a = assembler();
-        a.push(frame(0, true));
-        a.push(frame(1, false));
+        let _ = a.push(frame(0, true));
+        let _ = a.push(frame(1, false));
         let flushed = a.flush().expect("pending frames");
         assert_eq!(flushed.samples.len(), 2);
         assert!(flushed.samples.iter().all(|s| s.duration == 3000));
@@ -564,7 +600,7 @@ mod tests {
             a.push(frame(10, false)).is_none(),
             "non-sync frame after discontinuity is dropped"
         );
-        a.push(frame(11, true));
+        let _ = a.push(frame(11, true));
         let next = a.push(frame(12, true)).unwrap();
         assert!(next.new_run);
         assert_eq!(next.decode_time, 0);
@@ -573,8 +609,8 @@ mod tests {
     #[test]
     fn new_parameters_close_the_pending_fragment_with_the_old_entry() {
         let mut a = assembler();
-        a.push(frame(0, true));
-        a.push(frame(1, false));
+        let _ = a.push(frame(0, true));
+        let _ = a.push(frame(1, false));
         let new_entry = Arc::new(SampleEntry::new(
             Bytes::from_static(b"\0\0\0\x08hvc2"),
             "hvc1".into(),
@@ -672,7 +708,7 @@ mod tests {
     #[test]
     fn discontinuity_resets_the_wall_anchor() {
         let mut a = assembler();
-        a.push(frame(0, true));
+        let _ = a.push(frame(0, true));
         a.push(frame(1, true)).expect("fragment");
         assert!(a.wall_anchor.is_some());
         a.mark_discontinuity();

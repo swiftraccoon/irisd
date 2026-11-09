@@ -22,9 +22,8 @@ pub fn run(args: &Args) -> anyhow::Result<()> {
     println!("original length:  {} bytes", report.original_len);
     println!("valid length:     {} bytes", report.valid_len);
     println!("truncated:        {}", report.truncated);
-    println!("index rewritten:  {}", report.index_rewritten);
     match &report.stop {
-        Some(stop) => println!("scan stopped at:  {stop:?}"),
+        Some(stop) => println!("scan stopped at:  {stop}"),
         None => println!("scan stopped at:  clean end of file"),
     }
     Ok(())

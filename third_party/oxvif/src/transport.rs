@@ -58,6 +58,13 @@ pub enum TransportError {
     /// A SOAP response was not valid UTF-8 XML text.
     #[error("SOAP response is not valid UTF-8")]
     InvalidResponseEncoding,
+
+    /// HTTP digest authentication could not proceed: the challenge was
+    /// missing, unparseable, or of an unsupported scheme or algorithm, or the
+    /// request could not be prepared for a second attempt. `kind` names the
+    /// step without any server-controlled text.
+    #[error("HTTP digest authentication failed: {kind}")]
+    Authentication { kind: &'static str },
 }
 
 /// Errors returned while constructing the production HTTP transport.

@@ -3,33 +3,51 @@
 //! `/sys`, the service's cgroup, `systemctl show`, `ss`, `chronyc`, the
 //! journal, and the API over loopback.
 
-use std::collections::BTreeMap;
-use std::io::{Read, Write};
-use std::os::fd::AsRawFd;
+use std::collections::{BTreeMap, BTreeSet};
+use std::fs::{DirBuilder, File};
+use std::io::{self, Read, Write as _};
+use std::net::IpAddr;
+use std::os::fd::AsRawFd as _;
 use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use clap::Parser;
+use iris_core::id::{CameraId, StreamKind};
+use reqwest::redirect::Policy;
+use reqwest::{Client, Url};
+use rustix::fs::{FlockOperation, Mode, OFlags};
+use rustix::process::{Pid, Signal};
 use serde_json::{Map, Value, json};
 
-use crate::logs::terminal_safe;
-use crate::time::{iso, now};
+use crate::logs;
+use crate::time;
 
 const CGROUP_ROOT: &str = "/sys/fs/cgroup/system.slice";
 const HELPER_TIMEOUT: Duration = Duration::from_secs(5);
 const HELPER_OUTPUT_LIMIT: u64 = 256 * 1024;
+/// Largest kernel pseudo-file the sampler reads; the ones it reads are far smaller.
+const PSEUDO_FILE_LIMIT: u64 = 1024 * 1024;
 const API_CHECK_TIMEOUT: Duration = Duration::from_secs(30);
+const API_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+/// The span of segment rows an API check lists per stream.
+const SEGMENTS_WINDOW_SECONDS: f64 = 15.0 * 60.0;
+/// The span of the VOD playlist an API check fetches per stream; the report
+/// derives its restart horizon from it.
+pub const PLAYLIST_WINDOW_SECONDS: f64 = 10.0 * 60.0;
 const MAX_CAMERAS: usize = 128;
 const MAX_KINDS: usize = 8;
 const MAX_STREAM_REQUESTS: usize = 1_024;
+const MAX_SEGMENT_ROWS: usize = 100_000;
 const HEALTH_LIMIT: usize = 4 * 1024;
 const CAMERAS_LIMIT: usize = 256 * 1024;
 const SEGMENTS_LIMIT: usize = 4 * 1024 * 1024;
 const PLAYLIST_LIMIT: usize = 4 * 1024 * 1024;
 const METRICS_LIMIT: usize = 512 * 1024;
+/// Characters of an error kept in a sample's `error` field.
+const ERROR_CHARS: usize = 200;
 const SOAK_METRICS: [&str; 7] = [
     "irisd_catalog_batch_failures_total",
     "irisd_catalog_commands_rejected_total",
@@ -46,7 +64,8 @@ pub struct Args {
     /// Directory for `host.jsonl`, `api.jsonl`, and `journal.log`.
     #[arg(long)]
     out: PathBuf,
-    /// The systemd service name without `.service`.
+    /// The system service name without `.service`; its cgroup is read under
+    /// `system.slice`.
     #[arg(long)]
     unit: String,
     /// Block device of the recording root, for example `sda`.
@@ -58,13 +77,18 @@ pub struct Args {
     /// Camera subnet in CIDR form, for the TCP summary.
     #[arg(long)]
     subnet: Option<String>,
-    /// API base URL, for example `http://127.0.0.1:8554`.
+    /// API base URL on a literal loopback address, such as `http://127.0.0.1:8554`.
     #[arg(long)]
     api: Option<String>,
     /// Environment variable holding the API bearer token.
     #[arg(long, requires = "api")]
     token_env: Option<String>,
-    /// Minutes between API checks; 0 disables them.
+    /// PEM file of certificate authorities trusted beside the platform's store
+    /// for an `https` API behind a proxy with a private CA.
+    #[arg(long, requires = "api", value_name = "PEM")]
+    ca_file: Option<PathBuf>,
+    /// API checks run in the minutes since the epoch that are a multiple of
+    /// this value; 0 disables them.
     #[arg(long, default_value_t = 0, requires = "api")]
     api_check_every: u64,
     /// Stream kinds to check per camera.
@@ -78,8 +102,19 @@ pub struct Args {
     print: bool,
 }
 
+/// Reads a kernel pseudo-file whole, up to [`PSEUDO_FILE_LIMIT`].
 fn read_text(path: &Path) -> anyhow::Result<String> {
-    std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))
+    let mut text = String::new();
+    File::open(path)
+        .and_then(|file| file.take(PSEUDO_FILE_LIMIT + 1).read_to_string(&mut text))
+        .with_context(|| format!("reading {}", path.display()))?;
+    anyhow::ensure!(
+        text.len() as u64 <= PSEUDO_FILE_LIMIT,
+        "{} exceeds {} KiB",
+        path.display(),
+        PSEUDO_FILE_LIMIT / 1024
+    );
+    Ok(text)
 }
 
 /// Parses `key value` lines such as cgroup stat files.
@@ -95,7 +130,13 @@ fn read_kv(path: &Path) -> anyhow::Result<BTreeMap<String, i64>> {
         .collect())
 }
 
-fn read_limited(mut pipe: impl Read) -> std::io::Result<Vec<u8>> {
+/// An integer field, or JSON `null` when the text is not one, so a value
+/// that cannot be read never looks like a measured zero.
+fn integer(text: Option<&str>) -> Value {
+    json!(text.and_then(|value| value.parse::<i64>().ok()))
+}
+
+fn read_limited(mut pipe: impl Read) -> io::Result<Vec<u8>> {
     let mut bytes = Vec::new();
     pipe.by_ref()
         .take(HELPER_OUTPUT_LIMIT + 1)
@@ -103,9 +144,9 @@ fn read_limited(mut pipe: impl Read) -> std::io::Result<Vec<u8>> {
     Ok(bytes)
 }
 
-fn kill_supervised(child: &mut std::process::Child, pid: u32) -> anyhow::Result<()> {
-    if let Some(group) = rustix::process::Pid::from_raw(pid as i32) {
-        let _ = rustix::process::kill_process_group(group, rustix::process::Signal::KILL);
+fn kill_supervised(child: &mut Child, pid: u32) -> anyhow::Result<()> {
+    if let Some(group) = Pid::from_raw(pid as i32) {
+        let _ = rustix::process::kill_process_group(group, Signal::KILL);
     }
     let _ = child.kill();
     let deadline = Instant::now() + Duration::from_secs(2);
@@ -121,11 +162,39 @@ fn kill_supervised(child: &mut std::process::Child, pid: u32) -> anyhow::Result<
     }
 }
 
-fn run_cmd(cmd: &[&str], secret_env: Option<&str>) -> anyhow::Result<String> {
+/// Waits up to [`HELPER_TIMEOUT`] for a helper started under `setsid`, then
+/// kills its process group.
+fn supervise(child: &mut Child, program: &str) -> anyhow::Result<ExitStatus> {
+    let pid = child.id();
+    let deadline = Instant::now() + HELPER_TIMEOUT;
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Ok(status);
+        }
+        if Instant::now() >= deadline {
+            kill_supervised(child, pid)?;
+            anyhow::bail!(
+                "{program} timed out after {} seconds",
+                HELPER_TIMEOUT.as_secs()
+            );
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// A helper's stderr for an error message: escaped and cut short.
+fn helper_stderr(stderr: &[u8]) -> String {
+    logs::terminal_safe(&String::from_utf8_lossy(stderr))
+        .chars()
+        .take(ERROR_CHARS)
+        .collect()
+}
+
+fn run_cmd(program: &str, args: &[&str], secret_env: Option<&str>) -> anyhow::Result<String> {
     let mut command = Command::new("setsid");
     command
-        .arg(cmd[0])
-        .args(&cmd[1..])
+        .arg(program)
+        .args(args)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     if let Some(name) = secret_env {
@@ -133,72 +202,58 @@ fn run_cmd(cmd: &[&str], secret_env: Option<&str>) -> anyhow::Result<String> {
     }
     let mut child = command
         .spawn()
-        .with_context(|| format!("running {}", cmd[0]))?;
-    let pid = child.id();
+        .with_context(|| format!("running {program}"))?;
     let stdout = child.stdout.take().context("capturing helper stdout")?;
     let stderr = child.stderr.take().context("capturing helper stderr")?;
     let stdout_thread = std::thread::spawn(move || read_limited(stdout));
     let stderr_thread = std::thread::spawn(move || read_limited(stderr));
-    let deadline = Instant::now() + HELPER_TIMEOUT;
-    let status = loop {
-        if let Some(status) = child.try_wait()? {
-            break status;
-        }
-        if Instant::now() >= deadline {
-            kill_supervised(&mut child, pid)?;
-            anyhow::bail!("{} timed out after 5 seconds", cmd[0]);
-        }
-        std::thread::sleep(Duration::from_millis(20));
-    };
+    let status = supervise(&mut child, program)?;
     let stdout = stdout_thread
         .join()
-        .map_err(|_| anyhow::anyhow!("{} stdout reader panicked", cmd[0]))??;
+        .map_err(|_| anyhow::anyhow!("{program} stdout reader panicked"))??;
     let stderr = stderr_thread
         .join()
-        .map_err(|_| anyhow::anyhow!("{} stderr reader panicked", cmd[0]))??;
+        .map_err(|_| anyhow::anyhow!("{program} stderr reader panicked"))??;
     anyhow::ensure!(
         stdout.len() as u64 <= HELPER_OUTPUT_LIMIT && stderr.len() as u64 <= HELPER_OUTPUT_LIMIT,
-        "{} output exceeded 256 KiB",
-        cmd[0]
+        "{program} output exceeded {} KiB",
+        HELPER_OUTPUT_LIMIT / 1024
     );
     anyhow::ensure!(
         status.success(),
-        "{} failed with {}: {}",
-        cmd[0],
-        status,
-        terminal_safe(&String::from_utf8_lossy(&stderr))
-            .chars()
-            .take(200)
-            .collect::<String>()
+        "{program} failed with {status}: {}",
+        helper_stderr(&stderr)
     );
-    String::from_utf8(stdout).with_context(|| format!("{} output is not UTF-8", cmd[0]))
+    String::from_utf8(stdout).with_context(|| format!("{program} output is not UTF-8"))
 }
 
 /// Runs one section, turning a failure into an `error` field.
 fn section(f: impl FnOnce() -> anyhow::Result<Value>) -> Value {
     match f() {
-        Ok(v) => v,
-        Err(e) => {
-            let text: String = format!("{e:#}").chars().take(200).collect();
+        Ok(value) => value,
+        Err(error) => {
+            let text: String = format!("{error:#}").chars().take(ERROR_CHARS).collect();
             json!({ "error": text })
         }
     }
 }
 
 fn unit_props(unit: &str, secret_env: Option<&str>) -> anyhow::Result<Value> {
-    let props = "ActiveState,SubState,NRestarts,MainPID,StatusText,ExecMainStartTimestamp";
+    let props =
+        "ActiveState,SubState,NRestarts,MainPID,StatusText,ExecMainStartTimestamp,InvocationID";
     let text = run_cmd(
-        &["systemctl", "show", &format!("{unit}.service"), "-p", props],
+        "systemctl",
+        &["show", &format!("{unit}.service"), "-p", props],
         secret_env,
     )?;
     let mut out = Map::new();
     for line in text.lines() {
         if let Some((key, value)) = line.split_once('=') {
-            let v = match key {
-                "NRestarts" | "MainPID" => json!(value.parse::<i64>().unwrap_or(0)),
+            let value = match key {
+                "NRestarts" | "MainPID" => integer(Some(value)),
                 _ => json!(value),
             };
-            out.insert(key.to_owned(), v);
+            out.insert(key.to_owned(), value);
         }
     }
     Ok(Value::Object(out))
@@ -207,7 +262,7 @@ fn unit_props(unit: &str, secret_env: Option<&str>) -> anyhow::Result<Value> {
 fn block_devno(disk: &str) -> Option<String> {
     read_text(&Path::new("/sys/class/block").join(disk).join("dev"))
         .ok()
-        .map(|s| s.trim().to_owned())
+        .map(|text| text.trim().to_owned())
 }
 
 fn cgroup(unit: &str, devno: Option<&str>) -> anyhow::Result<Value> {
@@ -234,8 +289,8 @@ fn cgroup(unit: &str, devno: Option<&str>) -> anyhow::Result<Value> {
             let mut parts = line.split_whitespace();
             if parts.next() == Some(devno) {
                 for item in parts {
-                    if let Some((k, v)) = item.split_once('=') {
-                        out.insert(format!("io_{k}"), json!(v.parse::<i64>().unwrap_or(0)));
+                    if let Some((key, value)) = item.split_once('=') {
+                        out.insert(format!("io_{key}"), integer(Some(value)));
                     }
                 }
             }
@@ -246,9 +301,9 @@ fn cgroup(unit: &str, devno: Option<&str>) -> anyhow::Result<Value> {
 
 fn diskstats(disk: &str) -> anyhow::Result<Value> {
     for line in read_text(Path::new("/proc/diskstats"))?.lines() {
-        let f: Vec<&str> = line.split_whitespace().collect();
-        if f.len() >= 14 && f[2] == disk {
-            let n = |i: usize| f[i].parse::<i64>().unwrap_or(0);
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        if fields.len() >= 14 && fields[2] == disk {
+            let n = |index: usize| integer(fields.get(index).copied());
             return Ok(json!({
                 "reads": n(3), "sectors_read": n(5), "read_ms": n(6), "writes": n(7),
                 "sectors_written": n(9), "write_ms": n(10), "in_flight": n(11), "io_ms": n(12),
@@ -296,7 +351,7 @@ fn nic(iface: &str) -> anyhow::Result<Value> {
     let mut out = Map::new();
     for key in keys {
         if let Ok(text) = read_text(&base.join(key)) {
-            out.insert(key.into(), json!(text.trim().parse::<i64>().unwrap_or(0)));
+            out.insert(key.into(), integer(Some(text.trim())));
         }
     }
     anyhow::ensure!(!out.is_empty(), "no statistics for {iface}");
@@ -330,10 +385,10 @@ struct TcpClass {
 }
 
 fn tcp(subnet: &str, secret_env: Option<&str>) -> anyhow::Result<Value> {
-    let text = run_cmd(&["ss", "-tinH", "dst", subnet], secret_env)?;
+    let text = run_cmd("ss", &["-tinH", "dst", subnet], secret_env)?;
     let mut classes: BTreeMap<&str, TcpClass> = ["rtsp", "http", "other"]
         .into_iter()
-        .map(|k| (k, TcpClass::default()))
+        .map(|class| (class, TcpClass::default()))
         .collect();
     let mut current = "other";
     let (mut outstanding, mut unacked_max) = (0i64, 0i64);
@@ -341,18 +396,24 @@ fn tcp(subnet: &str, secret_env: Option<&str>) -> anyhow::Result<Value> {
         if !line.starts_with([' ', '\t']) {
             current = peer_class(line);
             if line.starts_with("ESTAB") {
-                classes.get_mut(current).expect("known class").conns += 1;
+                classes
+                    .get_mut(current)
+                    .expect("peer_class names one of the three classes")
+                    .conns += 1;
             }
             continue;
         }
-        let class = classes.get_mut(current).expect("known class");
+        let class = classes
+            .get_mut(current)
+            .expect("peer_class names one of the three classes");
         if let Some(rtt) =
             field_after(line, "rtt:").and_then(|v| v.split('/').next()?.parse::<f64>().ok())
         {
             class.rtts.push(rtt);
         }
-        if let Some(r) = field_after(line, "retrans:") {
-            let mut parts = r.split('/');
+        // Absent fields add nothing to these sums.
+        if let Some(retransmits) = field_after(line, "retrans:") {
+            let mut parts = retransmits.split('/');
             outstanding += parts
                 .next()
                 .and_then(|v| v.parse::<i64>().ok())
@@ -372,17 +433,17 @@ fn tcp(subnet: &str, secret_env: Option<&str>) -> anyhow::Result<Value> {
     let mut out = Map::new();
     out.insert("retrans_outstanding".into(), json!(outstanding));
     out.insert("unacked_max".into(), json!(unacked_max));
-    for (name, c) in classes {
-        let mean = if c.rtts.is_empty() {
+    for (name, class) in classes {
+        let mean = if class.rtts.is_empty() {
             0.0
         } else {
-            (c.rtts.iter().sum::<f64>() / c.rtts.len() as f64 * 1000.0).round() / 1000.0
+            (class.rtts.iter().sum::<f64>() / class.rtts.len() as f64 * 1000.0).round() / 1000.0
         };
         out.insert(
             name.into(),
             json!({
-                "conns": c.conns, "retrans_total": c.retrans_total, "lost": c.lost,
-                "rtt_max_ms": c.rtts.iter().copied().fold(0.0, f64::max), "rtt_mean_ms": mean,
+                "conns": class.conns, "retrans_total": class.retrans_total, "lost": class.lost,
+                "rtt_max_ms": class.rtts.iter().copied().fold(0.0, f64::max), "rtt_mean_ms": mean,
             }),
         );
     }
@@ -391,7 +452,7 @@ fn tcp(subnet: &str, secret_env: Option<&str>) -> anyhow::Result<Value> {
 
 fn chrony(secret_env: Option<&str>) -> anyhow::Result<Value> {
     let mut out = Map::new();
-    for line in run_cmd(&["chronyc", "tracking"], secret_env)?.lines() {
+    for line in run_cmd("chronyc", &["tracking"], secret_env)?.lines() {
         let Some((key, value)) = line.split_once(':') else {
             continue;
         };
@@ -399,12 +460,15 @@ fn chrony(secret_env: Option<&str>) -> anyhow::Result<Value> {
         match key {
             "System time" => {
                 let mut parts = value.split_whitespace();
-                if let (Some(n), Some("seconds"), Some(dir)) = (
+                if let (Some(n), Some("seconds"), Some(direction)) = (
                     parts.next().and_then(|v| v.parse::<f64>().ok()),
                     parts.next(),
                     parts.next(),
                 ) {
-                    out.insert("offset_s".into(), json!(if dir == "slow" { -n } else { n }));
+                    out.insert(
+                        "offset_s".into(),
+                        json!(if direction == "slow" { -n } else { n }),
+                    );
                 }
             }
             "RMS offset" => {
@@ -432,8 +496,9 @@ fn chrony(secret_env: Option<&str>) -> anyhow::Result<Value> {
 
 fn proc(pid: i64) -> anyhow::Result<Value> {
     anyhow::ensure!(pid > 0, "no main pid");
+    let base = Path::new("/proc").join(pid.to_string());
     let mut out = Map::new();
-    for line in read_text(&Path::new("/proc").join(pid.to_string()).join("status"))?.lines() {
+    for line in read_text(&base.join("status"))?.lines() {
         let Some((key, value)) = line.split_once(':') else {
             continue;
         };
@@ -446,31 +511,18 @@ fn proc(pid: i64) -> anyhow::Result<Value> {
                 | "voluntary_ctxt_switches"
                 | "nonvoluntary_ctxt_switches"
         ) {
-            out.insert(
-                key.into(),
-                json!(
-                    value
-                        .split_whitespace()
-                        .next()
-                        .and_then(|v| v.parse::<i64>().ok())
-                        .unwrap_or(0)
-                ),
-            );
+            out.insert(key.into(), integer(value.split_whitespace().next()));
         }
     }
-    let stat = read_text(&Path::new("/proc").join(pid.to_string()).join("stat"))?;
-    let after = &stat[stat.rfind(')').map_or(0, |i| i + 2)..];
+    let stat = read_text(&base.join("stat"))?;
+    // The command name may hold spaces and parentheses; fields follow the last `)`.
+    let after = &stat[stat.rfind(')').map_or(0, |i| i + 2).min(stat.len())..];
     let fields: Vec<&str> = after.split_whitespace().collect();
-    let n = |i: usize| {
-        fields
-            .get(i)
-            .and_then(|v| v.parse::<i64>().ok())
-            .unwrap_or(0)
-    };
-    out.insert("minflt".into(), json!(n(7)));
-    out.insert("majflt".into(), json!(n(9)));
-    out.insert("utime_ticks".into(), json!(n(11)));
-    out.insert("stime_ticks".into(), json!(n(12)));
+    let n = |index: usize| integer(fields.get(index).copied());
+    out.insert("minflt".into(), n(7));
+    out.insert("majflt".into(), n(9));
+    out.insert("utime_ticks".into(), n(11));
+    out.insert("stime_ticks".into(), n(12));
     Ok(Value::Object(out))
 }
 
@@ -483,43 +535,40 @@ fn host() -> anyhow::Result<Value> {
         if matches!(key, "MemAvailable" | "Cached" | "Dirty" | "Writeback") {
             out.insert(
                 format!("{}_kb", key.to_lowercase()),
-                json!(
-                    value
-                        .split_whitespace()
-                        .next()
-                        .and_then(|v| v.parse::<i64>().ok())
-                        .unwrap_or(0)
-                ),
+                integer(value.split_whitespace().next()),
             );
         }
     }
-    let load = read_text(Path::new("/proc/loadavg"))?;
+    let first_float = |text: &str| {
+        json!(
+            text.split_whitespace()
+                .next()
+                .and_then(|value| value.parse::<f64>().ok())
+        )
+    };
     out.insert(
         "load1".into(),
-        json!(
-            load.split_whitespace()
-                .next()
-                .and_then(|v| v.parse::<f64>().ok())
-                .unwrap_or(0.0)
-        ),
+        first_float(&read_text(Path::new("/proc/loadavg"))?),
     );
-    let uptime = read_text(Path::new("/proc/uptime"))?;
     out.insert(
         "uptime_s".into(),
-        json!(
-            uptime
-                .split_whitespace()
-                .next()
-                .and_then(|v| v.parse::<f64>().ok())
-                .unwrap_or(0.0)
-        ),
+        first_float(&read_text(Path::new("/proc/uptime"))?),
     );
     Ok(Value::Object(out))
 }
 
+/// How [`OutputDir::open_regular_fd`] opens an artifact.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OpenMode {
+    /// Write from the start, leaving the contents in place.
+    Write,
+    /// Append every write at the end.
+    Append,
+}
+
 struct OutputDir {
-    fd: std::fs::File,
-    _lock: std::fs::File,
+    fd: File,
+    _lock: File,
 }
 
 impl OutputDir {
@@ -528,31 +577,29 @@ impl OutputDir {
     /// its mode is otherwise the operator's and is never changed.
     fn open(path: &Path) -> anyhow::Result<Self> {
         if !path.exists() {
-            std::fs::DirBuilder::new()
+            DirBuilder::new()
                 .mode(0o700)
                 .create(path)
                 .with_context(|| format!("creating private output directory {}", path.display()))?;
         }
+        let uid = rustix::process::geteuid().as_raw();
         let metadata = std::fs::symlink_metadata(path)?;
         anyhow::ensure!(
             metadata.file_type().is_dir() && !metadata.file_type().is_symlink(),
             "output path must be a real directory"
         );
         anyhow::ensure!(
-            metadata.uid() == rustix::process::getuid().as_raw(),
+            metadata.uid() == uid,
             "output directory must be owned by the current user"
         );
-        let fd = rustix::fs::open(
+        let fd = File::from(rustix::fs::open(
             path,
-            rustix::fs::OFlags::RDONLY
-                | rustix::fs::OFlags::DIRECTORY
-                | rustix::fs::OFlags::NOFOLLOW,
-            rustix::fs::Mode::empty(),
-        )?;
-        let fd = std::fs::File::from(fd);
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW,
+            Mode::empty(),
+        )?);
         let opened = fd.metadata()?;
         anyhow::ensure!(
-            opened.is_dir() && opened.uid() == rustix::process::getuid().as_raw(),
+            opened.is_dir() && opened.uid() == uid,
             "opened output directory is not a caller-owned directory"
         );
         anyhow::ensure!(
@@ -563,115 +610,137 @@ impl OutputDir {
             opened.mode() & 0o7777,
             path.display()
         );
-        let lock = Self::open_regular_fd(&fd, ".lock", false)?;
-        rustix::fs::flock(&lock, rustix::fs::FlockOperation::NonBlockingLockExclusive)
+        let lock = Self::open_regular_fd(&fd, ".lock", OpenMode::Write)?;
+        rustix::fs::flock(&lock, FlockOperation::NonBlockingLockExclusive)
             .context("another soak-sample process holds the output lock")?;
         Ok(Self { fd, _lock: lock })
     }
 
-    fn open_regular_fd(
-        dir: &std::fs::File,
-        name: &str,
-        append: bool,
-    ) -> anyhow::Result<std::fs::File> {
+    /// Opens or creates `name` in the pinned directory without following a
+    /// link or blocking on a FIFO; it must be a caller-owned regular file with
+    /// one link. Helpers do not inherit the descriptor.
+    fn open_regular_fd(dir: &File, name: &str, mode: OpenMode) -> anyhow::Result<File> {
         anyhow::ensure!(
             !name.is_empty() && !name.contains('/') && name != "." && name != "..",
             "invalid sampler artifact name"
         );
-        let mut flags = rustix::fs::OFlags::WRONLY
-            | rustix::fs::OFlags::CREATE
-            | rustix::fs::OFlags::NOFOLLOW
-            | rustix::fs::OFlags::NONBLOCK;
-        if append {
-            flags |= rustix::fs::OFlags::APPEND;
+        let mut flags =
+            OFlags::WRONLY | OFlags::CREATE | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC;
+        if mode == OpenMode::Append {
+            flags |= OFlags::APPEND;
         }
-        let fd = rustix::fs::openat(
+        let file = File::from(rustix::fs::openat(
             dir,
             name,
             flags,
-            rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR,
-        )?;
-        let file = std::fs::File::from(fd);
+            Mode::RUSR | Mode::WUSR,
+        )?);
         let metadata = file.metadata()?;
         anyhow::ensure!(
             metadata.is_file()
                 && metadata.nlink() == 1
-                && metadata.uid() == rustix::process::getuid().as_raw(),
+                && metadata.uid() == rustix::process::geteuid().as_raw(),
             "sampler artifact {name} must be a caller-owned single-link regular file"
         );
         Ok(file)
     }
 
     fn append(&self, name: &str, value: &Value) -> anyhow::Result<()> {
-        let mut sink = Self::open_regular_fd(&self.fd, name, true)?;
+        let mut sink = Self::open_regular_fd(&self.fd, name, OpenMode::Append)?;
         writeln!(sink, "{value}")?;
         sink.sync_data()?;
         Ok(())
     }
 }
 
-fn export_journal(unit: &str, out: &OutputDir, secret_env: Option<&str>) -> anyhow::Result<Value> {
+/// Appends the unit's journal since the last export to `journal.log`. On a
+/// failure the appended bytes are removed again: `journalctl` stores its
+/// cursor only when it finishes, so the next run exports them once more.
+/// Whether `id` has the form of a systemd invocation id: 32 hexadecimal digits.
+fn valid_invocation(id: &str) -> bool {
+    id.len() == 32 && id.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+/// `journalctl`'s arguments for an export of `unit` from the cursor file at
+/// `cursor`. A first export, with no cursor yet, covers only `invocation`, the
+/// running instance, rather than the unit's whole history, which can outlast
+/// the helper timeout.
+fn journalctl_args(unit: &str, cursor: &str, invocation: Option<&str>) -> Vec<String> {
+    let mut args = vec![
+        "-u".to_owned(),
+        format!("{unit}.service"),
+        "-o".to_owned(),
+        "cat".to_owned(),
+        "--no-pager".to_owned(),
+        format!("--cursor-file={cursor}"),
+    ];
+    args.extend(invocation.map(|id| format!("_SYSTEMD_INVOCATION_ID={id}")));
+    args
+}
+
+fn export_journal(
+    unit: &str,
+    invocation: Option<&str>,
+    out: &OutputDir,
+    secret_env: Option<&str>,
+) -> anyhow::Result<Value> {
     // Precreate and validate the cursor. The directory descriptor is
     // intentionally inherited so /proc/self/fd/N remains stable in journalctl.
-    drop(OutputDir::open_regular_fd(
-        &out.fd,
-        "journal.cursor",
-        false,
-    )?);
-    let sink = OutputDir::open_regular_fd(&out.fd, "journal.log", true)?;
+    let first = OutputDir::open_regular_fd(&out.fd, "journal.cursor", OpenMode::Write)?
+        .metadata()?
+        .len()
+        == 0;
+    let sink = OutputDir::open_regular_fd(&out.fd, "journal.log", OpenMode::Append)?;
+    let before = sink.metadata()?.len();
+    let invocation = invocation.filter(|id| first && valid_invocation(id));
+    let exported = run_journalctl(unit, invocation, out, &sink, secret_env);
+    if exported.is_err() {
+        sink.set_len(before)
+            .context("removing a failed journal export")?;
+    }
+    let stderr = exported?;
+    sink.sync_data()?;
+    Ok(json!({
+        "bytes": sink.metadata()?.len(),
+        "stderr": String::from_utf8_lossy(&stderr).chars().take(120).collect::<String>(),
+    }))
+}
+
+fn run_journalctl(
+    unit: &str,
+    invocation: Option<&str>,
+    out: &OutputDir,
+    sink: &File,
+    secret_env: Option<&str>,
+) -> anyhow::Result<Vec<u8>> {
     let cursor = format!("/proc/self/fd/{}/journal.cursor", out.fd.as_raw_fd());
     let mut command = Command::new("setsid");
     command
         .arg("journalctl")
-        .args([
-            "-u",
-            &format!("{unit}.service"),
-            "-o",
-            "cat",
-            "--no-pager",
-            &format!("--cursor-file={cursor}"),
-        ])
+        .args(journalctl_args(unit, &cursor, invocation))
         .stdout(sink.try_clone()?)
         .stderr(Stdio::piped());
     if let Some(name) = secret_env {
         command.env_remove(name);
     }
     let mut child = command.spawn().context("running journalctl")?;
-    let pid = child.id();
     let stderr = child.stderr.take().context("capturing journalctl stderr")?;
     let stderr_thread = std::thread::spawn(move || read_limited(stderr));
-    let deadline = Instant::now() + HELPER_TIMEOUT;
-    let status = loop {
-        if let Some(status) = child.try_wait()? {
-            break status;
-        }
-        if Instant::now() >= deadline {
-            kill_supervised(&mut child, pid)?;
-            anyhow::bail!("journalctl timed out after 5 seconds");
-        }
-        std::thread::sleep(Duration::from_millis(20));
-    };
+    let status = supervise(&mut child, "journalctl")?;
     let stderr = stderr_thread
         .join()
         .map_err(|_| anyhow::anyhow!("journalctl stderr reader panicked"))??;
     anyhow::ensure!(
         stderr.len() as u64 <= HELPER_OUTPUT_LIMIT,
-        "journalctl stderr exceeded 256 KiB"
+        "journalctl stderr exceeded {} KiB",
+        HELPER_OUTPUT_LIMIT / 1024
     );
     anyhow::ensure!(
         status.success(),
         "journalctl failed with {status}: {}",
-        terminal_safe(&String::from_utf8_lossy(&stderr))
-            .chars()
-            .take(200)
-            .collect::<String>()
+        helper_stderr(&stderr)
     );
-    sink.sync_data()?;
-    Ok(json!({
-        "rc": status.code(),
-        "bytes": sink.metadata()?.len(),
-        "stderr": String::from_utf8_lossy(&stderr).chars().take(120).collect::<String>(),
-    }))
+    Ok(stderr)
 }
 
 fn hls_attributes(text: &str) -> anyhow::Result<BTreeMap<&str, &str>> {
@@ -734,9 +803,40 @@ fn validate_map(attrs: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The duration an `#EXTINF:` line gives, finite and positive.
+fn extinf_seconds(rest: &str, line_no: usize) -> anyhow::Result<f64> {
+    rest.split(',')
+        .next()
+        .and_then(|value| value.parse::<f64>().ok())
+        .filter(|value| value.is_finite() && *value > 0.0)
+        .with_context(|| format!("line {line_no}: invalid EXTINF"))
+}
+
+/// The positive length and the offset, when given, of an
+/// `#EXT-X-BYTERANGE:` line.
+fn byte_range(rest: &str, line_no: usize) -> anyhow::Result<(u64, Option<u64>)> {
+    let (length, offset) = rest
+        .split_once('@')
+        .map_or((rest, None), |(length, offset)| (length, Some(offset)));
+    let length = length
+        .parse::<u64>()
+        .ok()
+        .filter(|length| *length > 0)
+        .with_context(|| format!("line {line_no}: invalid byte-range length"))?;
+    let offset = offset
+        .map(str::parse::<u64>)
+        .transpose()
+        .with_context(|| format!("line {line_no}: invalid byte-range offset"))?;
+    Ok((length, offset))
+}
+
 /// Validates a byte-range VOD playlist and returns its bounded summary.
-pub fn playlist_summary(text: &str) -> anyhow::Result<Value> {
-    anyhow::ensure!(text.len() <= PLAYLIST_LIMIT, "playlist exceeds 4 MiB");
+fn playlist_summary(text: &str) -> anyhow::Result<Value> {
+    anyhow::ensure!(
+        text.len() <= PLAYLIST_LIMIT,
+        "playlist exceeds {} MiB",
+        PLAYLIST_LIMIT / (1024 * 1024)
+    );
     let mut lines = text.lines();
     anyhow::ensure!(
         lines.next() == Some("#EXTM3U"),
@@ -748,39 +848,20 @@ pub fn playlist_summary(text: &str) -> anyhow::Result<Value> {
     let mut next_offset: BTreeMap<String, u64> = BTreeMap::new();
     let mut pending_duration: Option<f64> = None;
     let mut pending_range: Option<(u64, Option<u64>)> = None;
-    for (line_no, line) in lines.enumerate() {
+    for (index, line) in lines.enumerate() {
+        let line_no = index + 2;
         if let Some(rest) = line.strip_prefix("#EXTINF:") {
             anyhow::ensure!(
                 pending_duration.is_none() && pending_range.is_none(),
-                "line {}: dangling media state before EXTINF",
-                line_no + 2
+                "line {line_no}: dangling media state before EXTINF"
             );
-            let value = rest
-                .split(',')
-                .next()
-                .and_then(|v| v.parse::<f64>().ok())
-                .filter(|v| v.is_finite() && *v > 0.0)
-                .with_context(|| format!("line {}: invalid EXTINF", line_no + 2))?;
-            pending_duration = Some(value);
+            pending_duration = Some(extinf_seconds(rest, line_no)?);
         } else if let Some(rest) = line.strip_prefix("#EXT-X-BYTERANGE:") {
             anyhow::ensure!(
                 pending_duration.is_some() && pending_range.is_none(),
-                "line {}: byte range requires one pending EXTINF",
-                line_no + 2
+                "line {line_no}: byte range requires one pending EXTINF"
             );
-            let (length, offset) = rest
-                .split_once('@')
-                .map_or((rest, None), |(l, o)| (l, Some(o)));
-            let length = length
-                .parse::<u64>()
-                .ok()
-                .filter(|length| *length > 0)
-                .with_context(|| format!("line {}: invalid byte-range length", line_no + 2))?;
-            let offset = offset
-                .map(str::parse::<u64>)
-                .transpose()
-                .with_context(|| format!("line {}: invalid byte-range offset", line_no + 2))?;
-            pending_range = Some((length, offset));
+            pending_range = Some(byte_range(rest, line_no)?);
         } else if line == "#EXT-X-DISCONTINUITY" {
             discontinuities = discontinuities
                 .checked_add(1)
@@ -790,28 +871,27 @@ pub fn playlist_summary(text: &str) -> anyhow::Result<Value> {
         } else if let Some(attrs) = line.strip_prefix("#EXT-X-MAP:") {
             anyhow::ensure!(
                 pending_duration.is_none() && pending_range.is_none(),
-                "line {}: map interrupts pending media",
-                line_no + 2
+                "line {line_no}: map interrupts pending media"
             );
-            validate_map(attrs).with_context(|| format!("line {}: invalid map", line_no + 2))?;
+            validate_map(attrs).with_context(|| format!("line {line_no}: invalid map"))?;
             maps = maps.checked_add(1).context("too many maps")?;
         } else if !line.is_empty() && !line.starts_with('#') {
-            anyhow::ensure!(maps > 0, "line {}: media precedes its map", line_no + 2);
+            anyhow::ensure!(maps > 0, "line {line_no}: media precedes its map");
             let segment_duration = pending_duration
                 .take()
-                .with_context(|| format!("line {}: media URI without EXTINF", line_no + 2))?;
+                .with_context(|| format!("line {line_no}: media URI without EXTINF"))?;
             let (length, offset) = pending_range
                 .take()
-                .with_context(|| format!("line {}: media URI without byte range", line_no + 2))?;
+                .with_context(|| format!("line {line_no}: media URI without byte range"))?;
             let offset = match offset {
                 None => next_offset.get(line).copied().with_context(|| {
-                    format!("line {}: first range needs an explicit offset", line_no + 2)
+                    format!("line {line_no}: first range needs an explicit offset")
                 })?,
-                Some(o) => {
-                    if next_offset.get(line).is_some_and(|&n| n != o) {
+                Some(offset) => {
+                    if next_offset.get(line).is_some_and(|&next| next != offset) {
                         breaks = breaks.checked_add(1).context("too many range breaks")?;
                     }
-                    o
+                    offset
                 }
             };
             let end = offset.checked_add(length).context("byte range overflow")?;
@@ -838,42 +918,188 @@ pub fn playlist_summary(text: &str) -> anyhow::Result<Value> {
     }))
 }
 
-async fn api_get(
-    client: &reqwest::Client,
-    base: &reqwest::Url,
-    path: &str,
-    token: Option<&str>,
-    limit: usize,
-) -> anyhow::Result<(u16, Vec<u8>)> {
-    let url = base.join(path)?;
-    anyhow::ensure!(
-        url.origin() == base.origin(),
-        "API request escaped the loopback origin"
-    );
-    let mut request = client.get(url);
-    if let Some(token) = token {
-        request = request.bearer_auth(token);
-    }
-    let mut response = request.send().await?;
-    let status = response.status().as_u16();
-    if let Some(length) = response.content_length() {
-        anyhow::ensure!(length <= limit as u64, "API response exceeds {limit} bytes");
-    }
-    let mut body = Vec::new();
-    while let Some(chunk) = response.chunk().await? {
-        anyhow::ensure!(
-            body.len()
-                .checked_add(chunk.len())
-                .is_some_and(|n| n <= limit),
-            "API response exceeds {limit} bytes"
-        );
-        body.extend_from_slice(&chunk);
-    }
-    Ok((status, body))
+/// The loopback API a check talks to: its client, origin, and bearer.
+struct Api<'a> {
+    client: Client,
+    base: &'a Url,
+    token: Option<&'a str>,
 }
 
-fn validate_api_base(text: &str) -> anyhow::Result<reqwest::Url> {
-    let mut url = reqwest::Url::parse(text).context("parsing --api")?;
+impl Api<'_> {
+    /// Fetches `path` on the base origin with the bearer, at most `limit` bytes.
+    async fn get(&self, path: &str, limit: usize) -> anyhow::Result<(u16, Vec<u8>)> {
+        let url = self.base.join(path)?;
+        anyhow::ensure!(
+            url.origin() == self.base.origin(),
+            "API request escaped the loopback origin"
+        );
+        let mut request = self.client.get(url);
+        if let Some(token) = self.token {
+            request = request.bearer_auth(token);
+        }
+        let mut response = request.send().await?;
+        let status = response.status().as_u16();
+        if let Some(length) = response.content_length() {
+            anyhow::ensure!(length <= limit as u64, "API response exceeds {limit} bytes");
+        }
+        let mut body = Vec::new();
+        while let Some(chunk) = response.chunk().await? {
+            anyhow::ensure!(
+                body.len()
+                    .checked_add(chunk.len())
+                    .is_some_and(|n| n <= limit),
+                "API response exceeds {limit} bytes"
+            );
+            body.extend_from_slice(&chunk);
+        }
+        Ok((status, body))
+    }
+
+    async fn health(&self) -> anyhow::Result<Value> {
+        let (status, body) = self.get("/api/health", HEALTH_LIMIT).await?;
+        let health: Value = serde_json::from_slice(&body).context("health response is not JSON")?;
+        anyhow::ensure!(
+            health.get("status").and_then(Value::as_str) == Some("ok")
+                && health
+                    .get("uptime_s")
+                    .and_then(Value::as_i64)
+                    .is_some_and(|uptime| uptime >= 0)
+                && health
+                    .get("version")
+                    .and_then(Value::as_str)
+                    .is_some_and(|version| !version.is_empty()),
+            "health response has an invalid schema"
+        );
+        anyhow::ensure!(status == 200, "health endpoint returned HTTP {status}");
+        Ok(json!({ "status": status, "body": health }))
+    }
+
+    /// `/metrics` requires the root bearer unless the daemon exposes it publicly.
+    async fn metrics(&self) -> anyhow::Result<Value> {
+        let (status, body) = self.get("/metrics", METRICS_LIMIT).await?;
+        anyhow::ensure!(status == 200, "metrics endpoint returned HTTP {status}");
+        let values = metrics_summary(std::str::from_utf8(&body).context("metrics are not UTF-8")?)?;
+        Ok(json!({ "status": status, "values": values }))
+    }
+
+    /// The camera ids discovery lists, and its summary for the check.
+    async fn cameras(&self, kinds: usize) -> anyhow::Result<(BTreeSet<CameraId>, Value)> {
+        let (status, body) = self.get("/api/cameras", CAMERAS_LIMIT).await?;
+        anyhow::ensure!(status == 200, "camera discovery returned HTTP {status}");
+        let cameras = serde_json::from_slice::<Vec<Value>>(&body)
+            .context("camera discovery is not an array")?;
+        anyhow::ensure!(
+            cameras.len() <= MAX_CAMERAS,
+            "camera discovery exceeds {MAX_CAMERAS} rows"
+        );
+        let mut ids = BTreeSet::new();
+        for camera in &cameras {
+            let id = camera
+                .get("id")
+                .and_then(Value::as_str)
+                .context("camera row is missing a string id")?;
+            let id = CameraId::try_new(id).context("invalid camera id")?;
+            anyhow::ensure!(!ids.contains(&id), "duplicate camera id {id}");
+            ids.insert(id);
+        }
+        let expected_streams = ids
+            .len()
+            .checked_mul(kinds)
+            .filter(|&streams| streams <= MAX_STREAM_REQUESTS)
+            .with_context(|| format!("camera/kind product exceeds {MAX_STREAM_REQUESTS}"))?;
+        let summary =
+            json!({ "status": status, "count": ids.len(), "expected_streams": expected_streams });
+        Ok((ids, summary))
+    }
+
+    /// One stream's segment rows and VOD playlist over the check's window.
+    async fn stream(
+        &self,
+        camera: &CameraId,
+        kind: StreamKind,
+        window: &CheckWindow,
+    ) -> anyhow::Result<Value> {
+        let mut entry = Map::new();
+        let path = format!(
+            "/api/streams/{camera}/{kind}/segments?from={}&to={}",
+            window.segments_from, window.to
+        );
+        let (status, body) = self.get(&path, SEGMENTS_LIMIT).await?;
+        entry.insert("segments_status".into(), json!(status));
+        if status == 200 {
+            entry.extend(segments_summary(&body)?);
+        }
+        let path = format!(
+            "/api/streams/{camera}/{kind}/hls/vod.m3u8?from={}&to={}",
+            window.playlist_from, window.to
+        );
+        let (status, body) = self.get(&path, PLAYLIST_LIMIT).await?;
+        entry.insert("playlist_status".into(), json!(status));
+        if status == 200 {
+            entry.insert(
+                "playlist".into(),
+                playlist_summary(std::str::from_utf8(&body).context("playlist is not UTF-8")?)?,
+            );
+        }
+        Ok(Value::Object(entry))
+    }
+}
+
+/// The times an API check asks about, in the API's RFC 3339 form.
+struct CheckWindow {
+    segments_from: String,
+    playlist_from: String,
+    to: String,
+}
+
+impl CheckWindow {
+    fn ending(now_s: f64) -> Self {
+        Self {
+            segments_from: time::iso(now_s - SEGMENTS_WINDOW_SECONDS),
+            playlist_from: time::iso(now_s - PLAYLIST_WINDOW_SECONDS),
+            to: time::iso(now_s),
+        }
+    }
+}
+
+/// The row count, sealed rows, bytes, fragments, runs, and discontinuities of
+/// a segment listing.
+fn segments_summary(body: &[u8]) -> anyhow::Result<Map<String, Value>> {
+    let rows: Vec<Value> = serde_json::from_slice(body).context("segment listing is not JSON")?;
+    anyhow::ensure!(
+        rows.len() <= MAX_SEGMENT_ROWS,
+        "segment response has too many rows"
+    );
+    let runs: BTreeSet<i64> = rows
+        .iter()
+        .filter_map(|row| row.get("run_seq")?.as_i64())
+        .collect();
+    let flagged = |key: &str| {
+        rows.iter()
+            .filter(|row| row.get(key).and_then(Value::as_bool) == Some(true))
+            .count()
+    };
+    let checked_sum = |key: &str| -> anyhow::Result<u64> {
+        rows.iter().try_fold(0u64, |total, row| {
+            let value = row
+                .get(key)
+                .and_then(Value::as_u64)
+                .with_context(|| format!("segment row has invalid {key}"))?;
+            total.checked_add(value).context("segment total overflow")
+        })
+    };
+    let mut summary = Map::new();
+    summary.insert("segments".into(), json!(rows.len()));
+    summary.insert("sealed".into(), json!(flagged("sealed")));
+    summary.insert("bytes".into(), json!(checked_sum("bytes")?));
+    summary.insert("fragments".into(), json!(checked_sum("fragments")?));
+    summary.insert("runs".into(), json!(runs.len()));
+    summary.insert("discontinuities".into(), json!(flagged("discontinuity")));
+    Ok(summary)
+}
+
+fn validate_api_base(text: &str) -> anyhow::Result<Url> {
+    let mut url = Url::parse(text).context("parsing --api")?;
     anyhow::ensure!(
         matches!(url.scheme(), "http" | "https"),
         "API scheme must be http or https"
@@ -892,11 +1118,7 @@ fn validate_api_base(text: &str) -> anyhow::Result<reqwest::Url> {
     );
     let loopback = url
         .host_str()
-        .and_then(|host| {
-            host.trim_matches(['[', ']'])
-                .parse::<std::net::IpAddr>()
-                .ok()
-        })
+        .and_then(|host| host.trim_matches(['[', ']']).parse::<IpAddr>().ok())
         .is_some_and(|ip| ip.is_loopback());
     anyhow::ensure!(loopback, "API host must be a literal loopback address");
     url.set_path("/");
@@ -935,164 +1157,50 @@ fn metrics_summary(text: &str) -> anyhow::Result<Value> {
     Ok(Value::Object(values))
 }
 
-fn parse_kinds(text: &str) -> anyhow::Result<Vec<String>> {
+fn parse_kinds(text: &str) -> anyhow::Result<Vec<StreamKind>> {
     let kinds = text
         .split(',')
         .map(str::trim)
         .filter(|kind| !kind.is_empty())
-        .map(str::to_owned)
-        .collect::<std::collections::BTreeSet<_>>();
+        .map(|kind| kind.parse::<StreamKind>().context("invalid stream kind"))
+        .collect::<anyhow::Result<BTreeSet<_>>>()?;
     anyhow::ensure!(
         !kinds.is_empty() && kinds.len() <= MAX_KINDS,
         "--kinds must contain 1..={MAX_KINDS} unique values"
     );
-    anyhow::ensure!(
-        kinds.iter().all(|kind| {
-            kind.len() <= 32
-                && kind
-                    .bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-'))
-        }),
-        "invalid stream kind"
-    );
     Ok(kinds.into_iter().collect())
 }
 
-#[allow(clippy::too_many_lines)]
-async fn api_check(
-    base: &reqwest::Url,
-    token: Option<&str>,
-    kinds: &[String],
-    now_s: f64,
-) -> anyhow::Result<Value> {
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(5))
-        .redirect(reqwest::redirect::Policy::none())
-        .build()?;
+/// The API client: redirects off, and for an `https` base the platform's
+/// trust store plus the `--ca-file` authorities.
+fn api_client(base: &Url, ca_file: Option<&Path>) -> anyhow::Result<Client> {
+    let builder = Client::builder()
+        .timeout(API_REQUEST_TIMEOUT)
+        .redirect(Policy::none());
+    let builder = if base.scheme() == "https" {
+        let tls = iris_tls::client_config(ca_file)
+            .context("building the TLS trust for the API checks")?;
+        builder.tls_backend_preconfigured((*tls).clone())
+    } else {
+        builder
+    };
+    Ok(builder.build()?)
+}
+
+async fn api_check(api: &Api<'_>, kinds: &[StreamKind], now_s: f64) -> anyhow::Result<Value> {
     let mut out = Map::new();
-    let (status, body) = api_get(&client, base, "/api/health", token, HEALTH_LIMIT).await?;
-    let health: Value = serde_json::from_slice(&body).context("health response is not JSON")?;
-    anyhow::ensure!(
-        health.get("status").and_then(Value::as_str) == Some("ok")
-            && health
-                .get("uptime_s")
-                .and_then(Value::as_i64)
-                .is_some_and(|uptime| uptime >= 0)
-            && health
-                .get("version")
-                .and_then(Value::as_str)
-                .is_some_and(|version| !version.is_empty()),
-        "health response has an invalid schema"
-    );
-    out.insert("health".into(), json!({ "status": status, "body": health }));
-    anyhow::ensure!(status == 200, "health endpoint returned HTTP {status}");
-    // `/metrics` requires the root bearer unless the daemon exposes it publicly.
-    let (status, body) = api_get(&client, base, "/metrics", token, METRICS_LIMIT).await?;
-    anyhow::ensure!(status == 200, "metrics endpoint returned HTTP {status}");
-    let metrics = metrics_summary(std::str::from_utf8(&body).context("metrics are not UTF-8")?)?;
-    out.insert(
-        "metrics".into(),
-        json!({ "status": status, "values": metrics }),
-    );
-    let (status, body) = api_get(&client, base, "/api/cameras", token, CAMERAS_LIMIT).await?;
-    anyhow::ensure!(status == 200, "camera discovery returned HTTP {status}");
-    let cameras =
-        serde_json::from_slice::<Vec<Value>>(&body).context("camera discovery is not an array")?;
-    anyhow::ensure!(
-        cameras.len() <= MAX_CAMERAS,
-        "camera discovery exceeds {MAX_CAMERAS} rows"
-    );
-    let mut ids = std::collections::BTreeSet::new();
-    for camera in &cameras {
-        let id = camera
-            .get("id")
-            .and_then(Value::as_str)
-            .context("camera row is missing a string id")?;
-        anyhow::ensure!(
-            !id.is_empty()
-                && id.len() <= 64
-                && id
-                    .bytes()
-                    .all(|b| { b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.') }),
-            "invalid camera id"
-        );
-        anyhow::ensure!(ids.insert(id.to_owned()), "duplicate camera id {id}");
-    }
-    anyhow::ensure!(
-        ids.len()
-            .checked_mul(kinds.len())
-            .is_some_and(|n| n <= MAX_STREAM_REQUESTS),
-        "camera/kind product exceeds {MAX_STREAM_REQUESTS}"
-    );
-    let expected_streams = ids
-        .len()
-        .checked_mul(kinds.len())
-        .context("camera/kind product overflow")?;
-    out.insert(
-        "cameras".into(),
-        json!({ "status": status, "count": ids.len(), "expected_streams": expected_streams }),
-    );
-    let segments_from = iso(now_s - 15.0 * 60.0);
-    let playlist_from = iso(now_s - 10.0 * 60.0);
-    let to = iso(now_s);
+    out.insert("health".into(), api.health().await?);
+    out.insert("metrics".into(), api.metrics().await?);
+    let (ids, cameras) = api.cameras(kinds.len()).await?;
+    out.insert("cameras".into(), cameras);
+    let window = CheckWindow::ending(now_s);
     let mut streams = Map::new();
     for camera in &ids {
-        for kind in kinds {
-            let mut entry = Map::new();
-            let path =
-                format!("/api/streams/{camera}/{kind}/segments?from={segments_from}&to={to}");
-            let (status, body) = api_get(&client, base, &path, token, SEGMENTS_LIMIT).await?;
-            entry.insert("segments_status".into(), json!(status));
-            if status == 200 {
-                let rows: Vec<Value> = serde_json::from_slice(&body)?;
-                anyhow::ensure!(rows.len() <= 100_000, "segment response has too many rows");
-                let runs: std::collections::BTreeSet<i64> = rows
-                    .iter()
-                    .filter_map(|r| r.get("run_seq")?.as_i64())
-                    .collect();
-                entry.insert("segments".into(), json!(rows.len()));
-                entry.insert(
-                    "sealed".into(),
-                    json!(
-                        rows.iter()
-                            .filter(|r| r.get("sealed").and_then(Value::as_bool) == Some(true))
-                            .count()
-                    ),
-                );
-                let checked_sum = |key: &str| -> anyhow::Result<u64> {
-                    rows.iter().try_fold(0u64, |total, row| {
-                        let value = row
-                            .get(key)
-                            .and_then(Value::as_u64)
-                            .with_context(|| format!("segment row has invalid {key}"))?;
-                        total.checked_add(value).context("segment total overflow")
-                    })
-                };
-                entry.insert("bytes".into(), json!(checked_sum("bytes")?));
-                entry.insert("fragments".into(), json!(checked_sum("fragments")?));
-                entry.insert("runs".into(), json!(runs.len()));
-                entry.insert(
-                    "discontinuities".into(),
-                    json!(
-                        rows.iter()
-                            .filter(
-                                |r| r.get("discontinuity").and_then(Value::as_bool) == Some(true)
-                            )
-                            .count()
-                    ),
-                );
-            }
-            let path =
-                format!("/api/streams/{camera}/{kind}/hls/vod.m3u8?from={playlist_from}&to={to}");
-            let (status, body) = api_get(&client, base, &path, token, PLAYLIST_LIMIT).await?;
-            entry.insert("playlist_status".into(), json!(status));
-            if status == 200 {
-                entry.insert(
-                    "playlist".into(),
-                    playlist_summary(std::str::from_utf8(&body).context("playlist is not UTF-8")?)?,
-                );
-            }
-            streams.insert(format!("{camera}/{kind}"), Value::Object(entry));
+        for &kind in kinds {
+            streams.insert(
+                format!("{camera}/{kind}"),
+                api.stream(camera, kind, &window).await?,
+            );
         }
     }
     out.insert("streams".into(), Value::Object(streams));
@@ -1100,22 +1208,36 @@ async fn api_check(
 }
 
 fn api_check_blocking(
-    base: &reqwest::Url,
+    base: &Url,
     token: Option<&str>,
-    kinds: &[String],
+    ca_file: Option<&Path>,
+    kinds: &[StreamKind],
     now_s: f64,
 ) -> anyhow::Result<Value> {
+    let api = Api {
+        client: api_client(base, ca_file)?,
+        base,
+        token,
+    };
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
     runtime
         .block_on(async {
-            tokio::time::timeout(API_CHECK_TIMEOUT, api_check(base, token, kinds, now_s)).await
+            tokio::time::timeout(API_CHECK_TIMEOUT, api_check(&api, kinds, now_s)).await
         })
-        .context("API check exceeded its 30-second budget")?
+        .with_context(|| {
+            format!(
+                "API check exceeded its {}-second budget",
+                API_CHECK_TIMEOUT.as_secs()
+            )
+        })?
 }
 
-/// Runs the tool.
+/// Appends one sample to `host.jsonl`, the journal since the last run to
+/// `journal.log`, and, when a check is due, one check to `api.jsonl`. Only
+/// invalid arguments and an unusable output directory, lock, or artifact fail
+/// the run; a section that fails becomes that section's `error` field.
 pub fn run(args: &Args) -> anyhow::Result<()> {
     anyhow::ensure!(
         args.api.is_some() || (args.api_check_every == 0 && args.token_env.is_none()),
@@ -1124,13 +1246,17 @@ pub fn run(args: &Args) -> anyhow::Result<()> {
     let api_base = args.api.as_deref().map(validate_api_base).transpose()?;
     let kinds = parse_kinds(&args.kinds)?;
     let out = OutputDir::open(&args.out)?;
-    let now_s = now();
+    let now_s = time::now();
     let secret_env = args.token_env.as_deref();
     let unit = section(|| unit_props(&args.unit, secret_env));
     let pid = unit.get("MainPID").and_then(Value::as_i64).unwrap_or(0);
+    let invocation = unit
+        .get("InvocationID")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
     let devno = args.disk.as_deref().and_then(block_devno);
     let mut sample = Map::new();
-    sample.insert("ts".into(), json!(iso(now_s)));
+    sample.insert("ts".into(), json!(time::iso(now_s)));
     sample.insert("unit".into(), unit);
     sample.insert(
         "cgroup".into(),
@@ -1152,7 +1278,7 @@ pub fn run(args: &Args) -> anyhow::Result<()> {
     if !args.no_journal {
         sample.insert(
             "journal".into(),
-            section(|| export_journal(&args.unit, &out, secret_env)),
+            section(|| export_journal(&args.unit, invocation.as_deref(), &out, secret_env)),
         );
     }
     let sample = Value::Object(sample);
@@ -1163,7 +1289,7 @@ pub fn run(args: &Args) -> anyhow::Result<()> {
     let due = args.api_check_every > 0 && (now_s as u64 / 60).is_multiple_of(args.api_check_every);
     if let (Some(base), true) = (&api_base, due) {
         let mut check = Map::new();
-        check.insert("ts".into(), json!(iso(now_s)));
+        check.insert("ts".into(), json!(time::iso(now_s)));
         let result = section(|| {
             let token = args
                 .token_env
@@ -1174,7 +1300,13 @@ pub fn run(args: &Args) -> anyhow::Result<()> {
                     })
                 })
                 .transpose()?;
-            api_check_blocking(base, token.as_deref(), &kinds, now_s)
+            api_check_blocking(
+                base,
+                token.as_deref(),
+                args.ca_file.as_deref(),
+                &kinds,
+                now_s,
+            )
         });
         match result {
             Value::Object(fields) => check.extend(fields),
@@ -1196,10 +1328,17 @@ pub fn run(args: &Args) -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::fmt::Write as _;
+    use std::fs::Permissions;
+    use std::io::{BufRead as _, BufReader};
+    use std::net::TcpListener;
     use std::os::unix::fs::PermissionsExt as _;
     use std::os::unix::fs::symlink;
+    use std::sync::{Arc, Mutex};
+
+    use rustix::io::FdFlags;
+
+    use super::*;
 
     #[test]
     fn tcp_fields_match_token_boundaries() {
@@ -1209,22 +1348,31 @@ mod tests {
         assert_eq!(field_after(line, "lost:"), None);
     }
 
-    #[test]
-    fn metrics_summary_selects_required_bounded_counters() {
+    fn metrics_text() -> String {
         let mut text = String::from("# HELP ignored ignored\nirisd_requests_total 9\n");
         for (index, name) in SOAK_METRICS.into_iter().enumerate() {
             writeln!(&mut text, "{name} {index}").unwrap();
         }
-        let summary = metrics_summary(&text).unwrap();
+        text
+    }
+
+    #[test]
+    fn metrics_summary_selects_the_soak_counters() {
+        let summary = metrics_summary(&metrics_text()).unwrap();
         assert_eq!(summary.as_object().unwrap().len(), SOAK_METRICS.len());
         assert_eq!(summary["irisd_catalog_batch_failures_total"], 0.0);
+    }
 
+    #[test]
+    fn a_partial_scrape_is_refused() {
         assert!(metrics_summary("irisd_catalog_batch_failures_total 0\n").is_err());
     }
 
     #[test]
     fn playlist_summary_counts_ranges_and_breaks() {
-        let text = "#EXTM3U\n#EXT-X-MAP:URI=\"a\",BYTERANGE=\"10@0\"\n#EXTINF:2.0,\n#EXT-X-BYTERANGE:100@10\na\n#EXTINF:2.0,\n#EXT-X-BYTERANGE:50\na\n#EXT-X-DISCONTINUITY\n#EXTINF:1.5,\n#EXT-X-BYTERANGE:20@500\na\n";
+        let text = "#EXTM3U\n#EXT-X-MAP:URI=\"a\",BYTERANGE=\"10@0\"\n#EXTINF:2.0,\n\
+                    #EXT-X-BYTERANGE:100@10\na\n#EXTINF:2.0,\n#EXT-X-BYTERANGE:50\na\n\
+                    #EXT-X-DISCONTINUITY\n#EXTINF:1.5,\n#EXT-X-BYTERANGE:20@500\na\n";
         let s = playlist_summary(text).unwrap();
         assert_eq!(s["media_segments"], 3);
         assert_eq!(s["duration_s"], 5.5);
@@ -1240,12 +1388,17 @@ mod tests {
             "#EXTINF:1,\n#EXT-X-BYTERANGE:1@0\na\n",
             "#EXTM3U\n#EXT-X-MAP:URI=\"i\",BYTERANGE=\"1@0\"\n#EXTINF:1,\n",
             "#EXTM3U\n#EXT-X-MAP:URI=\"i\",BYTERANGE=\"1@0\"\n#EXTINF:1,\na\n",
-            "#EXTM3U\n#EXT-X-MAP:URI=\"i\",BYTERANGE=\"1@0\"\n#EXTINF:1,\n#EXT-X-BYTERANGE:0@0\na\n",
-            "#EXTM3U\n#EXT-X-MAP:URI=\"i\",BYTERANGE=\"1@0\"\n#EXTINF:1,\n#EXT-X-BYTERANGE:2@18446744073709551615\na\n",
-            "#EXTM3U\n#EXT-X-MAP:URI=\"i\",BYTERANGE=\"bad\"\n#EXTINF:1,\n#EXT-X-BYTERANGE:1@0\na\n",
-            "#EXTM3U\n#EXT-X-MAP:URI=\"i\",BYTERANGE=\"2@18446744073709551615\"\n#EXTINF:1,\n#EXT-X-BYTERANGE:1@0\na\n",
+            "#EXTM3U\n#EXT-X-MAP:URI=\"i\",BYTERANGE=\"1@0\"\n#EXTINF:1,\n\
+             #EXT-X-BYTERANGE:0@0\na\n",
+            "#EXTM3U\n#EXT-X-MAP:URI=\"i\",BYTERANGE=\"1@0\"\n#EXTINF:1,\n\
+             #EXT-X-BYTERANGE:2@18446744073709551615\na\n",
+            "#EXTM3U\n#EXT-X-MAP:URI=\"i\",BYTERANGE=\"bad\"\n#EXTINF:1,\n\
+             #EXT-X-BYTERANGE:1@0\na\n",
+            "#EXTM3U\n#EXT-X-MAP:URI=\"i\",BYTERANGE=\"2@18446744073709551615\"\n#EXTINF:1,\n\
+             #EXT-X-BYTERANGE:1@0\na\n",
             "#EXTM3U\n#EXT-X-BYTERANGE:1@0\n#EXTINF:1,\na\n",
-            "#EXTM3U\n#EXTINF:1,\n#EXT-X-BYTERANGE:1@0\na\n#EXT-X-MAP:URI=\"i\",BYTERANGE=\"1@0\"\n",
+            "#EXTM3U\n#EXTINF:1,\n#EXT-X-BYTERANGE:1@0\na\n\
+             #EXT-X-MAP:URI=\"i\",BYTERANGE=\"1@0\"\n",
         ] {
             assert!(playlist_summary(text).is_err(), "{text:?}");
         }
@@ -1269,42 +1422,56 @@ mod tests {
     }
 
     #[test]
-    fn api_options_require_an_api_only_when_explicitly_requested() {
-        assert!(
-            Args::try_parse_from([
-                "soak-sample",
-                "--out",
-                "/tmp/unused",
-                "--unit",
-                "irisd",
-                "--no-journal",
-            ])
-            .is_ok()
+    fn stream_kinds_are_the_daemons() {
+        assert_eq!(
+            parse_kinds("sub, main,sub").unwrap(),
+            [StreamKind::Main, StreamKind::Sub]
+        );
+        assert!(parse_kinds("main,extra3").is_err());
+        assert!(parse_kinds(" , ").is_err());
+    }
+
+    fn parse(args: &[&str]) -> Result<Args, clap::Error> {
+        Args::try_parse_from(
+            ["soak-sample", "--out", "/tmp/unused", "--unit", "irisd"]
+                .iter()
+                .chain(args),
+        )
+    }
+
+    #[test]
+    fn the_sampler_runs_without_an_api() {
+        assert!(parse(&["--no-journal"]).is_ok());
+    }
+
+    #[test]
+    fn api_options_require_an_api() {
+        assert!(parse(&["--api-check-every", "1"]).is_err());
+        assert!(parse(&["--token-env", "TOKEN"]).is_err());
+    }
+
+    #[test]
+    fn a_first_export_covers_only_the_running_invocation() {
+        let id = "0123456789abcdef0123456789abcdef";
+        assert!(valid_invocation(id));
+        assert!(!valid_invocation("x=y"));
+        let args = journalctl_args("irisd", "/proc/self/fd/3/journal.cursor", Some(id));
+        assert_eq!(
+            args.last().map(String::as_str),
+            Some("_SYSTEMD_INVOCATION_ID=0123456789abcdef0123456789abcdef")
         );
         assert!(
-            Args::try_parse_from([
-                "soak-sample",
-                "--out",
-                "/tmp/unused",
-                "--unit",
-                "irisd",
-                "--api-check-every",
-                "1",
-            ])
-            .is_err()
+            !journalctl_args("irisd", "c", None)
+                .iter()
+                .any(|arg| arg.starts_with("_SYSTEMD"))
         );
-        assert!(
-            Args::try_parse_from([
-                "soak-sample",
-                "--out",
-                "/tmp/unused",
-                "--unit",
-                "irisd",
-                "--token-env",
-                "TOKEN",
-            ])
-            .is_err()
-        );
+    }
+
+    #[test]
+    fn an_absent_or_unreadable_integer_is_null() {
+        assert_eq!(integer(Some("12")), json!(12));
+        assert_eq!(integer(Some("n/a")), Value::Null);
+        assert_eq!(integer(None), Value::Null);
     }
 
     #[test]
@@ -1322,6 +1489,15 @@ mod tests {
     }
 
     #[test]
+    fn artifacts_are_not_inherited_by_helpers() {
+        let parent = tempfile::tempdir().unwrap();
+        let out = OutputDir::open(&parent.path().join("out")).unwrap();
+        let artifact = OutputDir::open_regular_fd(&out.fd, "api.jsonl", OpenMode::Append).unwrap();
+        let flags = rustix::io::fcntl_getfd(&artifact).unwrap();
+        assert!(flags.contains(FdFlags::CLOEXEC));
+    }
+
+    #[test]
     fn newly_created_output_directory_is_private() {
         let parent = tempfile::tempdir().unwrap();
         let out_path = parent.path().join("out");
@@ -1330,12 +1506,12 @@ mod tests {
     }
 
     #[test]
-    fn an_existing_output_directory_keeps_its_mode_unless_others_can_write() {
+    fn an_existing_output_directory_keeps_its_mode() {
         for mode in [0o755, 0o750, 0o700] {
             let parent = tempfile::tempdir().unwrap();
             let out_path = parent.path().join("out");
             std::fs::create_dir(&out_path).unwrap();
-            std::fs::set_permissions(&out_path, std::fs::Permissions::from_mode(mode)).unwrap();
+            std::fs::set_permissions(&out_path, Permissions::from_mode(mode)).unwrap();
             drop(OutputDir::open(&out_path).unwrap());
             assert_eq!(
                 std::fs::metadata(&out_path).unwrap().mode() & 0o777,
@@ -1343,11 +1519,15 @@ mod tests {
                 "mode {mode:o} is left alone"
             );
         }
+    }
+
+    #[test]
+    fn an_output_directory_others_can_write_is_refused_untouched() {
         for mode in [0o775, 0o777, 0o757] {
             let parent = tempfile::tempdir().unwrap();
             let out_path = parent.path().join("out");
             std::fs::create_dir(&out_path).unwrap();
-            std::fs::set_permissions(&out_path, std::fs::Permissions::from_mode(mode)).unwrap();
+            std::fs::set_permissions(&out_path, Permissions::from_mode(mode)).unwrap();
             let error = OutputDir::open(&out_path)
                 .err()
                 .unwrap_or_else(|| panic!("mode {mode:o} must be rejected"));
@@ -1363,12 +1543,7 @@ mod tests {
         let out_path = parent.path().join("out");
         std::fs::create_dir(&out_path).unwrap();
         let out = OutputDir::open(&out_path).unwrap();
-        rustix::fs::mkfifoat(
-            &out.fd,
-            "api.jsonl",
-            rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR,
-        )
-        .unwrap();
+        rustix::fs::mkfifoat(&out.fd, "api.jsonl", Mode::RUSR | Mode::WUSR).unwrap();
 
         let started = Instant::now();
         assert!(out.append("api.jsonl", &json!({ "ts": "now" })).is_err());
@@ -1386,19 +1561,14 @@ mod tests {
     }
 
     /// A loopback HTTP fixture for the API check: answers `/api/health`, a
-    /// `/metrics` that requires `Bearer t`, and an empty camera list, one
-    /// connection per request, and records each request's Authorization value.
-    fn api_fixture() -> (
-        String,
-        std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>>,
-    ) {
-        use std::io::BufRead as _;
-
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    /// `/metrics` that requires `Bearer t`, and a camera list, one connection
+    /// per request, and records each request's Authorization value.
+    fn api_fixture(cameras: &'static str) -> (String, Arc<Mutex<Vec<(String, String)>>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
-        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let record = std::sync::Arc::clone(&seen);
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let record = Arc::clone(&seen);
         std::thread::spawn(move || {
             let deadline = Instant::now() + Duration::from_secs(10);
             while Instant::now() < deadline {
@@ -1410,7 +1580,7 @@ mod tests {
                 socket
                     .set_read_timeout(Some(Duration::from_secs(2)))
                     .unwrap();
-                let mut reader = std::io::BufReader::new(&socket);
+                let mut reader = BufReader::new(&socket);
                 let mut request_line = String::new();
                 if reader.read_line(&mut request_line).is_err() {
                     continue;
@@ -1441,15 +1611,9 @@ mod tests {
                         "200 OK",
                         r#"{"status":"ok","uptime_s":1,"version":"0.1.0"}"#.to_owned(),
                     ),
-                    "/metrics" if authorization == "Bearer t" => {
-                        let mut metrics = String::new();
-                        for name in SOAK_METRICS {
-                            writeln!(metrics, "{name} 0").unwrap();
-                        }
-                        ("200 OK", metrics)
-                    }
+                    "/metrics" if authorization == "Bearer t" => ("200 OK", metrics_text()),
                     "/metrics" => ("401 Unauthorized", String::new()),
-                    "/api/cameras" => ("200 OK", "[]".to_owned()),
+                    "/api/cameras" => ("200 OK", cameras.to_owned()),
                     _ => ("404 Not Found", String::new()),
                 };
                 let mut socket = &socket;
@@ -1463,29 +1627,42 @@ mod tests {
         (base, seen)
     }
 
+    fn check(base: &str, token: Option<&str>) -> anyhow::Result<Value> {
+        let base = validate_api_base(base).unwrap();
+        api_check_blocking(&base, token, None, &[StreamKind::Main], time::now())
+    }
+
     #[test]
     fn the_metrics_scrape_sends_the_configured_bearer() {
-        let (base, seen) = api_fixture();
-        let base = validate_api_base(&base).unwrap();
-        let check = api_check_blocking(&base, Some("t"), &["main".to_owned()], now()).unwrap();
+        let (base, seen) = api_fixture("[]");
+        let check = check(&base, Some("t")).unwrap();
         assert_eq!(check["metrics"]["status"], 200, "{check}");
         let seen = seen.lock().unwrap().clone();
         assert!(
             seen.contains(&("/metrics".to_owned(), "Bearer t".to_owned())),
             "{seen:?}"
         );
+    }
 
-        let (unauthenticated, _) = api_fixture();
-        let unauthenticated = validate_api_base(&unauthenticated).unwrap();
-        let error = api_check_blocking(&unauthenticated, None, &["main".to_owned()], now())
-            .expect_err("a protected scrape without a token fails explicitly");
+    #[test]
+    fn a_protected_scrape_without_a_token_fails_with_http_401() {
+        let (base, _) = api_fixture("[]");
+        let error = check(&base, None).expect_err("a protected scrape without a token fails");
         assert!(format!("{error:#}").contains("HTTP 401"), "{error:#}");
     }
 
     #[test]
+    fn a_camera_id_the_daemon_would_refuse_fails_the_check() {
+        let (base, _) = api_fixture(r#"[{"id":".."}]"#);
+        let error = check(&base, Some("t")).expect_err("`..` is not a camera id");
+        assert!(
+            format!("{error:#}").contains("invalid camera id"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
     fn api_check_constructs_its_timer_inside_the_runtime() {
-        let base = validate_api_base("http://127.0.0.1:0").unwrap();
-        let result = api_check_blocking(&base, None, &["main".to_owned()], now());
-        assert!(result.is_err());
+        assert!(check("http://127.0.0.1:0", None).is_err());
     }
 }

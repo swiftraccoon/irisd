@@ -44,7 +44,8 @@ pub struct ServeLimits {
     /// Connections served at once, upgraded WebSocket connections included. A slot is
     /// taken before each `accept`, so further clients wait in the kernel's
     /// listen backlog instead of holding descriptors. Values below one are
-    /// raised to one.
+    /// raised to one and values above `tokio::sync::Semaphore::MAX_PERMITS`
+    /// lowered to it.
     pub max_connections: usize,
     /// Longest wait for a complete request head, counted from the moment the
     /// connection is ready for one; an idle kept-alive connection closes after
@@ -73,6 +74,16 @@ impl Default for ServeLimits {
 /// Cancellation stops accepting, lets every connection finish its in-flight
 /// response before closing, and returns once all connections have closed.
 /// Upgraded WebSocket sessions end through the shutdown token they observe.
+///
+/// # Errors
+///
+/// Only the error of reading the listener's local address. Accept errors are
+/// logged and retried: per-connection failures at once, resource exhaustion
+/// after a one-second pause.
+#[expect(
+    clippy::missing_panics_doc,
+    reason = "the expect names a semaphore this function owns and never closes"
+)]
 pub async fn serve_listener(
     listener: TcpListener,
     router: Router,
@@ -85,7 +96,9 @@ pub async fn serve_listener(
         max_connections = limits.max_connections,
         "API listening"
     );
-    let admission = Arc::new(Semaphore::new(limits.max_connections.max(1)));
+    let admission = Arc::new(Semaphore::new(
+        limits.max_connections.clamp(1, Semaphore::MAX_PERMITS),
+    ));
     let connections = TaskTracker::new();
     let mut http = http1::Builder::new();
     http.timer(TokioTimer::new())
@@ -147,13 +160,18 @@ pub async fn serve_listener(
     Ok(())
 }
 
-/// Errors that end one pending connection rather than the listener.
+/// Errors that end one pending connection rather than the listener: the
+/// network errors Linux's `accept(2)` reports for the connection it would have
+/// returned, which are retried at once like `EAGAIN`.
 fn is_connection_error(error: &io::Error) -> bool {
     matches!(
         error.kind(),
         io::ErrorKind::ConnectionRefused
             | io::ErrorKind::ConnectionAborted
             | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::NetworkDown
+            | io::ErrorKind::NetworkUnreachable
+            | io::ErrorKind::HostUnreachable
     )
 }
 

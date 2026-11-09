@@ -16,6 +16,7 @@ root applies to all of them.
 | `iris-api` | HTTP API: HLS, live WebSocket, export, snapshots, events, metrics |
 | `irisd` | the binary: `run`, `record`, `inspect`, `recover`, `hls`, `serve` |
 | `iris-replay` | RTSP replay server: recordings as synthetic cameras for benchmarks and fault injection |
+| `iris-tls` | the TLS client trust the viewer and the tools share: platform roots plus an optional CA file |
 | `iris-gui` | Linux viewer: GTK 4 live grid, focus, playback timeline, event retention, thumbnails, export |
 | `iris-tools` | the tools binary: log summaries, the soak sampler and report, the benchmark driver, camera probes, signed commits |
 
@@ -24,9 +25,11 @@ root applies to all of them.
 | Path | Contents |
 |---|---|
 | `../third_party/` | vendored dependencies with local patches (see its README) |
-| `../packaging/` | systemd unit and sysusers file |
+| `../packaging/` | systemd unit, sysusers file, and the install guide |
+| `../fuzz/` | cargo-fuzz targets for the parsers, with their own workspace, lockfile, and pinned nightly |
 | `../config/` | `cameras.example.toml`; local copies are gitignored |
 | `../docs/research/` | design research, decisions, and dated measurement records |
 | `../docs/design/` | crate contracts |
 | `../.rust-reference/` | the Rust project reference pack: policies and vendored guides; `STANDARDS.md` is the digest |
 | `../docs/standards/ietf/` | the protocol documents, as published |
+| `../.github/` | CI workflows (check, MSRV, audit, fuzz build, aarch64 clippy, references; rustdoc to GitHub Pages) and the weekly action updates |

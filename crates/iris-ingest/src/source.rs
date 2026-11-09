@@ -45,16 +45,27 @@ impl fmt::Debug for StreamSource {
 }
 
 /// Ingest policy.
+///
+/// `Default` gives a 2 s fragment cap, regularised timing, a 30 s inactivity
+/// timeout, a 10 s jump limit, the crate's user agent, no live ring, and
+/// packet-driven reads without a low-water mark. The daemon fills the read
+/// policy from its `[ingest]` table: timer-driven reads every 20 ms on a
+/// shared ticker and a 32 KiB low-water mark, the measured defaults of
+/// `docs/research/12-ingest-cost.md`.
 #[derive(Clone, Debug)]
 pub struct IngestOptions {
-    /// Longest fragment; a GOP longer than this is split.
+    /// Fragment cap: a fragment closes once its camera, receipt, or nominal
+    /// sample time reaches this plus a quarter, so timestamp jitter never
+    /// splits a GOP whose nominal length equals the cap.
     pub max_fragment: MediaTicks,
     /// How frame durations are derived.
     pub timestamp_mode: TimestampMode,
-    /// A session with no frames for this long is torn down and reconnected.
+    /// A session that delivers no RTSP data, neither frames nor RTCP, for this
+    /// long is torn down and reconnected.
     pub inactivity_timeout: Duration,
-    /// Timestamp jumps larger than this many seconds end the session.
-    pub max_jump_secs: u32,
+    /// Timestamp jumps longer than this end the session (whole seconds, at
+    /// least one).
+    pub max_jump: Duration,
     /// User-Agent sent to cameras.
     pub user_agent: String,
     /// Where to publish frames for live viewers, if anyone watches.
@@ -80,7 +91,7 @@ impl Default for IngestOptions {
             max_fragment: MediaTicks::from_secs(2),
             timestamp_mode: TimestampMode::Regularize,
             inactivity_timeout: Duration::from_secs(30),
-            max_jump_secs: 10,
+            max_jump: Duration::from_secs(10),
             user_agent: "irisd/0.1".to_owned(),
             live: None,
             read_interval: None,

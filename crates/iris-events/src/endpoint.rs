@@ -1,11 +1,15 @@
-//! Camera addressing and the sink events are delivered to.
+//! Camera addressing.
 
 use std::fmt;
 
-use iris_core::event::Event;
 use iris_core::id::CameraId;
 
 /// How to reach one camera's HTTP interface.
+///
+/// `host` is expected to pass [`iris_core::config::is_valid_host`], as every
+/// host the daemon accepts from configuration or the API does; the ONVIF entry
+/// points return `SessionError::InvalidEndpoint` for one that does not, and
+/// the CGI feed fails its request. `Debug` redacts both credentials.
 #[derive(Clone)]
 pub struct CameraEndpoint {
     /// The camera the events belong to.
@@ -45,22 +49,32 @@ impl fmt::Debug for CameraEndpoint {
             .field("http_port", &self.http_port)
             .field("https", &self.https)
             .field("tls_verify", &self.tls_verify)
-            .field("username", &self.username)
+            .field("username", &"<redacted>")
             .field("password", &"<redacted>")
             .finish()
     }
 }
 
-/// Receives normalised events.
-pub trait EventSink: Send + Sync {
-    /// Delivers one event. Implementations must not block for long; the
-    /// sources call this from their receive loops.
-    fn publish(&self, event: Event);
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn debug_output_redacts_the_credentials() {
+        let endpoint = CameraEndpoint {
+            camera: CameraId::try_new("a").unwrap(),
+            host: "192.0.2.7".into(),
+            http_port: 80,
+            https: false,
+            tls_verify: true,
+            username: "distinctive-user".to_owned(),
+            password: "distinctive-password".to_owned(),
+        };
+        for rendered in [format!("{endpoint:?}"), format!("{endpoint:#?}")] {
+            assert!(rendered.contains("192.0.2.7"), "{rendered}");
+            assert!(!rendered.contains("distinctive"), "{rendered}");
+        }
+    }
 
     #[test]
     fn base_urls_bracket_ipv6_and_preserve_other_hosts() {

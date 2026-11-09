@@ -16,21 +16,28 @@ Scope: this crate only. Read the root `AGENTS.md` first.
   omits samples starting at or after the cutoff, and shortens a crossing sample's duration.
   Keep sync preroll at the start; end clipping must not depend on edit-list support.
 - `reader::scan` stops at the first inconsistency and reports the valid length; it never
-  panics on any input (fuzz targets `scan`, `box_header`, `index`, `trailer`).
+  panics on any input (fuzz targets `scan`, `box_header`, `index`, `trailer`; `export_rebase`
+  covers `parse_fragment` and the export rewrites).
 - `ScanReport::init_len` is zero until both required initialization boxes are complete;
-  recovery relies on this guard before modifying files.
-- `reader::scan_from_offset` validates the same initialization and scans only at or after a
-  caller-proven fragment boundary; it must never turn an untrusted index offset into a prefix.
+  recovery relies on this guard before modifying files. An initialization-only file is a clean
+  scan with no fragments, not a truncation.
+- `parse_fragment` applies the scanner's bounds and structure rules, so a fragment the keyframe
+  and export paths accept is one the scanner accepts; keep the two readers in step.
 - `IndexWriter::from_claimed_file` writes only to a file whose exclusive ownership remains
   with the caller, so store initialization can roll back the exact pair without clobbering it.
-- Timescale 90 kHz, 64-bit `tfdt`, 32-bit per-sample durations (`04 §4`, §7).
+- Timescale 90 kHz, 64-bit `tfdt`, 32-bit per-sample durations (`04 §4`, §7). Codec structs
+  that mirror a box or record (`Sample`, `FragmentHeader`, `Fragment`, `FragmentInfo`,
+  `IndexHeader`, `IndexRecord`) carry the field's integer type with its unit documented
+  (`STANDARDS.md §5`).
 - Persisted-sidecar readers use the shared 131,072-record ceiling. Daemon code passes its own
   nonblocking, no-follow descriptor to `read_index_file_bounded` or
   `read_index_file_bound_to_media`; the path-taking `read_index_bounded` follows symlinks and can
-  block on special files, so it is for offline tools and tests. The low-level `read_index` codec
-  remains available only to callers that impose an equivalent bound. The bounded reader checks
-  metadata before allocation, rejects growth beyond the ceiling, and retains the format's
+  block on special files, so it is for offline tools and tests. `decode_index` is the pure codec
+  under all three and takes the same record budget. The bounded reader checks metadata before
+  allocation, rejects growth beyond the ceiling, and retains the format's
   trailing-partial-record ignore rule.
+- The sidecar's `raw_rtp`, `run_id`, and discontinuity and new-parameter flags exist nowhere in
+  the media; a rebuild from a scan loses them unless a prior sidecar's records match.
 - `scan` accepts at most the same 131,072 fragments; `ScanStop::FragmentLimit` reports a complete
   fragment beyond the limit and must never be treated as a truncation point.
 
@@ -40,10 +47,15 @@ Scope: this crate only. Read the root `AGENTS.md` first.
   `be_u64`.
 - `init.rs` — `SampleEntry`, `build_init_segment`, `VIDEO_TRACK_ID`.
 - `fragment.rs` — `Sample`, `Fragment`, `FragmentHeader`, `encode_fragment`,
-  `EncodedFragment`, the trailer codec and the format constants.
-- `reader.rs` — `scan`, `scan_from_offset`, and their report types.
-- `index.rs` — the sidecar codec, `IndexWriter`, `read_index`, `read_index_bounded`, flag constants.
-- `hls.rs` — `media_playlist`, `master_playlist`, `PlaylistOptions`.
+  `EncodedFragment`, the trailer codec, and the format constants (box flag bits included).
+- `reader.rs` — `scan`, `scan_with_limit`, `parse_fragment`, their report types, and the
+  `moof` table parsers both readers share.
+- `index.rs` — the sidecar codec, `decode_index`, `IndexWriter`, the bounded readers, flag
+  constants.
+- `export.rs` — `rebase_fragment`, `trim_fragment_end`, `with_edit_list`, `ExportError`; it
+  re-exports `MOVIE_TIMESCALE` from `init.rs`.
+- `hls.rs` — `media_playlist`, `master_playlist`, `variant_bit_rates` (RFC 8216 peak and
+  average segment bit rates), `PlaylistOptions`, `VariantBitRates`, `InvalidPlaylistText`.
 - `crc.rs` — `Crc32c`, `crc32c`.
 
 ## How to verify a change
@@ -53,7 +65,10 @@ cargo fmt -p iris-mp4
 cargo clippy -p iris-mp4 --all-targets -- -D warnings
 cargo test -p iris-mp4
 RUSTDOCFLAGS="-D warnings" cargo doc -p iris-mp4 --no-deps
-cd fuzz && cargo +nightly fuzz run scan -- -max_total_time=60   # after a parser change
+just fuzz-build                                                   # every target still builds
+cd fuzz && cargo fuzz run scan -- -max_total_time=60              # pinned nightly; after a parser
+                                                                  # change: scan, box_header, index,
+                                                                  # trailer, or export_rebase
 cargo run -p irisd -- inspect <file.mp4>                          # against a real recording
 ```
 
@@ -65,11 +80,14 @@ cargo run -p irisd -- inspect <file.mp4>                          # against a re
   `fragment_len` and CRC assume the prefix, samples, and trailer are contiguous.
 - The scanner tolerates a missing `prft` but requires `moof` then `mdat` then the trailer;
   an open-ended `mdat` is a `BadFragment`.
-- The memory parser enforces the same top-level order and one exact final trailer. Both
-  readers require native moof-relative sample addressing and complete declared trun fields.
-- `IndexRecord::decode` takes exactly 40 bytes; readers drop a trailing partial record.
-- `read_index` rejects impossible or noncontiguous fragment ranges; raw record decoding
-  remains a fixed-size codec.
+- The memory parser enforces the same top-level order, bounds, and one exact final trailer.
+  Both readers require native moof-relative sample addressing, complete declared table fields,
+  at least one sample, flags for the first sample, and containers without trailing bytes.
+- `IndexRecord::decode` takes exactly 40 bytes and accepts any; `IndexRecord::end` saturates
+  for a hand-built record. Readers drop a trailing partial record, and `decode_index` rejects
+  impossible or noncontiguous fragment ranges.
+- `media_playlist` trusts its records to come from a validated sidecar or scan; other records
+  give ranges that do not describe the file, never a panic.
 - Playlist byte ranges are contiguous per file; a change to grouping must keep
   `include_trailers = false` segments ending before each trailer (players reject unknown
   bytes inside a segment less than they reject gaps).

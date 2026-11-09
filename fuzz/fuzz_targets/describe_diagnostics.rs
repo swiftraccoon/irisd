@@ -48,13 +48,17 @@ impl log::Log for BoundedLog {
     fn flush(&self) {}
 }
 
+/// Room for the response head under retina's 1 MiB control-message limit, so
+/// every input reaches SDP interpretation.
+const MAX_BODY_BYTES: usize = 1024 * 1024 - 1024;
+
 fuzz_target!(|data: &[u8]| {
     static INIT: Once = Once::new();
     INIT.call_once(|| {
         log::set_logger(&BoundedLog).expect("the only logger");
         log::set_max_level(log::LevelFilter::Info);
     });
-    if data.len() > 1024 * 1024 - 1024 {
+    if data.len() > MAX_BODY_BYTES {
         return;
     }
     DESCRIBE_WARNINGS.store(0, Ordering::Relaxed);
@@ -74,5 +78,6 @@ fuzz_target!(|data: &[u8]| {
         );
         assert!(!error.bytes().any(|b| b.is_ascii_control()), "{error:?}");
     }
-    assert!(DESCRIBE_WARNINGS.load(Ordering::Relaxed) <= 1);
+    let warnings = DESCRIBE_WARNINGS.load(Ordering::Relaxed);
+    assert!(warnings <= 1, "{warnings} warnings for one DESCRIBE");
 });

@@ -14,6 +14,12 @@ these local hardening changes:
   representation, including significant child-adjacent mixed-content whitespace, rather than
   disappearing from notifications.
 - `WsSecurityToken`'s `Debug` output redacts the username, password digest, and nonce.
+- `TransportError::Authentication { kind }` names a digest-authentication step that could
+  not proceed (a missing, unparseable, or unsupported challenge, or a request that could not
+  be retried) without server text, instead of a fabricated HTTP 401.
+- A multicast probe keeps at most `MAX_PROBE_DATAGRAMS` (256) answer datagrams and
+  `MAX_PROBE_BYTES` (4 MiB) over every listener, so a host that floods the probe's source
+  port cannot grow memory for the length of the wait.
 
 The workspace uses this copy through `[patch.crates-io]` in the root `Cargo.toml`, so the
 dependency version stays `0.17.0`, and excludes the directory from its members, so the crate's
@@ -27,13 +33,18 @@ and patch entry only when an upstream release supplies every contract listed abo
 <https://github.com/scottlamb/retina>) with the benches removed and these local changes:
 
 - `PlayOptions::recv_low_water(bytes)` sets `SO_RCVLOWAT` on the RTSP socket after `PLAY`
-  succeeds on a TCP session.
+  succeeds on a TCP session. This is the one `unsafe` block the local changes add: a
+  `libc::setsockopt` call with a `SAFETY:` comment, justified by
+  `docs/research/12-ingest-cost.md` §4, because neither `socket2` 0.6 nor `rustix` 1.1 exposes
+  `SO_RCVLOWAT`. It adds a direct `libc` dependency (MIT OR Apache-2.0); the published crate
+  carries two `unsafe` blocks of its own.
 - `PlayOptions::detach_from_reactor(bool)` takes the socket out of tokio's reactor for
   callers that poll the session on their own timer. Reads that would block return `Pending`
   without a waker and a short read ends the tick's reads. Writes never block: a flush that
   would block returns `Pending`, keeps the unsent bytes, and continues on a later tick, so a
   server that stops reading fails the session at the next keepalive deadline. A message is
-  started only once the previous one is fully written.
+  started only once the previous one is fully written. A detach that fails loses the socket,
+  so it fails the `PLAY`.
 - A `TEARDOWN` on the session's own connection first returns its socket to the reactor and
   its low-water mark to one byte, so the request and its short response wake the task and
   the 5 s attempt deadline holds. `TEARDOWN`s on fresh connections go to the address the
@@ -54,6 +65,9 @@ and patch entry only when an upstream release supplies every contract listed abo
   receives in state `Playing` once, as its method and sizes; the stream goes on after such a
   request. The `Debug` output of `Tool` is such an excerpt, and that of `Credentials`
   redacts both fields.
+- The wall and monotonic clock are read once per socket read, and every message decoded
+  from the bytes that read delivered carries that time (`RtspMessageContext::received`);
+  the published crate read both clocks for every message.
 - SDP lines not in `type=value` form are ignored and noted rather than passed to
   `sdp-types` 0.1.8, which panics when one precedes any line but `m=`, and a media section
   without a payload type is unusable rather than a panic.
@@ -66,16 +80,17 @@ and patch entry only when an upstream release supplies every contract listed abo
 - The test helpers use the standard library instead of the `pretty_assertions` and `mylog`
   crates, so the crate's own tests run standalone:
   `cargo test --locked --manifest-path third_party/retina/Cargo.toml`. `testutil` also
-  exposes `parse_describe_response` for the `describe_diagnostics` fuzz target.
+  exposes `parse_describe_response` for the `describe_diagnostics` fuzz target and
+  `packet_meta` for `depacketize_h265`.
 
 The workspace uses this copy through `[patch.crates-io]` in the root `Cargo.toml`, so the
 dependency version stays `0.4.21` and the patch applies to every crate in the workspace, and
 excludes the directory from its members. The `Cargo.lock` beside it, generated for standalone
 test runs, is tracked.
-`retina-0.4.21-irisd.patch` carries the local changes to `Cargo.toml`, `src/client/mod.rs`, and
-`src/tokio.rs` (the socket policy, the non-blocking detached writes, the teardown routing and
-bound, and the bounded diagnostics in those files) as a diff against the published crate, for
-upstream submission; regenerate it from the published source after changing those files.
+`retina-0.4.21-irisd.patch` holds every local change as a diff against the published crate,
+except the removed benches and the tracked lockfile: applied with `patch -p0` to a copy of the
+published source without its `benches/`, it reproduces `retina/`. Regenerate it from the
+published source after changing any file here.
 Remove the vendored directory and patch entry only when an upstream release supplies every
 local contract listed above.
 
