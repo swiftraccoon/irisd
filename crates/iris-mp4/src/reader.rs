@@ -824,7 +824,10 @@ mod tests {
     use super::*;
     use crate::crc::crc32c;
     use crate::export::rebase_fragment;
-    use crate::fragment::{FragmentHeader, Sample, encode_fragment, encode_trailer};
+    use crate::fragment::{
+        FragmentHeader, NON_SYNC_SAMPLE_FLAGS, SYNC_SAMPLE_FLAGS, Sample, encode_fragment,
+        encode_trailer,
+    };
     use crate::init::build_init_segment;
     use crate::init::tests::fake_sample_entry;
 
@@ -1202,6 +1205,198 @@ mod tests {
         assert_fragment_rejected(&bytes);
     }
 
+    /// How a hand-built fragment lays out its `tfhd` and `trun`, for the
+    /// layouts another muxer writes and the recorder's encoder does not.
+    #[derive(Clone, Copy, Default)]
+    struct ForeignLayout<'a> {
+        /// `tfhd` flags beside default-base-is-moof; each declared optional
+        /// field is written as four bytes of `0xee`.
+        tfhd_flags: u32,
+        /// The default sample flags, written when `tfhd_flags` declares them.
+        default_flags: u32,
+        /// `trun` flags beside the data offset.
+        trun_flags: u32,
+        first_flags: u32,
+        /// Duration, size, and flags of each sample.
+        samples: &'a [(u32, u32, u32)],
+    }
+
+    fn boxed(kind: [u8; 4], body: &[u8]) -> Vec<u8> {
+        let mut out = u32::try_from(8 + body.len())
+            .unwrap()
+            .to_be_bytes()
+            .to_vec();
+        out.extend_from_slice(&kind);
+        out.extend_from_slice(body);
+        out
+    }
+
+    /// A fragment in `layout`: `moof`, an `mdat` of the declared sizes, and
+    /// the trailer.
+    fn foreign_fragment(layout: ForeignLayout<'_>) -> Vec<u8> {
+        let mut tfhd = (TFHD_DEFAULT_BASE_IS_MOOF | layout.tfhd_flags)
+            .to_be_bytes()
+            .to_vec();
+        tfhd.extend_from_slice(&1u32.to_be_bytes());
+        for optional in [
+            TFHD_SAMPLE_DESCRIPTION_INDEX_PRESENT,
+            TFHD_DEFAULT_SAMPLE_DURATION_PRESENT,
+            TFHD_DEFAULT_SAMPLE_SIZE_PRESENT,
+        ] {
+            if layout.tfhd_flags & optional != 0 {
+                tfhd.extend_from_slice(&[0xee; 4]);
+            }
+        }
+        if layout.tfhd_flags & TFHD_DEFAULT_SAMPLE_FLAGS_PRESENT != 0 {
+            tfhd.extend_from_slice(&layout.default_flags.to_be_bytes());
+        }
+        let mut tfdt = vec![1, 0, 0, 0];
+        tfdt.extend_from_slice(&7_000u64.to_be_bytes());
+        let trun_flags = TRUN_DATA_OFFSET_PRESENT | layout.trun_flags;
+        let mut trun = trun_flags.to_be_bytes().to_vec();
+        trun.extend_from_slice(&u32::try_from(layout.samples.len()).unwrap().to_be_bytes());
+        let data_offset_at = trun.len();
+        trun.extend_from_slice(&[0; 4]);
+        if trun_flags & TRUN_FIRST_SAMPLE_FLAGS_PRESENT != 0 {
+            trun.extend_from_slice(&layout.first_flags.to_be_bytes());
+        }
+        for (duration, size, flags) in layout.samples {
+            if trun_flags & TRUN_SAMPLE_DURATION_PRESENT != 0 {
+                trun.extend_from_slice(&duration.to_be_bytes());
+            }
+            if trun_flags & TRUN_SAMPLE_SIZE_PRESENT != 0 {
+                trun.extend_from_slice(&size.to_be_bytes());
+            }
+            if trun_flags & TRUN_SAMPLE_FLAGS_PRESENT != 0 {
+                trun.extend_from_slice(&flags.to_be_bytes());
+            }
+            if trun_flags & TRUN_COMPOSITION_OFFSETS_PRESENT != 0 {
+                trun.extend_from_slice(&[0xee; 4]);
+            }
+        }
+        let moof_len = 8 + 16 + 8 + (8 + tfhd.len()) + (8 + tfdt.len()) + (8 + trun.len());
+        let data_offset = u32::try_from(moof_len + 8).unwrap();
+        trun[data_offset_at..data_offset_at + 4].copy_from_slice(&data_offset.to_be_bytes());
+        let mut traf = boxed(*b"tfhd", &tfhd);
+        traf.extend(boxed(*b"tfdt", &tfdt));
+        traf.extend(boxed(*b"trun", &trun));
+        let mut moof = boxed(*b"mfhd", &[0, 0, 0, 0, 0, 0, 0, 9]);
+        moof.extend(boxed(*b"traf", &traf));
+        let mut bytes = boxed(*b"moof", &moof);
+        assert_eq!(bytes.len(), moof_len);
+        let payload: usize = layout.samples.iter().map(|s| s.1 as usize).sum();
+        bytes.extend(boxed(*b"mdat", &vec![0x5a; payload]));
+        bytes.extend_from_slice(&[0; TRAILER_LEN]);
+        repair_crc(&mut bytes);
+        bytes
+    }
+
+    const TIMED: u32 = TRUN_SAMPLE_DURATION_PRESENT | TRUN_SAMPLE_SIZE_PRESENT;
+
+    #[test]
+    fn optional_tfhd_fields_shift_the_default_sample_flags() {
+        for (default_flags, sync) in [(SYNC_SAMPLE_FLAGS, true), (NON_SYNC_SAMPLE_FLAGS, false)] {
+            for optional in [
+                0,
+                TFHD_SAMPLE_DESCRIPTION_INDEX_PRESENT,
+                TFHD_DEFAULT_SAMPLE_DURATION_PRESENT | TFHD_DEFAULT_SAMPLE_SIZE_PRESENT,
+                TFHD_SAMPLE_DESCRIPTION_INDEX_PRESENT
+                    | TFHD_DEFAULT_SAMPLE_DURATION_PRESENT
+                    | TFHD_DEFAULT_SAMPLE_SIZE_PRESENT,
+            ] {
+                let bytes = foreign_fragment(ForeignLayout {
+                    tfhd_flags: optional | TFHD_DEFAULT_SAMPLE_FLAGS_PRESENT,
+                    default_flags,
+                    trun_flags: TIMED,
+                    samples: &[(3000, 6, 0), (2990, 7, 0)],
+                    ..ForeignLayout::default()
+                });
+                assert_fragment_accepted(&bytes);
+                let info = parse_fragment(&bytes).unwrap();
+                assert_eq!(info.starts_with_sync, sync, "tfhd flags {optional:#x}");
+                assert_eq!(info.decode_time, 7_000);
+                assert_eq!(info.sequence, 9);
+            }
+        }
+    }
+
+    #[test]
+    fn a_tfhd_without_default_flags_must_still_hold_its_declared_fields() {
+        let layout = ForeignLayout {
+            tfhd_flags: TFHD_DEFAULT_SAMPLE_SIZE_PRESENT,
+            trun_flags: TIMED | TRUN_FIRST_SAMPLE_FLAGS_PRESENT,
+            first_flags: SYNC_SAMPLE_FLAGS,
+            samples: &[(3000, 6, 0)],
+            ..ForeignLayout::default()
+        };
+        let complete = foreign_fragment(layout);
+        assert_fragment_accepted(&complete);
+        assert!(parse_fragment(&complete).unwrap().starts_with_sync);
+
+        // The same header with the declared field cut off.
+        let mut short = complete;
+        let tfhd = box_at(&short, *b"tfhd");
+        short.drain(tfhd + 16..tfhd + 20);
+        for kind in [*b"moof", *b"traf", *b"tfhd"] {
+            grow_box(&mut short, kind, -4);
+        }
+        let trun = box_at(&short, *b"trun");
+        let data_offset = be_u32(&short, trun + 16).unwrap() - 4;
+        short[trun + 16..trun + 20].copy_from_slice(&data_offset.to_be_bytes());
+        repair_crc(&mut short);
+        assert_fragment_rejected(&short);
+    }
+
+    #[test]
+    fn per_sample_flags_and_composition_offsets_keep_the_sample_table_aligned() {
+        for (first, sync) in [(SYNC_SAMPLE_FLAGS, true), (NON_SYNC_SAMPLE_FLAGS, false)] {
+            for extra in [
+                TRUN_SAMPLE_FLAGS_PRESENT,
+                TRUN_SAMPLE_FLAGS_PRESENT | TRUN_COMPOSITION_OFFSETS_PRESENT,
+            ] {
+                // No first-sample flags and no default: the first sample's
+                // own flags decide, and the later samples' do not.
+                let bytes = foreign_fragment(ForeignLayout {
+                    trun_flags: TIMED | extra,
+                    samples: &[
+                        (3000, 6, first),
+                        (2990, 7, SYNC_SAMPLE_FLAGS),
+                        (3010, 5, NON_SYNC_SAMPLE_FLAGS),
+                    ],
+                    ..ForeignLayout::default()
+                });
+                assert_fragment_accepted(&bytes);
+                let info = parse_fragment(&bytes).unwrap();
+                assert_eq!(info.starts_with_sync, sync, "trun flags {extra:#x}");
+                assert_eq!(info.sample_durations, [3000, 2990, 3010]);
+                assert_eq!(info.sample_sizes, [6, 7, 5]);
+                assert_eq!(info.duration, 9000);
+            }
+        }
+        // Declared first-sample flags win over the first sample's own.
+        let bytes = foreign_fragment(ForeignLayout {
+            trun_flags: TIMED | TRUN_FIRST_SAMPLE_FLAGS_PRESENT | TRUN_SAMPLE_FLAGS_PRESENT,
+            first_flags: NON_SYNC_SAMPLE_FLAGS,
+            samples: &[(3000, 6, SYNC_SAMPLE_FLAGS)],
+            ..ForeignLayout::default()
+        });
+        assert!(!parse_fragment(&bytes).unwrap().starts_with_sync);
+    }
+
+    #[test]
+    fn a_trun_without_per_sample_durations_or_sizes_is_rejected() {
+        for trun_flags in [TRUN_SAMPLE_DURATION_PRESENT, TRUN_SAMPLE_SIZE_PRESENT, 0] {
+            let bytes = foreign_fragment(ForeignLayout {
+                tfhd_flags: TFHD_DEFAULT_SAMPLE_FLAGS_PRESENT,
+                default_flags: SYNC_SAMPLE_FLAGS,
+                trun_flags,
+                samples: &[(3000, 0, 0)],
+                ..ForeignLayout::default()
+            });
+            assert_fragment_rejected(&bytes);
+        }
+    }
+
     #[test]
     fn a_fragment_without_any_sample_flags_is_rejected() {
         // Clearing the tfhd default leaves a dependent fragment with no flags
@@ -1347,6 +1542,14 @@ mod tests {
         assert_eq!(f.wall, Some(WallUs::new(1_000_000)));
         assert_eq!(f.sample_durations, vec![3000, 2990]);
         assert_eq!(f.sample_sizes, vec![6, 7]);
+        // The payload offset is a file offset: the samples start there and
+        // the trailer follows them.
+        let payload = usize::try_from(f.payload_offset).unwrap();
+        assert_eq!(file[payload..payload + 6], [0, 0, 0, 2, 0x26, 1]);
+        assert_eq!(
+            f.payload_offset + 13 + TRAILER_LEN as u64,
+            f.offset + u64::from(f.len)
+        );
     }
 
     #[test]

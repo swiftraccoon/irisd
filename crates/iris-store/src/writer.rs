@@ -566,6 +566,83 @@ mod tests {
     }
 
     #[test]
+    fn queue_accounting_counts_fragments_and_bytes_in_and_out() {
+        let stats = WriterStats::default();
+        assert_eq!(stats.enqueue(700), (1, 700));
+        assert_eq!(stats.enqueue(300), (2, 1_000));
+        stats.observe_queue(2, 1_000);
+        assert_eq!((stats.queued(), stats.queued_bytes()), (2, 1_000));
+        stats.dequeue(700);
+        assert_eq!((stats.queued(), stats.queued_bytes()), (1, 300));
+        stats.dequeue(300);
+        assert_eq!((stats.queued(), stats.queued_bytes()), (0, 0));
+        assert_eq!(stats.queue_peak().get(), 2);
+        assert_eq!(stats.queue_bytes_peak().get(), 1_000);
+    }
+
+    #[test]
+    fn a_free_space_floor_above_one_hundred_percent_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let spawn = |percent| {
+            WriterHandle::spawn_with_probe(
+                vec![dir.path().to_owned()],
+                StoragePolicy::default(),
+                8,
+                percent,
+                Arc::new(NoopObserver),
+                marker_space,
+            )
+        };
+        let whole = spawn(100).expect("a floor of the whole file system is a valid setting");
+        whole.shutdown().unwrap();
+        assert_eq!(spawn(101).unwrap_err().kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(QueueFull.to_string(), "writer queue full");
+    }
+
+    /// A file system of 1,000 units with 50 available, 49 once a marker
+    /// file exists, or of no size at all under another marker.
+    fn floor_space(root: &Path) -> io::Result<FreeSpace> {
+        fs::metadata(root)?;
+        let (total, available) = if root.join("space-unknown").exists() {
+            (0, 0)
+        } else if root.join("space-49").exists() {
+            (1_000, 49)
+        } else {
+            (1_000, 50)
+        };
+        Ok(FreeSpace { total, available })
+    }
+
+    /// The floor is a share of the file system: exactly 5 % available
+    /// satisfies a 5 % floor, one unit less does not, and a file system
+    /// that reports no size has no space.
+    #[test]
+    fn the_free_space_floor_is_met_at_exactly_its_percentage() {
+        for (marker, written) in [(None, 1), (Some("space-49"), 0), (Some("space-unknown"), 0)] {
+            let dir = tempfile::tempdir().unwrap();
+            if let Some(marker) = marker {
+                fs::write(dir.path().join(marker), b"").unwrap();
+            }
+            let writer = WriterHandle::spawn_with_probe(
+                vec![dir.path().to_owned()],
+                StoragePolicy {
+                    preallocate_bytes: 0,
+                    ..StoragePolicy::default()
+                },
+                8,
+                5,
+                Arc::new(NoopObserver),
+                floor_space,
+            )
+            .unwrap();
+            writer.try_send(key(), fragment(0, Start::Sync)).unwrap();
+            writer.shutdown().unwrap();
+            assert_eq!(writer.stats().fragments(), written, "{marker:?}");
+            assert_eq!(writer.stats().dropped(), 1 - written, "{marker:?}");
+        }
+    }
+
+    #[test]
     fn the_first_root_with_space_receives_fragments_in_order() {
         let dir = tempfile::tempdir().unwrap();
         let first = dir.path().join("first");

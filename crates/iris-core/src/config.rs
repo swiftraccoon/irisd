@@ -574,8 +574,9 @@ pub struct StorageConfig {
     /// [`MIN_SYNC_INTERVAL_MS`]`..=`[`MAX_SYNC_INTERVAL_MS`].
     pub sync_interval_ms: u64,
     /// Fragment duration cap: a GOP is split once it spans this plus a quarter, so timestamp
-    /// jitter never splits a GOP of exactly this length, and a fragment lasts at most 1.25
-    /// times this. Must be in `1..=`[`MAX_FRAGMENT_MS`].
+    /// jitter never splits a GOP of exactly this length, and a fragment holds at most 1.25
+    /// times this of frames; frames the camera skipped lengthen its last frame by the gap.
+    /// Must be in `1..=`[`MAX_FRAGMENT_MS`].
     pub max_fragment_ms: u64,
     /// Space reserved ahead of the write position with `fallocate`. Must not exceed the
     /// smaller of `rotate_bytes` and [`MAX_PREALLOCATE_BYTES`]; zero disables it.
@@ -1140,6 +1141,82 @@ mod tests {
 
     fn parse(text: &str) -> Result<Config, ConfigError> {
         Config::from_toml_str(&format!("{DEV_API}{text}"))
+    }
+
+    #[test]
+    fn the_quota_converts_from_gibibytes_and_is_absent_when_unset() {
+        assert_eq!(parse("").unwrap().storage.quota_bytes(), None);
+        let quota = |gib: u64| {
+            parse(&format!("[storage]\nquota_gib={gib}\n"))
+                .unwrap()
+                .storage
+                .quota_bytes()
+        };
+        assert_eq!(quota(1), Some(1_073_741_824));
+        assert_eq!(quota(500), Some(500 * 1_073_741_824));
+    }
+
+    #[test]
+    fn a_camera_records_both_streams_by_default_and_names_their_urls() {
+        let camera = |extra: &str| {
+            parse(&format!(
+                "[[camera]]\nid=\"cam1\"\nname=\"n\"\nusername=\"u\"\npassword=\"p\"\n{extra}"
+            ))
+            .unwrap()
+            .cameras
+            .remove(0)
+        };
+        let derived = camera("rtsp_url=\"rtsp://192.0.2.7/s?channel=1&subtype=0\"\n");
+        assert_eq!(derived.record, [StreamKind::Main, StreamKind::Sub]);
+        assert_eq!(
+            derived.url_for(StreamKind::Main).as_deref(),
+            Some("rtsp://192.0.2.7/s?channel=1&subtype=0")
+        );
+        // Without a configured secondary URL, the main one with its subtype
+        // switched.
+        assert_eq!(
+            derived.url_for(StreamKind::Sub).as_deref(),
+            Some("rtsp://192.0.2.7/s?channel=1&subtype=1")
+        );
+        assert_eq!(derived.url_for(StreamKind::Audio), None);
+        let explicit =
+            camera("rtsp_url=\"rtsp://192.0.2.7/main\"\nsub_url=\"rtsp://192.0.2.7/low\"\n");
+        assert_eq!(
+            explicit.url_for(StreamKind::Sub).as_deref(),
+            Some("rtsp://192.0.2.7/low")
+        );
+        assert_eq!(
+            camera("rtsp_url=\"rtsp://192.0.2.7/main\"\nrecord=['main']\n")
+                .url_for(StreamKind::Sub),
+            None
+        );
+    }
+
+    #[test]
+    fn a_host_name_may_be_253_bytes_and_no_longer() {
+        // Labels of 63 bytes joined by dots: 63 * 3 + 61 + 3 dots = 253.
+        let label = "a".repeat(63);
+        let longest = format!("{label}.{label}.{label}.{}", "b".repeat(61));
+        assert_eq!(longest.len(), MAX_HOST_BYTES);
+        assert!(is_valid_host(&longest));
+        let longer = format!("{label}.{label}.{label}.{}", "b".repeat(62));
+        assert!(!is_valid_host(&longer));
+    }
+
+    #[test]
+    fn loading_reads_the_file_and_reports_a_missing_one() {
+        let dir = std::env::temp_dir().join(format!("iris-config-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("irisd.toml");
+        std::fs::write(&path, format!("{DEV_API}[storage]\nquota_gib=7\n")).unwrap();
+        let loaded = Config::load(&path).unwrap();
+        assert_eq!(loaded.storage.quota_gib, Some(7));
+        std::fs::remove_file(&path).unwrap();
+        assert!(matches!(
+            Config::load(&path),
+            Err(ConfigError::Io { path: missing, .. }) if missing == path
+        ));
+        std::fs::remove_dir(&dir).unwrap();
     }
 
     #[test]

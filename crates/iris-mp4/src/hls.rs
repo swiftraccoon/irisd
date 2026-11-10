@@ -412,6 +412,20 @@ mod tests {
     }
 
     #[test]
+    fn a_window_shorter_than_half_the_target_does_not_set_the_peak() {
+        // A 0.3 s segment of 9,000 bytes between two-second segments runs at
+        // 240,000 bit/s by itself, but the shortest window that counts is
+        // one second: with a neighbour it is 10,000 bytes over 2.3 s.
+        let records = [
+            timed_record(700, 1_000, 180_000),
+            timed_record(1_700, 9_000, 27_000),
+            timed_record(10_700, 1_000, 180_000),
+        ];
+        let rates = variant_bit_rates(&records, &options(1, true));
+        assert_eq!(rates.peak, 34_782);
+    }
+
+    #[test]
     fn a_single_large_segment_sets_the_peak() {
         let records = [
             timed_record(700, 1_000, 180_000),

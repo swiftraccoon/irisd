@@ -589,6 +589,64 @@ mod tests {
         assert!(served.ends_with(&[0xff, 0xd9]));
     }
 
+    /// The snapshot client verifies the camera's certificate unless the
+    /// camera is configured not to be verified: a self-signed certificate
+    /// stops a verified camera before any request, and an unverified one
+    /// serves its snapshot.
+    #[tokio::test]
+    async fn snapshots_verify_certificates_unless_told_not_to() {
+        use tokio_rustls::TlsAcceptor;
+        use tokio_rustls::rustls::ServerConfig;
+        use tokio_rustls::rustls::pki_types::PrivatePkcs8KeyDer;
+
+        for (tls_verify, served) in [(true, false), (false, true)] {
+            let certified =
+                rcgen::generate_simple_self_signed(vec!["127.0.0.1".to_owned()]).unwrap();
+            let key = PrivatePkcs8KeyDer::from(certified.signing_key.serialize_der());
+            let config = ServerConfig::builder()
+                .with_no_client_auth()
+                .with_single_cert(vec![certified.cert.der().clone()], key.into())
+                .unwrap();
+            let acceptor = TlsAcceptor::from(Arc::new(config));
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let camera = tokio::spawn(async move {
+                let (socket, _) = listener.accept().await.unwrap();
+                let Ok(mut socket) = acceptor.accept(socket).await else {
+                    return false;
+                };
+                let mut request = [0; 2_048];
+                if !matches!(socket.read(&mut request).await, Ok(length) if length > 0) {
+                    return false;
+                }
+                let body = jpeg_with_len(64);
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: image/jpeg\r\nContent-Length: {}\r\n\
+                     Connection: close\r\n\r\n",
+                    body.len()
+                );
+                socket.write_all(head.as_bytes()).await.is_ok()
+                    && socket.write_all(&body).await.is_ok()
+            });
+            let source = SnapshotSource::new(
+                address.ip().to_string(),
+                address.port(),
+                true,
+                tls_verify,
+                String::new(),
+                String::new(),
+                ResolvedSnapshot::DahuaCgi,
+            );
+            let fetched = fetch_snapshot(&cam1(), &source).await;
+            assert_eq!(fetched.is_ok(), served, "tls_verify={tls_verify}");
+            let reached = tokio::time::timeout(Duration::from_secs(5), camera)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(reached, served, "tls_verify={tls_verify}");
+        }
+    }
+
     fn upstream_text(error: ApiError) -> String {
         match error {
             ApiError::Upstream(text) => text,

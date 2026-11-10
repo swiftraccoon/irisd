@@ -21,6 +21,8 @@ jobs:
           persist-credentials: false
       - name: GTK and GStreamer development libraries (iris-gui)
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends $GTK_PACKAGES
+      - name: Allow unprivileged user namespaces (the full-filesystem test mounts a tmpfs in one)
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
       - name: Install the pinned toolchain
         run: rustup show active-toolchain || rustup toolchain install
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
@@ -31,7 +33,7 @@ jobs:
             third_party/retina -> target
       - uses: taiki-e/install-action@c509219cf42fba86913069efd0ade2458c59337b # v2.90.1
         with:
-          tool: just
+          tool: just@1.43.0
       - name: Fetch the vendored crates' locked dependencies (just vendor-test runs offline)
         run: |
           cargo fetch --locked --manifest-path third_party/oxvif/Cargo.toml
@@ -48,6 +50,8 @@ jobs:
           persist-credentials: false
       - name: GTK and GStreamer development libraries (iris-gui)
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends $GTK_PACKAGES
+      - name: Allow unprivileged user namespaces (the full-filesystem test mounts a tmpfs in one)
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
       - name: Install the minimum supported toolchain
         run: rustup toolchain install 1.92.0 --profile minimal
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
@@ -65,7 +69,7 @@ jobs:
         run: rustup show active-toolchain || rustup toolchain install
       - uses: taiki-e/install-action@c509219cf42fba86913069efd0ade2458c59337b # v2.90.1
         with:
-          tool: just,cargo-audit,cargo-deny
+          tool: just@1.43.0,cargo-audit@0.22.2,cargo-deny@0.20.2
       - name: just audit
         run: just audit
 
@@ -85,7 +89,7 @@ jobs:
           workspaces: fuzz -> target
       - uses: taiki-e/install-action@c509219cf42fba86913069efd0ade2458c59337b # v2.90.1
         with:
-          tool: just
+          tool: just@1.43.0
       - name: Install cargo-fuzz
         run: cargo install cargo-fuzz --version 0.13.2 --locked
       - name: just fuzz-clippy
@@ -94,7 +98,7 @@ jobs:
         run: just fuzz-build
 
   cross-check:
-    name: aarch64 type check
+    name: aarch64 clippy
     runs-on: ubuntu-latest
     env:
       CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
@@ -112,9 +116,29 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - uses: taiki-e/install-action@c509219cf42fba86913069efd0ade2458c59337b # v2.90.1
         with:
-          tool: just
+          tool: just@1.43.0
       - name: just cross-check
         run: just cross-check
+
+  cross-test:
+    name: aarch64 tests under emulation
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: User-mode emulation for 64-bit ARM
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends qemu-user-static
+      - name: Install the pinned toolchain and the target
+        run: |
+          rustup show active-toolchain || rustup toolchain install
+          rustup target add aarch64-unknown-linux-musl
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - uses: taiki-e/install-action@c509219cf42fba86913069efd0ade2458c59337b # v2.90.1
+        with:
+          tool: just@1.43.0
+      - name: just cross-test
+        run: just cross-test
 
   references:
     name: Reference pack snapshots
@@ -130,3 +154,5 @@ jobs:
           workspaces: .rust-reference/tools/reference-maintenance
       - name: Verify the snapshots against the manifest
         run: cargo run --locked --manifest-path .rust-reference/tools/reference-maintenance/Cargo.toml -- sync --check
+      - name: Test the maintenance tool
+        run: cargo test --locked --manifest-path .rust-reference/tools/reference-maintenance/Cargo.toml

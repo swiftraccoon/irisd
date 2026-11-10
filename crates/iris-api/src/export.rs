@@ -122,6 +122,9 @@ async fn compatible_init(
 /// timeline. Tail sample bytes outside the range are omitted, with a crossing
 /// sample's duration shortened, so end clipping does not depend on the player.
 /// The exclusive end rounds up to a media tick to retain a positive tail.
+/// Only the final fragment is trimmed: the wall anchor can step down inside a
+/// run, so an earlier fragment's wall interval may reach past the end, and
+/// the fragments after it need its last samples to decode.
 async fn stream_segments(
     segments: Vec<SegmentFragments>,
     range: TimeRange,
@@ -138,9 +141,12 @@ async fn stream_segments(
     init_slot.send(Ok(Bytes::from(init)));
     let mut sequence = 1u32;
     let mut decode_time = 0u64;
-    for seg in segments {
+    let last_segment = segments.len() - 1;
+    for (segment_index, seg) in segments.into_iter().enumerate() {
         let mut file = None;
-        for record in &seg.records {
+        let last_record = seg.records.len().saturating_sub(1);
+        for (record_index, record) in seg.records.iter().enumerate() {
+            let is_final = segment_index == last_segment && record_index == last_record;
             let Ok(fragment_slot) = tx.reserve().await else {
                 return Ok(());
             };
@@ -164,7 +170,7 @@ async fn stream_segments(
             validate_fragment_record(&fragment, record)?;
             let until = ticks_through(record.wall, range.to);
             let mut duration = u64::from(record.duration);
-            if until < u64::from(record.duration) {
+            if is_final && until < u64::from(record.duration) {
                 fragment = trim_fragment_end(
                     fragment,
                     FragmentHeader {
@@ -244,13 +250,19 @@ mod tests {
     use iris_core::id::{CameraId, StreamKey, StreamKind};
     use iris_mp4::index::IndexRecord;
 
-    #[tokio::test]
-    async fn export_omits_samples_starting_at_or_after_the_requested_end() {
+    const BASE: i64 = 1_700_000_000_000_000;
+
+    /// A recording of one-second fragments of twenty samples, one per entry
+    /// of `fragments`: its wall time in microseconds after [`BASE`] and
+    /// whether it starts with a sync sample. Returns it with its init bytes.
+    fn recording(
+        directory: &std::path::Path,
+        fragments: &[(i64, bool)],
+    ) -> (SegmentFragments, Bytes) {
         use iris_mp4::fragment::{FragmentHeader, Sample, encode_fragment};
         use iris_mp4::init::{SampleEntry, build_init_segment};
         use iris_mp4::reader::parse_fragment;
 
-        let dir = tempfile::tempdir().unwrap();
         let entry = SampleEntry::new(
             Bytes::from_static(b"\0\0\0\x10hvc1\0\0\0\0\0\0\0\0"),
             "hvc1".into(),
@@ -259,21 +271,23 @@ mod tests {
         );
         let init = build_init_segment(&entry);
         let mut bytes = init.to_vec();
-        let base = 1_700_000_000_000_000;
         let mut records = Vec::new();
-        for second in 1..=4 {
+        for (index, &(wall, sync)) in fragments.iter().enumerate() {
             let samples: Vec<Sample> = (0..20)
-                .map(|frame| Sample {
-                    data: Bytes::from(vec![0, 0, 0, 2, if frame == 0 { 0x26 } else { 0x02 }, 1]),
-                    duration: 4500,
-                    is_sync: frame == 0,
+                .map(|frame| {
+                    let is_sync = sync && frame == 0;
+                    Sample {
+                        data: Bytes::from(vec![0, 0, 0, 2, if is_sync { 0x26 } else { 0x02 }, 1]),
+                        duration: 4500,
+                        is_sync,
+                    }
                 })
                 .collect();
             let encoded = encode_fragment(
                 &FragmentHeader {
-                    sequence: second as u32,
-                    decode_time: second * 90_000,
-                    wall: WallUs::new(base + second as i64 * 1_000_000),
+                    sequence: index as u32 + 1,
+                    decode_time: index as u64 * 90_000,
+                    wall: WallUs::new(BASE + wall),
                 },
                 &samples,
             )
@@ -288,24 +302,55 @@ mod tests {
             records.push(record);
             bytes.extend_from_slice(&fragment);
         }
-        let mut segment = segment(dir.path(), records);
+        let mut segment = segment(directory, records);
         let extent = segment.media.extent();
-        segment.media = ValidatedMedia::for_test(dir.path(), &bytes, extent);
+        segment.media = ValidatedMedia::for_test(directory, &bytes, extent);
         segment.row.path = segment.media.path().to_path_buf();
-        let range = TimeRange {
-            from: WallUs::new(base + 1_250_000),
-            to: WallUs::new(base + 4_750_000),
+        (segment, init)
+    }
+
+    /// Exports `segment` over `range` and returns the parsed fragments.
+    async fn exported(
+        segment: SegmentFragments,
+        init: &[u8],
+        range: TimeRange,
+    ) -> Vec<iris_mp4::reader::FragmentInfo> {
+        // The producer waits for queue room, so it runs beside the reader.
+        let (tx, mut rx) = mpsc::channel(1);
+        let produce = async move {
+            stream_segments(vec![segment], range, init, &tx)
+                .await
+                .unwrap();
         };
-        let (tx, mut rx) = mpsc::channel(8);
-        stream_segments(vec![segment], range, &init, &tx)
-            .await
-            .unwrap();
-        drop(tx);
-        let _init = rx.recv().await.unwrap().unwrap();
+        let consume = async {
+            let _init = rx.recv().await.unwrap().unwrap();
+            let mut fragments = Vec::new();
+            while let Some(fragment) = rx.recv().await {
+                fragments.push(iris_mp4::reader::parse_fragment(&fragment.unwrap()).unwrap());
+            }
+            fragments
+        };
+        tokio::join!(produce, consume).1
+    }
+
+    #[tokio::test]
+    async fn export_omits_samples_starting_at_or_after_the_requested_end() {
+        let dir = tempfile::tempdir().unwrap();
+        let (segment, init) = recording(
+            dir.path(),
+            &[
+                (1_000_000, true),
+                (2_000_000, true),
+                (3_000_000, true),
+                (4_000_000, true),
+            ],
+        );
+        let range = TimeRange {
+            from: WallUs::new(BASE + 1_250_000),
+            to: WallUs::new(BASE + 4_750_000),
+        };
         let mut total = 0;
-        while let Some(fragment) = rx.recv().await {
-            let fragment = fragment.unwrap();
-            let info = parse_fragment(&fragment).unwrap();
+        for info in exported(segment, &init, range).await {
             let mut wall = info.wall.unwrap().get();
             for duration in info.sample_durations {
                 assert!(
@@ -321,6 +366,187 @@ mod tests {
             total, 75,
             "five leading samples remain as sync preroll, five tail samples are omitted"
         );
+    }
+
+    /// The wall anchor can step down inside a run, so a fragment's wall
+    /// interval may reach past the start of the one after it, or begin after
+    /// it. Such a fragment before the final one is exported whole and on one
+    /// continuous timeline, because the fragments after it depend on it.
+    #[tokio::test]
+    async fn export_trims_only_the_final_fragment_when_wall_intervals_overlap() {
+        // The second fragment covers 2.0 s to 3.0 s and the third, a
+        // continuation, starts at 2.5 s; then the second starts after the end.
+        for second_wall in [2_000_000, 3_000_000] {
+            let dir = tempfile::tempdir().unwrap();
+            let (segment, init) = recording(
+                dir.path(),
+                &[(1_000_000, true), (second_wall, true), (2_500_000, false)],
+            );
+            let range = TimeRange {
+                from: WallUs::new(BASE + 1_000_000),
+                to: WallUs::new(BASE + 2_800_000),
+            };
+            let edit = edit_list(std::slice::from_ref(&segment), range).unwrap();
+            let fragments = exported(segment, &init, range).await;
+            let samples: Vec<usize> = fragments
+                .iter()
+                .map(|info| info.sample_durations.len())
+                .collect();
+            assert_eq!(samples, [20, 20, 6], "second fragment at {second_wall}");
+            let mut decode_time = 0;
+            for info in &fragments {
+                assert_eq!(info.decode_time, decode_time);
+                decode_time += u64::from(info.duration);
+            }
+            assert_eq!(decode_time, 207_000);
+            assert_eq!(edit.duration_ms, 2_300);
+        }
+    }
+
+    /// The initialization section and every fragment must lie inside the
+    /// extent that was published with the records; one byte past it is
+    /// refused before anything of that part is read.
+    #[tokio::test]
+    async fn an_export_refuses_parts_past_the_published_extent() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut segment, init) = recording(dir.path(), &[(1_000_000, true), (2_000_000, true)]);
+        let bytes = std::fs::read(segment.media.path()).unwrap();
+        let extent = segment.media.extent();
+        let stats = crate::state::ApiStats::new_with_media_limits(1, 1);
+        let permit = stats.admit_media(MediaClass::Streaming).unwrap();
+        let init_len = u32::try_from(init.len()).unwrap();
+
+        segment.row.init_len = init_len;
+        let read = compatible_init(std::slice::from_ref(&segment), &permit)
+            .await
+            .unwrap();
+        assert_eq!(read, init);
+        // An initialization length that reaches past the extent, and one
+        // past the serving budget under an extent that would admit it.
+        segment.media = ValidatedMedia::for_test(dir.path(), &bytes, u64::from(init_len) - 1);
+        assert!(matches!(
+            compatible_init(std::slice::from_ref(&segment), &permit).await,
+            Err(ApiError::Unavailable(_))
+        ));
+        segment.media = ValidatedMedia::for_test(dir.path(), &bytes, u64::MAX);
+        segment.row.init_len = u32::try_from(MAX_INIT_BYTES).unwrap() + 1;
+        assert!(matches!(
+            compatible_init(std::slice::from_ref(&segment), &permit).await,
+            Err(ApiError::Unavailable(_))
+        ));
+
+        // The last fragment ends at the extent: one byte less refuses it.
+        let range = TimeRange {
+            from: WallUs::new(BASE),
+            to: WallUs::new(BASE + 10_000_000),
+        };
+        for (published, accepted) in [(extent, true), (extent - 1, false)] {
+            let published = SegmentFragments {
+                row: segment.row.clone(),
+                records: segment.records.clone(),
+                media: ValidatedMedia::for_test(dir.path(), &bytes, published),
+                discontinuity_before: true,
+            };
+            let (tx, mut rx) = mpsc::channel(8);
+            let outcome = stream_segments(vec![published], range, &init, &tx).await;
+            drop(tx);
+            let mut sent = 0;
+            while rx.recv().await.is_some() {
+                sent += 1;
+            }
+            if accepted {
+                outcome.unwrap();
+                assert_eq!(sent, 3);
+            } else {
+                assert_eq!(outcome.unwrap_err().kind(), io::ErrorKind::InvalidData);
+                assert_eq!(sent, 2, "the init and the first fragment");
+            }
+        }
+    }
+
+    /// A small deterministic generator (xorshift64*), so a failure
+    /// reproduces from its seed.
+    struct Rng(u64);
+
+    impl Rng {
+        /// A value in `0..n`.
+        fn below(&mut self, n: u64) -> i64 {
+            self.0 ^= self.0 >> 12;
+            self.0 ^= self.0 << 25;
+            self.0 ^= self.0 >> 27;
+            i64::try_from(self.0.wrapping_mul(0x2545_f491_4f6c_dd1d) % n).unwrap()
+        }
+    }
+
+    /// Over generated recordings whose wall anchor steps down now and then,
+    /// and generated ranges: the export holds every selected fragment once on
+    /// a continuous timeline from zero, opens at a sync sample, keeps every
+    /// fragment but the last whole, cuts the last where the range ends, and
+    /// carries an edit that starts at the range's start and stays inside the
+    /// serialized media.
+    #[tokio::test]
+    async fn generated_exports_are_continuous_and_cut_only_at_the_end() {
+        for seed in 1..=150 {
+            let mut rng = Rng(seed);
+            let count = 2 + rng.below(7);
+            let mut step = 0;
+            let fragments: Vec<(i64, bool)> = (0..count)
+                .map(|index| {
+                    if rng.below(3) == 0 {
+                        step += rng.below(300_000);
+                    }
+                    (
+                        index * 1_000_000 + 1_000_000 - step,
+                        index == 0 || rng.below(5) < 3,
+                    )
+                })
+                .collect();
+            let dir = tempfile::tempdir().unwrap();
+            let (mut segment, init) = recording(dir.path(), &fragments);
+            let from = BASE + rng.below(u64::try_from(count).unwrap() * 1_000_000 + 1_500_000);
+            let range = TimeRange {
+                from: WallUs::new(from),
+                to: WallUs::new(from + 1 + rng.below(4_000_000)),
+            };
+            segment.records = crate::hls::clip_records(&segment.records, &range);
+            let selected = segment.records.clone();
+            let Some(last) = selected.last() else {
+                continue;
+            };
+            let context = format!("seed {seed}: {fragments:?} over {range:?}");
+            let edit = edit_list(std::slice::from_ref(&segment), range).unwrap();
+            let exported = exported(segment, &init, range).await;
+
+            assert_eq!(exported.len(), selected.len(), "{context}");
+            assert!(exported[0].starts_with_sync, "{context}");
+            let mut decode_time = 0;
+            for (index, (info, record)) in exported.iter().zip(&selected).enumerate() {
+                assert_eq!(info.sequence as usize, index + 1, "{context}");
+                assert_eq!(info.decode_time, decode_time, "{context}");
+                assert_eq!(info.wall, Some(record.wall), "{context}");
+                decode_time += u64::from(info.duration);
+                if index + 1 < selected.len() {
+                    assert_eq!(info.sample_durations.len(), 20, "{context}");
+                }
+            }
+            // The last fragment keeps the samples that start before the end.
+            let until = ticks_through(last.wall, range.to);
+            let kept = usize::try_from(until.div_ceil(4500).min(20)).unwrap();
+            let tail = exported.last().unwrap();
+            assert_eq!(tail.sample_durations.len(), kept, "{context}");
+            assert_eq!(u64::from(tail.duration), until.min(90_000), "{context}");
+
+            // The edit starts where the range does, or at the first frame
+            // when the range starts before it, and ends inside the media.
+            let head = ticks_between(selected[0].wall, range.from);
+            assert_eq!(edit.media_time, head.min(decode_time - 1), "{context}");
+            let shown = edit.duration_ms * 90;
+            assert!(shown >= 1, "{context}");
+            assert!(
+                edit.media_time + shown < decode_time + 90,
+                "{context}: the edit runs past the media"
+            );
+        }
     }
 
     fn record(index: i64) -> IndexRecord {

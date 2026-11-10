@@ -1,5 +1,6 @@
 # Version updates for the SHA-pinned GitHub Actions in .github/workflows, grouped into one weekly
-# pull request. Cargo dependencies are updated by hand against the committed lockfiles.
+# pull request. Cargo dependencies are updated by hand against the committed lockfiles, and so
+# are the tool versions the workflows install (just, cargo-audit, cargo-deny, cargo-fuzz).
 version: 2
 updates:
   - package-ecosystem: github-actions

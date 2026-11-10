@@ -313,6 +313,18 @@ mod tests {
         );
     }
 
+    /// The entry point the daemon calls checks against the effective user
+    /// and repairs the same six modes.
+    #[test]
+    fn the_daemons_entry_point_repairs_for_the_effective_user() {
+        let (_dir, state) = shared_state();
+        let repairs = secure_state_directory(&state).unwrap();
+        assert_eq!(repairs.len(), 6, "{repairs:?}");
+        assert_eq!(mode(&state), 0o700);
+        assert_eq!(mode(&state.join(CATALOG_FILE)), 0o600);
+        assert_eq!(secure_state_directory(&state).unwrap(), Vec::new());
+    }
+
     #[test]
     fn private_state_and_absent_companions_need_no_repair() {
         let dir = tempfile::tempdir().unwrap();

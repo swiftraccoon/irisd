@@ -1368,6 +1368,59 @@ mod tests {
         queue.complete(1, command.bytes);
     }
 
+    /// Progress replaces only queued progress of the same file: another
+    /// file's progress in between stays, and so does a seal of another file,
+    /// which does not stop the search either.
+    #[test]
+    fn progress_coalesces_with_its_own_path_only() {
+        let other = |value: u64| Change::SegmentProgress {
+            path: PathBuf::from("/video/other.mp4"),
+            durable_len: value,
+            fragments: 1,
+            wall_end: WallUs::new(1),
+            media_end: value,
+        };
+        let metrics = Arc::new(CatalogMetrics::new());
+        let queue = CommandQueue::new(Arc::clone(&metrics));
+        for (step, (change, coalesced)) in [
+            (progress(1), false),
+            (other(10), false),
+            (sealed("/video/third.mp4"), false),
+            // Replaces the first entry, across the two between.
+            (progress(2), true),
+            (other(11), true),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let admission = queue.push_change(change);
+            assert_eq!(
+                matches!(admission, ChangeAdmission::Coalesced),
+                coalesced,
+                "step {step}"
+            );
+        }
+        assert_eq!(metrics.queue_depth(), 3);
+        assert_eq!(metrics.coalesced(), 2);
+        let mut lengths = Vec::new();
+        while let Receive::Command(command) = queue.receive(Duration::ZERO) {
+            if let Command::Change(Change::SegmentProgress {
+                path, durable_len, ..
+            }) = &command.command
+            {
+                lengths.push((path.clone(), *durable_len));
+            }
+            queue.complete(1, command.bytes);
+        }
+        assert_eq!(
+            lengths,
+            [
+                (PathBuf::from("/video/open.mp4"), 2),
+                (PathBuf::from("/video/other.mp4"), 11),
+            ]
+        );
+    }
+
     #[test]
     fn progress_is_not_coalesced_across_a_query() {
         let metrics = Arc::new(CatalogMetrics::new());

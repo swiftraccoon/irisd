@@ -1611,6 +1611,34 @@ mod tests {
         }
     }
 
+    /// An adopted recording's row carries the bounds of its fragments,
+    /// whether they were read from a sidecar that matches the media or from
+    /// a scan: three fragments of 6,000 ticks stamped 66,667 us apart.
+    #[tokio::test]
+    async fn an_adopted_recording_carries_the_bounds_of_its_fragments() {
+        for with_sidecar in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().join("video");
+            let catalog = CatalogHandle::open(&dir.path().join("catalog.db")).unwrap();
+            let approved = approve_root(&catalog, &root).await;
+            let path = sealed_recording(&root);
+            if !with_sidecar {
+                std::fs::remove_file(path.with_extension("idx")).unwrap();
+            }
+            assert_eq!(adopt_unknown(&catalog, &[approved]).await.unwrap(), 1);
+            let row = catalog.segment_by_path(&path).await.unwrap().unwrap();
+            let start = 1_700_000_000_000_000;
+            assert_eq!(row.wall_start, WallUs::new(start), "{with_sidecar}");
+            // The last fragment starts 133,334 us in and lasts 66,666 us.
+            assert_eq!(row.wall_end, WallUs::new(start + 200_000), "{with_sidecar}");
+            assert_eq!((row.media_start, row.media_end), (0, 18_000));
+            assert_eq!(row.fragments, 3);
+            assert!(row.sealed);
+            assert_eq!(row.bytes, std::fs::metadata(&path).unwrap().len());
+            catalog.shutdown();
+        }
+    }
+
     #[tokio::test]
     async fn forged_old_cache_times_cannot_make_adopted_media_age_expired() {
         let dir = tempfile::tempdir().unwrap();

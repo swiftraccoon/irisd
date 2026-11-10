@@ -39,6 +39,7 @@ tracing-subscriber = { workspace = true }
 
 [dev-dependencies]
 iris-catalog = { workspace = true, features = ["test-support"] }
+iris-replay = { workspace = true }
 rusqlite = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }

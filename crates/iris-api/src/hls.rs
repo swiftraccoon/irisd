@@ -386,7 +386,7 @@ pub(crate) async fn load_fragments(
 
 /// A continuation fragment needs its preceding sync fragment and all intervening
 /// fragments. A malformed sidecar without that preroll can resume only at a later sync.
-fn clip_records(records: &[IndexRecord], range: &TimeRange) -> Vec<IndexRecord> {
+pub(crate) fn clip_records(records: &[IndexRecord], range: &TimeRange) -> Vec<IndexRecord> {
     let Some(first) = records.iter().position(|r| overlaps(r, range)) else {
         return Vec::new();
     };
@@ -870,6 +870,166 @@ mod tests {
             ..record
         };
         assert!(validate_index_binding(&row, &header, vec![oversized], u64::MAX).is_err());
+    }
+
+    /// Each fact the binding checks, wrong by itself with everything else
+    /// right.
+    #[test]
+    fn sidecar_binding_rejects_each_mismatch_by_itself() {
+        let (row, header, record) = bound_fixture();
+        let bound = |row: &SegmentRow, header: &IndexHeader, record: IndexRecord| {
+            validate_index_binding(row, header, vec![record], u64::MAX).is_ok()
+        };
+        assert!(bound(&row, &header, record));
+
+        assert!(!bound(&row, &IndexHeader { flags: 1, ..header }, record));
+        for bad_record in [
+            IndexRecord {
+                wall: WallUs::new(record.wall.get() + 1),
+                ..record
+            },
+            IndexRecord {
+                decode_time: record.decode_time + 1,
+                ..record
+            },
+            IndexRecord {
+                duration: 0,
+                ..record
+            },
+            IndexRecord {
+                sample_count: 0,
+                ..record
+            },
+            IndexRecord {
+                flags: record.flags | 0x80,
+                ..record
+            },
+        ] {
+            assert!(!bound(&row, &header, bad_record), "{bad_record:?}");
+        }
+        // A sealed row states the extent and the fragment count.
+        for bad_row in [
+            SegmentRow {
+                bytes: row.bytes + 1,
+                ..row.clone()
+            },
+            SegmentRow {
+                durable_len: row.durable_len - 1,
+                ..row.clone()
+            },
+            SegmentRow {
+                fragments: 2,
+                ..row.clone()
+            },
+        ] {
+            assert!(!bound(&bad_row, &header, record));
+            // An open row is still growing and states none of them.
+            let open = SegmentRow {
+                sealed: false,
+                ..bad_row
+            };
+            assert!(bound(&open, &header, record));
+        }
+
+        // The largest initialization section and fragment that are served,
+        // and one byte more of each.
+        let open = SegmentRow {
+            sealed: false,
+            ..row.clone()
+        };
+        for (init_len, accepted) in [(MAX_INIT_BYTES, true), (MAX_INIT_BYTES + 1, false)] {
+            let init_len = u32::try_from(init_len).unwrap();
+            let row = SegmentRow {
+                init_len,
+                ..open.clone()
+            };
+            let header = IndexHeader { init_len, ..header };
+            assert_eq!(bound(&row, &header, record), accepted, "init {init_len}");
+        }
+        for (len, accepted) in [(MAX_FRAGMENT_BYTES, true), (MAX_FRAGMENT_BYTES + 1, false)] {
+            let sized = IndexRecord {
+                len: u32::try_from(len).unwrap(),
+                ..record
+            };
+            assert_eq!(bound(&open, &header, sized), accepted, "fragment {len}");
+        }
+    }
+
+    /// A fragment read for a transform must be the one its sidecar record
+    /// describes: each fact wrong by itself is refused.
+    #[test]
+    fn a_fragment_must_match_every_fact_of_its_sidecar_record() {
+        use iris_mp4::fragment::{FragmentHeader, Sample, encode_fragment};
+
+        let samples = [
+            Sample {
+                data: Bytes::from_static(&[0, 0, 0, 2, 0x26, 1]),
+                duration: 3_000,
+                is_sync: true,
+            },
+            Sample {
+                data: Bytes::from_static(&[0, 0, 0, 3, 0x02, 1, 7]),
+                duration: 3_000,
+                is_sync: false,
+            },
+        ];
+        let encoded = encode_fragment(
+            &FragmentHeader {
+                sequence: 1,
+                decode_time: 90_000,
+                wall: WallUs::new(1_700_000_000_000_000),
+            },
+            &samples,
+        )
+        .unwrap();
+        let fragment: Vec<u8> = encoded
+            .io_slices(&samples)
+            .iter()
+            .flat_map(|slice| slice.iter().copied())
+            .collect();
+        let record = IndexRecord::from_scan(&parse_fragment(&fragment).unwrap());
+        let info = validate_fragment_record(&fragment, &record).unwrap();
+        assert_eq!((info.sample_count, info.duration), (2, 6_000));
+
+        for bad_record in [
+            IndexRecord {
+                len: record.len + 1,
+                ..record
+            },
+            IndexRecord {
+                decode_time: record.decode_time + 1,
+                ..record
+            },
+            IndexRecord {
+                wall: WallUs::new(record.wall.get() + 1),
+                ..record
+            },
+            IndexRecord {
+                duration: record.duration + 1,
+                ..record
+            },
+            IndexRecord {
+                sample_count: record.sample_count + 1,
+                ..record
+            },
+            IndexRecord {
+                flags: record.flags ^ FLAG_STARTS_WITH_SYNC,
+                ..record
+            },
+        ] {
+            assert!(
+                validate_fragment_record(&fragment, &bad_record).is_err(),
+                "{bad_record:?}"
+            );
+        }
+        // Bytes shorter than a trailer, with a record of that length.
+        let stub = IndexRecord { len: 10, ..record };
+        assert!(validate_fragment_record(&fragment[..10], &stub).is_err());
+        // One flipped payload bit under the right record.
+        let mut flipped = fragment.clone();
+        let payload = usize::try_from(info.payload_offset).unwrap();
+        flipped[payload] ^= 1;
+        assert!(validate_fragment_record(&flipped, &record).is_err());
     }
 
     #[test]

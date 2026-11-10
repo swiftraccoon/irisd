@@ -904,7 +904,7 @@ mod tests {
         use bytes::Bytes;
         use iris_mp4::fragment::Sample;
         use iris_mp4::init::{SampleEntry, build_init_segment};
-        use iris_mp4::reader::{ScanOptions, scan};
+        use iris_mp4::reader::{self, ScanOptions};
         use std::sync::Arc;
 
         let dir = tempfile::tempdir().unwrap();
@@ -943,7 +943,7 @@ mod tests {
             written.is_ok(),
             "complete media must not be retried: {written:?}"
         );
-        let scan = scan(
+        let scan = reader::scan(
             File::open(&path).unwrap(),
             ScanOptions {
                 verify_crc: true,

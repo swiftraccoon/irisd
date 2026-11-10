@@ -81,6 +81,8 @@ Scope: this crate only. Read the root `AGENTS.md` first.
 - `src/types.rs` — row types, `SegmentCursor`, `StartupRow`, `Change`, `NewSegment`,
   `TimeRange`, `CatalogError`.
 - `src/metrics.rs` — `CatalogMetrics`.
+- `tests/retention_model.rs` — every statement that decides protection against one model; a
+  change to `protection_predicate` or a statement beside it must keep it green.
 - `tests/catalog.rs` — integration tests against a temporary database, through the methods
   the daemon and the API use.
 

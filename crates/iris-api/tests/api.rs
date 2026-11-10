@@ -877,6 +877,27 @@ async fn serves_ranges_and_streams_an_export_over_a_real_recording() {
     assert_eq!(init.len(), init_len as usize);
     assert_eq!(&init[4..8], b"ftyp");
 
+    // A HEAD names the file's length and sends none of it.
+    let head = app
+        .clone()
+        .oneshot(
+            Request::head(format!("/api/segments/{segment_id}/file.mp4"))
+                .header(header::AUTHORIZATION, "Bearer t")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(head.status(), StatusCode::OK);
+    assert_eq!(head.headers()[header::CONTENT_LENGTH], len.to_string());
+    assert_eq!(head.headers()[header::ACCEPT_RANGES], "bytes");
+    assert!(
+        to_bytes(head.into_body(), 1 << 20)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
     let export = get(
         &app,
         format!("/api/streams/cam1/main/export.mp4?from={from}&to={to}"),
@@ -1977,6 +1998,140 @@ async fn the_live_playlist_blocks_until_the_requested_part_and_rejects_bad_direc
     catalog.shutdown();
 }
 
+/// A recording in the middle of a range whose sidecar cannot be used is left
+/// out, and the playlist marks the break before the recording after it; one
+/// at the start of the range leaves nothing to break from.
+#[tokio::test]
+async fn an_unusable_recording_leaves_one_discontinuity_where_it_was() {
+    let dir = tempfile::tempdir().unwrap();
+    let catalog = CatalogHandle::open(&dir.path().join("c.db")).unwrap();
+    let entry = entry();
+    let fragments = (0..9).map(|index| fragment(index, &entry)).collect();
+    // Small files: a few fragments each.
+    let files = record_segments_with_rotation(dir.path(), &catalog, fragments, 2_500).await;
+    assert!(files.len() >= 3, "{files:?}");
+    let app = router(state(dir.path(), catalog.clone(), vec!["t".into()]));
+    let playlist = || async {
+        let uri = format!(
+            "/api/streams/cam1/main/hls/vod.m3u8?from={}&to={}",
+            wall(0).get(),
+            wall(10).get()
+        );
+        let response = get(&app, uri, None).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        body_string(response).await
+    };
+    let maps = |text: &str| text.matches("#EXT-X-MAP:").count();
+    let breaks = |text: &str| text.matches("#EXT-X-DISCONTINUITY\n").count();
+
+    let whole = playlist().await;
+    assert_eq!((maps(&whole), breaks(&whole)), (files.len(), 0), "{whole}");
+
+    // The second recording's sidecar is cut inside its header.
+    let second = iris_store::layout::index_path(&files[1]);
+    let saved = std::fs::read(&second).unwrap();
+    std::fs::write(&second, &saved[..10]).unwrap();
+    let broken = playlist().await;
+    assert_eq!(
+        (maps(&broken), breaks(&broken)),
+        (files.len() - 1, 1),
+        "{broken}"
+    );
+    // The break stands between the first recording and the third.
+    let at = broken.find("#EXT-X-DISCONTINUITY\n").unwrap();
+    assert_eq!(maps(&broken[..at]), 1, "{broken}");
+
+    // With the first recording unusable instead, the range starts later.
+    std::fs::write(&second, &saved).unwrap();
+    let first = iris_store::layout::index_path(&files[0]);
+    let head = std::fs::read(&first).unwrap();
+    std::fs::write(&first, &head[..10]).unwrap();
+    let late = playlist().await;
+    assert_eq!((maps(&late), breaks(&late)), (files.len() - 1, 0), "{late}");
+    catalog.shutdown();
+}
+
+/// A segment or part that is still being filled is served once it is
+/// complete, and a part index past the parts of a complete segment does not
+/// exist.
+#[tokio::test]
+async fn live_segments_and_parts_wait_until_they_are_complete() {
+    let (app, ring, entry, catalog, _dir) = live_setup().await;
+    let text = settled_playlist(&app).await;
+    // The first frame's wall time, to the millisecond.
+    assert!(
+        text.contains("#EXT-X-PROGRAM-DATE-TIME:2023-11-14T22:13:20.000Z\n"),
+        "{text}"
+    );
+    let fetch = |path: &'static str| {
+        let app = app.clone();
+        tokio::spawn(async move {
+            let response = get(&app, format!("/api/streams/cam1/main/hls/{path}"), None).await;
+            let status = response.status();
+            (
+                status,
+                to_bytes(response.into_body(), 1 << 20).await.unwrap(),
+            )
+        })
+    };
+    let fragments = |init: &[u8], media: &[u8]| {
+        let mut file = init.to_vec();
+        file.extend_from_slice(media);
+        let report = iris_mp4::reader::scan(
+            std::io::Cursor::new(file),
+            iris_mp4::reader::ScanOptions {
+                verify_crc: true,
+                collect_samples: false,
+            },
+        )
+        .unwrap();
+        assert_eq!(report.stop, None);
+        report.fragments
+    };
+    let (status, init) = fetch("init.mp4").await.unwrap();
+    assert_eq!(status, StatusCode::OK);
+
+    // Segment 2 holds twenty frames and its second part five.
+    let segment = fetch("seg/2/media.m4s");
+    let open_part = fetch("part/2/1/part.m4s");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(!segment.is_finished() && !open_part.is_finished());
+    // Ten more frames complete the part; the sync frame after them
+    // completes the segment.
+    for index in 80..=90u64 {
+        ring.publish(live_frame(&entry, index, index == 90));
+    }
+    let (status, media) = segment.await.unwrap();
+    assert_eq!(status, StatusCode::OK);
+    let listed = fragments(&init, &media);
+    assert_eq!(listed.len(), 30);
+    assert_eq!(listed[0].decode_time, 60 * 3000);
+    let (status, media) = open_part.await.unwrap();
+    assert_eq!(status, StatusCode::OK);
+    let listed = fragments(&init, &media);
+    assert_eq!(listed.len(), 15);
+    assert_eq!(listed[0].decode_time, 75 * 3000);
+
+    // The complete segment has two parts: a third does not exist.
+    let (status, _) = fetch("part/2/2/part.m4s").await.unwrap();
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    // Segment 3 has one frame; its first part completes at fifteen.
+    let first_part = fetch("part/3/0/part.m4s");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(!first_part.is_finished());
+    for index in 91..105u64 {
+        ring.publish(live_frame(&entry, index, false));
+    }
+    let (status, media) = first_part.await.unwrap();
+    assert_eq!(status, StatusCode::OK);
+    let listed = fragments(&init, &media);
+    assert_eq!(listed.len(), 15);
+    assert!(listed[0].starts_with_sync);
+    assert_eq!(listed[0].decode_time, 90 * 3000);
+    catalog.shutdown();
+}
+
 /// A blocking reload the feeder cannot satisfy answers 503 after three
 /// target durations (draft-pantos-hls-rfc8216bis §6.2.5.2).
 #[tokio::test(start_paused = true)]
@@ -1993,6 +2148,25 @@ async fn a_blocking_reload_that_cannot_advance_answers_503() {
     .await;
     assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(started.elapsed(), Duration::from_secs(6));
+
+    // The newest segment is 2, holding one complete part and one open. A
+    // reload may name a segment two past the newest and a part six (three
+    // seconds of parts) past the segment's parts: those wait and time out,
+    // and one further is refused at once.
+    let status = |query: &'static str| {
+        let app = app.clone();
+        async move {
+            let started = tokio::time::Instant::now();
+            let uri = format!("/api/streams/cam1/main/hls/live.m3u8?{query}");
+            (get(&app, uri, None).await.status(), started.elapsed())
+        }
+    };
+    let waited = (StatusCode::SERVICE_UNAVAILABLE, Duration::from_secs(6));
+    let refused = (StatusCode::BAD_REQUEST, Duration::ZERO);
+    assert_eq!(status("_HLS_msn=4").await, waited);
+    assert_eq!(status("_HLS_msn=5").await, refused);
+    assert_eq!(status("_HLS_msn=2&_HLS_part=8").await, waited);
+    assert_eq!(status("_HLS_msn=2&_HLS_part=9").await, refused);
     catalog.shutdown();
 }
 
@@ -2331,5 +2505,20 @@ async fn event_http_cursor_crosses_an_equal_timestamp_page_boundary() {
     )
     .await;
     assert_eq!(incomplete.status(), StatusCode::BAD_REQUEST);
+    assert!(body_string(incomplete).await.contains("supplied together"));
+    // A cursor names a stored event: ids start at one.
+    for id in [0, -1] {
+        let unreal = get(
+            &app,
+            format!("/api/events?from={from}&to={to}&after_us={from}&after_id={id}"),
+            None,
+        )
+        .await;
+        assert_eq!(unreal.status(), StatusCode::BAD_REQUEST, "after_id={id}");
+        assert!(
+            body_string(unreal).await.contains("positive event id"),
+            "after_id={id}"
+        );
+    }
     catalog.shutdown();
 }

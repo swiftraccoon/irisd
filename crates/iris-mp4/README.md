@@ -16,7 +16,7 @@ in → fMP4 on disk → byte-range serving).
   `fragment::encode_fragment` — one access unit, one assembled GOP, and the `prft`,
   `moof`, `mdat` header, and trailer around its samples (`EncodedFragment`).
 - `fragment::encode_trailer`, `decode_trailer`, and `Trailer` — the 24-byte `free` box with
-  magic, CRC-32C, and fragment length.
+  magic, CRC-32C, fragment length, and reserved bytes that must be zero.
 - `export::rebase_fragment`, `export::trim_fragment_end`, and `export::with_edit_list` — the
   rewrites that make an export a stand-alone recording: a fragment's sequence, decode time, and
   `prft` media time with a recomputed trailer, a tail prefix containing only samples before the
@@ -136,7 +136,10 @@ tail, playlist grouping, continuation trailer exclusion, and refused playlist te
 malformed-cache fallback, completed-init recovery guards, fragment order, addressing,
 optional-field, missing-flag, empty-`trun`, container-padding, and bound rejections, edit-parent
 and media-time restrictions, and a CRC cross-check against the reference crate at every start
-offset and after every chunk. The doctest in `lib.rs` runs in the suite. Fuzz targets under
+offset and after every chunk. `tests/properties.rs` holds seeded property tests over generated
+recordings: the scanner, the memory parser, and the sidecar record read back what the encoder
+wrote, a file cut inside a fragment is valid up to it, and a flipped bit anywhere in a fragment
+ends the valid prefix before it. The doctest in `lib.rs` runs in the suite. Fuzz targets under
 `fuzz/fuzz_targets/` (`scan`, `box_header`, `index`, `trailer`, and `export_rebase` for the export
 rewrites) cover the parsers. Container overhead and the checksum's cost are measured in
 `docs/research/04-storage-format.md §4` and `12-ingest-cost.md §5`.

@@ -652,6 +652,39 @@ mod tests {
     }
 
     #[test]
+    fn a_record_converts_from_a_scanned_fragment() {
+        let info = FragmentInfo {
+            offset: 767,
+            len: 4_096,
+            payload_offset: 900,
+            sequence: 3,
+            decode_time: 360_000,
+            duration: 180_000,
+            sample_count: 60,
+            starts_with_sync: true,
+            wall: Some(WallUs::new(1_700_000_000_000_000)),
+            sample_durations: Vec::new(),
+            sample_sizes: Vec::new(),
+        };
+        let record = IndexRecord::from(&info);
+        assert_eq!(record, IndexRecord::from_scan(&info));
+        assert_eq!(
+            record,
+            IndexRecord {
+                offset: 767,
+                decode_time: 360_000,
+                wall: WallUs::new(1_700_000_000_000_000),
+                len: 4_096,
+                duration: 180_000,
+                sample_count: 60,
+                flags: FLAG_STARTS_WITH_SYNC,
+                raw_rtp: 0,
+            }
+        );
+        assert_eq!(record.end(), 767 + 4_096);
+    }
+
+    #[test]
     fn a_hand_built_record_end_saturates() {
         let record = IndexRecord {
             offset: u64::MAX - 1,

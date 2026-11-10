@@ -51,7 +51,28 @@ audit:
 fuzz-build:
     cd fuzz && cargo fuzz build
 
-# Type-check every crate but the GUI (which needs a GTK sysroot) for 64-bit ARM. Needs
+# Mutation-test the given source files with cargo-mutants (`cargo install cargo-mutants`):
+# a mutant that survives is logic no test pins down. Runs on a copy of the committed tree,
+# because cargo-mutants copies the tree it runs in once per worker, build directories
+# included. The lists of caught and missed mutants land in target/mutants/mutants.out, and
+# the recipe fails when a mutant is missed.
+mutants +files:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    copy=$(mktemp -d)
+    trap 'rm -rf "$copy"' EXIT
+    git archive HEAD | tar -x -C "$copy"
+    out="$PWD/target/mutants"
+    cd "$copy"
+    cargo mutants -j 2 -o "$out" $(printf -- '-f %s ' {{files}})
+
+# Run the tests of the crates without C dependencies as 64-bit ARM code under user-mode
+# emulation, in release mode because emulated debug code is too slow for the timing tests.
+# Needs `rustup target add aarch64-unknown-linux-musl` and qemu-aarch64-static.
+cross-test:
+    CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=rust-lld CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_RUNNER=qemu-aarch64-static cargo test --release --locked --target aarch64-unknown-linux-musl -p iris-core -p iris-h265 -p iris-mp4 -p iris-store -p iris-ingest -p iris-replay
+
+# Lint every crate but the GUI (which needs a GTK sysroot) for 64-bit ARM. Needs
 # `rustup target add aarch64-unknown-linux-gnu` and a C cross compiler named by
 # CC_aarch64_unknown_linux_gnu; CFLAGS_aarch64_unknown_linux_gnu may add a --sysroot.
 cross-check target="aarch64-unknown-linux-gnu":
@@ -65,6 +86,7 @@ build:
 record duration="2m" root="data/recordings":
     cargo run --release -p irisd -- record --config config/cameras.local.toml --root {{root}} --duration {{duration}}
 
-# Verify the reference pack's snapshots against its manifest.
+# Verify the reference pack's snapshots against its manifest and run the maintenance tool's tests.
 references-check:
     cargo run --locked --manifest-path .rust-reference/tools/reference-maintenance/Cargo.toml -- sync --check
+    cargo test --locked --manifest-path .rust-reference/tools/reference-maintenance/Cargo.toml

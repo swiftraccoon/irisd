@@ -17,7 +17,7 @@ use iris_mp4::index::{
     MAX_PERSISTED_INDEX_RECORDS, read_index_bounded, read_index_file_bound_to_media,
 };
 use iris_mp4::init::SampleEntry;
-use iris_mp4::reader::{ScanOptions, ScanStop, scan};
+use iris_mp4::reader::{self, ScanOptions, ScanStop};
 use iris_store::recover::{RecoverError, recover_segment};
 use iris_store::{
     NoopObserver, QueueFull, RootExpectation, SegmentOpened, SegmentProgress, SegmentSealed,
@@ -188,7 +188,7 @@ fn round_trips_three_fragments() {
     let files = mp4_files(dir.path());
     assert_eq!(files.len(), 1, "{files:?}");
     assert!(files[0].ends_with("cam1/main/2026-10-31/153558.000000Z.mp4"));
-    let report = scan(
+    let report = reader::scan(
         File::open(&files[0]).unwrap(),
         ScanOptions {
             verify_crc: true,
@@ -583,7 +583,7 @@ fn a_writer_killed_mid_recording_leaves_a_recoverable_file() {
     let report = recover_segment(&path).unwrap();
     assert!(report.fragments >= 1, "{report:?}");
     assert_eq!(fs::metadata(&path).unwrap().len(), report.valid_len);
-    let scanned = scan(
+    let scanned = reader::scan(
         File::open(&path).unwrap(),
         ScanOptions {
             verify_crc: true,
@@ -817,7 +817,11 @@ fn observer_sees_open_progress_and_seal_in_order() {
     assert!(opened.discontinuity);
     assert_eq!(opened.media_start, 0);
     assert_eq!(opened.wall_start, WallUs::new(100 * 1_000_000));
-    assert!(opened.init_len > 0);
+    assert_eq!(
+        opened.init_len as usize,
+        iris_mp4::init::build_init_segment(&e).len(),
+        "the catalog serves the initialization section by this length"
+    );
     assert_eq!(opened.sample_entry.hash, e.hash);
     assert!(opened.path.exists());
 
@@ -910,7 +914,7 @@ fn the_writer_rotates_before_the_sidecar_record_limit() {
     for media in &files {
         let mut file = File::open(media).unwrap();
         let media_len = file.metadata().unwrap().len();
-        let report = scan(&mut file, ScanOptions::default()).unwrap();
+        let report = reader::scan(&mut file, ScanOptions::default()).unwrap();
         assert_eq!(report.stop, None, "{}", media.display());
         let index = File::open(media.with_extension("idx")).unwrap();
         let (_, records) =

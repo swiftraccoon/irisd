@@ -121,7 +121,7 @@ moov                                                                            
         stts/stsc/stsz/stco  (empty)
   mvex  trex (track 1, default_sample_flags 0x01010000)
 
-repeat per fragment (one GOP, ≤ 1.25 × max_fragment_ms):
+repeat per fragment (one GOP, ≤ 1.25 × max_fragment_ms of frames):
   prft  v1, flags 0x18, reference_track_ID 1, ntp_timestamp = NVR wall time for      32 B
         media_time, media_time = tfdt of this fragment
   moof                                                                      ≈ 96 + 8·N B
@@ -136,7 +136,7 @@ repeat per fragment (one GOP, ≤ 1.25 × max_fragment_ms):
   mdat  N access units, each NAL 4-byte-length-prefixed; VPS/SPS/PPS stripped (they
         live in hvcC), AUD and SEI kept
   free  size u32 = 24, 'free', 'IRX1' magic, crc32c u32 over [prft .. end of mdat],  24 B
-        fragment_len u32 (prft start → end of this trailer), flags u32
+        fragment_len u32 (prft start → end of this trailer), reserved u32 = 0
 ```
 
 - Sample entry `hvc1` with parameter sets only in `hvcC`: Apple's HLS authoring spec says
@@ -156,7 +156,9 @@ repeat per fragment (one GOP, ≤ 1.25 × max_fragment_ms):
   readable by the tools that parse `prft`.
 - The trailer is a standard, universally ignored 24-byte `free` box: size, `free`, the magic
   `IRX1`, a CRC-32C over `prft` through the end of `mdat`, `fragment_len` (from the start of
-  `prft` to the end of the trailer), and reserved flags. `fragment_len` lets recovery and
+  `prft` to the end of the trailer), and four reserved bytes that are zero. They lie outside
+  the CRC, so a reader rejects a trailer with any of them set: no byte of a fragment goes
+  unchecked, and a flag a reader does not know is never ignored. `fragment_len` lets recovery and
   reverse scans walk backwards (the UniFi/DHAV back-pointer idea); the CRC catches torn
   writes into preallocated (zero-filled) space and bit rot.
 - B-frame streams (not produced by Dahua/Hikvision IPCs) would need `trun` v1 composition
@@ -380,9 +382,13 @@ Units: wall time in microseconds since the Unix epoch (NVR `CLOCK_REALTIME`); me
    (01 §5):
    - nominal duration = declared rate (SDP `a=framerate`, SPS VUI) until a measured estimate
      over ≥ 16 fragments and ≥ 480 frames exists; the delivered rate replaces the declared
-     one while the typical (median) fragment runs more than 1 % off it, which is what a
-     uniformly slow encoder does (the probed cameras declare 30 fps and deliver 28.3 to 30
-     depending on scene load), whereas bursty drops leave the median on rate;
+     one while the typical fragment runs more than 1 % off it, which is what a uniformly
+     slow encoder does (the probed cameras declare 30 fps and deliver 28.3 to 30 depending
+     on scene load), whereas bursty drops leave the typical fragment on rate. Typical is
+     the median over frames, so the few-frame remainder that a GOP longer than the cap
+     leaves, whose span per frame is mostly stamp quantisation, does not count like a full
+     fragment. Without a declared rate the first fragment seeds the estimate and the same
+     comparison runs against the cadence (holds excluded);
    - a parameter-set epoch carrying a different valid effective frame rate retargets the
      nominal immediately and clears the estimator's history and current error. Decode time
      and cumulative hold, hole, and snap diagnostics continue. Repeated parameter bytes, an
@@ -397,17 +403,37 @@ Units: wall time in microseconds since the Unix epoch (NVR `CLOCK_REALTIME`); me
      fragment per fragment, spread evenly over its frames (±30 ticks each on a 60-frame
      fragment): a slow lock that absorbs a 30 ms step within two fragments without a visible
      rate change;
-   - a declared rate is also replaced when more than 5 % of camera time would be holds (a
-     camera declaring 30 fps and delivering 20); the two rules together mean a hold never
-     recurs at every GOP boundary, which would stutter on playback; a fragment whose average
-     frame span deviates more than 20 % from the nominal is left out of the estimate;
+   - the share of camera time spent in holds does not decide the rate: a camera that stalls
+     for a second now and then spends a tenth of its time in holds while every other
+     fragment is on rate, and re-timing it to the mean would put those fragments off by
+     that tenth and snap every few of them. A camera declaring 30 fps and delivering 20 is
+     caught by its typical fragment, so a hold still never recurs at every GOP boundary,
+     which would stutter on playback; a fragment whose average frame span deviates more
+     than 20 % from the nominal is left out of the estimate;
    - when the error that remains after holds and the correction exceeds the tolerance
-     (500 ms) in either direction, the fragment snaps: a camera that paused gets the span as
-     a hold on its last frame, one that ran ahead has the shorter span spread over its
-     frames, and a backwards step keeps nominal durations and takes the camera's new
-     position as the reference. A snap resets the error; three consecutive snaps also
-     restart the rate estimate. Any jump > `max_jump` (10 s) ends the session and starts a
-     separate run;
+     (500 ms) in either direction, the fragment snaps: it lasts its camera span less the
+     error carried into it, so the assigned timeline is back on the camera's. A camera that
+     paused gets the difference as a hold on its last frame, an assigned timeline that ran
+     ahead has the shorter time spread over the frames, and a backwards step keeps nominal
+     durations and takes the position the camera stepped to as the reference. A fragment whose span
+     is shorter than the error carried into it (a few frames closed by the cap) cannot
+     absorb all of it: its frames last one tick each and the rest stays carried into the
+     fragments after it. Three consecutive snaps also restart the rate estimate. The error
+     therefore never exceeds the tolerance and one fragment's correction, except across a
+     backwards step;
+   - four consecutive fragments corrected by the full 1 % in one direction, with at least an
+     eighth of the tolerance (62 ms) of error left after them, also restart the estimate,
+     because the nominal itself is then off: a camera that slowed for minutes and returns to
+     its declared rate would otherwise run against the two-minute average of the slower one
+     until it snapped. The estimate restarts from those four fragments, so it is what the
+     camera delivers at that moment, and the error that builds meanwhile stays under the
+     tolerance (380 ms from 28.3 fps back to 30). The error condition is there for a camera
+     whose GOPs each run a few percent faster or slower than its mean: its corrections are
+     often at the limit several fragments running while the error stays small, and
+     restarting on those would keep re-centring a good estimate. A restart never returns to
+     the declared rate: a camera measured 5 % off it would end every GOP in a hold of
+     several frames until the next warm-up. Any jump > `max_jump` (10 s) ends the session
+     and starts a separate run;
    - `timestamp_mode = "passthrough"` keeps raw RTP deltas for cameras with trustworthy clocks
      or for diagnostics. The raw RTP timestamp of each fragment's first sample is kept in the
      sidecar in both modes (never in the media), so the camera's timeline survives as long
@@ -449,8 +475,8 @@ Units: wall time in microseconds since the Unix epoch (NVR `CLOCK_REALTIME`); me
   (default 5 s), staggered across streams (each stream at its own sixteenth of the
   interval, in order of first appearance, kept across rotations); then one catalog
   transaction. A daemon crash loses the fragment under construction (at most 1.25 ×
-  `max_fragment_ms`, 2.5 s at the default) and any fragments still queued for the writer; the
-  page cache survives. A power loss adds up to one `sync_interval` (5 s).
+  `max_fragment_ms` of frames, 2.5 s at the default) and any fragments still queued for the
+  writer; the page cache survives. A power loss adds up to one `sync_interval` (5 s).
   `sync_file_range` is not used (it does not flush disk caches).
 - **Page cache**: writes and reads use the ordinary buffered path. `O_DIRECT` is rejected:
   alignment rules, no `O_SYNC` guarantee, and it fights buffered reads of the same file.
@@ -631,9 +657,12 @@ seconds, when read for diagnostics or from `prft`.
   requested stream starts from the frames since the ring's last sync frame, so its first
   segment completes within one GOP, and keeps complete GOPs until the complete GOPs after
   them cover three target durations (§6.2.2), at most 12; each GOP is a media segment
-  numbered when its sync frame arrives, cut into parts of a frame count pinned from the first
-  frame's duration (the whole frames that fit 0.5 s, at least one), so a part never changes
-  once listed and every non-final part lasts the declared `PART-TARGET` (§4.4.4.9).
+  numbered when its sync frame arrives. `PART-TARGET` is pinned from the first frame's
+  duration (what the whole frames that fit 0.5 s add up to, at least one frame), and parts are
+  cut by media time against it: a part ends before a frame that would take it past the target
+  and after a frame when another like it would. No listed part outlasts the target when the
+  regulariser re-times the stream under a running feeder, a part never changes once listed,
+  and with constant durations every non-final part lasts the target exactly (§4.4.4.9).
   `EXT-X-TARGETDURATION` is pinned when the first GOP completes, its length rounded up to
   whole seconds plus one second of headroom and at most the 10 s GOP budget, and never changes
   (§6.2.1); a GOP that would outlast it, or exceed 16 MiB or 600 frames, is cut where it is
@@ -671,6 +700,9 @@ seconds, when read for diagnostics or from `prft`.
   a sample crossing the boundary has its duration shortened. The final fragment's boxes
   and checksum are regenerated without changing retained sample bytes or decoding video.
   Tail exclusion therefore does not depend on a player's edit-list support.
+  Only the final fragment is cut: the wall anchor can step down inside a run (§7), so an
+  earlier fragment's wall interval may reach past `to`, and it is exported whole because
+  the fragments after it need its last samples to decode.
   A positive exclusive tail rounds up to a 90 kHz media tick. The edit duration is
   derived from the serialized media span and rounds up to a millisecond, so even a
   positive sub-tick request yields nonempty media and a positive presentation duration.

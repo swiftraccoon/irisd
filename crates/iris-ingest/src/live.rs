@@ -39,7 +39,9 @@ pub struct LiveFrame {
     /// Whether the frame is a random access point.
     pub is_sync: bool,
     /// Provisional decode time: the pending fragment's start plus the frame's
-    /// index times the nominal duration.
+    /// index times the nominal duration, and inside a run never at or below
+    /// the frame before, which follows by one tick when a shortened fragment
+    /// ended before the provisional times of its last frames.
     pub decode_time: u64,
     /// NVR wall time of the frame's first packet.
     pub wall: WallUs,
@@ -523,6 +525,32 @@ mod tests {
         let weak = Arc::downgrade(&frame);
         ring.publish(frame);
         assert_eq!(weak.strong_count(), 0);
+    }
+
+    /// Subscribers are counted while they exist, and the frames kept for
+    /// them go when the last one does.
+    #[test]
+    fn dropping_the_last_subscriber_releases_the_fan_out() {
+        let ring = LiveRing::new(8);
+        assert_eq!(ring.subscriber_count(), 0);
+        let first = ring.subscribe();
+        let second = ring.subscribe();
+        assert_eq!(ring.subscriber_count(), 2);
+        ring.publish(frame(0, true));
+        ring.publish(frame(1, false));
+        let kept = |ring: &LiveRing| {
+            let shared = ring.inner.shared.lock().unwrap();
+            (shared.fanout.len(), shared.fanout_payload_bytes)
+        };
+        assert_eq!(kept(&ring), (2, 12));
+        drop(first);
+        assert_eq!(ring.subscriber_count(), 1);
+        assert_eq!(kept(&ring), (2, 12), "a subscriber is still reading");
+        drop(second);
+        assert_eq!(ring.subscriber_count(), 0);
+        assert_eq!(kept(&ring), (0, 0));
+        // The frames for fast start stay.
+        assert_eq!(ring.recent_from_sync().len(), 2);
     }
 
     #[tokio::test]

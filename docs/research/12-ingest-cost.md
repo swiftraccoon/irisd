@@ -236,3 +236,62 @@ churn. Its call chain is `pwritev` → XFS buffered write → `folio_alloc`: the
 zeroes the part of each new large folio that a write does not cover, once per folio.
 glibc's `trim_threshold`/`mmap_threshold` tunables changed nothing (6.55 % against 6.57 %),
 and the cost is about 0.2 % of a core, inherent to buffered writes.
+
+## 8. Resident memory (2026-11-10)
+
+Measured on the same host with the release build of the audited tree and the harness's RSS
+figure (the maximum `VmRSS` over the measurement window), 150 s per run, 20 ms reads, 32 KiB
+low-water mark, thirteen fuzz targets running niced:
+
+    iris-tools replay-bench --file RECORDING.mp4 --cameras N --seconds 150 \
+      --read-interval-ms 20 --recv-low-water-kib 32 --root SCRATCH \
+      --irisd target/release/irisd --replay target/release/iris-replay --replay-arg=--pace
+
+| Replayed 4K streams | Payload | RSS |
+|---|---|---|
+| 1 | 10.2 Mbit/s | 17.9 MiB |
+| 6 (two runs) | 61.5 Mbit/s | 47.1, 45.9 MiB |
+| 14 (two runs) | 143.5 Mbit/s | 90.7, 91.1 MiB |
+
+The figures fit about 12 MiB plus 0.55 MiB per Mbit/s. glibc's `mallinfo2`, sampled every
+10 s in a fourteen-stream run through a preloaded diagnostic library (four samples, RSS
+89.1 MiB), splits the part that grows:
+
+- 28 to 35 MiB in use on the main heap, one 2 s GOP of every stream (35.9 MiB at this rate);
+- 3 to 17 MiB of free heap that the allocator keeps;
+- fourteen mappings of 2 MiB, 28.7 MiB together, one per stream: by size and count the
+  vendored retina's read ring of each connection, which grows by powers of two and never
+  shrinks (`third_party/retina/src/buf.rs`). One sample showed seven more mappings, 8.2 MiB
+  together. A ring that shrank would grow again at the next key frame, so that was not tried.
+
+So the cost per stream follows its GOP size and the size its read ring reached. Six streams
+at 61.5 Mbit/s hold 46 to 47 MiB, inside the 07 §7 budget of 64 MB (61 MiB) at a tenth more
+than its 56 Mbit/s.
+The service's seven cameras write about 93 Mbit/s and sit at 79 MiB, where the fit gives
+63 MiB. The difference was not broken down; the service also runs fourteen sessions, seven
+event feeds, and the catalog with retention. Of its 81 MiB, 61 MiB is the main heap.
+
+glibc's allocator settings trade memory for system time at fourteen streams. The defaults
+stay, and the first setting below is an operator's option (`packaging/README.md`):
+
+| `GLIBC_TUNABLES` | CPU (user / system) | RSS |
+|---|---|---|
+| default (four runs) | 2.89 (1.26 / 1.63), 2.81, 2.74 (1.17 / 1.57), 2.78 (1.24 / 1.54) % | 90.7, 91.1, 93.7, 92.5 MiB |
+| `glibc.malloc.mmap_threshold=65536` (two runs) | 3.13 (1.30 / 1.83), 3.09 (1.27 / 1.82) % | 75.4, 76.0 MiB |
+| `glibc.malloc.mmap_threshold=16384` | 3.47 (1.29 / 2.18) % | 75.8 MiB |
+| `glibc.malloc.trim_threshold=262144:glibc.malloc.top_pad=65536` | 3.03 (1.27 / 1.76) % | 79.4 MiB |
+
+The heap keeps its high-water mark, which the low-latency playlist raises: a feeder holds
+three target durations of a stream for as long as a client polls it and 30 s more. With every
+one of the fourteen streams polled for 40 s (`live.m3u8` every 2 s) and then left alone:
+
+| `GLIBC_TUNABLES` | RSS before | while polled | 75 s after the last request |
+|---|---|---|---|
+| default | 90 MiB | 265 MiB | 163 MiB |
+| `glibc.malloc.mmap_threshold=65536` | 72 MiB | 260 MiB | 108 MiB |
+
+The service showed the same on 2026-11-10: 174 MiB five minutes after every stream had been
+polled, 158 MiB of it heap, against 79 MiB before. Nothing leaks, since a later viewer reuses
+the pages, but they return to the system only at a restart. Fixing the threshold at 64 KiB
+sends larger frames to their own mappings, which do return, for about 0.3 points of a core at
+143 Mbit/s (12 % of ingest, 0.022 % per Mbit/s, inside the 07 §7 budget).

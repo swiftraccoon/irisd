@@ -436,7 +436,11 @@ mod tests {
         assert_eq!(info.sequence, 1);
         assert_eq!(info.decode_time, 6000);
         assert_eq!(info.sample_sizes, vec![6, 7]);
-        // The prft media time follows: scan the fragment behind an init segment with CRC checks.
+        // The prft media time follows the decode time: it sits behind the
+        // box header, version and flags, track id, and NTP time.
+        assert_eq!(&bytes[4..8], b"prft");
+        assert_eq!(bytes[24..32], 6000u64.to_be_bytes());
+        // Scan the fragment behind an init segment with CRC checks.
         let mut file = build_init_segment(&crate::init::tests::fake_sample_entry()).to_vec();
         file.extend_from_slice(&bytes);
         let report = scan(

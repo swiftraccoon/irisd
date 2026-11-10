@@ -205,8 +205,11 @@ mod tests {
         );
         assert_eq!(kind_for_code("NTPAdjustTime"), EventKind::TimeChange);
         assert_eq!(kind_for_code("NewFile"), EventKind::Other("NewFile".into()));
+        assert_eq!(state_for_action("Start"), EventState::Start);
         assert_eq!(state_for_action("Stop"), EventState::Stop);
         assert_eq!(state_for_action("State"), EventState::Pulse);
+        assert_eq!(state_for_action("Pulse"), EventState::Pulse);
+        assert_eq!(state_for_action("start"), EventState::Pulse);
     }
 
     #[test]

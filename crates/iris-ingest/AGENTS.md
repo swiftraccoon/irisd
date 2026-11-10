@@ -5,7 +5,8 @@ Scope: this crate only. Read the root `AGENTS.md` first.
 ## Invariants
 
 - The regulariser's rules (nominal durations, 1 % per-fragment correction, holds for
-  dropped frames, override after warm-up, snap beyond the tolerance) and its constants in
+  dropped frames, override after warm-up, snap beyond the tolerance, restart of a stale
+  estimate after four saturated corrections) and its constants in
   `src/regularize.rs` implement `docs/research/04-storage-format.md §7`; change them only
   with that section and `tests/replay.rs`.
 - Fragment boundaries (sync frame, new parameter sets, cap plus a quarter measured by

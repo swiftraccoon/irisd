@@ -12,7 +12,7 @@ use std::time::Duration;
 use iris_core::event::{Event, EventKind, EventSource, EventState};
 use iris_core::id::CameraId;
 use iris_core::text::LogSafe;
-use iris_core::time::WallUs;
+use iris_core::time::{self, WallUs};
 use oxvif::soap::SoapError;
 use oxvif::transport::{Transport, TransportError};
 use oxvif::{NotificationMessage, OnvifClient, OnvifError, PullPointSubscription};
@@ -759,14 +759,14 @@ pub fn parse_utc(text: &str) -> Option<WallUs> {
     // Bounded fields keep the arithmetic below in range for any input.
     if !(1970..=9999).contains(&year)
         || !(1..=12).contains(&month)
-        || !(1..=days_in_month(year, month)).contains(&day)
+        || !(1..=time::days_in_month(year, month)).contains(&day)
         || !(0..=23).contains(&hour)
         || !(0..=59).contains(&minute)
         || !(0..=59).contains(&second)
     {
         return None;
     }
-    let days = days_from_civil(year, month, day);
+    let days = time::days_from_civil(year, month, day);
     let secs = days * 86_400 + hour * 3600 + minute * 60 + second - offset_secs;
     Some(WallUs::new(secs * 1_000_000 + frac_micros))
 }
@@ -776,28 +776,6 @@ fn parse_decimal(bytes: &[u8]) -> Option<i64> {
         byte.is_ascii_digit()
             .then(|| value * 10 + i64::from(*byte - b'0'))
     })
-}
-
-fn days_in_month(year: i64, month: u32) -> u32 {
-    match month {
-        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
-        4 | 6 | 9 | 11 => 30,
-        2 if year % 4 == 0 && (year % 100 != 0 || year % 400 == 0) => 29,
-        2 => 28,
-        _ => 0,
-    }
-}
-
-/// Days since 1970-01-01 for a proleptic Gregorian date (Howard Hinnant).
-fn days_from_civil(year: i64, month: u32, day: u32) -> i64 {
-    let y = if month <= 2 { year - 1 } else { year };
-    let era = y.div_euclid(400);
-    let yoe = y.rem_euclid(400);
-    let m = i64::from(month);
-    let d = i64::from(day);
-    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    era * 146_097 + doe - 719_468
 }
 
 #[cfg(test)]
@@ -812,6 +790,31 @@ mod tests {
 
     use super::*;
     use crate::loopback;
+
+    /// Seeded instants from 1970 through 2104, to the microsecond: the
+    /// parser reads back what `WallUs` formats, with `Z` and behind an offset.
+    #[test]
+    fn parse_utc_reads_back_every_generated_instant_wall_us_formats() {
+        let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+        for _ in 0..20_000 {
+            state ^= state >> 12;
+            state ^= state << 25;
+            state ^= state >> 27;
+            let micros = i64::try_from(
+                state.wrapping_mul(0x2545_f491_4f6c_dd1d) % (135 * 365 * 86_400 * 1_000_000),
+            )
+            .unwrap();
+            let wall = WallUs::new(micros);
+            let text = wall.to_string();
+            assert_eq!(parse_utc(&text), Some(wall), "{text}");
+            let ahead = format!("{}+05:30", text.trim_end_matches('Z'));
+            assert_eq!(
+                parse_utc(&ahead),
+                Some(wall.offset(-19_800_000_000)),
+                "{ahead}"
+            );
+        }
+    }
 
     struct Ignore;
 
@@ -1863,6 +1866,67 @@ mod tests {
     }
 
     #[test]
+    fn each_fault_marker_is_recognised_in_any_case_and_spacing() {
+        for auth in [
+            "ter:NotAuthorized",
+            "Sender not authorized",
+            "wsse:FailedAuthentication",
+            "The security token failed authentication",
+            "wsse:InvalidSecurity",
+            "An invalid security token was provided",
+        ] {
+            assert!(is_auth_fault_marker(auth), "{auth}");
+            assert!(is_auth_fault_marker(&auth.to_ascii_uppercase()), "{auth}");
+            assert!(!is_clock_fault_marker(auth), "{auth}");
+        }
+        for clock in [
+            "wsu:MessageExpired",
+            "wsse:InvalidTimestamp",
+            "Clock skew too great",
+            "Wsse authorized time check failed",
+        ] {
+            assert!(is_clock_fault_marker(clock), "{clock}");
+            assert!(
+                is_clock_fault_marker(&clock.to_ascii_uppercase()),
+                "{clock}"
+            );
+            assert!(!is_auth_fault_marker(clock), "{clock}");
+        }
+        for other in ["ter:ActionNotSupported", "Receiver", ""] {
+            assert!(!is_auth_fault_marker(other) && !is_clock_fault_marker(other));
+        }
+    }
+
+    /// The data item that belongs to a topic's kind decides its state even
+    /// when a generic item beside it says otherwise; without a kind of its
+    /// own the two disagree and the state is not known.
+    #[test]
+    fn the_item_of_the_topics_kind_outranks_a_generic_state_item() {
+        for (kind, key) in [
+            (EventKind::Motion, "IsMotion"),
+            (EventKind::Intrusion, "IsInside"),
+            (EventKind::Tamper, "IsTamper"),
+            (EventKind::Audio, "IsSoundDetected"),
+            (EventKind::Face, "IsDetected"),
+        ] {
+            let data = HashMap::from([
+                (key.to_owned(), "true".to_owned()),
+                ("State".to_owned(), "false".to_owned()),
+            ]);
+            assert_eq!(
+                state_for_data("tns1:RuleEngine/Any", &kind, &data),
+                StateEvidence::Known(EventState::Start),
+                "{key}"
+            );
+            assert_eq!(
+                state_for_data("tns1:RuleEngine/Any", &EventKind::Other("x".into()), &data),
+                StateEvidence::Conflicting,
+                "{key}"
+            );
+        }
+    }
+
+    #[test]
     fn derives_state_from_the_topic_and_its_boolean_data() {
         let camera = CameraId::try_new("cam1").unwrap();
         let start = normalize_notification(
@@ -2152,9 +2216,34 @@ mod tests {
             "2026-01-01T00:00:00+14:01",
             "2026-01-01T00:00:00-14:01",
             "2026-01-01T00:00:00+15:00",
+            "2026-01-01T00:00:00+00:60",
+            // One field out of range at a time.
+            "1969-12-31T23:59:59Z",
+            "2026-00-10T00:00:00Z",
+            "2026-01-00T00:00:00Z",
+            "2026-01-01T24:00:00Z",
+            "2026-01-01T00:60:00Z",
+            // One zone digit that is not a digit at a time.
+            "2026-01-01T00:00:00+a0:00",
+            "2026-01-01T00:00:00+0a:00",
+            "2026-01-01T00:00:00+00:a0",
+            "2026-01-01T00:00:00+00:0a",
+            "2026-01-01T00:00:00+0000",
         ] {
             assert_eq!(parse_utc(invalid), None, "accepted {invalid}");
         }
+        // One separator wrong at a time.
+        for position in [4, 7, 10, 13, 16] {
+            let mut text = b"2026-01-01T00:00:00Z".to_vec();
+            text[position] = b'x';
+            let text = String::from_utf8(text).unwrap();
+            assert_eq!(parse_utc(&text), None, "accepted {text}");
+        }
+        assert_eq!(
+            parse_utc("1970-01-01T13:59:00+13:59"),
+            Some(WallUs::new(0)),
+            "the largest minute offset"
+        );
         for valid in [
             "2000-02-29T00:00:00Z",
             "2024-02-29T00:00:00Z",
@@ -2337,6 +2426,47 @@ mod tests {
             "{}",
             line.len()
         );
+    }
+
+    /// Against a loopback port nothing listens on, the subscription fails,
+    /// is counted, and is tried again after each backoff until shutdown,
+    /// which ends the task at once.
+    #[tokio::test(start_paused = true)]
+    async fn a_camera_that_refuses_connections_is_retried_until_shutdown() {
+        let unused = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = unused.local_addr().unwrap().port();
+        drop(unused);
+        let endpoint = CameraEndpoint {
+            camera: "cam1".parse().unwrap(),
+            host: "127.0.0.1".to_owned(),
+            http_port: port,
+            https: false,
+            tls_verify: true,
+            username: String::new(),
+            password: String::new(),
+        };
+        let stats = Arc::new(EventStats::new());
+        let shutdown = CancellationToken::new();
+        let task = tokio::spawn(run_onvif_pullpoint(
+            endpoint,
+            Arc::new(Ignore),
+            Arc::clone(&stats),
+            shutdown.clone(),
+        ));
+        // Backoff starts at a second and is capped at thirty.
+        tokio::time::sleep(Duration::from_mins(5)).await;
+        let attempts = stats.reconnects();
+        assert!(attempts >= 3, "{attempts} attempts in five minutes");
+        assert_eq!(stats.errors(), attempts);
+        assert!(!stats.connected());
+        assert_eq!(stats.events(), 0);
+        shutdown.cancel();
+        timeout(Duration::from_secs(1), task)
+            .await
+            .expect("the task ends at shutdown")
+            .unwrap();
+        // At most the attempt that was in flight is counted after that.
+        assert!(stats.reconnects() <= attempts + 1);
     }
 
     #[tokio::test]

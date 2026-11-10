@@ -1,6 +1,6 @@
 //! Allocation-free parsing of request timestamps, shared with the fuzz target.
 
-use iris_core::time::WallUs;
+use iris_core::time::{self, WallUs};
 
 /// Parses Unix microseconds or a Gregorian ASCII RFC 3339 timestamp with an optional fraction.
 /// Leap seconds are rejected because the recorder has no leap-second table.
@@ -34,7 +34,7 @@ fn parse_rfc3339(raw: &str) -> Option<WallUs> {
     let minute = two_digits(bytes, 14)?;
     let second = two_digits(bytes, 17)?;
     if !(1..=12).contains(&month)
-        || !(1..=days_in_month(year, month)).contains(&day)
+        || !(1..=time::days_in_month(year, month)).contains(&day)
         || hour > 23
         || minute > 59
         // Leap seconds are rejected rather than normalized because this API
@@ -74,7 +74,7 @@ fn parse_rfc3339(raw: &str) -> Option<WallUs> {
         }
         _ => return None,
     };
-    let days = days_from_civil(year, month, day);
+    let days = time::days_from_civil(year, month, day);
     let secs = days * 86_400 + i64::from(hour) * 3600 + i64::from(minute) * 60 + i64::from(second)
         - offset_secs;
     Some(WallUs::new(secs * 1_000_000 + micros))
@@ -95,34 +95,34 @@ fn four_digits(bytes: &[u8], start: usize) -> Option<u32> {
     Some(high * 100 + low)
 }
 
-fn days_in_month(year: i64, month: u32) -> u32 {
-    match month {
-        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
-        4 | 6 | 9 | 11 => 30,
-        2 if is_leap_year(year) => 29,
-        2 => 28,
-        _ => 0,
-    }
-}
-
-fn is_leap_year(year: i64) -> bool {
-    year % 4 == 0 && (year % 100 != 0 || year % 400 == 0)
-}
-
-/// Days since 1970-01-01 for a proleptic Gregorian date (Howard Hinnant's algorithm).
-fn days_from_civil(year: i64, month: u32, day: u32) -> i64 {
-    let y = if month <= 2 { year - 1 } else { year };
-    let era = y.div_euclid(400);
-    let yoe = y.rem_euclid(400);
-    let m = i64::from(month);
-    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + i64::from(day) - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    era * 146_097 + doe - 719_468
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Seeded instants from 1970 through 2104, to the microsecond: the
+    /// parser reads back what `WallUs` formats, with `Z` and behind an offset.
+    #[test]
+    fn parse_time_reads_back_every_generated_instant_wall_us_formats() {
+        let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+        for _ in 0..20_000 {
+            state ^= state >> 12;
+            state ^= state << 25;
+            state ^= state >> 27;
+            let micros = i64::try_from(
+                state.wrapping_mul(0x2545_f491_4f6c_dd1d) % (135 * 365 * 86_400 * 1_000_000),
+            )
+            .unwrap();
+            let wall = WallUs::new(micros);
+            let text = wall.to_string();
+            assert_eq!(parse_time(&text), Some(wall), "{text}");
+            let ahead = format!("{}+05:30", text.trim_end_matches('Z'));
+            assert_eq!(
+                parse_time(&ahead),
+                Some(wall.offset(-19_800_000_000)),
+                "{ahead}"
+            );
+        }
+    }
 
     #[test]
     fn parses_micros_and_rfc3339() {
@@ -193,9 +193,33 @@ mod tests {
             "2026-01-01T00:00:00+24:00",
             "2026-01-01T00:00:00+23:60",
             "2026-01-01T00:00:00+99:99",
+            // A zone must end the text and keep its colon.
+            "2026-01-01T00:00:00Zx",
+            "2026-01-01T00:00:00+01:00x",
+            "2026-01-01T00:00:00+01-00",
+            "2026-01-01T00:00:00+0100",
+            "2026-01-01T00:00:00",
+            // The shortest valid text is twenty bytes.
+            "2026-01-01T00:00:0Z",
         ] {
             assert!(parse_time(raw).is_none(), "accepted {raw:?}");
         }
+        // One separator wrong at a time.
+        for position in [4, 7, 10, 13, 16] {
+            let mut raw = b"2026-01-01T00:00:00Z".to_vec();
+            raw[position] = b'x';
+            let raw = String::from_utf8(raw).unwrap();
+            assert!(parse_time(&raw).is_none(), "accepted {raw:?}");
+        }
+        // Digits past the sixth of a fraction are read and dropped.
+        assert_eq!(
+            parse_time("1970-01-01T00:00:00.1234567Z"),
+            Some(WallUs::new(123_456))
+        );
+        assert_eq!(
+            parse_time("1970-01-01T00:00:00.000009Z"),
+            Some(WallUs::new(9))
+        );
     }
 
     #[test]

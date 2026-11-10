@@ -280,6 +280,7 @@ async fn get_with_digest_inner(
 
 #[cfg(test)]
 mod tests {
+    use iris_core::event::{Event, EventKind, EventSource, EventState};
     use tokio::io::AsyncReadExt as _;
     use tokio::net::TcpListener;
 
@@ -319,6 +320,189 @@ mod tests {
         assert_eq!(parts, [b"Heartbeat".to_vec()]);
         deadline.observe(near_deadline, parts.len());
         assert_eq!(deadline.deadline(), near_deadline + STALL);
+    }
+
+    struct Collect(std::sync::Mutex<Vec<Event>>);
+
+    impl EventSink for Collect {
+        fn publish(&self, event: Event) {
+            self.0.lock().unwrap().push(event);
+        }
+    }
+
+    /// The whole feed task against a loopback camera that sends a heartbeat
+    /// and two events and closes: the events reach the sink normalised, the
+    /// counters follow, the feed is attached again after the backoff, and
+    /// shutdown ends the task.
+    #[tokio::test]
+    async fn the_feed_task_delivers_events_reconnects_and_stops_at_shutdown() {
+        const FEED: &str = "--myboundary\r\nContent-Type: text/plain\r\nContent-Length: 9\r\n\r\n\
+            Heartbeat\r\n--myboundary\r\nContent-Type: text/plain\r\nContent-Length: 39\r\n\r\n\
+            Code=VideoMotion;action=Start;index=0\r\n\r\n--myboundary\r\n\
+            Content-Type: text/plain\r\nContent-Length: 36\r\n\r\n\
+            Code=VideoLoss;action=Stop;index=0\r\n\r\n--myboundary\r\n";
+        let camera = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = camera.local_addr().unwrap();
+        let attaches = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let server = tokio::spawn({
+            let attaches = Arc::clone(&attaches);
+            async move {
+                loop {
+                    let (mut socket, _) = camera.accept().await.unwrap();
+                    let mut request = [0; 1_024];
+                    let read = socket.read(&mut request).await.unwrap();
+                    let request = String::from_utf8_lossy(&request[..read]).into_owned();
+                    assert!(
+                        request.starts_with(
+                            "GET /cgi-bin/eventManager.cgi?action=attach&codes=[All]&heartbeat=5 "
+                        ),
+                        "{request}"
+                    );
+                    attaches.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: multipart/x-mixed-replace; \
+                         boundary=myboundary\r\nConnection: close\r\n\r\n{FEED}"
+                    );
+                    tokio::io::AsyncWriteExt::write_all(&mut socket, response.as_bytes())
+                        .await
+                        .unwrap();
+                }
+            }
+        });
+        let endpoint = CameraEndpoint {
+            camera: "cam1".parse().unwrap(),
+            host: address.ip().to_string(),
+            http_port: address.port(),
+            https: false,
+            tls_verify: true,
+            username: String::new(),
+            password: String::new(),
+        };
+        let sink = Arc::new(Collect(std::sync::Mutex::new(Vec::new())));
+        let stats = Arc::new(EventStats::new());
+        let shutdown = CancellationToken::new();
+        let task = tokio::spawn(run_dahua_cgi(
+            endpoint,
+            Arc::clone(&sink) as Arc<dyn EventSink>,
+            Arc::clone(&stats),
+            shutdown.clone(),
+        ));
+
+        // The second attach follows the first backoff of about a second.
+        timeout(Duration::from_secs(10), async {
+            while attaches.load(std::sync::atomic::Ordering::SeqCst) < 2
+                || sink.0.lock().unwrap().len() < 4
+            {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the feed attached twice and delivered both rounds");
+        {
+            let events = sink.0.lock().unwrap();
+            let seen: Vec<_> = events
+                .iter()
+                .take(2)
+                .map(|event| (event.kind.clone(), event.state, event.source))
+                .collect();
+            assert_eq!(
+                seen,
+                [
+                    (EventKind::Motion, EventState::Start, EventSource::DahuaCgi),
+                    (
+                        EventKind::VideoLoss,
+                        EventState::Stop,
+                        EventSource::DahuaCgi
+                    ),
+                ]
+            );
+            assert!(events.iter().all(|event| event.camera.as_str() == "cam1"));
+        }
+        assert!(stats.events() >= 4);
+        assert!(stats.messages() >= 6, "heartbeats count as messages");
+        assert!(stats.reconnects() >= 1);
+        assert!(stats.errors() >= 1, "a feed that ends is counted");
+
+        shutdown.cancel();
+        timeout(Duration::from_secs(2), task)
+            .await
+            .expect("the task ends at shutdown")
+            .unwrap();
+        assert!(!stats.connected());
+        server.abort();
+    }
+
+    /// A loopback HTTPS camera with a self-signed certificate that answers
+    /// one request with an empty 200; the task returns whether a request reached
+    /// HTTP.
+    async fn self_signed_camera(
+        tls_verify: bool,
+    ) -> (CameraEndpoint, tokio::task::JoinHandle<bool>) {
+        use tokio_rustls::TlsAcceptor;
+        use tokio_rustls::rustls::ServerConfig;
+        use tokio_rustls::rustls::pki_types::PrivatePkcs8KeyDer;
+
+        let certified = rcgen::generate_simple_self_signed(vec!["127.0.0.1".to_owned()]).unwrap();
+        let key = PrivatePkcs8KeyDer::from(certified.signing_key.serialize_der());
+        let config = ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![certified.cert.der().clone()], key.into())
+            .unwrap();
+        let acceptor = TlsAcceptor::from(Arc::new(config));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let Ok(mut socket) = acceptor.accept(socket).await else {
+                return false;
+            };
+            let mut request = [0; 2_048];
+            if !matches!(socket.read(&mut request).await, Ok(length) if length > 0) {
+                return false;
+            }
+            tokio::io::AsyncWriteExt::write_all(
+                &mut socket,
+                b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            )
+            .await
+            .is_ok()
+        });
+        let endpoint = CameraEndpoint {
+            camera: "cam1".parse().unwrap(),
+            host: "127.0.0.1".to_owned(),
+            http_port: address.port(),
+            https: true,
+            tls_verify,
+            username: String::new(),
+            password: String::new(),
+        };
+        (endpoint, server)
+    }
+
+    /// The feed's HTTP client verifies the camera's certificate unless the
+    /// camera is configured not to be verified: a self-signed certificate
+    /// stops a verified camera before any request, and an unverified one is
+    /// attached to.
+    #[tokio::test]
+    async fn the_feed_client_verifies_certificates_unless_told_not_to() {
+        for (tls_verify, reaches_http) in [(true, false), (false, true)] {
+            let (endpoint, server) = self_signed_camera(tls_verify).await;
+            let path = "/cgi-bin/eventManager.cgi?action=attach";
+            let url = format!("{}{path}", endpoint.base_url());
+            let result = get_with_digest(
+                &cgi_client(&endpoint).unwrap(),
+                &url,
+                path,
+                &mut DigestAuth::new("", ""),
+            )
+            .await;
+            assert_eq!(result.is_ok(), reaches_http, "tls_verify={tls_verify}");
+            let reached = timeout(Duration::from_secs(5), server)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(reached, reaches_http, "tls_verify={tls_verify}");
+        }
     }
 
     #[tokio::test]
