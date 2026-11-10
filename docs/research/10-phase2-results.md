@@ -82,6 +82,89 @@ fixed before the run, and their artifacts did not reproduce on 2026-11-02.
 | `scan` | 7.29 × 10⁹ |
 | `trailer` | 1.93 × 10¹⁰ |
 
+## Fuzzing (2026-11-08 to 2026-11-09)
+
+Six targets added after the first campaign ran the same command for 24 h each from
+2026-11-08T17:18Z, without a finding. They were built from the tree of that hour, before the
+standards audit of 2026-11-09 changed the event, export, and query-time code that
+`onvif_soap`, `export_rebase`, and `api_time` reach, and `tools_protocol` held three parsers
+then.
+
+| Target | Runs in 24 h |
+|---|---|
+| `api_time` | 1.05 × 10¹⁰ |
+| `describe_diagnostics` | 1.85 × 10⁸ |
+| `export_rebase` | 4.81 × 10⁹ |
+| `onvif_soap` | 2.73 × 10⁸ |
+| `rtsp_message` | 3.02 × 10⁷ |
+| `tools_protocol` (three parsers) | 3.59 × 10⁹ |
+
+## Fuzzing (2026-11-09 to 2026-11-10)
+
+Seven more targets ran the same command for 24 h each from 2026-11-09T05:07Z, without a
+finding, on a tree that held the audit's changes to the code they reach. The civil-date
+arithmetic the ONVIF timestamp parser calls moved to `iris-core` afterwards, unchanged.
+
+| Target | Runs in 24 h |
+|---|---|
+| `api_auth` | 9.88 × 10⁹ |
+| `api_range` | 1.47 × 10¹⁰ |
+| `depacketize_h265` | 1.03 × 10⁸ |
+| `discovery_parts` | 5.63 × 10⁷ |
+| `onvif_notification` | 1.20 × 10⁷ |
+| `rtp_packet` | 1.71 × 10¹⁰ |
+| `vod_playlist` | 7.49 × 10⁷ |
+
+## Mutation testing (2026-11-10)
+
+`just mutants FILE...` (cargo-mutants 27.1.0, two workers, each crate's own tests) over the
+format, timing, parsing, storage, catalog, API, and daemon code. A mutant that hangs the tests
+counts as detected. The figures are of the first run over each set, before the tests written
+from it; the second round reran the first two sets and added the export and LL-HLS handlers.
+
+| Code | Mutants | Caught | Timed out | Missed | Unviable |
+|---|---:|---:|---:|---:|---:|
+| ingest: regulariser, assembler | 279 | 223 | 0 | 48 | 8 |
+| mp4: fragment, index, reader, export | 502 | 407 | 12 | 58 | 25 |
+| mp4: boxes, init, hls, crc | 113 | 89 | 1 | 19 | 4 |
+| second round, with api export and llhls | 783 | 635 | 13 | 102 | 33 |
+| h265 | 51 | 46 | 0 | 3 | 2 |
+| core: time, id, event | 294 | 239 | 1 | 36 | 18 |
+| core: config | 139 | 125 | 0 | 10 | 4 |
+| events: onvif | 191 | 153 | 0 | 24 | 14 |
+| events: feed, dahua, multipart, digest, backoff | 237 | 174 | 6 | 41 | 16 |
+| store: recover, segment | 148 | 80 | 0 | 44 | 24 |
+| store: writer, stream, root worker, layout, policy | 159 | 117 | 0 | 31 | 11 |
+| catalog: db | 308 | 209 | 3 | 50 | 46 |
+| catalog: handle; replay: synth | 200 | 120 | 2 | 41 | 37 |
+| api: auth, query, segments | 267 | 199 | 7 | 30 | 31 |
+| api: hls, keyframe, live, admission | 247 | 179 | 0 | 49 | 19 |
+| api: state, events, cameras, provision, snapshot, websocket, server, metrics, health, error, onvif | 240 | 106 | 10 | 35 | 89 |
+| ingest: live, stats, source, session; tls | 270 | 166 | 17 | 64 | 23 |
+| irisd: retention | 122 | 80 | 0 | 38 | 4 |
+| irisd: adopt, inspect, hls | 235 | 117 | 0 | 101 | 17 |
+| irisd: run, record, selfcheck, capability, permissions, catalog observer, provision | 432 | 207 | 0 | 131 | 94 |
+
+What the missed mutants showed, and what followed the same day:
+
+- A regulariser rule no test needed, which measurement then showed to do harm
+  (`11-multi-camera-results.md`, generated stalls); it was removed.
+- Whole paths that no test ran: the Dahua feed task, the ONVIF retry loop, the daemon's
+  recording path from camera to sealed catalog row, the offline `hls` and `inspect` commands,
+  and every field of the initialization segment. Each has an end-to-end or field-by-field
+  test.
+- Settings that could be inverted unnoticed: certificate verification in the Dahua feed and
+  snapshot clients (the ONVIF client was covered), and the watchdog's progress condition.
+- Facts checked only in combination or only at one end: sidecar binding and fragment checks,
+  capability expiry and path limits, the free-space floor, event maintenance at its age and
+  recording-horizon boundaries, `tfhd` and `trun` layouts of other muxers.
+
+Left as they are: mutants equivalent to the original (a second loop exit, flags that share no
+bit, log-only branches), limits of 64 MiB and more that a test would have to allocate, and
+error handling that needs injected faults (transient resource errors, `AlreadyExists` retries,
+directory sync), which the full-filesystem test covers only for `ENOSPC`. `iris-tools`,
+`iris-gui`, and the rest of `iris-replay` were not run.
+
 ## Open items (phase-2 exit criteria in `08-roadmap.md`)
 
 ONVIF PullPoint events, open on 2026-11-02, ran against hardware later
@@ -90,9 +173,9 @@ ONVIF PullPoint events, open on 2026-11-02, ran against hardware later
 - Seven-day soak: run the daemon as the packaged systemd service.
 - `mediastreamvalidator` on the daemon's playlists and AVPlayer on an iPhone (needs a LAN
   `listen` address).
-- Fuzzing: the targets added after 2026-11-02 (`api_time`, `api_range`, `api_auth`,
-  `export_rebase`, `onvif_soap`, `onvif_notification`, `discovery_parts`, `tools_protocol`,
-  `tools_logs`, `describe_diagnostics`, `rtsp_message`, `depacketize_h265`, `rtp_packet`,
-  `vod_playlist`) lack a completed 24 h run. So does `rtsp_request` since it was extended to the
-  replay server's `Transport` and `Session` parsers, and `tools_protocol` since it was extended
-  to the probe's interleaved-stream, RTCP, H.265 payload, SDP, and digest parsers.
+- Fuzzing: `tools_logs` lacks a completed 24 h run. So do `rtsp_request` since it was extended
+  to the replay server's `Transport` and `Session` parsers, `tools_protocol` since it was
+  extended to the probe's interleaved-stream, RTCP, H.265 payload, SDP, and digest parsers, and
+  `api_time`, `export_rebase`, and `onvif_soap` on the code the audit changed; runs of these
+  six started on 2026-11-10T01:29Z. The ten targets of the first campaign ran on the 2026-11-01
+  tree; the exit criterion is judged on a 24 h run of every target on the release tree.

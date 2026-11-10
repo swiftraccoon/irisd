@@ -441,7 +441,7 @@ mod tests {
             .collect()
     }
 
-    /// The CRC-32C (Castagnoli, reflected) byte table.
+    /// The CRC-32C (reflected) byte table.
     fn crc32c_table() -> [u32; 256] {
         let mut table = [0u32; 256];
         for (index, slot) in table.iter_mut().enumerate() {

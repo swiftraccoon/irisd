@@ -380,8 +380,12 @@ mod tests {
         let info = inspect_access_unit(&au).unwrap();
         assert_eq!(info.nal_count, 4);
         assert!(info.is_irap && info.has_parameter_sets);
+        // Three parameter sets of a two-byte header and one byte, each
+        // behind its four-byte prefix: what stripping removes.
+        assert_eq!(info.parameter_set_bytes, 3 * (4 + 3));
         let stripped = strip_parameter_sets(&au).unwrap().unwrap();
         assert_eq!(stripped, nal(19, b"idr-slice"));
+        assert_eq!(stripped.len(), au.len() - info.parameter_set_bytes);
         assert!(strip_parameter_sets(&stripped).unwrap().is_none());
     }
 

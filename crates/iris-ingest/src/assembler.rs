@@ -187,6 +187,13 @@ impl FragmentAssembler {
         Some(self.decode_time + index as u64 * u64::from(self.nominal()))
     }
 
+    /// Whether the pending fragment is the first of a run, whose decode
+    /// timeline starts at zero.
+    #[must_use]
+    pub(crate) fn pending_starts_run(&self) -> bool {
+        self.new_run
+    }
+
     /// Adds a frame; returns the fragment it completed, if any.
     ///
     /// A frame larger than 64 MiB flushes any pending fragment and is dropped.
@@ -374,6 +381,280 @@ mod tests {
         }
         a.push(frame(62, true))
             .expect("closes at the next sync frame")
+    }
+
+    /// A small deterministic generator (xorshift64*) for the property test.
+    struct Rng(u64);
+
+    impl Rng {
+        fn below(&mut self, n: u64) -> u64 {
+            self.0 ^= self.0 >> 12;
+            self.0 ^= self.0 << 25;
+            self.0 ^= self.0 >> 27;
+            self.0.wrapping_mul(0x2545_f491_4f6c_dd1d) % n
+        }
+    }
+
+    /// A camera timeline as the test cameras produce it: 30 fps stamped at
+    /// 10 ms resolution, with duplicated stamps, in GOPs of 20 to 90 frames,
+    /// dropping one to `most` frames about once in `one_in`. A stamp is never
+    /// repeated across dropped frames. Every frame carries its index as
+    /// payload and comes with the exact time the stamp was rounded or
+    /// repeated from.
+    fn camera_timeline(rng: &mut Rng, frames: u64, one_in: u64, most: u64) -> Vec<(Frame, i64)> {
+        let gop = 20 + rng.below(71);
+        let mut exact = 5_000_i64;
+        let mut previous = exact;
+        (0..frames)
+            .map(|index| {
+                let dropped = rng.below(one_in) == 0;
+                if dropped {
+                    exact += 3000 * i64::try_from(1 + rng.below(most)).unwrap();
+                }
+                let raw_ts = if rng.below(16) == 0 && !dropped {
+                    previous
+                } else {
+                    (exact / 900) * 900
+                };
+                previous = raw_ts;
+                let frame = Frame {
+                    data: Bytes::from(index.to_be_bytes().to_vec()),
+                    raw_ts,
+                    wall: WallUs::new(
+                        1_000_000 + exact * 100 / 9 + i64::try_from(rng.below(20_000)).unwrap(),
+                    ),
+                    is_sync: index % gop == 0,
+                    new_params: false,
+                };
+                let at = exact;
+                exact += 3000;
+                (frame, at)
+            })
+            .collect()
+    }
+
+    /// Pushes a whole timeline and returns the largest distance, at a
+    /// fragment boundary, between the media time assigned so far and the
+    /// camera's exact time, after checking what holds for every fragment:
+    /// frames come out once and in order, the first fragment starts a run at
+    /// a sync frame and the rest continue its decode time, and no sample has
+    /// a zero duration. The flushed tail has no following stamp to be
+    /// measured against, so it is checked for order only, and a boundary
+    /// whose stamp is repeated is not measured. Every fragment's wall time
+    /// lies between `early_us` before the capture of its first frame and the
+    /// generator's 20 ms of receipt delay after it: the anchor follows the
+    /// least-delayed frame at once and rises by 500 ppm, so it sits early by
+    /// up to the distance the media time has run ahead.
+    fn worst_boundary_drift(frames: &[(Frame, i64)], early_us: i64, seed: u64) -> i64 {
+        worst_boundary_drift_and_snaps(frames, early_us, seed).0
+    }
+
+    /// [`worst_boundary_drift`] with the number of fragments that snapped.
+    fn worst_boundary_drift_and_snaps(
+        frames: &[(Frame, i64)],
+        early_us: i64,
+        seed: u64,
+    ) -> (i64, u64) {
+        let mut a = assembler();
+        let mut next_index = 0usize;
+        let mut next_decode = None;
+        let mut media = 0i64;
+        let mut worst = 0i64;
+        let mut check = |fragment: &Fragment, next_index: &mut usize| {
+            match next_decode {
+                Some(expected) => {
+                    assert!(!fragment.new_run, "seed {seed}");
+                    assert_eq!(fragment.decode_time, expected, "seed {seed}");
+                }
+                None => assert!(
+                    fragment.new_run && fragment.starts_with_sync(),
+                    "seed {seed}"
+                ),
+            }
+            for sample in &fragment.samples {
+                let index = u64::from_be_bytes(sample.data[..].try_into().unwrap());
+                assert_eq!(index, *next_index as u64, "seed {seed}");
+                *next_index += 1;
+                assert!(sample.duration >= 1, "seed {seed}");
+            }
+            next_decode = Some(fragment.decode_time + fragment.duration());
+        };
+        for (frame, _) in frames {
+            if let Some(fragment) = a.push(frame.clone()) {
+                let captured = 1_000_000 + frames[next_index].1 * 100 / 9;
+                let late = fragment.wall.get() - captured;
+                assert!(
+                    (-early_us..=20_000).contains(&late),
+                    "seed {seed}: fragment wall {late} us after its capture"
+                );
+                check(&fragment, &mut next_index);
+                media += i64::try_from(fragment.duration()).unwrap();
+                // The frame that closed the fragment is the next one's first.
+                // A repeated stamp there hides the time since the frame
+                // before it, a drop included, until the next fragment, so
+                // only a boundary with a fresh stamp is measured.
+                let (boundary, exact) = &frames[next_index];
+                if exact - boundary.raw_ts < 900 {
+                    let camera = exact - frames[0].1;
+                    worst = worst.max((media - camera).abs());
+                }
+            }
+        }
+        if let Some(tail) = a.flush() {
+            check(&tail, &mut next_index);
+        }
+        assert_eq!(next_index, frames.len(), "seed {seed}");
+        (worst, a.snap_count())
+    }
+
+    /// A camera that drops about half a percent of its frames, more than
+    /// any of the test cameras: the timeline stays within 100 ms of the
+    /// camera's at every fragment boundary.
+    #[test]
+    fn a_camera_dropping_few_frames_is_tracked_within_100_ms_at_every_fragment() {
+        for seed in 1..=200 {
+            let frames = camera_timeline(&mut Rng(seed), 3_000, 400, 3);
+            let drift = worst_boundary_drift(&frames, 200_000, seed);
+            assert!(drift <= 9_000, "seed {seed}: drift {drift} ticks");
+        }
+    }
+
+    /// A camera that drops a frame and a half in every hundred, so often
+    /// that the typical frame sits in a fragment running more than 1 % long:
+    /// the delivered rate takes over and lags when the drops stop, and the
+    /// timeline stays within the 500 ms snap tolerance and one fragment's
+    /// 1 % correction.
+    #[test]
+    fn a_camera_dropping_many_frames_stays_within_the_snap_tolerance() {
+        for seed in 1..=200 {
+            let frames = camera_timeline(&mut Rng(seed), 3_000, 200, 5);
+            let drift = worst_boundary_drift(&frames, 550_000, seed);
+            assert!(drift <= 45_000 + 2_250, "seed {seed}: drift {drift} ticks");
+        }
+    }
+
+    /// A camera on rate that stalls for up to two seconds about every
+    /// thirteen: a tenth of its time is holes. Each stall becomes a hold and
+    /// the declared rate stays in use, so the timeline stays within the snap
+    /// tolerance and fewer than one timeline in fifty snaps (one in seventy
+    /// over 20,000 seeds). Re-timing such a camera to its mean delivered
+    /// rate would snap several times in every hundred seconds.
+    /// A cluster of stalls can swing the error both ways, and the wall
+    /// anchor, which rises by 500 ppm only, then sits early by one swing
+    /// while the media time is behind by the other.
+    #[test]
+    fn a_camera_that_stalls_now_and_then_rarely_snaps() {
+        let mut snaps = 0;
+        let mut timelines = 0;
+        for seed in 1..=200 {
+            let frames = camera_timeline(&mut Rng(seed), 3_000, 400, 60);
+            let (drift, snapped) = worst_boundary_drift_and_snaps(&frames, 1_050_000, seed);
+            assert!(drift <= 45_000 + 2_250, "seed {seed}: drift {drift} ticks");
+            snaps += snapped;
+            timelines += 1;
+        }
+        assert!(
+            snaps * 50 <= timelines,
+            "{snaps} snaps over {timelines} timelines"
+        );
+    }
+
+    #[test]
+    fn an_hour_of_generated_camera_time_stays_within_100_ms_of_the_camera() {
+        for seed in 1..=3 {
+            let frames = camera_timeline(&mut Rng(seed), 108_000, 400, 3);
+            let drift = worst_boundary_drift(&frames, 200_000, seed);
+            assert!(drift <= 9_000, "seed {seed}: drift {drift} ticks");
+        }
+    }
+
+    /// A parameter change that halves the frame rate: the fragment before
+    /// it keeps the durations of the first rate, and after retargeting the
+    /// following fragments take the declared duration at once, with no
+    /// snap. Without the retarget the doubled span is two seconds past what
+    /// the first rate predicts, which snaps.
+    #[test]
+    fn retargeting_at_a_parameter_change_applies_the_declared_rate_without_a_snap() {
+        let mut a = assembler();
+        let before = first_gop(&mut a);
+        assert!(before.samples.iter().all(|s| s.duration == 3000));
+        for index in 63..122 {
+            assert!(a.push(frame(index, false)).is_none());
+        }
+        let slow = |index: i64| Frame {
+            data: Bytes::from(vec![0, 0, 0, 2, 0x26, 0]),
+            raw_ts: 5_000 + 122 * 3000 + index * 6000,
+            wall: WallUs::new(5_000_000 + index * 66_667),
+            is_sync: index % 30 == 0,
+            new_params: index == 0,
+        };
+        let old_rate = a.push(slow(0)).expect("new parameters close the fragment");
+        assert!(old_rate.samples.iter().all(|s| s.duration == 3000));
+        a.retarget_timing(6000);
+        assert_eq!(a.nominal(), 6000);
+        assert_eq!(a.last_provisional_decode_time(), Some(360_000));
+        let mut closed = 0;
+        for index in 1..=90 {
+            let completed = a.push(slow(index));
+            if index == 2 {
+                // The third pending frame, two declared durations in.
+                assert_eq!(a.last_provisional_decode_time(), Some(372_000));
+            }
+            if let Some(fragment) = completed {
+                assert!(!fragment.new_run);
+                assert!(fragment.samples.iter().all(|s| s.duration == 6000));
+                closed += 1;
+            }
+        }
+        assert_eq!(closed, 3);
+        assert_eq!(a.snap_count(), 0);
+        assert_eq!(a.holes(), 0);
+    }
+
+    /// A fragment corrected shorter by more than one frame ends before the
+    /// provisional time of its last frame: here 120 frames delivered 1 %
+    /// fast, which the correction takes out in full. The live path has to
+    /// expect the next fragment's provisional times to start below where
+    /// the last ones ended.
+    #[test]
+    fn a_shortened_fragment_ends_before_its_last_provisional_decode_time() {
+        let options = IngestOptions {
+            max_fragment: MediaTicks::new(i64::MAX),
+            ..IngestOptions::default()
+        };
+        let regularizer = Regularizer::new(
+            TimestampMode::Regularize,
+            Some(3000),
+            MediaTicks::from_millis(500),
+        );
+        let mut a = FragmentAssembler::new(&options, regularizer, entry());
+        assert!(a.pending_starts_run());
+        let fast = |index: i64| Frame {
+            data: Bytes::from(vec![0, 0, 0, 2, 0x26, 0]),
+            raw_ts: index * 2970,
+            wall: WallUs::new(1_000_000 + index * 33_000),
+            is_sync: index % 120 == 0,
+            new_params: false,
+        };
+        for index in 0..120 {
+            assert!(a.push(fast(index)).is_none());
+        }
+        let last_provisional = a.last_provisional_decode_time().unwrap();
+        assert_eq!(last_provisional, 119 * 3000);
+        let first = a.push(fast(120)).expect("the sync frame closes the GOP");
+        assert_eq!(first.duration(), 120 * 2970);
+        assert!(!a.pending_starts_run());
+        let next_start = a.last_provisional_decode_time().unwrap();
+        assert_eq!(next_start, 120 * 2970);
+        assert!(next_start < last_provisional);
+    }
+
+    #[test]
+    fn frame_debug_output_shows_the_payload_length_only() {
+        let text = format!("{:?}", frame(7, true));
+        assert!(text.contains("<6 bytes>"), "{text}");
+        assert!(text.contains("raw_ts: 26000"), "{text}");
+        assert!(text.contains("is_sync: true"), "{text}");
     }
 
     #[test]

@@ -186,7 +186,9 @@ mod tests {
     #[test]
     fn nests_and_patches_sizes() {
         let mut w = BoxWriter::default();
+        assert!(w.is_empty());
         let outer = w.begin(b"moov");
+        assert!(!w.is_empty());
         let inner = w.begin_full(b"mvhd", 1, 0);
         w.u32(7);
         w.end(inner);

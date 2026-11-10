@@ -179,6 +179,10 @@ The example is compiled with the crate's doctests.
 
 ## Tests and measurements
 
+- `tests/retention_model.rs`: seeded model test of event protection. Over generated
+  segments, events, and retain marks on a time grid, the candidate pages (whole and in small
+  pages), the per-stream age pages, and the atomic deletion mark each agree with one overlap
+  rule written out in the test, at exact bounds and for a mark that lapses at the instant.
 - `tests/catalog.rs`: ordered segment lifecycle; open-row listing grace and zero-fragment
   exclusion; retention pages oldest first across equal start times, the atomic mark refusing a
   protected row and marking it once the mark is cleared, root-bound marks and pages, hidden

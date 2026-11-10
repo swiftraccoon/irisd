@@ -566,6 +566,129 @@ mod tests {
         assert_eq!(loaded, expected);
     }
 
+    /// A recording of two one-second fragments, each one sync sample.
+    fn two_second_recording() -> Vec<u8> {
+        use bytes::Bytes;
+        use iris_core::time::WallUs;
+        use iris_mp4::fragment::{FragmentHeader, Sample, encode_fragment};
+        use iris_mp4::init::{SampleEntry, build_init_segment};
+
+        let entry = SampleEntry::new(
+            Bytes::from_static(b"\0\0\0\x10hvc1\0\0\0\0\0\0\0\0"),
+            "hvc1".into(),
+            16,
+            16,
+        );
+        let mut file = build_init_segment(&entry).to_vec();
+        let samples = [Sample {
+            data: Bytes::from_static(&[0, 0, 0, 2, 38, 1]),
+            duration: 90_000,
+            is_sync: true,
+        }];
+        for sequence in 1..=2u32 {
+            let encoded = encode_fragment(
+                &FragmentHeader {
+                    sequence,
+                    decode_time: u64::from(sequence - 1) * 90_000,
+                    wall: WallUs::new(0),
+                },
+                &samples,
+            )
+            .unwrap();
+            for slice in encoded.io_slices(&samples) {
+                file.extend_from_slice(&slice);
+            }
+        }
+        file
+    }
+
+    fn arguments(file: &Path, out: &Path) -> Args {
+        Args {
+            file: file.to_path_buf(),
+            out: out.to_path_buf(),
+            fragments_per_segment: NonZeroUsize::new(1).unwrap(),
+            exclude_trailers: false,
+            codecs: "hvc1.1.6.L150.B0".into(),
+            resolution: (1920, 1080),
+        }
+    }
+
+    /// The command end to end: the output directory holds the recording
+    /// under its own name and two playlists that describe it.
+    #[test]
+    fn the_command_writes_both_playlists_and_links_the_recording() {
+        let dir = tempfile::tempdir().unwrap();
+        let recording = two_second_recording();
+        let source = dir.path().join("front door.mp4");
+        fs::write(&source, &recording).unwrap();
+        let out = dir.path().join("site");
+        run(&arguments(&source, &out)).unwrap();
+
+        assert_eq!(fs::read(out.join("front door.mp4")).unwrap(), recording);
+        let media = fs::read_to_string(out.join(MEDIA_PLAYLIST)).unwrap();
+        assert!(media.starts_with("#EXTM3U\n"), "{media}");
+        assert!(media.contains("#EXT-X-TARGETDURATION:1\n"), "{media}");
+        assert!(
+            media.contains("#EXT-X-MAP:URI=\"front%20door.mp4\",BYTERANGE=\""),
+            "{media}"
+        );
+        assert_eq!(media.matches("#EXTINF:1.00000,\n").count(), 2, "{media}");
+        assert_eq!(media.matches("\nfront%20door.mp4\n").count(), 2, "{media}");
+        assert!(media.ends_with("#EXT-X-ENDLIST\n"), "{media}");
+        let master = fs::read_to_string(out.join(MASTER_PLAYLIST)).unwrap();
+        assert!(
+            master.contains("CODECS=\"hvc1.1.6.L150.B0\",RESOLUTION=1920x1080\n"),
+            "{master}"
+        );
+        assert!(master.ends_with(&format!("{MEDIA_PLAYLIST}\n")), "{master}");
+        // Nothing else: no temporary file stays behind.
+        assert_eq!(fs::read_dir(&out).unwrap().count(), 3);
+
+        // A second run over the same output replaces the playlists.
+        run(&arguments(&source, &out)).unwrap();
+        assert_eq!(fs::read_dir(&out).unwrap().count(), 3);
+        assert_eq!(fs::read_to_string(out.join(MEDIA_PLAYLIST)).unwrap(), media);
+    }
+
+    /// A playlist name in the output directory that is the recording itself
+    /// (a hard link) would be overwritten by publication: the command
+    /// refuses and the recording keeps its bytes.
+    #[test]
+    fn an_output_playlist_name_that_is_the_recording_is_refused() {
+        for name in [MEDIA_PLAYLIST, MASTER_PLAYLIST] {
+            let dir = tempfile::tempdir().unwrap();
+            let recording = two_second_recording();
+            let source = dir.path().join("recording.mp4");
+            fs::write(&source, &recording).unwrap();
+            let out = dir.path().join("site");
+            fs::create_dir(&out).unwrap();
+            fs::hard_link(&source, out.join(name)).unwrap();
+            let error = run(&arguments(&source, &out)).unwrap_err();
+            assert!(error.to_string().contains("aliases the input"), "{error:#}");
+            assert_eq!(fs::read(&source).unwrap(), recording);
+            assert_eq!(fs::read(out.join(name)).unwrap(), recording);
+        }
+    }
+
+    #[test]
+    fn a_recording_without_a_complete_fragment_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let recording = two_second_recording();
+        let report =
+            reader::scan(std::io::Cursor::new(&recording), ScanOptions::default()).unwrap();
+        let source = dir.path().join("recording.mp4");
+        // The initialization section and half of the first fragment.
+        let cut = report.fragments[0].offset as usize + report.fragments[0].len as usize / 2;
+        fs::write(&source, &recording[..cut]).unwrap();
+        let out = dir.path().join("site");
+        let error = run(&arguments(&source, &out)).unwrap_err();
+        assert!(
+            error.to_string().contains("no complete fragments"),
+            "{error:#}"
+        );
+        assert!(!out.exists());
+    }
+
     #[test]
     fn an_unrelated_file_at_the_link_path_is_not_replaced() {
         let dir = tempfile::tempdir().unwrap();

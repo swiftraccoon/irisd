@@ -24,8 +24,9 @@ min_free_percent = 5
 # quota_gib = 2000
 # Power-loss window: open files are flushed this often (milliseconds). Range: 100..=60000.
 sync_interval_ms = 5000
-# Fragment duration cap: a GOP is split once it spans this plus a quarter, so a fragment lasts
-# at most 1.25 times this. Range: 1..=60000.
+# Fragment duration cap: a GOP is split once it spans this plus a quarter, so a fragment holds
+# at most 1.25 times this of frames. Frames the camera skipped lengthen its last frame by the
+# gap. Range: 1..=60000.
 max_fragment_ms = 2000
 # Space reserved ahead of each file's written length (bytes). Range: 0 up to the smaller
 # of rotate_bytes and 4294967296 (4 GiB); zero disables preallocation.

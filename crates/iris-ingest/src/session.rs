@@ -547,10 +547,12 @@ impl SessionState {
             assembler.retarget_timing(nominal);
             self.nominal = Some(nominal);
         }
-        let live_decode_time = assembler.last_provisional_decode_time().or_else(|| {
-            self.last_live_decode_time
-                .map(|decode_time| decode_time.saturating_add(u64::from(assembler.nominal())))
-        });
+        let live_decode_time = live_decode_time(
+            assembler.last_provisional_decode_time(),
+            self.last_live_decode_time,
+            assembler.pending_starts_run(),
+            assembler.nominal(),
+        );
         if let Some(live) = &options.live
             && let Some(data) = live_data
             && let Some(decode_time) = live_decode_time
@@ -570,6 +572,27 @@ impl SessionState {
             self.close_fragment(fragment, sink, source, stats);
         }
         Ok(())
+    }
+}
+
+/// The decode time a frame is published to the live ring with: its
+/// provisional time in the recording, or one nominal duration past the last
+/// published time while recording waits for a sync frame. Inside a run it
+/// never steps back: a fragment that the regulariser shortened by more than
+/// a frame ends before the provisional times of its last frames, and the
+/// frames after it are published one tick apart until the provisional time
+/// has passed the last published one. Only the first fragment of a run,
+/// whose decode timeline starts over, publishes a lower time.
+fn live_decode_time(
+    provisional: Option<u64>,
+    last_published: Option<u64>,
+    starts_run: bool,
+    nominal: u32,
+) -> Option<u64> {
+    match (provisional, last_published) {
+        (Some(time), Some(last)) if !starts_run && time <= last => Some(last.saturating_add(1)),
+        (Some(time), _) => Some(time),
+        (None, last) => last.map(|time| time.saturating_add(u64::from(nominal))),
     }
 }
 
@@ -838,6 +861,47 @@ mod tests {
         }
     }
 
+    #[test]
+    fn live_decode_times_never_step_back_inside_a_run() {
+        const IN_RUN: bool = false;
+        const STARTS_RUN: bool = true;
+        // The provisional time of the recording, as it is.
+        assert_eq!(
+            live_decode_time(Some(6000), Some(3000), IN_RUN, 3000),
+            Some(6000)
+        );
+        assert_eq!(live_decode_time(Some(0), None, STARTS_RUN, 3000), Some(0));
+        // A shortened fragment: the next frames follow the last published
+        // time by a tick until the provisional time has passed it.
+        assert_eq!(
+            live_decode_time(Some(356_400), Some(357_000), IN_RUN, 3000),
+            Some(357_001)
+        );
+        assert_eq!(
+            live_decode_time(Some(357_001), Some(357_001), IN_RUN, 3000),
+            Some(357_002)
+        );
+        assert_eq!(
+            live_decode_time(Some(359_400), Some(357_002), IN_RUN, 3000),
+            Some(359_400)
+        );
+        // A run starts its timeline over.
+        assert_eq!(
+            live_decode_time(Some(0), Some(357_000), STARTS_RUN, 3000),
+            Some(0)
+        );
+        assert_eq!(
+            live_decode_time(Some(3000), Some(0), STARTS_RUN, 3000),
+            Some(3000)
+        );
+        // No recording frame is pending: one nominal duration onwards.
+        assert_eq!(
+            live_decode_time(None, Some(357_000), IN_RUN, 3000),
+            Some(360_000)
+        );
+        assert_eq!(live_decode_time(None, None, STARTS_RUN, 3000), None);
+    }
+
     fn pending_frame(raw_ts: i64, index: i64) -> Frame {
         Frame {
             data: Bytes::from_static(b"\0\0\0\x02\x26\x01"),
@@ -920,7 +984,11 @@ mod tests {
         assert_eq!(nominal_from_rate((1, 15)), Some(6000));
         assert_eq!(nominal_from_rate((1001, 30000)), Some(3003));
         assert_eq!(nominal_from_rate((0, 7)), None);
+        assert_eq!(nominal_from_rate((7, 0)), None);
         assert_eq!(nominal_from_rate((1, 241)), None);
+        // Either orientation of a fraction that is not in lowest terms.
+        assert_eq!(nominal_from_rate((60, 2)), Some(3000));
+        assert_eq!(nominal_from_rate((2, 60)), Some(3000));
     }
 
     #[test]
@@ -957,6 +1025,27 @@ mod tests {
             }
         }
         assert!(values.len() > 100, "only {} jitter values", values.len());
+        // The values use the whole range, not one end of it.
+        let low = values.iter().filter(|millis| **millis < 9_000).count();
+        let high = values.iter().filter(|millis| **millis > 11_000).count();
+        assert!(low >= 20 && high >= 20, "{low} low and {high} high values");
+
+        // Fourteen streams that lose their cameras together do not retry
+        // together: their first delays differ.
+        let mut first_delays = HashSet::new();
+        for camera in 1..=7 {
+            for kind in [
+                iris_core::id::StreamKind::Main,
+                iris_core::id::StreamKind::Sub,
+            ] {
+                let key = StreamKey {
+                    camera: format!("cam{camera}").parse().expect("camera id"),
+                    kind,
+                };
+                first_delays.insert(jittered(Duration::from_secs(1), &key, 0));
+            }
+        }
+        assert!(first_delays.len() >= 12, "{first_delays:?}");
     }
 
     #[test]
@@ -1027,6 +1116,46 @@ mod tests {
         );
         assert_eq!(clock.wall, realtime);
         assert_eq!(clock.instant, sample);
+    }
+
+    /// The stream's hold counters are the assembler's totals, fragment
+    /// after fragment: each close adds what that fragment held and no more.
+    #[test]
+    fn holds_are_counted_once_across_fragments() {
+        let mut session = session_state_with_timing(3000, 500);
+        let sink = CountingSink {
+            calls: AtomicUsize::new(0),
+            reject: false,
+        };
+        let stats = StreamStats::new();
+        let source = source_for_test();
+        for (index, raw_ts) in [0, 3000, 100_000].into_iter().enumerate() {
+            let assembler = session.assembler.as_mut().expect("assembler");
+            assert!(
+                assembler
+                    .push(pending_frame(raw_ts, index as i64))
+                    .is_none()
+            );
+        }
+        session.flush(&sink, &source, &stats);
+        assert_eq!((stats.holds(), stats.hold_ticks()), (31, 93_000));
+        for (index, raw_ts) in [200_000, 203_000, 290_000].into_iter().enumerate() {
+            let assembler = session.assembler.as_mut().expect("assembler");
+            assert!(
+                assembler
+                    .push(pending_frame(raw_ts, index as i64))
+                    .is_none()
+            );
+        }
+        session.flush(&sink, &source, &stats);
+        let assembler = session.assembler.as_ref().expect("assembler");
+        assert_eq!(
+            (stats.holds(), stats.hold_ticks()),
+            (assembler.holes(), assembler.hold_ticks())
+        );
+        assert_eq!(stats.holds(), 31 + 28);
+        assert_eq!(stats.fragments(), 2);
+        assert_eq!(stats.snaps(), assembler.snap_count());
     }
 
     #[test]

@@ -8,9 +8,10 @@ on:
 # Each job names the permissions it needs; only the deploy job may write Pages or mint an OIDC token.
 permissions: {}
 
+# A deployment in flight finishes; a newer run waits for it instead of cancelling it mid-way.
 concurrency:
   group: pages
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 jobs:
   build:

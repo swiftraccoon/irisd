@@ -74,16 +74,18 @@ access units exactly once before reconnect or shutdown.
 
 - **Timing.** The NVR clock is the authority; RTP timestamps give relative timing through the
   regulariser, which assigns the nominal frame duration, corrects by at most 1 % per fragment,
-  renders camera-dropped frames as frame-long holds, re-times the stream to its delivered rate after
-  warm-up when the median fragment runs more than 1 % off the declared rate (or holes exceed 5 % of
-  camera time), and snaps to the camera timeline when the error exceeds the tolerance (500 ms). A
+  renders camera-dropped frames and stalls as holds, re-times the stream to its delivered rate after
+  warm-up when the typical fragment (the median over frames) runs more than 1 % off the declared
+  rate, and snaps to the camera timeline when the error exceeds the tolerance (500 ms). A
   parameter-set epoch carrying a different valid frame rate starts a fresh timing estimate at that
   rate while preserving decode-time continuity and cumulative diagnostics; an unchanged, absent, or
   invalid rate preserves the estimator. Fixed by `docs/research/04-storage-format.md §7` and
   `05-ingest-events.md §2`; the constants live at the top of `src/regularize.rs`.
 - **Fragments.** A fragment opens at a sync frame and closes at the next sync frame, at a
   parameter-set change, or once camera time, receipt time, or nominal sample time exceeds
-  the cap by a quarter (default cap 2 s). Each pending fragment is also bounded at 4,096
+  the cap by a quarter (default cap 2 s). A gap the camera left is added to the last frame's
+  duration when the fragment closes, so a fragment's duration is at most the cap and a quarter
+  plus that gap, which the 10 s jump limit bounds. Each pending fragment is also bounded at 4,096
   frames and 64 MiB of payload, so stalled RTP timestamps cannot grow it indefinitely.
   The patched H.265 depacketizer independently limits both pinned payload and projected
   frame output to 64 MiB while an access unit is assembled; exceeding either limit ends
@@ -137,8 +139,10 @@ access units exactly once before reconnect or shutdown.
   dependent recording frames are discarded until the next sync frame, which begins a run
   at decode time zero. Live publication continues throughout (`04 §8`).
 - **Live ring.** Frames are published with provisional durations before the fragment
-  closes. The fast-start cache retains at most 600 frames and 64 MiB of payload from the
-  most recent sync frame; crossing either limit abandons that run until a later fitting sync.
+  closes, at decode times that increase inside a run even when the regulariser shortens a
+  fragment by more than a frame. The fast-start cache retains at most 600 frames and 64 MiB
+  of payload from the most recent sync frame; crossing either limit abandons that run until a
+  later fitting sync.
   Subscriber fan-out retains each frame once, bounded by the configured frame capacity
   and 64 MiB of payload per stream, and retains no fan-out payload without subscribers.
   Overflow reports lag and delivery resumes at the next sync frame
@@ -149,7 +153,11 @@ access units exactly once before reconnect or shutdown.
 - Unit tests in `src/regularize.rs` (jitter, drift, gaps, backwards timelines, wrong
   declared rates, passthrough, and generated timelines checked for positive durations, a
   bounded error, and exact snaps), `src/assembler.rs` (first-sync drop, cap splits,
-  discontinuities, oversized-frame gaps, parameter-set changes, hold accounting),
+  discontinuities, oversized-frame gaps, parameter-set changes, hold accounting, and generated
+  camera timelines with quantised, duplicated, and skipped stamps that must come out whole and
+  continuous, within 100 ms of the camera at every fragment for a camera dropping half a
+  percent of its frames, over 100 s and over an hour, and within the snap tolerance for one
+  dropping three times that in bursts),
   `src/session.rs` (declared-rate parsing, injected realtime steps, wall-clock mapping, the
   shared tick), `src/stats.rs`, and `src/live.rs`.
 - `tests/replay.rs` replays the camera timeline of a real ten-minute recording (the sidecar

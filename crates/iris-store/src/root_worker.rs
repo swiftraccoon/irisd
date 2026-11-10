@@ -335,7 +335,7 @@ mod tests {
     use std::sync::atomic::AtomicUsize;
     use std::sync::mpsc::{TryRecvError, sync_channel};
 
-    use iris_mp4::reader::{ScanOptions, scan};
+    use iris_mp4::reader::{self, ScanOptions};
 
     use crate::observer::NoopObserver;
 
@@ -470,7 +470,8 @@ mod tests {
             }
         }
         assert_eq!(media.len(), 1, "the open file was never abandoned");
-        let report = scan(fs::File::open(&media[0]).unwrap(), ScanOptions::default()).unwrap();
+        let report =
+            reader::scan(fs::File::open(&media[0]).unwrap(), ScanOptions::default()).unwrap();
         assert_eq!(report.fragments.len(), 3);
     }
 

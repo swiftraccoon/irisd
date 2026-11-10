@@ -37,8 +37,10 @@ Where the sources conflict, the order of precedence is:
 | Supply chain | `cargo audit` on every lockfile; `cargo deny check` (`deny.toml`) for the root and `fuzz/` graphs (`just audit`) | required before a release |
 | Fuzz build | `just fuzz-build` (the nightly pinned in `fuzz/rust-toolchain.toml`) | CI |
 | 64-bit ARM portability | `just cross-check` (clippy with warnings as errors on every crate but the GUI for `aarch64-unknown-linux-gnu`) | CI |
+| 64-bit ARM tests | `just cross-test` (the six crates without C dependencies, as `aarch64-unknown-linux-musl` code under `qemu-aarch64-static`) | CI |
 | MSRV | `cargo +1.92.0 test --workspace --locked` (`rust-version` in `Cargo.toml`) | CI |
-| Reference pack | `just references-check` (the snapshots match `manifest.json`) | CI |
+| Reference pack | `just references-check` (the snapshots match `manifest.json`; the maintenance tool's tests) | CI |
+| Mutation testing | `just mutants FILE...` (cargo-mutants on a copy of the committed tree; a surviving mutant is logic no test pins down) | on demand, for format, timing, and parsing code |
 
 `just check` runs the required set. The `check`, cross-check, and fuzz jobs and the docs
 workflow treat warnings as errors; the MSRV job builds and tests without denying them, because
@@ -163,9 +165,9 @@ smallest item that needs it. `clippy.toml` raises `too-many-arguments-threshold`
 - Unit tests live in `mod tests` with `use super::*`; golden tests use captured camera media
   kept outside git (the one committed capture,
   `crates/iris-ingest/tests/data/cam1-main-10min.idx`, is a timing-only sidecar: header and
-  records, no payload or text); seeded property tests cover the timestamp regulariser, and the
-  `index` fuzz target checks the record codec's round trip; chaos tests (SIGKILL, truncation,
-  zero-filled tails) cover the store; fuzz targets cover parsers.
+  records, no payload or text); seeded property tests cover the timestamp regulariser and the
+  fragment codec with its scanner and sidecar record; chaos tests (SIGKILL, truncation,
+  zero-filled tails, a filesystem that fills up) cover the store; fuzz targets cover parsers.
 - A test asserts one behaviour and names it: `rejects_truncated_trun`, not `test1`.
 
 ## 9. Commits, versions, and changes

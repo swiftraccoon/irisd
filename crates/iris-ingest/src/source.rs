@@ -122,7 +122,25 @@ mod tests {
                 .expect("URL"),
             ..source.clone()
         };
-        for (source, shows_url) in [(source, true), (embedded, false)] {
+        // A user name alone or a password alone in the URL hides it too.
+        let user_only = StreamSource {
+            url: "rtsp://distinctive-user@192.0.2.10/cam"
+                .parse()
+                .expect("URL"),
+            ..source.clone()
+        };
+        let password_only = StreamSource {
+            url: "rtsp://:distinctive-password@192.0.2.10/cam"
+                .parse()
+                .expect("URL"),
+            ..source.clone()
+        };
+        for (source, shows_url) in [
+            (source, true),
+            (embedded, false),
+            (user_only, false),
+            (password_only, false),
+        ] {
             for rendered in [format!("{source:?}"), format!("{source:#?}")] {
                 assert!(rendered.contains("<redacted>"), "{rendered}");
                 assert!(rendered.contains("cam1"), "{rendered}");

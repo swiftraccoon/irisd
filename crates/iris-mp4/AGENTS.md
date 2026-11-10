@@ -81,6 +81,8 @@ cargo run -p irisd -- inspect <file.mp4>                          # against a re
 - The scanner tolerates a missing `prft` but requires `moof` then `mdat` then the trailer;
   an open-ended `mdat` is a `BadFragment`.
 - The memory parser enforces the same top-level order, bounds, and one exact final trailer.
+  `decode_trailer` refuses a set reserved byte, so with the CRC every byte of a fragment is
+  checked; `tests/properties.rs` holds that property and fails with the seed that broke it.
   Both readers require native moof-relative sample addressing, complete declared table fields,
   at least one sample, flags for the first sample, and containers without trailing bytes.
 - `IndexRecord::decode` takes exactly 40 bytes and accepts any; `IndexRecord::end` saturates

@@ -297,6 +297,126 @@ daemon on the development host; `ffmpeg` and `curl` as clients:
 Open: `mediastreamvalidator` and `AVPlayer`, which need Apple hardware
 (`08-roadmap.md` phase-2 exit criteria).
 
+## Low-latency HLS on the service (2026-11-10)
+
+On the build that cuts parts by media time, with the fourteen camera streams, over the
+loopback with `curl`:
+
+- `live.m3u8` of every stream fetched every six seconds for the first 100 s after a start,
+  the window in which a stream is re-timed if it will be: 2,121 `EXT-X-PART` lines, each
+  0.500 s against `PART-TARGET=0.500`, and 1,061 segment lines, each 2.000 s against
+  `EXT-X-TARGETDURATION:3`. No stream was re-timed, so the case the change fixes did not occur.
+- One 1080p segment and the four parts listed for it, fetched through the capability URIs of
+  the playlist and each appended to `init.mp4`: both files scan clean with `irisd inspect`
+  (60 fragments, 2.000 s, 1,224,429 payload bytes, no sequence or decode-time gap), and
+  `ffprobe -count_frames` reads 60 frames from each. The same segment without a capability
+  answers 401.
+- The polling left the daemon at 174 MiB resident (`12-ingest-cost.md` §8).
+
+## Timestamp snaps on the service (2026-11-09 to 2026-11-10)
+
+Over the 19.7 h run that ended on 2026-11-10T03:23Z (fourteen streams, about 2.1 million
+frames each), twelve streams never snapped; the 4K stream of one camera snapped twice and
+the secondary stream of another twice. The per-minute lines around the first camera's snaps
+show the cause: its delivered rate had been near 29 fps and returned to 30, the error rose
+from 147 ms to 490 ms over two minutes, and the fragment snapped. Holds ran from 0 to 0.33 %
+of frames per stream.
+
+Two changes follow from it (`04-storage-format.md` §7.3). A snap takes the error carried
+into it out of its fragment; before, each such snap left up to the 500 ms tolerance in the
+timeline. And four fragments corrected by the full 1 % in one direction restart the rate
+estimate. In a test of ten minutes on rate, ten at a slower rate, and ten on rate again, in
+2 s GOPs stamped at 10 ms resolution:
+
+| Slow phase | Before: snaps, worst error | After: snaps, worst error |
+|---|---|---|
+| 28.3 fps | 5, 479 ms | 0, 384 ms |
+| 28.9 fps | 2, 491 ms | 0, 215 ms |
+| 29.4 fps | 0, 351 ms | 0, 78 ms |
+
+The replay of the ten-minute camera recording (`crates/iris-ingest/tests/replay.rs`) is
+unchanged: locked, without a snap.
+
+The service ran with both changes from 2026-11-10T05:21Z to 14:50Z (9.5 h, the same fourteen
+streams): no stream snapped, and the largest timeline error on any per-minute line was 116 ms
+(the secondary stream of one camera; under 30 ms on the camera that had reached 490 ms). The
+figures are the `snaps` and `err_ms` fields of the journal's `stream` lines.
+
+### A camera whose slow rate varies by GOP (2026-11-10)
+
+Later the same day, with the scene busier, one camera's 1080p stream delivered 28.6 fps under
+its 30 fps declaration, and the per-minute lines showed its nominal rate switching between
+30.00 and about 28.5 fps with 40 to 65 holds a minute while at 30. An export of five minutes
+(`/api/streams/{camera}/sub/export.mp4`, then `irisd inspect --samples`) gave the cause: each
+of 144 fragments spanned 2.07 to 2.20 s for its 60 frames, a different amount in every GOP,
+so the 1 % correction was often at its limit for four fragments running, and the restart
+added in the morning discarded the estimate each time. The declared rate then applied for the
+sixteen fragments of another warm-up, and every GOP ended in a hold of two to five frames.
+
+The corrected restart needs an error of at least an eighth of the tolerance after the four
+fragments, keeps those four as the estimate, and keeps the warm-up
+(`04-storage-format.md` §7.3). The 144 camera spans are a test
+(`crates/iris-ingest/src/regularize.rs`); replayed six times over, 864 fragments:
+
+| Restart rule | Switches between declared and delivered rate | Fragments ending in a hold | Held frames | Worst error |
+|---|---:|---:|---:|---:|
+| Of that morning | 28 | 361 | 725 | 61 ms |
+| No restart on saturation | 1 | 187 | 194 | 148 ms |
+| Error condition, four fragments kept | 1 | 228 | 204 | 79 ms |
+
+The slow-and-return table above is unchanged under the last rule (0 snaps; 384, 215, and
+78 ms). About one GOP in four still ends in a one-frame hold: a GOP more than 1 % slower than
+the estimate leads it by 0.6 frame or more, which the regulariser renders as a dropped frame.
+
+On the service, the build before the change ran 83 minutes and the build with it the 45
+minutes after (the `holds` and `fps` fields of the journal's `stream` lines; the three
+cameras that were delivering under 29 fps):
+
+| Stream | Before: holds a minute | After: holds a minute | After: minutes at the declared rate |
+|---|---:|---:|---:|
+| First camera, 1080p | 21 | 8.6 | 0 of 45 |
+| Second camera, 1080p | 27 | 6.2 | 0 of 45 |
+| Third camera, 1080p | 18 | 6.8 | 0 of 45 |
+
+No stream snapped in either window; the largest timeline error after the change was 112 ms.
+
+Not adopted, and measured by a temporary change on the same spans for the decision: holding
+only the part of a lead that the correction cannot absorb leaves 108 fragments ending in a
+hold (138 frames) at the 1 % limit, 36 at 2 %, 18 at 3 %, and 6 at 4 %, with the worst error
+at 79, 76, 56, and 37 ms. A single dropped frame then stretches its GOP by 1 % instead of
+holding its last frame. A limit above 1 % shortens ordinary fragments by more than a frame,
+which the live stream's provisional decode times did not expect until this date: they stepped
+backwards after such a fragment, and LL-HLS answers a decode time that does not increase with
+a discontinuity. At 1 % that took a fragment of 100 frames or more. The published decode
+times of the corrected code increase inside a run whatever the correction
+(`crates/iris-ingest/src/session.rs`).
+
+### Generated stalls (2026-11-10)
+
+Mutation testing of the regulariser (`cargo mutants` 27.1.0 on `regularize.rs`) showed that no
+test depended on the rule that replaced a declared rate once holds passed 5 % of camera time.
+Measured on generated cameras that stay on rate and stall now and then, the rule did harm. The
+generator is the one of the assembler's property tests (30 fps, 10 ms stamps, repeated
+stamps); each row is 300 timelines of 6,000 frames pushed through the assembler by a
+temporary test, with the error measured at fragment boundaries. The columns were measured in
+this order as the changes were made, and all three include the carried-error change described
+below the table:
+
+| Stalls | With the 5 % rule: snaps, worst error | Without it | Without it, median over frames |
+|---|---|---|---|
+| up to 2 s, about every 13 s | 2,431, 503 ms | 4, 378 ms | 0, 23 ms |
+| up to 1.5 s, about every 10 s | 2,088, 503 ms | 0, 284 ms | 0, 23 ms |
+| up to 4 s, about every 20 s | 5,170, 503 ms | 0, 409 ms | 0, 26 ms |
+| up to 1 s, about every 7 s | 1,267, 503 ms | 62, 491 ms | 23, 490 ms |
+
+Three changes follow (`04-storage-format.md` §7.3). The 5 % rule is gone; the comparison of
+the typical fragment with the declared rate, which already caught a camera delivering 20 fps
+under a 30 fps declaration, also runs against the cadence when no rate is declared. The
+typical fragment is the median over frames instead of over fragments. And a snap in a
+fragment whose span is shorter than the error carried into it keeps the rest carried: before,
+such a fragment kept its nominal durations and the error was forgotten, which let the first
+row's worst error reach 5.9 s.
+
 ## Report memory (2026-11-07)
 
 Measured with debug builds on a copy of a soak sampler directory spanning 2026-10-31 to

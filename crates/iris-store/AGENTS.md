@@ -71,6 +71,9 @@ Scope: this crate only. Read the root `AGENTS.md` first.
 - `src/fs.rs` — root identity/admission, `pwritev_all`, preallocation, directory sync,
   approved-root free-space and contained opens, and descriptor-relative pair removal.
 - `tests/store.rs` — integration tests against a temporary root.
+- `tests/full_disk.rs` — the writer against real `ENOSPC` on a small tmpfs in a namespace.
+- `tests/recover_properties.rs` — recovery after generated damage; a failure names its seed.
+- `tests/writer_properties.rs` — generated fragment sequences through rotation.
 
 ## How to verify a change
 

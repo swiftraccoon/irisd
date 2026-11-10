@@ -237,7 +237,8 @@ pub fn free_space(root: &Path) -> io::Result<FreeSpace>;              // FreeSpa
 ```rust
 pub struct LiveFrame { pub key: StreamKey, pub sample_entry: Arc<SampleEntry>, pub data: Bytes,
     pub duration: u32 /* the regulariser's nominal, provisional */, pub is_sync: bool,
-    pub decode_time: u64 /* provisional: fragment start + index × nominal */, pub wall: WallUs }
+    pub decode_time: u64 /* provisional: fragment start + index × nominal, increasing in a run */,
+    pub wall: WallUs }
 #[derive(Clone)] pub struct LiveRing;                      // one per stream, cheap to clone
 impl LiveRing {
     pub fn new(capacity: usize) -> Self;                  // subscriber fan-out capacity in frames (256)

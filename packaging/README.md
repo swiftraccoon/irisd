@@ -109,6 +109,18 @@ symbolic or hard links and special files in their place, and removes group and o
 with a warning. An installation whose catalog was readable by other users is therefore repaired at
 its next start; reading the catalog afterwards requires the service account.
 
+The daemon's memory follows its busiest moment: glibc keeps freed heap pages, so after
+clients have watched many streams through the low-latency playlist the resident size stays
+high until a restart (`docs/research/12-ingest-cost.md` §8). A host short of memory can trade
+CPU for it with a drop-in that sends frames over 64 KiB to mappings of their own, which return
+to the system when freed; measured at fourteen 4K streams, about 0.3 points of a core more,
+17 MiB less at rest, and 55 MiB less after such a burst:
+
+```sh
+printf '[Service]\nEnvironment=GLIBC_TUNABLES=glibc.malloc.mmap_threshold=65536\n' |
+  sudo tee /etc/systemd/system/irisd.service.d/memory.conf
+```
+
 `LimitNOFILE=65536` gives recording files, camera sockets, and API clients one descriptor
 budget; the daemon raises its soft limit to the hard limit at startup and logs both.
 

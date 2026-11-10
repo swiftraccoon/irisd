@@ -645,6 +645,39 @@ mod tests {
         );
     }
 
+    /// Either HEVC sample entry is read; another codec's is refused by name.
+    #[test]
+    fn only_hevc_sample_entries_are_read() {
+        let sets = vec![TEST_VPS.to_vec(), TEST_SPS.to_vec(), TEST_PPS.to_vec()];
+        let init = build_init_segment(&synth::sample_entry(&sets).unwrap());
+        let stsd = init.windows(4).position(|w| w == b"stsd").unwrap();
+        let kind = stsd + init[stsd..].windows(4).position(|w| w == b"hvc1").unwrap();
+        let mut hev1 = init.to_vec();
+        hev1[kind..kind + 4].copy_from_slice(b"hev1");
+        assert_eq!(parameter_sets(&hev1).unwrap(), sets);
+        let mut avc1 = init.to_vec();
+        avc1[kind..kind + 4].copy_from_slice(b"avc1");
+        assert_eq!(
+            parameter_sets(&avc1),
+            Err(HvccError::NotHevc("avc1".to_owned()))
+        );
+    }
+
+    /// An empty box is stepped over; a box that claims more bytes than are
+    /// left ends the search.
+    #[test]
+    fn boxes_are_walked_by_their_declared_sizes() {
+        let sets = vec![TEST_VPS.to_vec(), TEST_SPS.to_vec(), TEST_PPS.to_vec()];
+        let init = build_init_segment(&synth::sample_entry(&sets).unwrap());
+        let mut led = b"\0\0\0\x08free".to_vec();
+        led.extend_from_slice(&init);
+        assert_eq!(parameter_sets(&led).unwrap(), sets);
+        assert_eq!(
+            parameter_sets(&init[..init.len() - 1]),
+            Err(HvccError::Missing("moov"))
+        );
+    }
+
     #[test]
     fn decode_times_are_relative_to_the_first_fragment() {
         let bytes = synth::recording(Plan {
@@ -927,6 +960,9 @@ mod tests {
         let mut short = required_hvcc_arrays();
         short[0] = (32, vec![vec![32 << 1]]);
         assert_eq!(parse_hvcc(&hvcc(&short)), Err(HvccError::ShortNal));
+        // A NAL unit that is its two-byte header alone is whole.
+        short[0] = (32, vec![vec![32 << 1, 1]]);
+        assert_eq!(parse_hvcc(&hvcc(&short)).unwrap()[0], [32 << 1, 1]);
 
         let mut reserved = hvcc(&required_hvcc_arrays());
         reserved[23] |= 0x40;

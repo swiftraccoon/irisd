@@ -43,7 +43,7 @@ docs/design/         the cross-crate interfaces of the phase-2 crates
 docs/standards/ietf/ the RTSP, RTP, HEVC payload, HLS, and codecs documents, as published
 third_party/         vendored dependencies with local patches (retina, oxvif); see its README
 .github/             workflows/check.yml (format, clippy, tests, rustdoc, vendored tests, MSRV,
-                     audit, fuzz build, aarch64 clippy, references), workflows/docs.yml
+                     audit, fuzz build, aarch64 clippy and tests, references), workflows/docs.yml
                      (rustdoc to GitHub Pages), dependabot.yml (weekly action updates)
 ```
 
@@ -53,8 +53,10 @@ third_party/         vendored dependencies with local patches (retina, oxvif); s
   crates' tests. Run before finishing any change.
 - `just fmt`, `just test`, `just clippy`, `just doc`, `just vendor-test` (the vendored crates'
   own test suites, offline), `just audit` (cargo-audit over every lockfile and cargo-deny),
-  `just fuzz-build` (every fuzz target on the pinned nightly), `just cross-check` (type-check
-  for 64-bit ARM; needs the target and a C cross compiler).
+  `just fuzz-build` (every fuzz target on the pinned nightly), `just cross-check` (clippy
+  for 64-bit ARM; needs the target and a C cross compiler), `just cross-test` (tests of the
+  crates without C dependencies as ARM code under `qemu-aarch64-static`), `just mutants
+  FILE...` (mutation testing of the named source files; needs cargo-mutants).
 - `just record 2m` — record the configured cameras for two minutes into the default root.
 - `cargo run -p irisd -- inspect <file.mp4>` — list fragments and timing of a recording.
 

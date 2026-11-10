@@ -15,6 +15,8 @@ reading a TOML file.
   as `{camera, kind}`). Configuration rejects audio recording.
 - `time::WallUs` — microseconds since the Unix epoch on the NVR's clock, with NTP64 (both
   eras) and RFC 3339 conversions; the only wall clock the system trusts.
+- `time::days_from_civil` and `time::days_in_month` — the civil-date arithmetic the API's and
+  the ONVIF timestamp parsers share, the inverse of the conversion `WallUs` formats with.
 - `time::MediaTicks` and `time::TIMESCALE` — 90 kHz media time, the scale of every
   recording.
 - `event::Event` with `EventSource`, `EventKind`, and `EventState` — one normalised camera

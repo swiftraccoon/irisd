@@ -665,7 +665,7 @@ mod tests {
     use iris_mp4::fragment::{FragmentHeader, Sample, encode_fragment};
     use iris_mp4::index::{FLAG_STARTS_WITH_SYNC, RECORD_LEN, read_index_bounded};
     use iris_mp4::init::{SampleEntry, build_init_segment};
-    use iris_mp4::reader::scan;
+    use iris_mp4::reader;
 
     fn recover_with_publication(
         media: &Path,
@@ -829,7 +829,7 @@ mod tests {
                 bytes.extend_from_slice(&slice);
             }
         }
-        let report = scan(
+        let report = reader::scan(
             Cursor::new(&bytes),
             ScanOptions {
                 verify_crc: true,
@@ -886,7 +886,7 @@ mod tests {
         std::fs::write(&index, index_bytes).unwrap();
 
         let report = recover_segment(&media).unwrap();
-        let full = scan(Cursor::new(&bytes), ScanOptions::default()).unwrap();
+        let full = reader::scan(Cursor::new(&bytes), ScanOptions::default()).unwrap();
         assert_eq!(report.fragments, full.fragments.len());
         assert_eq!(report.valid_len, full.valid_len);
         assert_eq!(
@@ -915,7 +915,7 @@ mod tests {
             .collect();
 
         let mut full_reader = Counting::new(Cursor::new(&bytes));
-        let full = scan(
+        let full = reader::scan(
             &mut full_reader,
             ScanOptions {
                 verify_crc: true,

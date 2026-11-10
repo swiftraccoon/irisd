@@ -186,6 +186,42 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
     )
 }
 
+/// Days since 1970-01-01 of a proleptic Gregorian civil date: the inverse of
+/// the conversion behind [`WallUs::to_civil`], by the `days_from_civil`
+/// algorithm of *chrono-Compatible Low-Level Date Algorithms*. Parsers check
+/// the date with [`days_in_month`] first; a `month` outside 1 to 12 or a `day`
+/// past the month's end gives a count that names another date or none.
+///
+/// ```
+/// use iris_core::time::days_from_civil;
+///
+/// assert_eq!(days_from_civil(1970, 1, 1), 0);
+/// assert_eq!(days_from_civil(2026, 10, 31), 20_757);
+/// ```
+#[must_use]
+pub fn days_from_civil(year: i64, month: u32, day: u32) -> i64 {
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = y.div_euclid(400);
+    let yoe = y.rem_euclid(400);
+    let m = i64::from(month);
+    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + i64::from(day) - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
+/// Days in `month` of the proleptic Gregorian `year`; zero for a month
+/// outside 1 to 12.
+#[must_use]
+pub fn days_in_month(year: i64, month: u32) -> u32 {
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if year % 4 == 0 && (year % 100 != 0 || year % 400 == 0) => 29,
+        2 => 28,
+        _ => 0,
+    }
+}
+
 /// A duration or position in 90 kHz media ticks ([`TIMESCALE`]).
 #[derive(
     Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
@@ -282,6 +318,50 @@ mod tests {
             WallUs::from_ntp64(last_microsecond.to_ntp64()),
             last_microsecond
         );
+    }
+
+    /// Every day from 1600 through 2400: the two conversions invert each
+    /// other, the calendar advances one day at a time, and no day lies past
+    /// its month's end.
+    #[test]
+    fn the_civil_conversions_invert_each_other_day_by_day() {
+        let first = days_from_civil(1600, 1, 1);
+        let last = days_from_civil(2400, 12, 31);
+        let mut previous = civil_from_days(first - 1);
+        for days in first..=last {
+            let (year, month, day) = civil_from_days(days);
+            assert_eq!(days_from_civil(year, month, day), days);
+            assert!((1..=days_in_month(year, month)).contains(&day), "{days}");
+            let (py, pm, pd) = previous;
+            let next_day = (year, month, day) == (py, pm, pd + 1);
+            let next_month =
+                day == 1 && pd == days_in_month(py, pm) && (year, month) == (py, pm + 1);
+            let next_year = (month, day) == (1, 1) && (pm, pd) == (12, 31) && year == py + 1;
+            assert!(next_day || next_month || next_year, "{days}");
+            previous = (year, month, day);
+        }
+    }
+
+    #[test]
+    fn wall_times_read_back_and_subtract_with_sign() {
+        let later = WallUs::new(1_700_000_001_500_000);
+        let earlier = WallUs::new(1_700_000_000_000_000);
+        assert_eq!(later.get(), 1_700_000_001_500_000);
+        assert_eq!(later.micros_since(earlier), 1_500_000);
+        assert_eq!(earlier.micros_since(later), -1_500_000);
+        assert_eq!(earlier.offset(1_500_000), later);
+        assert!((WallUs::new(1_500_000).as_secs_f64() - 1.5).abs() < 1e-12);
+        // The clock reads after 2020-01-01.
+        assert!(WallUs::now().get() > 1_577_836_800_000_000);
+    }
+
+    #[test]
+    fn media_ticks_add_subtract_and_convert_to_seconds() {
+        let second = MediaTicks::new(90_000);
+        let half = MediaTicks::new(45_000);
+        assert_eq!((second + half).get(), 135_000);
+        assert_eq!((half - second).get(), -45_000);
+        assert!(((second + half).as_secs_f64() - 1.5).abs() < 1e-12);
     }
 
     #[test]

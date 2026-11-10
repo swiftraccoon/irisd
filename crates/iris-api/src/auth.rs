@@ -397,6 +397,101 @@ mod tests {
         assert!(constant_time_eq(b"abc", b"abc"));
         assert!(!constant_time_eq(b"abc", b"abd"));
         assert!(!constant_time_eq(b"abc", b"ab"));
+        // Two differences that are the same bit pattern must not cancel.
+        assert!(!constant_time_eq(&[1, 1], &[0, 0]));
+        assert!(!constant_time_eq(&[0x80, 0x7f, 0x80], &[0, 0x7f, 0]));
+    }
+
+    /// A capability is valid from its issue through the second it expires,
+    /// and one that claims more than its path's longest lifetime is refused
+    /// even with a valid signature.
+    #[test]
+    fn a_capability_is_valid_through_its_expiry_and_within_its_paths_limit() {
+        let secret = test_secret();
+        let now = 1_000_000;
+        let request = |path: &str, capability: &str| {
+            Request::builder()
+                .uri(format!("{path}?token={capability}"))
+                .body(axum::body::Body::empty())
+                .unwrap()
+        };
+        let issued = |path: &str, expires_at: u64| {
+            CapabilityIssuer {
+                key: CapabilityKey::from_secret(&secret),
+                issued_at: now,
+                default_expires_at: expires_at,
+                max_expires_at: expires_at,
+            }
+            .issue_at(path, expires_at)
+        };
+        for (path, limit) in [
+            (
+                "/api/streams/cam1/main/hls/seg/1/media.m4s",
+                ROLLING_CAPABILITY_TTL.as_secs(),
+            ),
+            ("/api/segments/7/file.mp4", MAX_VOD_CAPABILITY_TTL.as_secs()),
+        ] {
+            for (expires_at, valid) in [
+                (now - 1, false),
+                (now, true),
+                (now + 1, true),
+                (now + limit, true),
+                (now + limit + 1, false),
+                (now + limit + 86_400, false),
+            ] {
+                let capability = issued(path, expires_at);
+                assert_eq!(
+                    capability_issuer(&secret, &request(path, &capability), Some(now)).is_some(),
+                    valid,
+                    "{path} expiring {} s from now",
+                    expires_at as i64 - now as i64
+                );
+            }
+        }
+    }
+
+    /// Issued capabilities expire by the wall clock: a rolling one within
+    /// its fifteen minutes of the present.
+    #[test]
+    fn issued_capabilities_expire_by_the_wall_clock() {
+        let tokens = vec!["root secret".to_owned()];
+        let secret = test_secret();
+        let before = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let issuer = root_issuer(&tokens, &secret, "root secret", unix_seconds()).unwrap();
+        let capability = issuer.issue("/api/streams/cam1/main/hls/init.mp4");
+        let (expires_at, _) = parse_capability(&capability).unwrap();
+        let limit = ROLLING_CAPABILITY_TTL.as_secs();
+        assert!(
+            (before + 1..=before + limit + 5).contains(&expires_at),
+            "expires {expires_at}, issued about {before}"
+        );
+    }
+
+    #[test]
+    fn capability_paths_need_well_formed_kinds_and_numbers() {
+        for path in [
+            "/api/segments/x/file.mp4",
+            "/api/segments/7x/file.mp4",
+            "/api/streams/cam1/bogus/hls/init.mp4",
+            "/api/streams/cam1/bogus/hls/seg/1/media.m4s",
+            "/api/streams/cam1/main/hls/seg/x/media.m4s",
+            "/api/streams/cam1/main/hls/seg/-1/media.m4s",
+            "/api/streams/cam1/bogus/hls/part/1/2/part.m4s",
+            "/api/streams/cam1/main/hls/part/x/2/part.m4s",
+            "/api/streams/cam1/main/hls/part/1/x/part.m4s",
+            "/api/streams/cam1/bogus/hls/part/x/y/part.m4s",
+        ] {
+            assert!(!is_capability_path(path), "{path}");
+        }
+        for kind in ["main", "sub", "audio"] {
+            assert!(valid_stream_fields("cam1", kind), "{kind}");
+            assert!(!valid_stream_fields("", kind), "{kind}");
+        }
+        assert!(!valid_stream_fields("cam1", "bogus"));
+        assert!(!valid_stream_fields("", "bogus"));
     }
 
     /// RFC 4231 test case 1: a 20-byte key of `0x0b`, zero-padded to the

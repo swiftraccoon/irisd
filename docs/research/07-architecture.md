@@ -336,7 +336,9 @@ CRC-32C; the remaining kernel items are listed in 12 §7. Measured again on
 2026-11-02 after one shared read ticker and sockets detached from the reactor (12 §6):
 0.021 % per Mbit/s at 132 Mbit/s, under the budget, with 70 wake-ups and 930 system
 calls per second for fourteen streams. Measured on 2026-11-08 with the build that bounds every
-camera-supplied diagnostic (12 §6): 0.024 to 0.025 % per Mbit/s at 143 Mbit/s.
+camera-supplied diagnostic (12 §6): 0.024 to 0.025 % per Mbit/s at 143 Mbit/s. RSS measured on
+2026-11-10 (12 §8): 46 to 47 MiB for six replayed streams at 61.5 Mbit/s, inside the budget,
+and about 12 MiB plus 0.55 MiB per Mbit/s across one to fourteen streams.
 
 Harness (`iris-replay` and `iris-tools replay-bench`):
 
@@ -366,11 +368,33 @@ Harness (`iris-replay` and `iris-tools replay-bench`):
 - Integration tests that run ingest sessions against loopback replay servers and
   fault-injecting RTSP peers (`crates/iris-ingest/tests/`), and the API's routes, limits, and
   WebSocket lifetimes against a test catalog (`crates/iris-api/tests/`).
+- The daemon binary end to end (`crates/irisd/tests/`): start-up, readiness, and shutdown
+  order, and one run that records a loopback camera served by the replay server, lists the
+  open recording through the authenticated API, and on SIGTERM leaves a recording that
+  scans clean, a sidecar bound to it, and a sealed catalog row with the same length and
+  fragment count.
 - Fuzz targets for every parser that faces the network (§2, `fuzz/README.md`).
 - Recordings checked with `ffprobe`, `irisd inspect`, and GStreamer playback.
-- Not implemented: property-based tests, writer tests against a loop device with injected
-  errors, captured-camera golden tests, and `mediastreamvalidator` and AVPlayer conformance
-  (`08-roadmap.md`, phase-2 exit criteria).
+- The writer on a filesystem that fills up: a small tmpfs in a user namespace returns the real
+  failed preallocations, short writes, and `ENOSPC` (`crates/iris-store/tests/full_disk.rs`).
+- Seeded property tests of the regulariser (`crates/iris-ingest`) and of generated recordings
+  through the encoder, scanner, memory parser, and sidecar record
+  (`crates/iris-mp4/tests/properties.rs`), and of recovery after generated damage to a written
+  recording and its sidecar (`crates/iris-store/tests/recover_properties.rs`), of the writer
+  over generated fragment sequences through rotation, of the fragment
+  assembler over generated camera timelines, of the LL-HLS part and segment targets under
+  changing frame durations, of exports of generated recordings over generated ranges, and
+  model tests of every retention statement's event protection and of the event pages and
+  segment listings (`crates/iris-catalog/tests/retention_model.rs`, `query_model.rs`).
+- Mutation testing on demand (`just mutants FILE...`): a mutant of the format, timing, or
+  parsing code that every test still passes names logic no test pins down. The first runs
+  (2026-11-10) led to the removal of a regulariser rule that no test needed and that
+  measurements then showed to do harm (`11-multi-camera-results.md`).
+- The tests of the crates without C dependencies as 64-bit ARM code under user-mode
+  emulation (`just cross-test`, CI).
+- Not implemented: writer tests with injected read and write errors (`EIO`), captured-camera
+  golden tests, and `mediastreamvalidator` and AVPlayer conformance (`08-roadmap.md`, phase-2
+  exit criteria).
 
 ## 9. Observability
 

@@ -381,6 +381,23 @@ mod tests {
             body.extend_from_slice(&payload[3..]);
         }
         assert_eq!(body, nal[2..]);
+        assert_eq!(usize::from(p.next_seq()), out.len());
+    }
+
+    /// A NAL unit whose body fills its fragments exactly needs no further
+    /// packet, and the announced length counts down as packets are taken.
+    #[test]
+    fn the_packet_count_is_exact_at_a_fragment_boundary_and_counts_down() {
+        let fragment_payload = 1_400 - RTP_HEADER_LEN - 3;
+        let nal = vec![0x26; 2 + 3 * fragment_payload];
+        let nals = [nal.as_slice()];
+        let mut p = Packetizer::new(Ssrc::new(1), 0);
+        let mut packets = p.access_unit(&nals, RtpTimestamp::new(0), 1_400).unwrap();
+        assert_eq!(packets.len(), 3);
+        assert!(format!("{packets:?}").contains("remaining: 3"));
+        assert!(packets.next().is_some());
+        assert_eq!(packets.len(), 2);
+        assert_eq!(packets.count(), 2);
     }
 
     /// A sender report after one three-byte packet, mapping `wall` to RTP time 90.

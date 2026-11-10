@@ -93,7 +93,10 @@ Scope: this crate only. Read the root `AGENTS.md` first.
 - LL-HLS follows the vendored HLS draft (`docs/standards/ietf/`): the target duration and the
   part target are pinned per feeder and never change, complete segments stay until three
   target durations follow them (at most 12), a blocking reload waits three target durations,
-  and a GOP past the pinned target is cut with a discontinuity. Timestamp resets, lag, and
+  and a GOP past the pinned target is cut with a discontinuity. Parts are cut by media time
+  against the pinned part target (`Gop::parts`), from frames a part already holds or the one
+  that ends it: a complete part never changes, because clients fetch parts by index. The
+  property test in `llhls.rs` holds both under changing frame durations. Timestamp resets, lag, and
   budget breaches end the open segment and resume at sync with a discontinuity; a new sample
   entry starts the window over. Each GOP carries its discontinuity sequence so removing
   playlist entries preserves the epoch. Changing a tag or window rule needs the draft's section

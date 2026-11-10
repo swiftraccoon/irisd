@@ -202,6 +202,20 @@ mod tests {
     }
 
     #[test]
+    fn ids_and_keys_display_as_they_are_written_in_paths_and_logs() {
+        let camera = CameraId::try_new("cam1").unwrap();
+        assert_eq!(camera.as_str(), "cam1");
+        assert_eq!(camera.to_string(), "cam1");
+        assert_eq!(StreamKind::Main.to_string(), "main");
+        assert_eq!(StreamKind::Sub.to_string(), "sub");
+        let key = StreamKey {
+            camera,
+            kind: StreamKind::Sub,
+        };
+        assert_eq!(key.to_string(), "cam1/sub");
+    }
+
+    #[test]
     fn stream_keys_serialize_as_camera_and_kind() {
         let key = StreamKey {
             camera: CameraId::try_new("cam1").unwrap(),

@@ -47,8 +47,8 @@ use crate::media_admission::{self, MediaPermit};
 use crate::segments::stream_key;
 use crate::state::{ApiState, MediaClass};
 
-/// Longest partial segment in media ticks (0.5 s): a part holds as many
-/// whole frames as fit, at least one.
+/// Longest partial segment in media ticks (0.5 s). The part target is pinned
+/// to what the whole first-duration frames that fit this add up to.
 const PART_TARGET_TICKS: u64 = 45_000;
 /// Complete segments a feeder keeps at most, whatever the target duration:
 /// the memory bound of one watched stream is this many GOPs.
@@ -95,21 +95,46 @@ struct Gop {
 }
 
 impl Gop {
-    /// Partial segments available so far, `frames_per_part` frames each:
-    /// `(index, frame range, complete)`.
-    fn parts(&self, frames_per_part: usize) -> Vec<Part> {
-        let n = frames_per_part.max(1);
+    /// Partial segments available so far, cut by media time against the
+    /// pinned part target so that none outlasts it (§4.4.4.9) whatever
+    /// durations the frames carry. A part ends before a frame that would take
+    /// it past `target_ticks`, and after a frame when another of the same
+    /// duration would. Both rules read only frames the part already holds or
+    /// the one that ends it, so a complete part never changes as frames
+    /// arrive. With constant durations this is the whole frames that fit the
+    /// target. A single frame longer than the target is a part of its own.
+    fn parts(&self, target_ticks: u64) -> Vec<Part> {
         let mut parts = Vec::new();
         let mut start = 0usize;
-        while start < self.frames.len() {
-            let end = (start + n).min(self.frames.len());
-            let complete = end - start == n || self.complete;
+        let mut ticks = 0u64;
+        for (index, (frame, _)) in self.frames.iter().enumerate() {
+            let duration = u64::from(frame.duration);
+            if index > start && ticks + duration > target_ticks {
+                parts.push(Part {
+                    index: parts.len(),
+                    range: start..index,
+                    complete: true,
+                });
+                start = index;
+                ticks = 0;
+            }
+            ticks += duration;
+            if ticks + duration > target_ticks {
+                parts.push(Part {
+                    index: parts.len(),
+                    range: start..index + 1,
+                    complete: true,
+                });
+                start = index + 1;
+                ticks = 0;
+            }
+        }
+        if start < self.frames.len() {
             parts.push(Part {
                 index: parts.len(),
-                range: start..end,
-                complete,
+                range: start..self.frames.len(),
+                complete: self.complete,
             });
-            start = end;
         }
         parts
     }
@@ -159,21 +184,14 @@ struct Inner {
     /// The declared target duration in ticks, pinned when the first GOP
     /// completes; `None` before.
     target_ticks: Option<u64>,
-    /// Frames per partial segment, pinned from the first accepted frame.
-    part_frames: Option<usize>,
-    /// The declared part target in ticks: `part_frames` times the first
-    /// frame's duration.
+    /// The declared part target in ticks, pinned from the first accepted
+    /// frame: the whole frames of its duration that fit half a second.
     part_target_ticks: Option<u64>,
     last_access: Option<Instant>,
     closed: bool,
 }
 
 impl Inner {
-    /// Frames per partial segment: the pinned count, or one.
-    fn frames_per_part(&self) -> usize {
-        self.part_frames.unwrap_or(1)
-    }
-
     /// The declared part target in ticks: the pinned value, or the default.
     fn part_target_ticks(&self) -> u64 {
         self.part_target_ticks.unwrap_or(PART_TARGET_TICKS)
@@ -202,18 +220,15 @@ impl Inner {
         }
     }
 
-    /// Pins the part size from the first frame: as many frames as fit the
-    /// part target, at least one, and the target they add up to.
+    /// Pins the part target from the first frame: what the whole frames of
+    /// its duration that fit half a second add up to, at least one frame.
     fn pin_part_target(&mut self, frame: &LiveFrame) {
-        if self.part_frames.is_some() {
+        if self.part_target_ticks.is_some() {
             return;
         }
         let duration = u64::from(frame.duration.max(1));
-        let frames = usize::try_from(PART_TARGET_TICKS / duration)
-            .unwrap_or(1)
-            .max(1);
-        self.part_frames = Some(frames);
-        self.part_target_ticks = Some(frames as u64 * duration);
+        let frames = (PART_TARGET_TICKS / duration).max(1);
+        self.part_target_ticks = Some(frames * duration);
     }
 
     /// Marks the open GOP complete, pinning the target duration from the
@@ -553,7 +568,7 @@ pub(crate) async fn playlist(
             )));
         }
         if let (Some(part), Some(gop)) = (params.part, inner.gops.iter().find(|g| g.msn == msn))
-            && part > gop.parts(inner.frames_per_part()).len() + advance_part_limit(&inner)
+            && part > gop.parts(inner.part_target_ticks()).len() + advance_part_limit(&inner)
         {
             return Err(ApiError::BadRequest(format!(
                 "_HLS_part {part} is too far ahead"
@@ -605,15 +620,18 @@ fn reload_satisfied(inner: &Inner, msn: u64, part: Option<usize>) -> bool {
         // Already gone from the playlist, or not yet started: served when newer exists.
         return inner.gops.back().is_some_and(|g| g.msn > msn);
     };
-    let frames_per_part = inner.frames_per_part();
+    let part_target_ticks = inner.part_target_ticks();
     match part {
         None => gop.complete,
         Some(index) => {
-            let parts = gop.parts(frames_per_part);
+            let parts = gop.parts(part_target_ticks);
             match parts.get(index) {
                 Some(p) => p.complete,
                 None if gop.complete => inner.gops.iter().any(|g| {
-                    g.msn == msn + 1 && g.parts(frames_per_part).first().is_some_and(|p| p.complete)
+                    g.msn == msn + 1
+                        && g.parts(part_target_ticks)
+                            .first()
+                            .is_some_and(|p| p.complete)
                 }),
                 None => false,
             }
@@ -636,7 +654,7 @@ fn seconds(ticks: u64) -> f64 {
 fn render(inner: &Inner, auth: &AuthContext, base_path: &str) -> String {
     let target = inner.target_secs();
     let part_target = seconds(inner.part_target_ticks());
-    let frames_per_part = inner.frames_per_part();
+    let part_target_ticks = inner.part_target_ticks();
     let first_msn = inner.gops.front().map_or(0, |g| g.msn);
     let first_discontinuity = inner
         .gops
@@ -680,7 +698,7 @@ fn render(inner: &Inner, auth: &AuthContext, base_path: &str) -> String {
         }
         if i >= with_parts_from {
             for part in gop
-                .parts(frames_per_part)
+                .parts(part_target_ticks)
                 .into_iter()
                 .filter(|p| p.complete)
             {
@@ -712,7 +730,7 @@ fn render(inner: &Inner, auth: &AuthContext, base_path: &str) -> String {
             );
         } else {
             let next = gop
-                .parts(frames_per_part)
+                .parts(part_target_ticks)
                 .into_iter()
                 .filter(|p| p.complete)
                 .count();
@@ -813,7 +831,7 @@ pub(crate) async fn part(
             let Some(gop) = inner.gops.iter().find(|g| g.msn == msn) else {
                 return inner.gops.front().is_some_and(|g| g.msn > msn);
             };
-            let parts = gop.parts(inner.frames_per_part());
+            let parts = gop.parts(inner.part_target_ticks());
             parts.get(index).is_some_and(|p| p.complete) || (gop.complete && parts.len() <= index)
         })
         .await?;
@@ -829,7 +847,7 @@ pub(crate) async fn part(
             .find(|g| g.msn == msn)
             .ok_or(ApiError::NotFound)?;
         let part = gop
-            .parts(inner.frames_per_part())
+            .parts(inner.part_target_ticks())
             .into_iter()
             .nth(index)
             .ok_or(ApiError::NotFound)?;
@@ -984,15 +1002,148 @@ mod tests {
     }
 
     #[test]
-    fn parts_are_cut_by_frame_count_and_the_tail_waits_for_completion() {
+    fn parts_hold_the_frames_that_fit_the_target_and_the_tail_waits_for_completion() {
         let g = gop(5, 40, false);
-        let parts = g.parts(15);
+        let parts = g.parts(45_000);
         assert_eq!(parts.len(), 3);
         assert_eq!(parts[0].range, 0..15);
         assert!(parts[0].complete && parts[1].complete && !parts[2].complete);
         let done = gop(5, 40, true);
-        assert!(done.parts(15)[2].complete);
-        assert_eq!(done.parts(15)[2].range, 30..40);
+        assert!(done.parts(45_000)[2].complete);
+        assert_eq!(done.parts(45_000)[2].range, 30..40);
+    }
+
+    #[test]
+    fn a_gop_that_ends_on_a_part_boundary_has_no_empty_last_part() {
+        let ranges: Vec<_> = gop(5, 30, true)
+            .parts(45_000)
+            .into_iter()
+            .map(|part| part.range)
+            .collect();
+        assert_eq!(ranges, [0..15, 15..30]);
+    }
+
+    #[test]
+    fn frames_longer_than_the_target_are_parts_of_their_own() {
+        let durations = [3000, 50_000, 50_000, 3000, 3000];
+        let mut decode_time = 0;
+        let frames: Vec<_> = durations
+            .iter()
+            .enumerate()
+            .map(|(index, &duration)| {
+                let frame = frame_with(
+                    decode_time,
+                    index == 0,
+                    Bytes::from_static(&[0, 0, 0, 2, 0x26, 1]),
+                    duration,
+                );
+                decode_time += u64::from(duration);
+                (frame, index as u32 + 1)
+            })
+            .collect();
+        let g = Gop {
+            msn: 1,
+            discontinuity_sequence: 0,
+            payload_bytes: 30,
+            duration_ticks: decode_time,
+            frames,
+            complete: true,
+        };
+        let ranges: Vec<_> = g.parts(45_000).into_iter().map(|part| part.range).collect();
+        assert_eq!(ranges, [0..1, 1..2, 2..3, 3..5]);
+    }
+
+    /// A small deterministic generator (xorshift64*) for the property test.
+    struct Rng(u64);
+
+    impl Rng {
+        fn below(&mut self, n: u64) -> u64 {
+            self.0 ^= self.0 >> 12;
+            self.0 ^= self.0 << 25;
+            self.0 ^= self.0 >> 27;
+            self.0.wrapping_mul(0x2545_f491_4f6c_dd1d) % n
+        }
+    }
+
+    /// The regulariser re-times a stream to its delivered rate, so the
+    /// nominal frame duration changes under a running feeder. Whatever the
+    /// durations do, a listed part never outlasts the pinned part target, a
+    /// part other than a segment's last falls short of it by less than one
+    /// frame (so it reaches the 85 % of §4.4.4.9 while frames stay under
+    /// 15 % of the target), a segment never outlasts the target duration, and
+    /// a complete part keeps its frames, since clients fetch parts by index.
+    #[test]
+    fn parts_and_segments_stay_inside_their_pinned_targets_as_frame_durations_change() {
+        for seed in 1..=200 {
+            let mut rng = Rng(seed);
+            let mut inner = Inner::default();
+            assert_eq!(inner.target_secs(), 2, "the target before any frame");
+            let mut waiting_for_sync = true;
+            let mut duration = [1_500, 3_000, 3_186, 3_600, 6_000][rng.below(5) as usize];
+            let gop_frames = 10 + rng.below(80);
+            let mut decode_time = 0;
+            let mut seen: HashMap<(u64, usize), std::ops::Range<usize>> = HashMap::new();
+            for index in 0..600 {
+                if rng.below(150) == 0 {
+                    // A re-timing of up to 8 % either way.
+                    duration = duration * (92 + rng.below(17)) / 100;
+                }
+                let frame = frame_with(
+                    decode_time,
+                    index % gop_frames == 0,
+                    Bytes::from_static(&[0, 0, 0, 2, 0x26, 1]),
+                    u32::try_from(duration).unwrap(),
+                );
+                decode_time += duration;
+                inner.accept_frame(frame, &mut waiting_for_sync);
+                let part_target = inner.part_target_ticks();
+                for gop in &inner.gops {
+                    // The listed duration and the payload budget count
+                    // exactly the frames the segment holds.
+                    let (ticks, bytes) = gop.frames.iter().fold((0, 0), |(t, b), (frame, _)| {
+                        (t + u64::from(frame.duration), b + frame.data.len())
+                    });
+                    assert_eq!(gop.duration_ticks(), ticks, "seed {seed}");
+                    assert_eq!(gop.payload_bytes, bytes, "seed {seed}");
+                    if gop.complete {
+                        assert!(
+                            gop.duration_ticks() <= inner.target_secs() * u64::from(TIMESCALE),
+                            "seed {seed}: a segment outlasts the target duration"
+                        );
+                    }
+                    let parts = gop.parts(part_target);
+                    let mut next = 0;
+                    for part in &parts {
+                        assert_eq!(part.range.start, next, "seed {seed}: parts are contiguous");
+                        next = part.range.end;
+                        if !part.complete {
+                            continue;
+                        }
+                        let ticks: u64 = gop.frames[part.range.clone()]
+                            .iter()
+                            .map(|(frame, _)| u64::from(frame.duration))
+                            .sum();
+                        assert!(ticks <= part_target, "seed {seed}: {ticks} > {part_target}");
+                        // A part that is not its segment's last falls short of
+                        // the target by less than its last frame or the frame
+                        // that ended it, whichever is longer.
+                        if let Some((following, _)) = gop.frames.get(part.range.end) {
+                            let (last, _) = &gop.frames[part.range.end - 1];
+                            let frame = u64::from(last.duration.max(following.duration));
+                            assert!(
+                                ticks + frame > part_target,
+                                "seed {seed}: {ticks} is a frame or more under {part_target}"
+                            );
+                        }
+                        let kept = seen
+                            .entry((gop.msn, part.index))
+                            .or_insert_with(|| part.range.clone());
+                        assert_eq!(*kept, part.range, "seed {seed}: a complete part changed");
+                    }
+                    assert_eq!(next, gop.frames.len(), "seed {seed}");
+                }
+            }
+        }
     }
 
     /// The part size follows the first frame's duration: as many whole
@@ -1008,11 +1159,11 @@ mod tests {
         ] {
             let mut inner = Inner::default();
             inner.pin_part_target(&frame_with(0, true, Bytes::new(), duration));
-            assert_eq!(inner.frames_per_part(), frames, "{duration}");
             assert_eq!(inner.part_target_ticks(), target, "{duration}");
+            assert_eq!(target, frames * u64::from(duration), "{duration}");
             // Pinned once: a later frame of another duration changes nothing.
             inner.pin_part_target(&frame_with(0, true, Bytes::new(), 1));
-            assert_eq!(inner.frames_per_part(), frames, "{duration}");
+            assert_eq!(inner.part_target_ticks(), target, "{duration}");
         }
     }
 
@@ -1126,6 +1277,69 @@ mod tests {
         assert_eq!(inner.gops[2].discontinuity_sequence, 1);
     }
 
+    /// A blocking reload is satisfied by the complete segment or part it
+    /// names, by anything newer once the segment has left the playlist, and,
+    /// for a part index past a complete segment's parts, by the first part
+    /// of the segment after it.
+    #[test]
+    fn a_reload_is_satisfied_by_what_it_names_or_by_what_follows_it() {
+        let playlist = |next_frames: usize| {
+            let mut inner = Inner::default();
+            inner.gops.push_back(gop(5, 30, true));
+            inner.gops.push_back(gop(6, next_frames, false));
+            inner
+        };
+        let inner = playlist(10);
+        assert!(reload_satisfied(&inner, 5, None));
+        assert!(!reload_satisfied(&inner, 6, None), "segment 6 is open");
+        assert!(reload_satisfied(&inner, 4, None), "left the playlist");
+        assert!(!reload_satisfied(&inner, 7, None), "not started");
+        assert!(reload_satisfied(&inner, 5, Some(0)));
+        assert!(reload_satisfied(&inner, 5, Some(1)));
+        assert!(
+            !reload_satisfied(&inner, 6, Some(0)),
+            "ten of fifteen frames"
+        );
+        assert!(!reload_satisfied(&inner, 6, Some(1)));
+        // Segment 5 has two parts: part 2 means part 0 of segment 6.
+        assert!(!reload_satisfied(&inner, 5, Some(2)));
+        let inner = playlist(20);
+        assert!(reload_satisfied(&inner, 5, Some(2)));
+        assert!(reload_satisfied(&inner, 6, Some(0)));
+        assert!(
+            !reload_satisfied(&inner, 6, Some(1)),
+            "five of fifteen frames"
+        );
+        // Only the segment right after counts, and only for a complete one.
+        let mut gap = playlist(20);
+        gap.gops[1].msn = 7;
+        assert!(!reload_satisfied(&gap, 5, Some(2)));
+        assert!(!reload_satisfied(&inner, 6, Some(2)), "segment 6 is open");
+    }
+
+    #[test]
+    fn removing_a_camera_forgets_its_streams_and_no_other() {
+        let registry = LiveHlsRegistry::default();
+        let key = |camera: &str, kind| StreamKey {
+            camera: camera.parse().unwrap(),
+            kind,
+        };
+        {
+            let mut streams = registry.streams.lock().unwrap();
+            for key in [
+                key("cam1", iris_core::id::StreamKind::Main),
+                key("cam1", iris_core::id::StreamKind::Sub),
+                key("cam2", iris_core::id::StreamKind::Main),
+            ] {
+                streams.insert(key, LiveHls::new());
+            }
+        }
+        registry.remove_camera(&"cam1".parse().unwrap());
+        let streams = registry.streams.lock().unwrap();
+        let left: Vec<_> = streams.keys().cloned().collect();
+        assert_eq!(left, [key("cam2", iris_core::id::StreamKind::Main)]);
+    }
+
     #[test]
     fn the_advance_part_limit_is_three_seconds_of_parts() {
         let mut inner = Inner {
@@ -1142,7 +1356,6 @@ mod tests {
     /// An `Inner` as a feeder leaves it after 2 s GOPs at 30 fps.
     fn pinned(mut inner: Inner) -> Inner {
         inner.target_ticks = Some(3 * 90_000);
-        inner.part_frames = Some(15);
         inner.part_target_ticks = Some(45_000);
         inner
     }
@@ -1279,7 +1492,7 @@ mod tests {
         .await;
     }
 
-    /// CRC-32C (Castagnoli, reflected polynomial 0x82f63b78) lookup table.
+    /// CRC-32C (reflected polynomial 0x82f63b78) lookup table.
     fn crc32c_table() -> [u32; 256] {
         let mut table = [0u32; 256];
         for (index, slot) in table.iter_mut().enumerate() {

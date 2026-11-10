@@ -523,6 +523,34 @@ mod tests {
         );
     }
 
+    /// Each launch checks the stream after the one before and wraps after
+    /// the last, so every stream is visited once a cycle. A stream without
+    /// a sealed recording is done at once and counts as skipped.
+    #[tokio::test]
+    async fn launches_visit_the_streams_in_turn() {
+        let dir = tempfile::tempdir().unwrap();
+        let catalog = CatalogHandle::open(&dir.path().join("state").join("irisd.db")).unwrap();
+        let mut check =
+            SelfCheck::new(vec![key("a"), key("b"), key("c")], CancellationToken::new());
+        let mut visited = Vec::new();
+        for _ in 0..7 {
+            visited.push(check.next);
+            check.launch_next(&catalog).await;
+            // The next launch reaps the finished check itself.
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while !check.active.as_ref().is_some_and(JoinHandle::is_finished) {
+                    tokio::time::sleep(Duration::from_millis(2)).await;
+                }
+            })
+            .await
+            .expect("a stream without recordings is checked at once");
+        }
+        assert_eq!(visited, [0, 1, 2, 0, 1, 2, 0]);
+        assert_eq!(check.stats().skipped(), 7);
+        assert_eq!((check.stats().ok(), check.stats().failed()), (0, 0));
+        catalog.shutdown();
+    }
+
     #[test]
     fn interval_divides_the_cycle_over_the_streams() {
         let keys = vec![key("a"); 4];

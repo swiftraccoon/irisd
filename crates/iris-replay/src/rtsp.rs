@@ -391,9 +391,51 @@ mod tests {
     }
 
     #[test]
+    fn the_limits_are_64_kib() {
+        assert_eq!((MAX_HEAD, MAX_BODY), (65_536, 65_536));
+    }
+
+    #[test]
+    fn an_unterminated_head_is_refused_only_once_the_limit_is_passed() {
+        let mut head = b"OPTIONS rtsp://h/x RTSP/1.0\r\nX-Pad: ".to_vec();
+        head.resize(MAX_HEAD + 3, b'a');
+        assert_eq!(parse(&head), Parsed::Incomplete, "a terminator may follow");
+        head.push(b'a');
+        assert_eq!(parse(&head), Parsed::Invalid);
+    }
+
+    #[test]
+    fn a_body_is_awaited_and_bounded() {
+        let request = |declared: usize, sent: usize| {
+            let mut bytes =
+                format!("SET_PARAMETER rtsp://h/x RTSP/1.0\r\nContent-Length: {declared}\r\n\r\n")
+                    .into_bytes();
+            bytes.resize(bytes.len() + sent, b'b');
+            bytes
+        };
+        assert_eq!(parse(&request(3, 2)), Parsed::Incomplete);
+        assert_eq!(parse(&request(3, 0)), Parsed::Incomplete);
+        let largest = request(MAX_BODY, MAX_BODY);
+        let Parsed::Request(parsed, consumed) = parse(&largest) else {
+            panic!("the largest body is accepted");
+        };
+        assert_eq!((parsed.body.len(), consumed), (MAX_BODY, largest.len()));
+        assert_eq!(parse(&request(MAX_BODY + 1, MAX_BODY + 1)), Parsed::Invalid);
+    }
+
+    #[test]
     fn interleaved_frames_are_skipped_by_length() {
         assert_eq!(parse(b"$\x01\x00\x03abcXX"), Parsed::Interleaved(7));
         assert_eq!(parse(b"$\x01\x00\x03ab"), Parsed::Incomplete);
+        // The four-byte prefix is awaited; an empty frame is that prefix alone.
+        assert_eq!(parse(b"$"), Parsed::Incomplete);
+        assert_eq!(parse(b"$\x01\x00"), Parsed::Incomplete);
+        assert_eq!(parse(b"$\x01\x00\x00"), Parsed::Interleaved(4));
+    }
+
+    #[test]
+    fn a_mount_name_displays_as_written() {
+        assert_eq!(MountName::try_new("cam").unwrap().to_string(), "cam");
     }
 
     #[test]

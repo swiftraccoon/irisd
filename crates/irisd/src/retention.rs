@@ -1992,6 +1992,56 @@ mod tests {
     }
 
     #[test]
+    fn free_space_is_reported_as_a_percentage_and_sizes_in_gibibytes() {
+        let quarter = FreeSpace {
+            total: 4_000,
+            available: 1_000,
+        };
+        assert!((free_percent(&quarter) - 25.0).abs() < 1e-9);
+        let unknown = FreeSpace {
+            total: 0,
+            available: 0,
+        };
+        assert!(free_percent(&unknown).abs() < 1e-9);
+        assert_eq!(gib(None), "-");
+        assert_eq!(gib(Some(0)), "0.00");
+        assert_eq!(gib(Some(3 << 29)), "1.50");
+    }
+
+    /// A pass reports what it deleted and the bytes those files held.
+    #[tokio::test]
+    async fn a_pass_reports_the_segments_and_bytes_it_freed() {
+        let dir = tempfile::tempdir().unwrap();
+        let (catalog, root, approved) = approved_catalog(dir.path()).await;
+        for (index, len) in [100usize, 250, 700].into_iter().enumerate() {
+            seed_segment_starting(
+                &catalog,
+                &layout_path(&root, "cam1", index),
+                "cam1",
+                &vec![0x5a; len],
+                1_000_000 * (index as i64 + 1),
+            )
+            .await;
+        }
+        let mut state = state();
+        // A quota of 700 bytes: the two oldest go, the newest stays.
+        let report = pass_approved(
+            &catalog,
+            std::slice::from_ref(&approved),
+            &mut state,
+            0,
+            Some(700),
+            &HashMap::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!((report.deleted, report.freed), (2, 350));
+        assert_eq!(catalog.total_bytes().await.unwrap(), 700);
+        assert!(layout_path(&root, "cam1", 2).exists());
+        catalog.shutdown();
+    }
+
+    #[test]
     fn quota_compares_total_bytes_with_the_cap() {
         assert!(!over_quota(1 << 40, None));
         assert!(!over_quota(100, Some(100)));

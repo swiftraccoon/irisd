@@ -270,7 +270,8 @@ pub fn encode_fragment(
     })
 }
 
-/// Serializes the trailer: `free` box with magic, CRC-32C, fragment length, flags.
+/// Serializes the trailer: `free` box with magic, CRC-32C, fragment length,
+/// and four reserved bytes that are zero.
 #[must_use]
 pub fn encode_trailer(crc: u32, fragment_len: u32) -> [u8; TRAILER_LEN] {
     let mut t = [0u8; TRAILER_LEN];
@@ -290,17 +291,19 @@ pub struct Trailer {
     pub crc: u32,
     /// Length from the start of `prft` to the end of the trailer.
     pub fragment_len: u32,
-    /// Reserved flags.
-    pub flags: u32,
 }
 
-/// Decodes a trailer; `None` if the box or magic does not match.
+/// Decodes a trailer; `None` if the box or magic does not match, or a
+/// reserved byte is set. The reserved bytes lie outside the CRC, so
+/// requiring zero leaves no byte of a fragment unchecked, and a reader never
+/// accepts a fragment that carries a flag it does not know.
 #[must_use]
 pub fn decode_trailer(buf: &[u8]) -> Option<Trailer> {
     if buf.len() < TRAILER_LEN
         || buf[0..4] != (TRAILER_LEN as u32).to_be_bytes()
         || &buf[4..8] != b"free"
         || buf[8..12] != TRAILER_MAGIC
+        || buf[20..24] != [0; 4]
     {
         return None;
     }
@@ -308,7 +311,6 @@ pub fn decode_trailer(buf: &[u8]) -> Option<Trailer> {
     Some(Trailer {
         crc: field(12),
         fragment_len: field(16),
-        flags: field(20),
     })
 }
 
@@ -389,6 +391,8 @@ mod tests {
             encode_fragment(&header(), &samples).unwrap_err(),
             FragmentError::TooManySamples(65_536)
         );
+        // One fewer is the most a fragment holds.
+        assert!(encode_fragment(&header(), &samples[1..]).is_ok());
     }
 
     #[test]
@@ -405,6 +409,35 @@ mod tests {
             encode_fragment(&header(), &samples).unwrap_err(),
             FragmentError::PayloadTooLarge(1_025 << 20)
         );
+        // Exactly the maximum is accepted: the samples share one buffer and
+        // encoding builds only the boxes around them.
+        let encoded = encode_fragment(&header(), &samples[1..]).unwrap();
+        assert_eq!(
+            encoded.total_len(),
+            (encoded.prefix.len() + encoded.trailer.len()) as u64 + MAX_PAYLOAD_LEN
+        );
+    }
+
+    #[test]
+    fn a_fragment_reports_its_payload_duration_and_sync_start() {
+        let entry = Arc::new(crate::init::tests::fake_sample_entry());
+        let mut fragment = Fragment {
+            samples: samples(),
+            decode_time: 0,
+            wall: WallUs::new(0),
+            raw_rtp: 0,
+            new_run: true,
+            sample_entry: entry,
+        };
+        assert_eq!(fragment.payload_len(), 14);
+        assert_eq!(fragment.duration(), 6000);
+        assert!(fragment.starts_with_sync());
+        fragment.samples.remove(0);
+        assert_eq!(fragment.payload_len(), 7);
+        assert_eq!(fragment.duration(), 3000);
+        assert!(!fragment.starts_with_sync());
+        fragment.samples.clear();
+        assert!(!fragment.starts_with_sync());
     }
 
     #[test]
@@ -415,7 +448,6 @@ mod tests {
             Some(Trailer {
                 crc: 1,
                 fragment_len: 2,
-                flags: 0
             })
         );
         assert!(decode_trailer(&good[..TRAILER_LEN - 1]).is_none());
@@ -428,5 +460,14 @@ mod tests {
         let mut wrong_magic = good;
         wrong_magic[8] = b'J';
         assert!(decode_trailer(&wrong_magic).is_none());
+    }
+
+    #[test]
+    fn decode_trailer_rejects_every_set_reserved_bit() {
+        for bit in 0..32 {
+            let mut reserved = encode_trailer(1, 2);
+            reserved[20 + bit / 8] ^= 1 << (bit % 8);
+            assert!(decode_trailer(&reserved).is_none(), "bit {bit}");
+        }
     }
 }

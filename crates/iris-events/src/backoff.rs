@@ -93,6 +93,41 @@ mod tests {
     }
 
     #[test]
+    fn a_session_that_only_just_connected_does_not_reset_the_schedule() {
+        let mut b = Backoff::new("cam1/dahua");
+        for _ in 0..5 {
+            b.delay();
+        }
+        assert!(b.connected_at.is_none());
+        b.session_connected();
+        assert!(b.connected_at.is_some());
+        // Connected a moment ago: the schedule keeps its place, at the cap.
+        let d = b.delay();
+        assert!(d >= MAX.mul_f64(0.5), "{d:?}");
+        assert!(b.connected_at.is_none(), "one connection counts once");
+    }
+
+    #[test]
+    fn the_jitter_of_one_source_varies_from_attempt_to_attempt() {
+        let mut b = Backoff::new("cam1/onvif");
+        for _ in 0..5 {
+            b.delay();
+        }
+        // At the cap every delay is 30 s within 20 %, and the 401 jitter
+        // steps come out spread over that range, not stuck at one value.
+        let delays: Vec<Duration> = (0..32).map(|_| b.delay()).collect();
+        let distinct: std::collections::HashSet<_> = delays.iter().collect();
+        assert!(distinct.len() >= 24, "{} distinct delays", distinct.len());
+        assert!(delays.iter().any(|d| *d < MAX.mul_f64(0.9)));
+        assert!(delays.iter().any(|d| *d > MAX.mul_f64(1.1)));
+        assert!(
+            delays
+                .iter()
+                .all(|d| *d >= MAX.mul_f64(0.8) && *d <= MAX.mul_f64(1.2))
+        );
+    }
+
+    #[test]
     fn seeds_decorrelate_simultaneous_sources() {
         let delays: std::collections::HashSet<Duration> = (0..64)
             .map(|camera| Backoff::new(&format!("cam{camera}/onvif")).delay())

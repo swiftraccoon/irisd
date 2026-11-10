@@ -202,6 +202,142 @@ pub(crate) mod tests {
         SampleEntry::new(w.into_bytes(), "hvc1.1.6.L150.B0".into(), 3840, 2160)
     }
 
+    /// The boxes of `buf` that hold fields, each with its path through the
+    /// containers and its body. `dref` counts as one: its body holds the
+    /// entry count and the `url ` box.
+    fn field_boxes(buf: &[u8], prefix: &str, out: &mut Vec<(String, Vec<u8>)>) {
+        let mut rest = buf;
+        while !rest.is_empty() {
+            let header = BoxHeader::parse(rest).expect("a box header");
+            let size = usize::try_from(header.size.expect("a sized box")).unwrap();
+            let body = &rest[usize::from(header.header_len)..size];
+            let path = format!("{prefix}{}", std::str::from_utf8(&header.kind).unwrap());
+            if [
+                *b"moov", *b"trak", *b"mdia", *b"minf", *b"dinf", *b"stbl", *b"mvex",
+            ]
+            .contains(&header.kind)
+            {
+                field_boxes(body, &format!("{path}/"), out);
+            } else {
+                out.push((path, body.to_vec()));
+            }
+            rest = &rest[size..];
+        }
+    }
+
+    /// Big-endian bytes of a list of fields, each `(value, width in bytes)`.
+    fn fields(list: &[(u64, usize)]) -> Vec<u8> {
+        list.iter()
+            .flat_map(|&(value, width)| value.to_be_bytes()[8 - width..].to_vec())
+            .collect()
+    }
+
+    /// Every field of the initialization segment, box by box, written out
+    /// here from ISO/IEC 14496-12: version 1 `mvhd`, `tkhd`, and `mdhd`
+    /// with zero times and durations, the unity matrix, the track's size
+    /// in 16.16 fixed point, a 90 kHz media timescale, the sample entry
+    /// verbatim in `stsd`, empty sample tables, and `trex` defaults that
+    /// mark samples as dependent.
+    #[test]
+    fn every_box_of_the_init_segment_carries_the_specified_fields() {
+        let entry = fake_sample_entry();
+        let init = build_init_segment(&entry);
+        let mut boxes = Vec::new();
+        field_boxes(&init, "", &mut boxes);
+        let matrix = [
+            (0x0001_0000, 4),
+            (0, 4),
+            (0, 4),
+            (0, 4),
+            (0x0001_0000, 4),
+            (0, 4),
+            (0, 4),
+            (0, 4),
+            (0x4000_0000, 4),
+        ];
+        let mut mvhd = fields(&[
+            (0x0100_0000, 4), // version 1, no flags
+            (0, 8),           // creation time
+            (0, 8),           // modification time
+            (1000, 4),        // movie timescale
+            (0, 8),           // duration, unknown in a fragmented file
+            (0x0001_0000, 4), // rate 1.0
+            (0x0100, 2),      // volume 1.0
+            (0, 2),           // reserved
+            (0, 8),           // reserved
+        ]);
+        mvhd.extend(fields(&matrix));
+        mvhd.extend(fields(&[(0, 8), (0, 8), (0, 8), (2, 4)])); // pre_defined, next track id
+        let mut tkhd = fields(&[
+            (0x0100_0007, 4), // version 1; enabled, in movie, in preview
+            (0, 8),
+            (0, 8),
+            (1, 4), // track id
+            (0, 4), // reserved
+            (0, 8), // duration
+            (0, 8), // reserved
+            (0, 2), // layer
+            (0, 2), // alternate group
+            (0, 2), // volume of a video track
+            (0, 2), // reserved
+        ]);
+        tkhd.extend(fields(&matrix));
+        tkhd.extend(fields(&[(3840 << 16, 4), (2160 << 16, 4)]));
+        let mut hdlr = fields(&[(0, 4), (0, 4)]);
+        hdlr.extend_from_slice(b"vide");
+        hdlr.extend_from_slice(&[0; 12]);
+        hdlr.extend_from_slice(b"irisd video\0");
+        let mut dref = fields(&[(0, 4), (1, 4), (12, 4)]);
+        dref.extend_from_slice(b"url ");
+        dref.extend(fields(&[(1, 4)])); // the media is in this file
+        let mut stsd = fields(&[(0, 4), (1, 4)]);
+        stsd.extend_from_slice(&entry.bytes);
+        let empty_table = fields(&[(0, 4), (0, 4)]);
+        let expected: Vec<(&str, Vec<u8>)> = vec![
+            ("ftyp", b"iso6\0\0\0\0iso6cmfcmp41".to_vec()),
+            ("moov/mvhd", mvhd),
+            ("moov/trak/tkhd", tkhd),
+            (
+                "moov/trak/mdia/mdhd",
+                fields(&[
+                    (0x0100_0000, 4),
+                    (0, 8),
+                    (0, 8),
+                    (90_000, 4), // media timescale
+                    (0, 8),
+                    (0x55c4, 2), // language "und"
+                    (0, 2),
+                ]),
+            ),
+            ("moov/trak/mdia/hdlr", hdlr),
+            (
+                "moov/trak/mdia/minf/vmhd",
+                fields(&[(1, 4), (0, 2), (0, 6)]),
+            ),
+            ("moov/trak/mdia/minf/dinf/dref", dref),
+            ("moov/trak/mdia/minf/stbl/stsd", stsd),
+            ("moov/trak/mdia/minf/stbl/stts", empty_table.clone()),
+            ("moov/trak/mdia/minf/stbl/stsc", empty_table.clone()),
+            (
+                "moov/trak/mdia/minf/stbl/stsz",
+                fields(&[(0, 4), (0, 4), (0, 4)]),
+            ),
+            ("moov/trak/mdia/minf/stbl/stco", empty_table),
+            (
+                "moov/mvex/trex",
+                // Track 1, sample description 1, no default duration or
+                // size, and samples that depend on others and are not sync.
+                fields(&[(0, 4), (1, 4), (1, 4), (0, 4), (0, 4), (0x0101_0000, 4)]),
+            ),
+        ];
+        let paths: Vec<&str> = boxes.iter().map(|(path, _)| path.as_str()).collect();
+        let expected_paths: Vec<&str> = expected.iter().map(|(path, _)| *path).collect();
+        assert_eq!(paths, expected_paths);
+        for ((path, body), (_, wanted)) in boxes.iter().zip(&expected) {
+            assert_eq!(body, wanted, "{path}");
+        }
+    }
+
     #[test]
     fn init_segment_has_ftyp_then_moov() {
         let init = build_init_segment(&fake_sample_entry());

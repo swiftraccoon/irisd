@@ -2744,6 +2744,71 @@ mod tests {
         assert!(validate_period("period", Duration::ZERO).is_err());
     }
 
+    /// The watchdog is fed only while every ingest task is alive and has
+    /// moved since the last check: frames or reconnects. One task that
+    /// stands still, or one that has ended, withholds it.
+    #[tokio::test]
+    async fn the_watchdog_needs_every_stream_alive_and_moving() {
+        let task = |last_progress: (u64, u64), running: bool| {
+            let handle = if running {
+                tokio::spawn(std::future::pending::<()>())
+            } else {
+                tokio::spawn(async {})
+            };
+            StreamTask {
+                key: StreamKey {
+                    camera: "cam1".parse().unwrap(),
+                    kind: StreamKind::Main,
+                },
+                stats: Arc::new(StreamStats::new()),
+                handle,
+                last_progress,
+            }
+        };
+        // The counters stand at (0, 0): a remembered (9, 0) means progress.
+        let moved = (9, 0);
+        let mut streams = vec![task(moved, true), task((0, 7), true)];
+        assert!(all_streams_progressed(&mut streams));
+        // The check remembered the counters, and nothing moved since.
+        assert_eq!(streams[0].last_progress, (0, 0));
+        assert!(!all_streams_progressed(&mut streams));
+
+        let mut one_still = vec![task(moved, true), task((0, 0), true)];
+        assert!(!all_streams_progressed(&mut one_still));
+
+        let mut one_ended = vec![task(moved, true), task(moved, false)];
+        while !one_ended[1].handle.is_finished() {
+            tokio::task::yield_now().await;
+        }
+        assert!(!all_streams_progressed(&mut one_ended));
+
+        assert!(all_streams_progressed(&mut []));
+        for task in streams.iter().chain(&one_still).chain(&one_ended) {
+            task.handle.abort();
+        }
+    }
+
+    #[test]
+    fn age_limits_come_from_the_cameras_that_set_one() {
+        let camera = |id: &str, extra: &str| {
+            format!(
+                "[[camera]]\nid=\"{id}\"\nname=\"n\"\nrtsp_url=\"rtsp://192.0.2.7/{id}\"\n\
+                 username=\"u\"\npassword=\"p\"\n{extra}"
+            )
+        };
+        let config = Config::from_toml_str(&format!(
+            "[api]\nallow_unauthenticated=true\n{}{}{}",
+            camera("cam1", "retention_days=7\n"),
+            camera("cam2", ""),
+            camera("cam3", "retention_days=30\n"),
+        ))
+        .unwrap();
+        let limits = age_limits(&config);
+        assert_eq!(limits.len(), 2);
+        assert_eq!(limits[&"cam1".parse::<CameraId>().unwrap()], 7);
+        assert_eq!(limits[&"cam3".parse::<CameraId>().unwrap()], 30);
+    }
+
     #[test]
     fn queue_capacity_rejects_no_streams_and_overflow() {
         assert!(checked_queue_capacity(0, 0).is_err());

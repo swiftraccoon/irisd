@@ -62,7 +62,7 @@ one `moof` + `mdat` each.
 | `GET /api/streams/{camera}/{kind}/hls/vod.m3u8?from&to` | a byte-range VOD playlist over the range |
 | `GET /api/streams/{camera}/{kind}/export.mp4?from&to` | a stand-alone recording of the range, streamed: the init segment with an edit list for start preroll, then fragments rebased from zero with fresh sequence numbers and trailers; tail samples at or after `to` are omitted and a crossing sample's duration is shortened (`docs/research/04-storage-format.md §10`) |
 | `GET /api/streams/{camera}/{kind}/live` | WebSocket: an init segment, then one fragment per frame, each message at most 16 MiB + 1 byte |
-| `GET /api/streams/{camera}/{kind}/hls/live.m3u8[?_HLS_msn&_HLS_part]` | the low-latency live playlist from the live ring: parts of as many whole frames as fit 0.5 s, blocking reload (waits up to three target durations, 12 s before the first segment completes, then 503; a directive more than two segments or three seconds of parts ahead is 400), preload hints; relative URIs `init.mp4`, `seg/{msn}/media.m4s`, `part/{msn}/{index}/part.m4s` beside it, served from memory (`docs/research/04-storage-format.md §10`) |
+| `GET /api/streams/{camera}/{kind}/hls/live.m3u8[?_HLS_msn&_HLS_part]` | the low-latency live playlist from the live ring: parts of up to 0.5 s cut by media time, blocking reload (waits up to three target durations, 12 s before the first segment completes, then 503; a directive more than two segments or three seconds of parts ahead is 400), preload hints; relative URIs `init.mp4`, `seg/{msn}/media.m4s`, `part/{msn}/{index}/part.m4s` beside it, served from memory (`docs/research/04-storage-format.md §10`) |
 | `GET /api/streams/{camera}/{kind}/keyframe?t=` | a playable MP4 of one frame: the init segment and a single-sample fragment holding the sync sample at or before `t` (default: the newest), looked up within the two minutes before `t`; `x-iris-wall-us` carries the sample's time |
 | `GET /api/segments/{id}/file.mp4` | one recording file, with HTTP range support: one `bytes` range, clamped to the validated extent; a range unit other than `bytes` is ignored and the whole file served; several ranges or an unsatisfiable one answer 416 |
 | `POST /api/events/{id}/retain` | body `{"until": TIME}` keeps the footage around the event (30 s each side) from retention until then; `{"until": null}` or an empty body clears it; the body is read as JSON whatever its `Content-Type`, and an unknown field or an unparseable time is 400; returns the event with `retain_until_us` |
@@ -137,9 +137,11 @@ spawns `serve_listener` before reporting readiness.
   between them. VOD presents this preroll; exports use `elst` to hide start preroll while
   retaining the samples needed to decode it. Tail samples starting at or after the requested
   end are removed from the serialized sample table and payload; a crossing sample's duration
-  is shortened. The exclusive end rounds up to a 90 kHz media tick, and the edit's positive
-  presentation duration rounds up to a millisecond. Requests shorter than either timescale
-  remain nonempty; end clipping does not depend on the player's edit-list support.
+  is shortened. Only the final fragment is cut, so a fragment before it whose wall interval
+  reaches past the end stays whole. The exclusive end rounds up to a 90 kHz media tick, and
+  the edit's positive presentation duration rounds up to a millisecond. Requests shorter
+  than either timescale remain nonempty; end clipping does not depend on the player's
+  edit-list support.
 - VOD playlists carry one `#IRIS-FRAGMENT:WALL-US=<i64>,DURATION-TICKS=<u32>` comment per
   served fragment, in playback order, including sync preroll. `WALL-US` is Unix microseconds;
   `DURATION-TICKS` uses 90,000 ticks per second. Clients sum ticks before converting units to
@@ -150,9 +152,11 @@ spawns `serve_listener` before reporting readiness.
 - LL-HLS follows the vendored HLS draft: `EXT-X-TARGETDURATION` is pinned per feeder when
   the first GOP completes (its length rounded up to whole seconds plus one second, at most the
   10 s GOP budget) and never changes; `PART-TARGET` is pinned from the first frame's duration
-  (the whole frames that fit 0.5 s, at least one, so every non-final part lasts exactly the
-  target); complete segments stay listed until the complete segments after them cover three
-  target durations, at most 12; `EXT-X-VERSION` is 6; each segment after a discontinuity
+  (what the whole frames that fit 0.5 s add up to, at least one frame), and parts are cut by
+  media time against it, so no part outlasts the target when frame durations change and every
+  non-final part lasts exactly the target while they do not; complete segments stay listed
+  until the complete segments after them cover three target durations, at most 12;
+  `EXT-X-VERSION` is 6; each segment after a discontinuity
   carries `EXT-X-PROGRAM-DATE-TIME`; and a blocking reload waits three target durations. A
   GOP that would outlast the pinned target, or exceed 16 MiB or 600 frames, is cut where it is
   with `EXT-X-DISCONTINUITY`, as is the open segment on ring lag or a non-increasing decode

@@ -387,6 +387,28 @@ mod tests {
     }
 
     #[test]
+    fn truncation_cuts_at_a_character_boundary_and_drops_spare_capacity() {
+        // "ab" and a three-byte character: a limit inside it cuts before it.
+        for (limit, kept) in [
+            (5, "ab度"),
+            (4, "ab"),
+            (3, "ab"),
+            (2, "ab"),
+            (1, "a"),
+            (0, ""),
+        ] {
+            let mut value = String::from("ab度");
+            truncate_utf8(&mut value, limit);
+            assert_eq!(value, kept, "limit {limit}");
+        }
+        let mut roomy = String::with_capacity(4096);
+        roomy.push_str("ab");
+        truncate_utf8(&mut roomy, 16);
+        assert_eq!(roomy, "ab");
+        assert!(roomy.capacity() <= 16);
+    }
+
+    #[test]
     fn invalid_payload_is_json_quoted() {
         let event = Event {
             camera: CameraId::try_new("cam1").unwrap(),
