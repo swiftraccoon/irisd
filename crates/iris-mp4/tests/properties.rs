@@ -2,6 +2,11 @@
 //! the scanner, the memory parser, and the sidecar record read back, and a
 //! damaged file is valid exactly up to the damage.
 
+#![expect(
+    clippy::unwrap_used,
+    reason = "a helper of a test fails as the test does, by panicking"
+)]
+
 use std::io::Cursor;
 
 use bytes::Bytes;

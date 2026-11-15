@@ -77,6 +77,10 @@ and patch entry only when an upstream release supplies every contract listed abo
 - Production RTSP connections limit one control message, head and body together, to 1 MiB.
   The parser applies the limit while lines and bodies accumulate, and socket reads do not
   reserve beyond the remaining allowance. Interleaved RTP keeps its protocol length limit.
+- The timestamp policy of `PlayOptions::enforce_timestamps_with_max_jump_secs` applies to
+  video streams only. Cameras step the RTP timestamps of an audio stream backwards by a
+  fraction of a frame, and the published crate ends the whole session at the first such
+  step, picture included.
 - The test helpers use the standard library instead of the `pretty_assertions` and `mylog`
   crates, so the crate's own tests run standalone:
   `cargo test --locked --manifest-path third_party/retina/Cargo.toml`. `testutil` also

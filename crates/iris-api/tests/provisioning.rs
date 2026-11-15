@@ -2,6 +2,12 @@
 //! for the daemon's control loop: the routes validate, authenticate, and
 //! relay; the stand-in registers and forgets cameras as the daemon would.
 
+#![expect(
+    clippy::missing_assert_message,
+    clippy::unwrap_used,
+    reason = "a helper of a test fails as the test does, by panicking"
+)]
+
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use std::time::Instant;
@@ -199,6 +205,7 @@ async fn cameras_are_added_listed_and_removed_through_the_daemon_control() {
     assert_eq!(body["id"], "added1");
     assert_eq!(body["name"], "Camera added1");
     assert_eq!(body["has_snapshot"], true);
+    assert_eq!(body["has_audio"], false);
     assert_eq!(body["provisioned"], true);
     assert!(
         body.get("password").is_none(),

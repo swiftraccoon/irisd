@@ -1,7 +1,5 @@
 # Appendix B — Storage-layer research notes (2026-10-31)
 
-Edited on 2026-11-09: a disk product line and the development host's disks are described by
-their class.
 
 Research notes produced by the storage thread. Tags: verified-primary / secondary / inferred.
 Summarised and adapted in `../04-storage-format.md` (the final design differs in details:
@@ -45,7 +43,7 @@ one file per elementary stream, a sidecar index instead of a `fragment` table, 2
    preceding durations); later recordings start where the previous ended. Media duration comes from
    RTP deltas; `wall_duration = media_duration + clamp(local_start − start,
    ±media_duration/2000)`. System-clock steps mid-recording are not corrected (retroactive
-   correction/splitting listed as future work); leap seconds assumed smeared; RTCP SRs "may be
+   correction/splitting listed as work not done); leap seconds assumed smeared; RTCP SRs "may be
    absent or late… budget cameras appear not to frequency-correct" RTP. Camera-SR-derived start
    time was rejected initially (5 s mismatch rule) as it could misalign streams by up to
    2×threshold. https://github.com/scottlamb/moonfire-nvr/blob/master/design/time.md
@@ -283,9 +281,9 @@ reboot), seal the segment and start a new run.
   before freezing the trailer design.
 - `prft` placement/semantics verified only via a secondary quote of 14496-12; confirm against the
   2022 text and that ffprobe/Apple tolerate it.
-- Do the target Dahua models emit RTCP SRs, how soon after PLAY, and is their NTP sane? Measure;
+- Do the target Dahua models emit RTCP SRs, how long after PLAY, and is their NTP sane? Measure;
   also confirm they emit VPS/SPS/PPS before every IDR and whether they ever change SPS without a
-  reconnect. *(Answered for cam1 in 01: SRs every 5 s, NTP sane within 100 ms, parameter sets before
+  reconnect. *(Answered in 01: SRs every 5 s, NTP sane within 100 ms, parameter sets before
   every IDR.)*
 - ext4 vs XFS: run a multi-week FIFO soak at 12 streams and compare extent counts and unlink
   latency.

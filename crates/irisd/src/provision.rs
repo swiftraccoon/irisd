@@ -166,6 +166,7 @@ mod tests {
             password: "secret".to_owned(),
             vendor: None,
             record: vec![StreamKind::Main],
+            audio_steps: false,
             timestamp_mode: TimestampMode::default(),
             http_port: None,
             https: false,

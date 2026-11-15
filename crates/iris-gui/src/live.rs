@@ -15,6 +15,7 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest as _;
 use tokio_tungstenite::tungstenite::http::HeaderValue;
 use tokio_tungstenite::tungstenite::http::Request;
+use tokio_tungstenite::tungstenite::http::StatusCode;
 use tokio_tungstenite::tungstenite::http::header;
 use tokio_tungstenite::tungstenite::protocol::CloseFrame;
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
@@ -157,6 +158,12 @@ pub async fn run(
                 debug!(camera = %feed.camera, "live feed ended");
                 RECONNECT_DELAY
             }
+            Err(error) if feed.kind == StreamKind::Audio && is_not_found(&error) => {
+                // The daemon has no live audio for this camera: it records
+                // none. There is nothing to reconnect to.
+                debug!(camera = %feed.camera, "the camera has no live audio");
+                return;
+            }
             Err(error) => {
                 warn!(camera = %feed.camera, error = %format!("{error:#}"), "live feed failed");
                 RECONNECT_DELAY
@@ -168,6 +175,15 @@ pub async fn run(
             () = tokio::time::sleep(delay) => {}
         }
     }
+}
+
+/// Whether a session failed because the daemon answered the upgrade with
+/// 404: the stream has no live feed.
+fn is_not_found(error: &anyhow::Error) -> bool {
+    matches!(
+        error.downcast_ref::<WebSocketError>(),
+        Some(WebSocketError::Http(response)) if response.status() == StatusCode::NOT_FOUND
+    )
 }
 
 fn connect_request(url: &Url, token: Option<&str>) -> anyhow::Result<Request<()>> {
@@ -584,5 +600,57 @@ mod tests {
             [Duration::from_secs(2), Duration::from_secs(4)],
             "the tile shows the oversized state with a growing retry delay"
         );
+    }
+
+    /// A daemon that records no audio for a camera answers its audio feed
+    /// with 404: that feed ends, with no restart asked of its branch. A
+    /// video feed answered so keeps trying, since its stream is configured
+    /// and comes back.
+    #[tokio::test]
+    async fn an_audio_feed_the_daemon_does_not_have_ends() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        // No route: every upgrade is answered with 404.
+        tokio::spawn(async move { axum::serve(listener, Router::new()).await });
+        gst::init().unwrap();
+        let api = format!("http://{address}");
+
+        let (events_tx, events_rx) = async_channel::unbounded();
+        let sound = Feed {
+            kind: StreamKind::Audio,
+            ..feed(&api, None)
+        };
+        tokio::time::timeout(
+            TEST_DEADLINE,
+            run(
+                sound,
+                Source::for_tests(),
+                events_tx,
+                CancellationToken::new(),
+            ),
+        )
+        .await
+        .expect("the audio feed ends");
+        assert!(events_rx.try_recv().is_err(), "no restart was asked");
+
+        let (events_tx, events_rx) = async_channel::unbounded();
+        let cancel = CancellationToken::new();
+        let picture = tokio::spawn(run(
+            feed(&api, None),
+            Source::for_tests(),
+            events_tx,
+            cancel.clone(),
+        ));
+        let event = tokio::time::timeout(TEST_DEADLINE, events_rx.recv())
+            .await
+            .expect("the video feed reports its failed session")
+            .unwrap();
+        assert_eq!(event, TileEvent::Restart);
+        assert!(!picture.is_finished(), "the video feed keeps trying");
+        cancel.cancel();
+        tokio::time::timeout(TEST_DEADLINE, picture)
+            .await
+            .expect("the cancelled feed ends")
+            .unwrap();
     }
 }

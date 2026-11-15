@@ -422,6 +422,8 @@ mod tests {
             duration: 180_000,
             sample_count: 60,
             starts_with_sync: true,
+            all_sync: false,
+            track_id: 1,
             wall,
             sample_durations: Vec::new(),
             sample_sizes: Vec::new(),

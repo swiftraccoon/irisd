@@ -28,6 +28,7 @@ use crate::vod::PlaybackFragment;
 
 /// The video sink handed to `playbin3`; see [`Playback::start`].
 const VIDEO_SINK: &str = "glupload ! glcolorconvert ! gtk4paintablesink name=sink sync=true";
+
 /// How often the playhead follows the pipeline position.
 const POSITION_PERIOD: Duration = Duration::from_millis(250);
 /// Most events drawn on the timeline.
@@ -151,6 +152,9 @@ pub struct Playback {
     picture: gtk::Picture,
     title: gtk::Label,
     status: gtk::Label,
+    /// The "Sound" button: shown while the window plays with recorded
+    /// audio, and muting the player while it is off.
+    sound: gtk::ToggleButton,
     /// The window, its recordings, the playhead, and the export marks.
     timeline: Timeline,
     thumbnail_decoders: Arc<Semaphore>,
@@ -191,6 +195,11 @@ impl Playback {
         }
         let play = gtk::Button::with_label("Play / Pause");
         header.append(&play);
+        // Shown while the window plays with recorded audio; off mutes it.
+        let sound = gtk::ToggleButton::with_label("Sound");
+        sound.set_active(true);
+        sound.set_visible(false);
+        header.append(&sound);
         let mark_in = gtk::Button::with_label("Mark in");
         header.append(&mark_in);
         let mark_out = gtk::Button::with_label("Mark out");
@@ -242,6 +251,7 @@ impl Playback {
                 picture,
                 title,
                 status,
+                sound: sound.clone(),
                 timeline,
                 thumbnail_decoders,
                 pipeline: RefCell::new(None),
@@ -256,6 +266,16 @@ impl Playback {
             }
         });
         Self::connect_buttons(&this, [play, mark_in, mark_out, keep, export]);
+        sound.connect_toggled({
+            let weak = Rc::downgrade(&this);
+            move |button| {
+                if let Some(this) = weak.upgrade()
+                    && let Some(running) = this.pipeline.borrow().as_ref()
+                {
+                    running.playbin.set_property("mute", !button.is_active());
+                }
+            }
+        });
         this
     }
 
@@ -726,6 +746,15 @@ impl Playback {
         let paintable = sink.property::<gdk::Paintable>("paintable");
         self.picture.set_paintable(Some(&paintable));
         playbin.set_property("video-sink", &sink_bin);
+        if crate::sound::silent() {
+            let silent = gst::ElementFactory::make("fakesink")
+                .property("sync", true)
+                .build()
+                .context("creating the silent audio sink")?;
+            playbin.set_property("audio-sink", &silent);
+        }
+        self.sound.set_visible(snapshot.has_audio());
+        playbin.set_property("mute", !self.sound.is_active());
         playbin.set_property("uri", snapshot.url().as_str());
         let bus = playbin.bus().context("playbin bus")?;
         let bus_watch = bus
@@ -903,7 +932,21 @@ async fn fetch_window(
     } else {
         async {
             let playlist = client.vod_playlist(&camera, kind, from, to).await?;
-            let snapshot = Snapshot::new(playlist.body).await?;
+            // The camera's audio lies on the main stream's timeline, so it
+            // plays with that stream alone. A window without recorded audio
+            // answers 404, and no fault of the audio keeps the picture away.
+            let audio = if kind == StreamKind::Main {
+                client
+                    .vod_playlist(&camera, StreamKind::Audio, from, to)
+                    .await
+                    .ok()
+            } else {
+                None
+            };
+            let snapshot = match audio {
+                Some(audio) => Snapshot::with_audio(playlist.body, audio.body).await?,
+                None => Snapshot::new(playlist.body).await?,
+            };
             Ok(Some((playlist.fragments, snapshot)))
         }
         .await
@@ -1445,7 +1488,7 @@ pub(crate) mod tests {
         let address = listener.local_addr().unwrap();
         let server = runtime.spawn(async move {
             let app = axum::Router::new().route(
-                "/api/streams/fixture/main/export.mp4",
+                "/api/cameras/fixture/export.mp4",
                 routing::get(|| async {
                     let chunks = futures::stream::iter(
                         (0..CHUNKS)
@@ -1609,5 +1652,137 @@ pub(crate) mod tests {
         assert!(marks_status(Some(i), None).ends_with("set the out mark"));
         assert!(marks_status(None, Some(o)).ends_with("set the in mark"));
         assert_eq!(marks_status(None, None), "");
+    }
+
+    /// A VOD body of one fragment of `segment`, as the daemon writes it.
+    fn vod_body(segment: u32) -> String {
+        format!(
+            "#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-TARGETDURATION:1\n#EXT-X-MEDIA-SEQUENCE:0\n\
+             #EXT-X-PLAYLIST-TYPE:VOD\n#EXT-X-INDEPENDENT-SEGMENTS\n\
+             #EXT-X-MAP:URI=\"/api/segments/{segment}/file.mp4?token=t{segment}\",BYTERANGE=\"700@0\"\n\
+             #IRIS-FRAGMENT:WALL-US=0,DURATION-TICKS=90000\n#EXTINF:1.00000,\n\
+             #EXT-X-BYTERANGE:1000@700\n/api/segments/{segment}/file.mp4?token=t{segment}\n\
+             #EXT-X-ENDLIST\n"
+        )
+    }
+
+    /// A daemon that lists one recording of every stream of `fixture` and
+    /// serves the main and sub playlists, the audio one only when `audio`;
+    /// `audio_requests` counts the fetches of the audio playlist.
+    async fn window_fixture(
+        audio: bool,
+        audio_requests: Arc<AtomicUsize>,
+    ) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let segments = || async { r#"[{"wall_start_us":0,"wall_end_us":1000000,"sealed":true}]"# };
+        let app = axum::Router::new()
+            .route("/api/streams/fixture/main/segments", routing::get(segments))
+            .route("/api/streams/fixture/sub/segments", routing::get(segments))
+            .route("/api/events", routing::get(|| async { "[]" }))
+            .route(
+                "/api/streams/fixture/main/hls/vod.m3u8",
+                routing::get(|| async { vod_body(1) }),
+            )
+            .route(
+                "/api/streams/fixture/sub/hls/vod.m3u8",
+                routing::get(|| async { vod_body(3) }),
+            )
+            .route(
+                "/api/streams/fixture/audio/hls/vod.m3u8",
+                routing::get(move || {
+                    audio_requests.fetch_add(1, Ordering::SeqCst);
+                    async move {
+                        if audio {
+                            Ok(vod_body(2))
+                        } else {
+                            Err(axum::http::StatusCode::NOT_FOUND)
+                        }
+                    }
+                }),
+            );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (address, server)
+    }
+
+    async fn fetch_text(url: Url) -> String {
+        let http = reqwest::Client::builder().no_proxy().build().unwrap();
+        http.get(url).send().await.unwrap().text().await.unwrap()
+    }
+
+    /// Main-stream playback of a window with recorded audio is a multivariant
+    /// playlist with the audio beside it; without recorded audio, and for the
+    /// sub stream, whose timeline the audio is not on, it is the video
+    /// playlist alone.
+    #[tokio::test]
+    async fn the_main_stream_plays_with_recorded_audio_and_the_sub_stream_without() {
+        let requests = Arc::new(AtomicUsize::new(0));
+        let (address, server) = window_fixture(true, Arc::clone(&requests)).await;
+        let lists = fetch_window(
+            client_for(address),
+            camera("fixture"),
+            StreamKind::Main,
+            at(0),
+            at(1_000_000),
+        )
+        .await;
+        let (fragments, snapshot) = lists.playback.unwrap().unwrap();
+        assert_eq!(fragments.len(), 1);
+        assert!(snapshot.has_audio(), "the view shows its Sound button");
+        let multivariant = fetch_text(snapshot.url().clone()).await;
+        assert!(
+            multivariant.contains("#EXT-X-MEDIA:TYPE=AUDIO"),
+            "{multivariant}"
+        );
+        let audio = fetch_text(snapshot.url().join("audio.m3u8").unwrap()).await;
+        assert!(
+            audio.contains(&format!(
+                "http://{address}/api/segments/2/file.mp4?token=t2"
+            )),
+            "{audio}"
+        );
+        let video = fetch_text(snapshot.url().join("video.m3u8").unwrap()).await;
+        assert!(video.contains(&format!(
+            "http://{address}/api/segments/1/file.mp4?token=t1"
+        )));
+
+        let lists = fetch_window(
+            client_for(address),
+            camera("fixture"),
+            StreamKind::Sub,
+            at(0),
+            at(1_000_000),
+        )
+        .await;
+        let (_, snapshot) = lists.playback.unwrap().unwrap();
+        assert!(!snapshot.has_audio());
+        let alone = fetch_text(snapshot.url().clone()).await;
+        assert!(!alone.contains("EXT-X-MEDIA:"), "{alone}");
+        assert!(alone.contains("/api/segments/3/file.mp4"), "{alone}");
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            1,
+            "the sub stream asks for no audio"
+        );
+        server.abort();
+
+        let requests = Arc::new(AtomicUsize::new(0));
+        let (address, server) = window_fixture(false, Arc::clone(&requests)).await;
+        let lists = fetch_window(
+            client_for(address),
+            camera("fixture"),
+            StreamKind::Main,
+            at(0),
+            at(1_000_000),
+        )
+        .await;
+        let (_, snapshot) = lists.playback.unwrap().unwrap();
+        let alone = fetch_text(snapshot.url().clone()).await;
+        assert!(!alone.contains("EXT-X-MEDIA:"), "{alone}");
+        assert!(alone.contains("/api/segments/1/file.mp4"), "{alone}");
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+        server.abort();
     }
 }

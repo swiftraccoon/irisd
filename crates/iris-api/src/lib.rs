@@ -26,7 +26,9 @@
 //! | `GET /api/cameras/{camera}/snapshot.jpg` | a JPEG proxied from the camera (Dahua CGI or the ONVIF Media service) |
 //! | `GET /api/streams/{camera}/{kind}/segments` | catalog rows in a time range |
 //! | `GET /api/streams/{camera}/{kind}/hls/vod.m3u8` | a byte-range VOD playlist |
+//! | `GET /api/cameras/{camera}/hls/vod.m3u8` | a multivariant playlist: the main stream's VOD playlist and, when recorded, the audio as a rendition |
 //! | `GET /api/streams/{camera}/{kind}/export.mp4` | init segment plus the fragments in range |
+//! | `GET /api/cameras/{camera}/export.mp4` | the main stream's export with recorded audio as a second track |
 //! | `GET /api/streams/{camera}/{kind}/live` | WebSocket: init segment, then a fragment per frame |
 //! | `GET /api/streams/{camera}/{kind}/hls/live.m3u8` | LL-HLS playlist with in-memory init, segment, and part resources |
 //! | `GET /api/streams/{camera}/{kind}/keyframe` | a playable MP4 containing one sync sample |
@@ -126,6 +128,11 @@ pub fn router(state: Arc<ApiState>) -> Router {
         )
         .route("/api/streams/{camera}/{kind}/segments", get(segments::list))
         .route("/api/streams/{camera}/{kind}/hls/vod.m3u8", get(hls::vod))
+        .route("/api/cameras/{camera}/hls/vod.m3u8", get(hls::camera_vod))
+        .route(
+            "/api/cameras/{camera}/export.mp4",
+            get(export::camera_export),
+        )
         .route(
             "/api/streams/{camera}/{kind}/export.mp4",
             get(export::export),

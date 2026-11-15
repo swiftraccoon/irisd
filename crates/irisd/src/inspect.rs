@@ -66,8 +66,28 @@ fn write_report(args: &Args, out: &mut impl Write) -> anyhow::Result<()> {
     writeln!(out, "fragments:          {}", fragments.len())?;
     writeln!(out, "crc verified:       {}", args.verify)?;
 
-    if let (Some(first), Some(last)) = (fragments.first(), fragments.last()) {
-        report_timing(out, fragments, first, last, report.valid_len)?;
+    let mut tracks: Vec<u32> = fragments.iter().map(|f| f.track_id).collect();
+    tracks.sort_unstable();
+    tracks.dedup();
+    if tracks.len() > 1 {
+        // An export with sound: each track has a timeline of its own, and
+        // the sequence numbers count over both.
+        writeln!(out, "sequence gaps:      {}", sequence_gaps(fragments))?;
+        for track in tracks {
+            let of_track: Vec<FragmentInfo> = fragments
+                .iter()
+                .filter(|f| f.track_id == track)
+                .cloned()
+                .collect();
+            writeln!(
+                out,
+                "track {track}:            {} fragments",
+                of_track.len()
+            )?;
+            report_timing(out, &of_track, None)?;
+        }
+    } else if !fragments.is_empty() {
+        report_timing(out, fragments, Some(report.valid_len))?;
     }
     match &report.stop {
         Some(stop) => writeln!(out, "scan stopped:       {stop}")?,
@@ -84,13 +104,25 @@ fn write_report(args: &Args, out: &mut impl Write) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// How many fragments do not carry the sequence number after the one before.
+fn sequence_gaps(fragments: &[FragmentInfo]) -> usize {
+    fragments
+        .windows(2)
+        .filter(|w| w[1].sequence != w[0].sequence.wrapping_add(1))
+        .count()
+}
+
+/// Writes the timing of `fragments`, which are one track's and not empty.
+/// `valid_len` is the file's valid length when the track is the whole file;
+/// the container overhead and the sequence gaps are of a file, not a track.
 fn report_timing(
     out: &mut impl Write,
     fragments: &[FragmentInfo],
-    first: &FragmentInfo,
-    last: &FragmentInfo,
-    valid_len: u64,
+    valid_len: Option<u64>,
 ) -> anyhow::Result<()> {
+    let (Some(first), Some(last)) = (fragments.first(), fragments.last()) else {
+        return Ok(());
+    };
     let end_time = last
         .decode_time
         .checked_add(u64::from(last.duration))
@@ -116,12 +148,14 @@ fn report_timing(
         "samples:            {sample_count} ({payload} payload bytes)"
     )?;
     if payload > 0 {
-        let overhead = valid_len.saturating_sub(payload);
-        writeln!(
-            out,
-            "container overhead: {:.4} % ({overhead} bytes including the init segment)",
-            overhead as f64 / payload as f64 * 100.0
-        )?;
+        if let Some(valid_len) = valid_len {
+            let overhead = valid_len.saturating_sub(payload);
+            writeln!(
+                out,
+                "container overhead: {:.4} % ({overhead} bytes including the init segment)",
+                overhead as f64 / payload as f64 * 100.0
+            )?;
+        }
         if total_secs > 0.0 {
             writeln!(
                 out,
@@ -136,10 +170,6 @@ fn report_timing(
         }
     }
 
-    let sequence_gaps = fragments
-        .windows(2)
-        .filter(|w| w[1].sequence != w[0].sequence.wrapping_add(1))
-        .count();
     let decode_gaps = fragments
         .windows(2)
         .filter(|w| {
@@ -152,7 +182,9 @@ fn report_timing(
     {
         bail!("invalid media timeline: decode time decreases between fragments");
     }
-    writeln!(out, "sequence gaps:      {sequence_gaps}")?;
+    if valid_len.is_some() {
+        writeln!(out, "sequence gaps:      {}", sequence_gaps(fragments))?;
+    }
     writeln!(out, "decode-time gaps:   {decode_gaps}")?;
     let sync_starts = fragments.iter().filter(|f| f.starts_with_sync).count();
     writeln!(
@@ -254,20 +286,25 @@ fn print_fragments(out: &mut impl Write, fragments: &[FragmentInfo]) -> std::io:
     writeln!(out)?;
     writeln!(
         out,
-        "{:>6} {:>12} {:>9} {:>12} {:>7} {:>5} {:>4}  wall",
-        "seq", "offset", "len", "decode", "dur", "n", "sync"
+        "{:>6} {:>5} {:>12} {:>9} {:>12} {:>7} {:>5} {:>4}  wall",
+        "seq", "track", "offset", "len", "decode", "dur", "n", "sync"
     )?;
     for f in fragments {
         writeln!(
             out,
-            "{:>6} {:>12} {:>9} {:>12} {:>7} {:>5} {:>4}  {}",
+            "{:>6} {:>5} {:>12} {:>9} {:>12} {:>7} {:>5} {:>4}  {}",
             f.sequence,
+            f.track_id,
             f.offset,
             f.len,
             f.decode_time,
             f.duration,
             f.sample_count,
-            if f.starts_with_sync { "yes" } else { "no" },
+            match (f.all_sync, f.starts_with_sync) {
+                (true, _) => "all",
+                (false, true) => "yes",
+                (false, false) => "no",
+            },
             f.wall.map_or_else(|| "-".to_owned(), |w| w.to_string())
         )?;
     }
@@ -290,6 +327,8 @@ mod tests {
             duration,
             sample_count: 1,
             starts_with_sync: true,
+            all_sync: false,
+            track_id: 1,
             wall,
             sample_durations: vec![duration],
             sample_sizes: vec![1],
@@ -395,7 +434,7 @@ mod tests {
                 "sidecar index:      none at {}",
                 file.with_extension("idx").display()
             ),
-            "   seq       offset       len       decode     dur     n sync  wall".to_owned(),
+            "   seq track       offset       len       decode     dur     n sync  wall".to_owned(),
         ] {
             assert!(
                 report.lines().any(|reported| reported == line),
@@ -403,7 +442,7 @@ mod tests {
             );
         }
         let rows: Vec<&str> = report.lines().rev().take(3).collect();
-        assert!(rows[0].starts_with("     4 "), "{report}");
+        assert!(rows[0].starts_with("     4     1 "), "{report}");
         assert!(rows[0].contains("    15000    6000     2   no  2023-11-14T22:13:20.200000Z"));
         assert!(rows[2].contains("        0    6000     2  yes  2023-11-14T22:13:20.000000Z"));
     }
@@ -439,28 +478,118 @@ mod tests {
         assert!(!report.contains("   seq "), "{report}");
     }
 
+    /// An export with sound has a timeline for each track: the audio's
+    /// starts where the export does, so its decode times run behind the
+    /// video's, and the report gives each track its own timing.
+    #[test]
+    fn the_report_of_a_file_with_two_tracks_times_each_track() {
+        use bytes::Bytes;
+        use iris_mp4::export::retrack_fragment;
+        use iris_mp4::fragment::{FragmentHeader, Sample, encode_fragment};
+        use iris_mp4::init::{AV_AUDIO_TRACK_ID, SampleEntry, build_av_init_segment};
+
+        let video = SampleEntry::new(
+            Bytes::from_static(b"\0\0\0\x10hvc1\0\0\0\0\0\0\0\0"),
+            "hvc1".into(),
+            16,
+            16,
+        );
+        let audio = SampleEntry::audio(
+            Bytes::from_static(b"\0\0\0\x10mp4a\0\0\0\0\0\0\0\0"),
+            "mp4a.40.2".into(),
+        );
+        let mut export = build_av_init_segment(&video, &audio).to_vec();
+        // (sequence, decode time, whether it is sound)
+        for (sequence, decode_time, sound) in [
+            (1, 0, false),
+            (2, 90, true),
+            (3, 6_000, false),
+            (4, 2_970, true),
+        ] {
+            let samples: Vec<Sample> = (0..2)
+                .map(|index| Sample {
+                    data: Bytes::from_static(&[0, 0, 0, 1, 0x26]),
+                    duration: if sound { 1_440 } else { 3_000 },
+                    is_sync: sound || index == 0,
+                })
+                .collect();
+            let header = FragmentHeader {
+                sequence,
+                decode_time,
+                wall: WallUs::new(1_700_000_000_000_000),
+            };
+            let encoded = encode_fragment(&header, &samples).unwrap();
+            let mut fragment = Vec::new();
+            for slice in encoded.io_slices(&samples) {
+                fragment.extend_from_slice(&slice);
+            }
+            if sound {
+                retrack_fragment(&mut fragment, AV_AUDIO_TRACK_ID).unwrap();
+            }
+            export.extend_from_slice(&fragment);
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("export.mp4");
+        std::fs::write(&file, &export).unwrap();
+        let mut out = Vec::new();
+        write_report(
+            &Args {
+                file,
+                verify: true,
+                samples: true,
+            },
+            &mut out,
+        )
+        .unwrap();
+        let report = String::from_utf8(out).unwrap();
+        let lines: Vec<&str> = report.lines().collect();
+        let at = |line: &str| {
+            lines
+                .iter()
+                .position(|reported| *reported == line)
+                .unwrap_or_else(|| panic!("missing {line:?} in\n{report}"))
+        };
+        assert_eq!(at("fragments:          4"), 3);
+        let gaps = at("sequence gaps:      0");
+        let first = at("track 1:            2 fragments");
+        let second = at("track 2:            2 fragments");
+        assert!(gaps < first && first < second, "{report}");
+        assert_eq!(
+            lines[first + 1],
+            "decode time:        0 .. 12000 ticks (0.133 s)"
+        );
+        assert_eq!(
+            lines[second + 1],
+            "decode time:        90 .. 5850 ticks (0.064 s)"
+        );
+        // Neither track has a gap, and the file's overhead is stated for no
+        // one track.
+        assert_eq!(report.matches("decode-time gaps:   0\n").count(), 2);
+        assert_eq!(report.matches("sequence gaps:").count(), 1);
+        assert!(!report.contains("container overhead"), "{report}");
+        assert!(report.contains("sync-start frags:   2 of 2\n"), "{report}");
+        let rows: Vec<&str> = lines.iter().rev().take(4).copied().collect();
+        assert!(rows[0].starts_with("     4     2 "), "{report}");
+        assert!(
+            rows[0].contains("     2970    2880     2  all  "),
+            "{report}"
+        );
+        assert!(rows[1].starts_with("     3     1 "), "{report}");
+        assert!(
+            rows[1].contains("     6000    6000     2  yes  "),
+            "{report}"
+        );
+    }
+
     #[test]
     fn timing_report_rejects_maximum_decreasing_and_unrepresentable_deltas() {
         let maximum = fragment(u64::MAX, 1, None);
-        let error = report_timing(
-            &mut Vec::new(),
-            std::slice::from_ref(&maximum),
-            &maximum,
-            &maximum,
-            800,
-        )
-        .unwrap_err();
+        let error =
+            report_timing(&mut Vec::new(), std::slice::from_ref(&maximum), Some(800)).unwrap_err();
         assert!(error.to_string().contains("overflows u64"), "{error:#}");
 
         let decreasing = [fragment(3_000, 1, None), fragment(0, 1, None)];
-        let error = report_timing(
-            &mut Vec::new(),
-            &decreasing,
-            &decreasing[0],
-            &decreasing[1],
-            900,
-        )
-        .unwrap_err();
+        let error = report_timing(&mut Vec::new(), &decreasing, Some(900)).unwrap_err();
         assert!(
             error.to_string().contains("precedes first decode time"),
             "{error:#}"
@@ -470,8 +599,7 @@ mod tests {
             fragment(0, 1, Some(WallUs::new(0))),
             fragment(i64::MAX as u64 + 1, 0, Some(WallUs::new(0))),
         ];
-        let error =
-            report_timing(&mut Vec::new(), &too_wide, &too_wide[0], &too_wide[1], 900).unwrap_err();
+        let error = report_timing(&mut Vec::new(), &too_wide, Some(900)).unwrap_err();
         assert!(error.to_string().contains("exceeds i64"), "{error:#}");
     }
 
@@ -482,13 +610,13 @@ mod tests {
             fragment(0, 1, Some(WallUs::new(0))),
             fragment(largest_convertible, 0, Some(WallUs::new(i64::MAX))),
         ];
-        report_timing(&mut Vec::new(), &boundary, &boundary[0], &boundary[1], 900).unwrap();
+        report_timing(&mut Vec::new(), &boundary, Some(900)).unwrap();
 
         let ordinary = [
             fragment(90_000, 90_000, Some(WallUs::new(1_000_000))),
             fragment(180_000, 90_000, Some(WallUs::new(2_000_000))),
         ];
-        report_timing(&mut Vec::new(), &ordinary, &ordinary[0], &ordinary[1], 900).unwrap();
+        report_timing(&mut Vec::new(), &ordinary, Some(900)).unwrap();
     }
 
     #[test]

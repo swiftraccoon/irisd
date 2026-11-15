@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use axum::Json;
 use axum::extract::{Path, State};
-use iris_core::id::CameraId;
+use iris_core::id::{CameraId, StreamKey, StreamKind};
 use iris_core::time::WallUs;
 use serde::Serialize;
 
@@ -18,6 +18,9 @@ pub(crate) struct CameraDto {
     name: String,
     vendor: Option<String>,
     has_snapshot: bool,
+    /// The daemon records the camera's audio, which then has a live feed
+    /// (`/api/streams/{camera}/audio/live`).
+    has_audio: bool,
     /// Added through the API; `DELETE /api/cameras/{camera}` applies to it.
     provisioned: bool,
 }
@@ -116,6 +119,13 @@ pub(crate) fn camera_dto(camera: &ActiveCamera, state: &ApiState) -> CameraDto {
             .read()
             .expect("no holder panics while the snapshot registry is locked")
             .contains_key(&camera.id),
+        has_audio: state
+            .live
+            .get(&StreamKey {
+                camera: camera.id.clone(),
+                kind: StreamKind::Audio,
+            })
+            .is_some(),
         id: camera.id.to_string(),
         name: camera.name.clone(),
         vendor: camera.vendor.clone(),

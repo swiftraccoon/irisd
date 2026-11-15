@@ -30,7 +30,7 @@ deny` in CI, body/XML size caps, `panic = "abort"`, per-camera task isolation, a
 
 ## 3. Why tokio without io_uring
 
-- Workload: 12 long-lived TCP sockets at ≈ 56 Mbps aggregate ≈ 5,000 packets/s (cam1 main
+- Workload: 12 long-lived TCP sockets at ≈ 56 Mbps aggregate ≈ 5,000 packets/s (a main stream
   stream alone is 707 packets/s). A readiness loop costs 2–4 `recv` + an amortised
   `epoll_wait` per frame burst at 1–2 µs each: well under 1 % of one core.
 - io_uring wins (multishot recv, provided buffer rings, zero syscalls per packet, zero-copy
@@ -64,7 +64,7 @@ and several rows here were not adopted.
 |---|---|---|---|---|
 | tokio | runtime | 1.54.1 | 2026-10-21 | |
 | bytes | zero-copy buffers | 1.12.1 | 2026-07-08 | |
-| retina | RTSP client, H.264/H.265/ONVIF-metadata depacketisers | 0.4.21 | 2026-10-04 | **enable feature `h265`** (not default). Pin a git rev if CRA/BLA random-access detection (unreleased on main) is needed; cam1 uses IDR only |
+| retina | RTSP client, H.264/H.265/ONVIF-metadata depacketisers | 0.4.21 | 2026-10-04 | **enable feature `h265`** (not default). Pin a git rev if CRA/BLA random-access detection (unreleased on main) is needed; the test cameras use IDR only |
 | hevc_parser | VPS/SPS/PPS, slice header (`first_slice_segment_in_pic_flag`), 0 unsafe | 0.6.12 | 2026-08-29 | author says "mostly for my own tools": vendor or rely on retina's parser |
 | bitstream-io | Exp-Golomb bit reader | 4.10.0 | 2026-04-14 | |
 | mp4-atom | ISO-BMFF box codec for the hand-rolled fMP4 writer/reader | 0.17.0 | 2026-10-30 | the `mp4` crate (2023) is stale; `h265` crate is an empty placeholder |
@@ -97,16 +97,17 @@ Do not use: `tokio-uring`, `glommio`, `monoio` (stale or incompatible), `mp4` 0.
 
 - Profile: `panic = "abort"`, `lto = "fat"`, `codegen-units = 1`, `strip = true`; expect a
   4–8 MB static-ish binary with rustls + bundled SQLite.
-- ARM64 SBCs: CI lints every crate but the GUI for `aarch64-unknown-linux-gnu` with the GNU
-  cross toolchain (`just cross-check`) and runs the tests of the six crates without C
-  dependencies (core, H.265, MP4, store, ingest, replay) as `aarch64-unknown-linux-musl` code
-  under user-mode emulation (`just cross-test`), so a portability break surfaces on the change
-  that makes it. On 2026-11-10 those 459 tests passed under `qemu-aarch64-static`, among them
-  the CRC-32C cross-check on the ARM implementation and the MP4 and recovery properties; in
-  debug builds three of ingest's timing tests exceed their bounds under emulation, which is
-  why the recipe builds for release. Release binaries for a board come from `cargo zigbuild --target
-  aarch64-unknown-linux-gnu.2.28` (or musl for a static binary), cross-rs as fallback. The GUI
-  needs a GTK sysroot for the target and is built on the board.
+- ARM64 SBCs: CI lints every crate but the GUI for `aarch64-unknown-linux-gnu` with the GNU cross
+  toolchain (`just cross-check`) and runs the tests of the six crates without C dependencies (core,
+  H.265, MP4, store, ingest, replay) as `aarch64-unknown-linux-musl` code (`just cross-test`: on
+  CI's 64-bit ARM runner, and elsewhere under user-mode emulation), so a portability break surfaces
+  on the change that makes it. An emulator without `openat2` fails the store's tests. On 2026-11-10
+  those 459 tests passed under `qemu-aarch64-static`, among them the CRC-32C cross-check on the ARM
+  implementation and the MP4 and recovery properties; in debug builds three of ingest's timing tests
+  exceed their bounds under emulation, which is why the recipe builds for release. Release binaries
+  for a board come from `cargo zigbuild --target aarch64-unknown-linux-gnu.2.28` (or musl for a
+  static binary), cross-rs as fallback. The GUI needs a GTK sysroot for the target and is built on
+  the board.
 - systemd unit: `Type=notify`, `WatchdogSec=60` (ping only when every ingest task reported
   progress, so a wedged runtime is killed), `Restart=always`, static `User=irisd` via
   `sysusers.d`, `StateDirectory=irisd` for the catalog, `ReadWritePaths=` for the video root,

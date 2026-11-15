@@ -3,6 +3,11 @@
 //! the lifecycle rules written out here keep, with exactly the marks that are
 //! still active.
 
+#![expect(
+    clippy::unwrap_used,
+    reason = "a helper of a test fails as the test does, by panicking"
+)]
+
 use std::path::PathBuf;
 use std::time::Duration;
 

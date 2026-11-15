@@ -14,7 +14,7 @@ use iris_api::{ApiState, ApiStats, LiveRegistry, router};
 use iris_catalog::{CatalogHandle, Change};
 use iris_core::id::{CameraId, StreamKey, StreamKind};
 use iris_core::time::WallUs;
-use iris_mp4::fragment::{Fragment, Sample};
+use iris_mp4::fragment::{Fragment, FrameSteps, Sample};
 use iris_mp4::index::{
     FLAG_STARTS_WITH_SYNC, IndexHeader, IndexRecord, IndexWriter, MAX_PERSISTED_INDEX_RECORDS,
     read_index_bounded,
@@ -70,6 +70,7 @@ fn fragment(index: u64, entry: &Arc<SampleEntry>, payload: usize) -> Fragment {
         wall: wall(index),
         raw_rtp: 0,
         new_run: index == 0,
+        steps: FrameSteps::default(),
         sample_entry: Arc::clone(entry),
     }
 }

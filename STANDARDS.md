@@ -30,16 +30,20 @@ Where the sources conflict, the order of precedence is:
 | Check | Command | Status |
 |---|---|---|
 | Formatting | `cargo fmt --all -- --check` | required |
-| Lints | `cargo clippy --workspace --all-targets -- -D warnings` with `clippy::all` and `clippy::pedantic` enabled in `Cargo.toml` (`[workspace.lints]`) | required |
+| Lints | `cargo clippy --workspace --all-targets -- -D warnings` with `clippy::all`, `clippy::pedantic`, and the restriction lints named below enabled in `Cargo.toml` (`[workspace.lints]`) | required |
+| Mechanical rules | `just standards` (`iris-tools standards tree`): the rules of this file and of `AGENTS.md` that a program can decide, listed below | required |
+| Commits | `iris-tools standards commits RANGE` for a range; `iris-tools standards message FILE` as the `commit-msg` hook (`just hooks`); `iris-tools gh-commit` on the message it is given, before it publishes | CI for a message's form; the hook and `gh-commit` for its form and for what it says of its change |
 | Unsafe code | `#![forbid(unsafe_code)]` workspace-wide (`unsafe_code = "forbid"`) | required |
 | Public docs | `missing_docs`, and clippy's `missing_errors_doc` and `missing_panics_doc` (pedantic); `cargo doc` with `RUSTDOCFLAGS=-D warnings` | required |
 | Tests | `cargo test --workspace` and the vendored crates' suites (`just vendor-test`) | required |
 | Supply chain | `cargo audit` on every lockfile; `cargo deny check` (`deny.toml`) for the root and `fuzz/` graphs (`just audit`) | required before a release |
 | Fuzz build | `just fuzz-build` (the nightly pinned in `fuzz/rust-toolchain.toml`) | CI |
 | 64-bit ARM portability | `just cross-check` (clippy with warnings as errors on every crate but the GUI for `aarch64-unknown-linux-gnu`) | CI |
-| 64-bit ARM tests | `just cross-test` (the six crates without C dependencies, as `aarch64-unknown-linux-musl` code under `qemu-aarch64-static`) | CI |
+| 64-bit ARM tests | `just cross-test` (the six crates without C dependencies, as `aarch64-unknown-linux-musl` code, on a 64-bit ARM host or under `qemu-aarch64-static`) | CI |
 | MSRV | `cargo +1.92.0 test --workspace --locked` (`rust-version` in `Cargo.toml`) | CI |
 | Reference pack | `just references-check` (the snapshots match `manifest.json`; the maintenance tool's tests) | CI |
+| Viewer display tests | `just display-test` (the `#[ignore]`d tests of `iris-gui` that need a display, an H.264 encoder, or GStreamer's plugins, on a virtual display) | after any change to `iris-gui` |
+| Before a push | `just ci`: every row above that CI runs, and `just ext4-test` (the tests with their temporary files on ext4, as a CI runner has them) | required |
 | Mutation testing | `just mutants FILE...` (cargo-mutants on a copy of the committed tree; a surviving mutant is logic no test pins down) | on demand, for format, timing, and parsing code |
 
 `just check` runs the required set. The `check`, cross-check, and fuzz jobs and the docs
@@ -50,7 +54,37 @@ lints differ between toolchains.
 `cast_possible_truncation`, `cast_possible_wrap`, `cast_precision_loss`, `cast_sign_loss`, and
 `module_name_repetitions`. Any other exception is an `#[expect(lint, reason = "…")]` on the
 smallest item that needs it. `clippy.toml` raises `too-many-arguments-threshold` to 8 (default
-7) and `type-complexity-threshold` to 300 (default 250).
+7) and `type-complexity-threshold` to 300 (default 250). Seven restriction lints are on:
+`allow_attributes` and `allow_attributes_without_reason` (an exception is an `expect` with its
+reason), `unwrap_used` and `missing_assert_message` outside tests (§6; an integration test's
+helpers carry an `expect`), and `dbg_macro`, `todo`, and `unimplemented`.
+
+`iris-tools standards` checks what the tools above do not. In every file git tracks or would
+track: private and non-example addresses, home and mount paths, mail addresses, hardware
+addresses, and the names in the gitignored `docs/local/denylist.txt` (`AGENTS.md` rule 9; a
+clone without that file checks none); conflict markers; a tracked file of a mode other than
+100644, which `gh-commit` cannot publish. In Markdown: the 100-column wrap, the
+timeless words of §7 where they date a statement, phrases that tell how a text came to be
+(another commit, an attempt given up, a review, someone finding or deciding), counts of a
+site's cameras, capture groups a scripted edit left unfilled, and that every `just` recipe and
+repository path a document names exists. In Rust: a path inside `use` braces, uppercase hex,
+`allow` attributes, `TODO` without an owner, `get_` getters, timeless words and the same
+phrases in rustdoc, and in public functions `bool` parameters and tuples of bare numbers. In
+the tree: each crate's `README.md`, `AGENTS.md`, crate documentation, and line in the layout
+of `AGENTS.md`; each fuzz target's `[[bin]]` and `fuzz/README.md` row. In a commit: the
+subject's form, type, scope, length, and mood, a body free of those phrases, no attribution
+lines; and, against its change, that its scope's crate is the one changed and the body names
+any other, that a `feat` changes a document or names one under `docs/`, and that a package
+added to a lockfile comes with the word *license*.
+
+The rules that read meaning from words or shapes (timeless words, those phrases, camera
+counts, `get_`, `bool` parameters, bare tuples) can be wrong, and `standards.toml` holds their
+accepted exceptions: a file, a rule, a count, and a reason. A file with more breaches than its
+waiver fails, and so does one with fewer. The other rules have no exceptions beyond the
+published texts `standards.toml` lists as allowed. A reviewer still decides what no program
+can: whether the research behind a change was adequate, whether a document is true, whether a
+parser that faces the network has its fuzz target, whether a commit is one change, and whether
+a text that uses none of those phrases still tells a story in place of a fact.
 
 ## 2. Formatting (Rust Style Guide)
 
@@ -59,8 +93,8 @@ smallest item that needs it. `clippy.toml` raises `too-many-arguments-threshold`
   deliberate alignment such as matrices or box layouts.
 - Options the Google guide recommends but that stable rustfmt does not support
   (`imports_granularity = "Module"`, `hex_literal_case = "Lower"`,
-  `format_macro_matchers`) are followed by hand and checked in review: one `use` per module
-  (no `::` inside braces), lowercase hex literals.
+  `format_macro_matchers`) are followed by hand: one `use` per module (no `::` inside braces)
+  and lowercase hex literals, both of which `iris-tools standards` checks.
 - `Cargo.toml` follows
   `.rust-reference/references/rust-style-guide/src/doc/style-guide/src/cargo.md`: `[package]`
   first, with `name` and `version` leading and `description` last; keys version-sorted within
@@ -174,7 +208,10 @@ smallest item that needs it. `clippy.toml` raises `too-many-arguments-threshold`
 
 - Commit messages follow Conventional Commits 1.0.0: `type(scope): description`, with a
   lowercase type and scope, an imperative description without a trailing period and under
-  72 characters, and a body that explains the reason and what was measured. `!` and a
+  72 characters, and a body that explains the reason and what was measured. The body describes
+  the change: what the code does after it and why. It does not tell how the change was
+  reached, name another commit, or recount an abandoned attempt; a measurement that rules a
+  design out belongs in the design's document, stated as a measurement. `!` and a
   `BREAKING CHANGE:` footer describe incompatibility with a published compatibility promise;
   differences only from unpublished alpha history do not use them. Types: `feat`, `fix`,
   `docs`, `refactor`, `perf`, `test`, `build`, `ci`, `style`, `chore`, `revert`. Scopes are

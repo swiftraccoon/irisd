@@ -4,6 +4,11 @@
 //! that starts with a sync sample is never dropped, and the counters match
 //! what a scan of the files finds.
 
+#![expect(
+    clippy::unwrap_used,
+    reason = "a helper of a test fails as the test does, by panicking"
+)]
+
 use std::fs::{self, File};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -12,7 +17,7 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 use iris_core::id::{CameraId, StreamKey, StreamKind};
 use iris_core::time::WallUs;
-use iris_mp4::fragment::{Fragment, Sample};
+use iris_mp4::fragment::{Fragment, FrameSteps, Sample};
 use iris_mp4::index::{MAX_PERSISTED_INDEX_RECORDS, read_index_file_bound_to_media};
 use iris_mp4::init::SampleEntry;
 use iris_mp4::reader::{self, FragmentInfo, ScanOptions};
@@ -65,6 +70,7 @@ fn fragment(index: u64, sent: Sent, payload: usize, entry: &Arc<SampleEntry>) ->
         wall: WallUs::new(1_793_460_958_000_000 + i64::try_from(index).unwrap() * 250_000),
         raw_rtp: 42,
         new_run: sent.new_run,
+        steps: FrameSteps::default(),
         sample_entry: Arc::clone(entry),
     }
 }

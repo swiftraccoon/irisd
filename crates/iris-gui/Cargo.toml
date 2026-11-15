@@ -38,6 +38,8 @@ tracing-subscriber = { workspace = true }
 url = { workspace = true }
 
 [dev-dependencies]
+bytes = { workspace = true }
+iris-mp4 = { workspace = true }
 rcgen = { workspace = true }
 tempfile = { workspace = true }
 tokio-rustls = { workspace = true }

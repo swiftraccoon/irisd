@@ -5,7 +5,10 @@ Scope: this crate only. Read the root `AGENTS.md` first.
 ## Invariants
 
 - The viewer's Rust code never parses video: the daemon's byte stream goes straight into
-  `appsrc` and `qtdemux`. GStreamer's native elements parse and decode camera-originated
+  `appsrc` and `qtdemux`. The one thing it reads from a live payload is the media time of the
+  `prft` box a fragment starts with (`src/fragment.rs`, free of GTK and GStreamer so that the
+  `live_fragment` fuzz target includes it by path). GStreamer's native elements parse and
+  decode camera-originated
   media inside the viewer process without a sandbox. Changing the live feed format is an API
   change (`crates/iris-api`, `docs/research/07-architecture.md §5`), not a viewer change.
 - The live message ceiling is 16 MiB + 1 bytes (`live::LIVE_MESSAGE_BYTES`), shared with the
@@ -60,6 +63,11 @@ Scope: this crate only. Read the root `AGENTS.md` first.
 
 ## Where things are
 
+- `src/sound.rs` — the timing that plays a camera's audio feed and its picture against one
+  clock in the focused view (`docs/research/13-audio.md` §10.4): least delay per feed, half a
+  second of hold, pad offsets after each demuxer. `sound::silent` is true in every test; no
+  test or check may play audio on the machine it runs on, so run the viewer with `--mute`.
+
 - `src/main.rs` — options, GStreamer and plugin initialisation, the window with its grid
   and focused views, the main-loop event handler (`show_grid`, `focus`, `start_view`), the
   Add camera form with its Discover and Fetch streams lookups, the Remove camera
@@ -83,10 +91,11 @@ Scope: this crate only. Read the root `AGENTS.md` first.
 cargo fmt -p iris-gui
 cargo clippy -p iris-gui --all-targets -- -D warnings
 cargo test -p iris-gui
+just display-test       # the three display-dependent sets below; `just check` leaves them out
 cargo test -p iris-gui --bin iris-gui -- --ignored --test-threads=1  # xvfb-run: gtk_lifecycle_checks
-just fuzz-build                                                       # after a change to src/vod.rs
 cargo test -p iris-gui --test playback_snapshot -- --ignored  # ffmpeg/libx264 + Xvfb + HLS/H.264 plugins
 cargo test -p iris-gui --test playback_origin -- --ignored  # Xvfb
+just fuzz-build                                                       # after a change to src/vod.rs
 RUSTDOCFLAGS="-D warnings" cargo doc -p iris-gui --no-deps
 cargo build --release -p iris-gui
 IRISD_TOKEN=... timeout 45 xvfb-run -a target/release/iris-gui --api http://127.0.0.1:8554   # grid smoke run
@@ -101,6 +110,9 @@ The build needs the GTK 4 and GStreamer development libraries (`gtk4-devel`,
 smoke run needs a daemon with at least one camera and `xorg-x11-server-Xvfb` or a session.
 
 ## Pitfalls
+
+- The checks of sound that need GStreamer's plugins are `#[ignore]`d display tests: CI
+  installs the development packages alone. `just display-test` runs them.
 
 - GStreamer caches a plugin's feature list in `~/.cache/gstreamer-1.0/registry.*.bin`. If
   the NVIDIA plugin failed to initialise CUDA once (driver not loaded), `nvh265dec` stays

@@ -72,8 +72,8 @@ pub enum StreamKind {
     Main,
     /// The low-resolution video stream used for grids and thumbnails.
     Sub,
-    /// The audio stream. Reserved: catalog types carry it, and configuration
-    /// rejects recording it.
+    /// The audio stream: the AAC audio of the main stream's session,
+    /// recorded in files of its own.
     Audio,
 }
 

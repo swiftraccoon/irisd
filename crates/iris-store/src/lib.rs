@@ -61,7 +61,7 @@
 //! use iris_core::id::{CameraId, StreamKey, StreamKind};
 //! use iris_store::{Fragment, StoragePolicy, WriterHandle};
 //! # use bytes::Bytes;
-//! # use iris_mp4::fragment::Sample;
+//! # use iris_mp4::fragment::{FrameSteps, Sample};
 //! # use iris_mp4::init::SampleEntry;
 //!
 //! let root = tempfile::tempdir()?;
@@ -87,6 +87,7 @@
 //! #     wall: iris_core::time::WallUs::now(),
 //! #     raw_rtp: 0,
 //! #     new_run: true,
+//! #     steps: FrameSteps::default(),
 //! #     sample_entry: entry,
 //! # };
 //! // Ingest calls this on its own task; a full queue returns QueueFull instead of waiting.

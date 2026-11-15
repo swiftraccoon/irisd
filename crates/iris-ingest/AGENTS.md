@@ -36,12 +36,43 @@ Scope: this crate only. Read the root `AGENTS.md` first.
 - `FragmentSink::send` must not block the ingest task. Rejection ends recording continuity,
   counts one gap for the loss epoch, and resumes only from a sync frame in a run whose
   decode time starts at zero; it does not stop live publication.
+- Audio (`src/audio.rs`) implements `docs/research/13-audio.md` §5.2: time within a run is the
+  count of frames, never a camera timestamp; a run is placed once, against the video fragment
+  that closed last, by least receipt delay; a video run starts an audio run and a break in
+  the audio starts one in the video; nothing ends a run for drift: a camera's audio
+  timestamps wander too far against the count to measure it (§5.2 item 5), and the logged
+  `drift_us` of a fragment's placement follows the video's delay estimate (§5.1a). Live
+  audio frames carry the decode times of the recording and are published only once their
+  run is placed. Change these with that
+  section and its measurements.
 - Every terminal path after session setup flushes complete pending frames through the same
   accounting and delivery path exactly once before the reconnect loop clears connection
   state. The outer loop must not race cancellation against the session future.
 - Fresh realtime/monotonic correlations detect recorder clock steps over 2 s and end the
   run. Sealed-fragment wall placement uses finalized media durations and a per-run
   least-delay anchor whose upward correction is limited to 500 ppm.
+- Every wait of a stream's task is bounded and ends in `StreamStats::beat`: a quiet camera
+  and the rest between attempts in slices of `LIVENESS_SLICE`, each step of set-up within
+  `SETUP_TIMEOUT`. The daemon's watchdog takes a count that stands still for a task that is
+  stuck: a healthy task goes at most 20 s without a beat, the watchdog checks every 30 s, and
+  a wait added without a beat inside that gets the daemon restarted.
+- The drift rule (`steer::Rule`) changes a recording only under `IngestOptions::audio_steps`,
+  which is off unless a camera sets it; without it the rule logs and counts the step it would
+  make (`docs/research/13-audio.md` §5.3.6). A rule whose steps are made is built with
+  `Rule::making_steps`, so that nothing is taken off the place it reads; the two must agree.
+  The measures of `sync` are logged and decide nothing else.
+- A step (`AudioAssembler::step`) moves the count that gives decode times and never the count
+  the camera's timestamps are held against (`13-audio.md` §5.3.4): decode times stay a count
+  without a gap, a frame is noted for the place and published once for every time it is
+  recorded, and a run that is placed anew holds no step (`lay_again`).
+- Sender reports of the two streams are a pair when the recorder receives them within a
+  second of each other; a window is read by reports from eight pairs on, by the lower tenth
+  of the video's epoch less the audio's (`docs/research/14-drift.md` §3).
+- A window of the audio's place (`sync::Place`) retains at most 1,024 values of each kind it
+  reads by a quantile: differences of paired sender reports, and audio timestamps. Above
+  that bound it doubles a power-of-two sampling stride, which keeps the sample spread across
+  the window: sender reports and audio that arrive while no window closes cannot grow the
+  session's memory without bound.
 - The live fast-start cache and subscriber fan-out have independent 64 MiB payload-reference
   budgets in addition to their frame-count limits. Overflow abandons fast start or reports
   lag, respectively; neither path resumes delivery before a sync frame.
@@ -57,6 +88,12 @@ Scope: this crate only. Read the root `AGENTS.md` first.
 - `src/regularize.rs` — the regulariser and its constants.
 - `src/source.rs` — `StreamSource` and `IngestOptions` with their defaults.
 - `src/sink.rs` — `FragmentSink` and `SinkError`.
+- `src/audio.rs` — the audio assembler: frames counted onto the video run's timeline, cut
+  with the video's fragments, the continuity rule, and the steps made on arriving frames.
+- `src/sync.rs` — the watches of parted clocks and `Place`, the audio's place against the
+  video read by pairs of sender reports, by arrival, and by timestamps alone.
+- `src/steer.rs` — the drift rule, which names the step for each window of the audio's place.
+- `src/cadence.rs` — the per-frame cadence and sender-report debug log targets.
 - `src/stats.rs` — `StreamStats` counters and their `pub(crate)` mutators.
 - `src/live.rs` — the live ring.
 - `tests/replay.rs`, `tests/data/` — the recorded-timeline regression test.
@@ -106,7 +143,7 @@ recording from `iris-replay` on a loopback port. Never point a test at a live ca
 - Receipt wall times remain raw observations for fragment caps and clock-step detection;
   sealed fragment walls come from the run anchor plus finalized decode time.
 - Parameter sets are stripped from samples (`hvc1`); a new set closes the pending fragment
-  with the old entry before the new one applies. Reset the regulariser's estimation history
+  with the entry it replaces before it applies. Reset the regulariser's estimation history
   only when the parameter epoch supplies a different valid effective frame rate; preserve
   decode continuity and cumulative diagnostics.
 - The live ring is fed before the fragment closes, so `LiveFrame::duration` is provisional.
@@ -117,7 +154,9 @@ recording from `iris-replay` on a loopback port. Never point a test at a live ca
 ## Related documents
 
 - `docs/research/05-ingest-events.md`, `04-storage-format.md §7–8`, `12-ingest-cost.md`,
-  `01-camera-probe.md`, `docs/design/phase2-interfaces.md`.
+  `13-audio.md §5` (the audio against its picture and the drift rule), `14-drift.md` (the
+  clocks and every measure of their parting), `01-camera-probe.md`,
+  `docs/design/phase2-interfaces.md`.
 - Depends on `iris-core`, `iris-h265`, `iris-mp4`, and `retina` (patched copy under
   `third_party/retina`). Depended on by `irisd` and `iris-api` (live ring, statistics);
   `iris-replay` is a dev-dependency.

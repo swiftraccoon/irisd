@@ -1,9 +1,9 @@
-//! Initialization segment (`ftyp` + `moov`) for a single video track.
+//! Initialization segment (`ftyp` + `moov`) for a single video or audio track.
 
 use bytes::Bytes;
 
-use crate::boxes::BoxWriter;
-use crate::fragment::NON_SYNC_SAMPLE_FLAGS;
+use crate::boxes::{BoxHeader, BoxWriter};
+use crate::fragment::{NON_SYNC_SAMPLE_FLAGS, SYNC_SAMPLE_FLAGS};
 use iris_core::time::TIMESCALE;
 
 /// The track id used for video in every irisd file.
@@ -13,17 +13,19 @@ pub const VIDEO_TRACK_ID: u32 = 1;
 /// durations are expressed in it (milliseconds).
 pub const MOVIE_TIMESCALE: u32 = 1000;
 
-/// A codec configuration: the complete `hvc1` sample entry box plus the facts
-/// playlists and clients need.
+/// A codec configuration: the complete sample entry box (`hvc1` for video,
+/// `mp4a` for audio) plus the facts playlists and clients need. The box's own
+/// type says which of the two a track is ([`SampleEntry::is_audio`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SampleEntry {
-    /// The serialized sample entry box, parameter sets included (`hvcC`).
+    /// The serialized sample entry box, parameter sets included (`hvcC`, or
+    /// `esds` for audio).
     pub bytes: Bytes,
-    /// RFC 6381 codecs string, for example `hvc1.1.6.L150.B0`.
+    /// RFC 6381 codecs string, for example `hvc1.1.6.L150.B0` or `mp4a.40.2`.
     pub codecs: String,
-    /// Display width in pixels.
+    /// Display width in pixels; zero for audio.
     pub width: u16,
-    /// Display height in pixels.
+    /// Display height in pixels; zero for audio.
     pub height: u16,
     /// CRC-32C of `bytes` when built with [`SampleEntry::new`]: a hint for a
     /// parameter-set epoch, not an identity. The store and the catalog
@@ -45,12 +47,164 @@ impl SampleEntry {
             hash,
         }
     }
+
+    /// Wraps a serialized audio sample entry: no picture size.
+    #[must_use]
+    pub fn audio(bytes: Bytes, codecs: String) -> Self {
+        Self::new(bytes, codecs, 0, 0)
+    }
+
+    /// Whether the entry describes audio: its box type is `mp4a`.
+    #[must_use]
+    pub fn is_audio(&self) -> bool {
+        self.bytes.get(4..8) == Some(b"mp4a")
+    }
 }
 
-/// Builds the initialization segment for one video track.
+/// The duration in 90 kHz media ticks of an audio frame of `frame_samples`
+/// samples at `sample_rate` hertz, when it is a whole number of ticks.
+///
+/// Audio files use the 90 kHz media timescale of the video files, so one
+/// time model serves both; that is exact for the rates whose frames are whole
+/// ticks (an AAC frame of 1,024 samples at 8, 16, 32, 48, 64, or 96 kHz) and
+/// refused for the others (the 44.1 kHz family), whose timeline would drift.
+///
+/// ```
+/// use iris_mp4::init::audio_frame_ticks;
+///
+/// assert_eq!(audio_frame_ticks(64_000, 1_024), Some(1_440));
+/// assert_eq!(audio_frame_ticks(44_100, 1_024), None);
+/// ```
+#[must_use]
+pub fn audio_frame_ticks(sample_rate: u32, frame_samples: u32) -> Option<u32> {
+    let ticks = u64::from(frame_samples) * u64::from(TIMESCALE);
+    let rate = u64::from(sample_rate);
+    if rate == 0 || ticks == 0 || !ticks.is_multiple_of(rate) {
+        return None;
+    }
+    u32::try_from(ticks / rate).ok()
+}
+
+/// Builds the initialization segment for the one track `entry` describes.
+///
+/// An audio track ([`SampleEntry::is_audio`]) has the layout of a video one
+/// with a sound handler and media header, no picture size, full volume, and
+/// `trex` defaults that mark every sample a sync sample, since audio frames
+/// do not depend on each other.
 #[must_use]
 pub fn build_init_segment(entry: &SampleEntry) -> Bytes {
-    let mut w = BoxWriter::with_capacity(entry.bytes.len() + 512);
+    let kind = if entry.is_audio() {
+        TrackKind::Audio
+    } else {
+        TrackKind::Video {
+            width: entry.width,
+            height: entry.height,
+        }
+    };
+    build(&[(&entry.bytes, kind, VIDEO_TRACK_ID)])
+}
+
+/// The body of the first child box of type `kind` in `buf`, or `None` when
+/// there is none or a box claims more than `buf` holds.
+fn child(buf: &[u8], kind: [u8; 4]) -> Option<&[u8]> {
+    let mut rest = buf;
+    while !rest.is_empty() {
+        let header = BoxHeader::parse(rest)?;
+        let size = usize::try_from(header.size?).ok()?;
+        if size > rest.len() {
+            return None;
+        }
+        if header.kind == kind {
+            return rest.get(usize::from(header.header_len)..size);
+        }
+        rest = &rest[size..];
+    }
+    None
+}
+
+/// The sample entry box of the first track of an initialization segment
+/// (`moov/trak/mdia/minf/stbl/stsd`), whole, as [`SampleEntry::bytes`] holds
+/// it. `None` when a box on the way is missing or does not fit.
+///
+/// ```
+/// use bytes::Bytes;
+/// use iris_mp4::init::{SampleEntry, build_init_segment, sample_entry_bytes};
+///
+/// let entry = SampleEntry::audio(Bytes::from_static(b"\0\0\0\x08mp4a"), "mp4a.40.2".into());
+/// let init = build_init_segment(&entry);
+/// assert_eq!(sample_entry_bytes(&init), Some(&entry.bytes[..]));
+/// ```
+#[must_use]
+pub fn sample_entry_bytes(init: &[u8]) -> Option<&[u8]> {
+    let mut body = init;
+    for kind in [b"moov", b"trak", b"mdia", b"minf", b"stbl", b"stsd"] {
+        body = child(body, *kind)?;
+    }
+    // A full box: version and flags, then the entry count, then the entries.
+    let entries = body.get(8..)?;
+    let header = BoxHeader::parse(entries)?;
+    entries.get(..usize::try_from(header.size?).ok()?)
+}
+
+/// The channel count an `mp4a` sample entry declares in its `channelcount`
+/// field, or `None` when `entry` is not an `mp4a` box that reaches the field
+/// or the field is zero. The entry irisd records for an AAC stream carries
+/// the count its configuration declares (`docs/research/13-audio.md` §8).
+///
+/// ```
+/// use iris_mp4::init::audio_channel_count;
+///
+/// // size, type, reserved, data_reference_index, reserved, channelcount.
+/// let mut entry = b"\0\0\0\x1amp4a\0\0\0\0\0\0\0\x01\0\0\0\0\0\0\0\0".to_vec();
+/// entry.extend_from_slice(&[0, 2]);
+/// assert_eq!(audio_channel_count(&entry), Some(2));
+/// assert_eq!(audio_channel_count(&entry[..25]), None);
+/// ```
+#[must_use]
+pub fn audio_channel_count(entry: &[u8]) -> Option<u16> {
+    if entry.get(4..8)? != b"mp4a" {
+        return None;
+    }
+    let count = u16::from_be_bytes(*entry.get(24..26)?.first_chunk::<2>()?);
+    (count != 0).then_some(count)
+}
+
+/// The track id of the audio track in a file that holds a video track and an
+/// audio track; the video track is [`VIDEO_TRACK_ID`].
+pub const AV_AUDIO_TRACK_ID: u32 = 2;
+
+/// Builds the initialization segment of a file with two tracks: `video` as
+/// track [`VIDEO_TRACK_ID`] and `audio` as track [`AV_AUDIO_TRACK_ID`], each
+/// as [`build_init_segment`] writes it alone, with one `trex` for each
+/// (`docs/research/13-audio.md` §9). A fragment of the audio track names
+/// that track id in its `tfhd`.
+#[must_use]
+pub fn build_av_init_segment(video: &SampleEntry, audio: &SampleEntry) -> Bytes {
+    build(&[
+        (
+            &video.bytes,
+            TrackKind::Video {
+                width: video.width,
+                height: video.height,
+            },
+            VIDEO_TRACK_ID,
+        ),
+        (&audio.bytes, TrackKind::Audio, AV_AUDIO_TRACK_ID),
+    ])
+}
+
+/// What a track carries, for the boxes that differ between the two.
+#[derive(Clone, Copy)]
+enum TrackKind {
+    Video { width: u16, height: u16 },
+    Audio,
+}
+
+/// Builds `ftyp` and `moov` for `tracks`: each a sample entry, what it
+/// carries, and its track id, in ascending order of id.
+fn build(tracks: &[(&[u8], TrackKind, u32)]) -> Bytes {
+    let entries: usize = tracks.iter().map(|(entry, _, _)| entry.len()).sum();
+    let mut w = BoxWriter::with_capacity(entries + 512 * tracks.len());
 
     let ftyp = w.begin(b"ftyp");
     w.bytes(b"iso6");
@@ -61,16 +215,24 @@ pub fn build_init_segment(entry: &SampleEntry) -> Bytes {
     w.end(ftyp);
 
     let moov = w.begin(b"moov");
-    write_mvhd(&mut w);
-    write_trak(&mut w, entry);
+    let next_track_id = tracks.iter().map(|(_, _, id)| *id).max().unwrap_or(0) + 1;
+    write_mvhd(&mut w, next_track_id);
+    for &(entry, kind, track_id) in tracks {
+        write_trak(&mut w, entry, kind, track_id);
+    }
     let mvex = w.begin(b"mvex");
-    let trex = w.begin_full(b"trex", 0, 0);
-    w.u32(VIDEO_TRACK_ID);
-    w.u32(1); // default_sample_description_index
-    w.u32(0); // default_sample_duration
-    w.u32(0); // default_sample_size
-    w.u32(NON_SYNC_SAMPLE_FLAGS);
-    w.end(trex);
+    for &(_, kind, track_id) in tracks {
+        let trex = w.begin_full(b"trex", 0, 0);
+        w.u32(track_id);
+        w.u32(1); // default_sample_description_index
+        w.u32(0); // default_sample_duration
+        w.u32(0); // default_sample_size
+        w.u32(match kind {
+            TrackKind::Video { .. } => NON_SYNC_SAMPLE_FLAGS,
+            TrackKind::Audio => SYNC_SAMPLE_FLAGS,
+        });
+        w.end(trex);
+    }
     w.end(mvex);
     w.end(moov);
 
@@ -79,7 +241,7 @@ pub fn build_init_segment(entry: &SampleEntry) -> Bytes {
 
 const UNITY_MATRIX: [i32; 9] = [0x0001_0000, 0, 0, 0, 0x0001_0000, 0, 0, 0, 0x4000_0000];
 
-fn write_mvhd(w: &mut BoxWriter) {
+fn write_mvhd(w: &mut BoxWriter, next_track_id: u32) {
     let mvhd = w.begin_full(b"mvhd", 1, 0);
     w.u64(0); // creation_time
     w.u64(0); // modification_time
@@ -92,29 +254,33 @@ fn write_mvhd(w: &mut BoxWriter) {
         w.i32(m);
     }
     w.zeros(6 * 4); // pre_defined
-    w.u32(VIDEO_TRACK_ID + 1); // next_track_ID
+    w.u32(next_track_id);
     w.end(mvhd);
 }
 
-fn write_trak(w: &mut BoxWriter, entry: &SampleEntry) {
+fn write_trak(w: &mut BoxWriter, entry: &[u8], kind: TrackKind, track_id: u32) {
+    let (width, height, volume, handler, name) = match kind {
+        TrackKind::Video { width, height } => (width, height, 0, b"vide", &b"irisd video\0"[..]),
+        TrackKind::Audio => (0, 0, 0x0100, b"soun", &b"irisd audio\0"[..]),
+    };
     let trak = w.begin(b"trak");
 
     let tkhd = w.begin_full(b"tkhd", 1, 0x7); // enabled | in_movie | in_preview
     w.u64(0); // creation_time
     w.u64(0); // modification_time
-    w.u32(VIDEO_TRACK_ID);
+    w.u32(track_id);
     w.u32(0); // reserved
     w.u64(0); // duration
     w.zeros(8); // reserved
     w.i16(0); // layer
     w.i16(0); // alternate_group
-    w.i16(0); // volume (video)
+    w.i16(volume); // 8.8 fixed point: zero for video, 1.0 for audio
     w.u16(0); // reserved
     for m in UNITY_MATRIX {
         w.i32(m);
     }
-    w.u32(u32::from(entry.width) << 16);
-    w.u32(u32::from(entry.height) << 16);
+    w.u32(u32::from(width) << 16);
+    w.u32(u32::from(height) << 16);
     w.end(tkhd);
 
     let mdia = w.begin(b"mdia");
@@ -129,16 +295,26 @@ fn write_trak(w: &mut BoxWriter, entry: &SampleEntry) {
 
     let hdlr = w.begin_full(b"hdlr", 0, 0);
     w.u32(0); // pre_defined
-    w.bytes(b"vide");
+    w.bytes(handler);
     w.zeros(12); // reserved
-    w.bytes(b"irisd video\0");
+    w.bytes(name);
     w.end(hdlr);
 
     let minf = w.begin(b"minf");
-    let vmhd = w.begin_full(b"vmhd", 0, 1);
-    w.u16(0); // graphicsmode
-    w.zeros(6); // opcolor
-    w.end(vmhd);
+    match kind {
+        TrackKind::Video { .. } => {
+            let vmhd = w.begin_full(b"vmhd", 0, 1);
+            w.u16(0); // graphicsmode
+            w.zeros(6); // opcolor
+            w.end(vmhd);
+        }
+        TrackKind::Audio => {
+            let smhd = w.begin_full(b"smhd", 0, 0);
+            w.i16(0); // balance
+            w.u16(0); // reserved
+            w.end(smhd);
+        }
+    }
 
     let dinf = w.begin(b"dinf");
     let dref = w.begin_full(b"dref", 0, 0);
@@ -151,10 +327,10 @@ fn write_trak(w: &mut BoxWriter, entry: &SampleEntry) {
     let stbl = w.begin(b"stbl");
     let sample_description = w.begin_full(b"stsd", 0, 0);
     w.u32(1);
-    w.bytes(&entry.bytes);
+    w.bytes(entry);
     w.end(sample_description);
-    for kind in [b"stts", b"stsc"] {
-        let b = w.begin_full(kind, 0, 0);
+    for table in [b"stts", b"stsc"] {
+        let b = w.begin_full(table, 0, 0);
         w.u32(0);
         w.end(b);
     }
@@ -348,5 +524,204 @@ pub(crate) mod tests {
         assert_eq!(ftyp.size.unwrap() + moov.size.unwrap(), init.len() as u64);
         assert!(init.windows(4).any(|w| w == b"hvcC"));
         assert!(init.windows(4).any(|w| w == b"trex"));
+    }
+
+    /// A syntactically valid `mp4a` sample entry without its `esds`.
+    fn fake_audio_entry() -> SampleEntry {
+        let mut w = BoxWriter::default();
+        let b = w.begin(b"mp4a");
+        w.zeros(6);
+        w.u16(1); // data_reference_index
+        w.zeros(8);
+        w.u16(1); // channelcount
+        w.u16(16); // samplesize
+        w.zeros(4);
+        w.u32(64_000 << 16);
+        w.end(b);
+        SampleEntry::audio(w.into_bytes(), "mp4a.40.2".into())
+    }
+
+    /// The audio initialization segment differs from the video one in the
+    /// boxes that describe the medium and in nothing else: no picture size
+    /// and full volume in `tkhd`, a sound handler, `smhd` for `vmhd`, the
+    /// audio sample entry, and `trex` defaults that mark samples as sync.
+    #[test]
+    fn the_audio_init_segment_differs_only_in_the_boxes_of_its_medium() {
+        let audio_entry = fake_audio_entry();
+        assert_eq!(audio_entry.hash, crate::crc::crc32c(&audio_entry.bytes));
+        assert!(audio_entry.is_audio());
+        assert_eq!((audio_entry.width, audio_entry.height), (0, 0));
+        let mut audio = Vec::new();
+        field_boxes(&build_init_segment(&audio_entry), "", &mut audio);
+        let video_entry = fake_sample_entry();
+        assert!(!video_entry.is_audio());
+        let mut video = Vec::new();
+        field_boxes(&build_init_segment(&video_entry), "", &mut video);
+
+        let differing: Vec<(&str, &str)> = audio
+            .iter()
+            .zip(&video)
+            .filter(|(a, v)| a != v)
+            .map(|(a, v)| (a.0.as_str(), v.0.as_str()))
+            .collect();
+        assert_eq!(audio.len(), video.len());
+        assert_eq!(
+            differing,
+            [
+                ("moov/trak/tkhd", "moov/trak/tkhd"),
+                ("moov/trak/mdia/hdlr", "moov/trak/mdia/hdlr"),
+                ("moov/trak/mdia/minf/smhd", "moov/trak/mdia/minf/vmhd"),
+                (
+                    "moov/trak/mdia/minf/stbl/stsd",
+                    "moov/trak/mdia/minf/stbl/stsd"
+                ),
+                ("moov/mvex/trex", "moov/mvex/trex"),
+            ]
+        );
+        let body = |path: &str| &audio.iter().find(|(p, _)| p == path).unwrap().1;
+        let tkhd = body("moov/trak/tkhd");
+        // Volume 1.0 and its reserved field before the matrix; zero width and height last.
+        assert_eq!(tkhd[tkhd.len() - 48..tkhd.len() - 44], [1, 0, 0, 0]);
+        assert_eq!(tkhd[tkhd.len() - 8..], [0; 8]);
+        let hdlr = body("moov/trak/mdia/hdlr");
+        assert_eq!(&hdlr[8..12], b"soun");
+        assert_eq!(&hdlr[24..], b"irisd audio\0");
+        assert_eq!(body("moov/trak/mdia/minf/smhd"), &[0; 8]);
+        let stsd = body("moov/trak/mdia/minf/stbl/stsd");
+        assert_eq!(&stsd[8..], &audio_entry.bytes[..]);
+        assert_eq!(
+            body("moov/mvex/trex"),
+            &fields(&[(0, 4), (1, 4), (1, 4), (0, 4), (0, 4), (0x0200_0000, 4)])
+        );
+    }
+
+    #[test]
+    fn an_audio_frame_is_a_whole_number_of_ticks_or_refused() {
+        for (rate, ticks) in [
+            (8_000, 11_520),
+            (16_000, 5_760),
+            (32_000, 2_880),
+            (48_000, 1_920),
+            (64_000, 1_440),
+            (96_000, 960),
+        ] {
+            assert_eq!(audio_frame_ticks(rate, 1_024), Some(ticks), "{rate}");
+        }
+        for rate in [11_025, 22_050, 44_100, 88_200, 0] {
+            assert_eq!(audio_frame_ticks(rate, 1_024), None, "{rate}");
+        }
+        assert_eq!(audio_frame_ticks(48_000, 0), None);
+        assert_eq!(audio_frame_ticks(48_000, 960), Some(1_800));
+        assert_eq!(audio_frame_ticks(1, u32::MAX), None, "past 32 bits");
+    }
+
+    /// The two-track initialization segment holds the video track as it is
+    /// alone, the audio track as it is alone but for its track id, a `trex`
+    /// for each, and the next free track id.
+    #[test]
+    fn the_two_track_init_segment_is_both_single_tracks_under_one_movie() {
+        let (video_entry, audio_entry) = (fake_sample_entry(), fake_audio_entry());
+        let boxes_of = |init: &Bytes| {
+            let mut boxes = Vec::new();
+            field_boxes(init, "", &mut boxes);
+            boxes
+        };
+        let both = boxes_of(&build_av_init_segment(&video_entry, &audio_entry));
+        let video = boxes_of(&build_init_segment(&video_entry));
+        let audio = boxes_of(&build_init_segment(&audio_entry));
+        let paths: Vec<&str> = both.iter().map(|(path, _)| path.as_str()).collect();
+        let track = |boxes: &[(String, Vec<u8>)]| -> Vec<(String, Vec<u8>)> {
+            boxes
+                .iter()
+                .filter(|(path, _)| path.starts_with("moov/trak/"))
+                .cloned()
+                .collect()
+        };
+        let (video_track, audio_track) = (track(&video), track(&audio));
+        let tracks = track(&both);
+        assert_eq!(paths[..2], ["ftyp", "moov/mvhd"]);
+        assert_eq!(tracks.len(), video_track.len() + audio_track.len());
+        assert_eq!(tracks[..video_track.len()], video_track[..]);
+        // The audio track's `tkhd` names track 2; nothing else differs.
+        let second = &tracks[video_track.len()..];
+        for (index, ((path, body), (alone_path, alone_body))) in
+            second.iter().zip(&audio_track).enumerate()
+        {
+            assert_eq!(path, alone_path);
+            if index == 0 {
+                assert_eq!(path, "moov/trak/tkhd");
+                // Version and flags, two times of eight bytes, then the id.
+                assert_eq!(body[20..24], [0, 0, 0, 2]);
+                assert_eq!(alone_body[20..24], [0, 0, 0, 1]);
+                assert_eq!(
+                    (&body[..20], &body[24..]),
+                    (&alone_body[..20], &alone_body[24..])
+                );
+            } else {
+                assert_eq!(body, alone_body, "{path}");
+            }
+        }
+        let mvhd = &both.iter().find(|(path, _)| path == "moov/mvhd").unwrap().1;
+        assert_eq!(mvhd[mvhd.len() - 4..], [0, 0, 0, 3], "next_track_ID");
+        let trex: Vec<&Vec<u8>> = both
+            .iter()
+            .filter(|(path, _)| path == "moov/mvex/trex")
+            .map(|(_, body)| body)
+            .collect();
+        assert_eq!(
+            trex,
+            [
+                &fields(&[(0, 4), (1, 4), (1, 4), (0, 4), (0, 4), (0x0101_0000, 4)]),
+                &fields(&[(0, 4), (2, 4), (1, 4), (0, 4), (0, 4), (0x0200_0000, 4)]),
+            ]
+        );
+    }
+
+    /// The channel count is read from an `mp4a` entry alone, and only when
+    /// the entry reaches the field and the field is not zero.
+    #[test]
+    fn the_channel_count_is_the_field_of_an_mp4a_entry() {
+        let audio = fake_audio_entry();
+        assert_eq!(audio_channel_count(&audio.bytes), Some(1));
+        let mut six = audio.bytes.to_vec();
+        six[24..26].copy_from_slice(&6u16.to_be_bytes());
+        assert_eq!(audio_channel_count(&six), Some(6));
+        six[24..26].copy_from_slice(&0u16.to_be_bytes());
+        assert_eq!(audio_channel_count(&six), None);
+        for cut in 0..26 {
+            assert_eq!(
+                audio_channel_count(&audio.bytes[..cut]),
+                None,
+                "cut at {cut}"
+            );
+        }
+        assert_eq!(audio_channel_count(&audio.bytes[..26]), Some(1));
+        // A video entry has other fields where an audio entry counts channels.
+        let mut video = audio.bytes.to_vec();
+        video[4..8].copy_from_slice(b"hvc1");
+        assert_eq!(audio_channel_count(&video), None);
+        // The count comes through an init segment's sample entry.
+        let init = build_init_segment(&audio);
+        assert_eq!(
+            sample_entry_bytes(&init).and_then(audio_channel_count),
+            Some(1)
+        );
+    }
+
+    /// The sample entry of an init segment reads back whole, for either kind
+    /// and for the first track of two; a segment cut anywhere has none.
+    #[test]
+    fn the_sample_entry_reads_back_from_an_init_segment() {
+        let (video, audio) = (fake_sample_entry(), fake_audio_entry());
+        for entry in [&video, &audio] {
+            let init = build_init_segment(entry);
+            assert_eq!(sample_entry_bytes(&init), Some(&entry.bytes[..]));
+            for cut in 0..init.len() {
+                assert_eq!(sample_entry_bytes(&init[..cut]), None, "cut at {cut}");
+            }
+        }
+        let both = build_av_init_segment(&video, &audio);
+        assert_eq!(sample_entry_bytes(&both), Some(&video.bytes[..]));
+        assert_eq!(sample_entry_bytes(b""), None);
     }
 }

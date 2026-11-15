@@ -6,6 +6,12 @@
 //! Where the host forbids unprivileged user namespaces the test reports that
 //! and passes without running the body.
 
+#![expect(
+    clippy::missing_assert_message,
+    clippy::unwrap_used,
+    reason = "a helper of a test fails as the test does, by panicking"
+)]
+
 use std::fs::{self, File};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus};
@@ -15,7 +21,7 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 use iris_core::id::{CameraId, StreamKey, StreamKind};
 use iris_core::time::WallUs;
-use iris_mp4::fragment::{Fragment, Sample};
+use iris_mp4::fragment::{Fragment, FrameSteps, Sample};
 use iris_mp4::init::SampleEntry;
 use iris_mp4::reader::{self, ScanOptions};
 use iris_store::recover::recover_segment;
@@ -69,6 +75,7 @@ fn fragment(index: u64, new_run: bool, entry: &Arc<SampleEntry>) -> Fragment {
         wall: WallUs::new((1_793_460_958 + 2 * i64::try_from(index).unwrap()) * 1_000_000),
         raw_rtp: 42,
         new_run,
+        steps: FrameSteps::default(),
         sample_entry: Arc::clone(entry),
     }
 }

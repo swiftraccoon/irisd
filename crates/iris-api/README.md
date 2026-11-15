@@ -51,7 +51,7 @@ one `moof` + `mdat` each.
 |---|---|
 | `GET /api/health` | liveness: status, uptime, version |
 | `GET /metrics` | Prometheus text: requests, clients, event WebSocket lag, API admission rejections (media classes, WebSocket caps, snapshots), rows outside the approved roots, oversized live closes, uptime, catalog queue/state totals, rows and bytes in deletion intent, failed batches, catalog admission rejections, pruning, and database/WAL sizes; root bearer token required unless `public_metrics` is set |
-| `GET /api/cameras` | the running cameras, configured or added through the API; `provisioned` marks the added ones, which `DELETE` applies to |
+| `GET /api/cameras` | the running cameras, configured or added through the API; `provisioned` marks the added ones, which `DELETE` applies to, and `has_audio` those with recorded audio and a live audio feed |
 | `POST /api/cameras` | adds a camera described like a `[[camera]]` table (JSON) and answers 201 with it as the list shows it; needs `[provisioning] enabled` on the daemon (403 otherwise) and the root token; 400 for an invalid camera, a port outside `provisioning.connect_ports`, or the `max_cameras` limit, 409 for an id in use, 503 when the daemon cannot write its store or start the camera |
 | `DELETE /api/cameras/{camera}` | stops and forgets a camera the API added (204); 409 for a configured camera, 404 for an unknown one; recordings and catalog rows stay |
 | `GET /api/onvif/devices?wait_ms` | the cameras a WS-Discovery probe finds within `wait_ms` (default 3000, 500 to 10000): device service host and port, and the name, hardware, and location scopes, bounded and sanitised; needs `[provisioning] enabled` (403 otherwise) and the root token; 503 when the probe cannot be sent or four lookups run already |
@@ -59,9 +59,11 @@ one `moof` + `mdat` each.
 | `GET /api/cameras/{camera}` | the camera with the health of each recorded stream: connected, frames, fragments, bytes, reconnects, loss events, gaps, last frame time, codec, nominal frame duration, camera clock offset, live viewers |
 | `GET /api/cameras/{camera}/snapshot.jpg` | a size-capped JPEG fetched without redirects or a proxy from the camera with digest authentication, from the Dahua CGI endpoint or, for a camera whose `snapshot` is `onvif` (the default when its events come from ONVIF pull-point alone), from the URL its ONVIF Media service names for its first profile, resolved on first use, kept for an hour, forgotten after a failed fetch, and rebased onto the configured camera; one request per camera at a time, served through its final end-of-image marker |
 | `GET /api/streams/{camera}/{kind}/segments?from&to` | catalog rows in a time range |
-| `GET /api/streams/{camera}/{kind}/hls/vod.m3u8?from&to` | a byte-range VOD playlist over the range |
+| `GET /api/streams/{camera}/{kind}/hls/vod.m3u8?from&to` | a byte-range VOD playlist over the range; an `audio` stream's takes its segments and discontinuities from the main stream's |
+| `GET /api/cameras/{camera}/hls/vod.m3u8?from&to` | a multivariant playlist: the main stream and, when recorded, the audio as a rendition |
 | `GET /api/streams/{camera}/{kind}/export.mp4?from&to` | a stand-alone recording of the range, streamed: the init segment with an edit list for start preroll, then fragments rebased from zero with fresh sequence numbers and trailers; tail samples at or after `to` are omitted and a crossing sample's duration is shortened (`docs/research/04-storage-format.md §10`) |
-| `GET /api/streams/{camera}/{kind}/live` | WebSocket: an init segment, then one fragment per frame, each message at most 16 MiB + 1 byte |
+| `GET /api/cameras/{camera}/export.mp4?from&to` | the main stream's export with recorded audio as a second track |
+| `GET /api/streams/{camera}/{kind}/live` | WebSocket: an init segment, then one fragment per frame, each message at most 16 MiB + 1 byte; `audio` is a stream of its own in the same protocol |
 | `GET /api/streams/{camera}/{kind}/hls/live.m3u8[?_HLS_msn&_HLS_part]` | the low-latency live playlist from the live ring: parts of up to 0.5 s cut by media time, blocking reload (waits up to three target durations, 12 s before the first segment completes, then 503; a directive more than two segments or three seconds of parts ahead is 400), preload hints; relative URIs `init.mp4`, `seg/{msn}/media.m4s`, `part/{msn}/{index}/part.m4s` beside it, served from memory (`docs/research/04-storage-format.md §10`) |
 | `GET /api/streams/{camera}/{kind}/keyframe?t=` | a playable MP4 of one frame: the init segment and a single-sample fragment holding the sync sample at or before `t` (default: the newest), looked up within the two minutes before `t`; `x-iris-wall-us` carries the sample's time |
 | `GET /api/segments/{id}/file.mp4` | one recording file, with HTTP range support: one `bytes` range, clamped to the validated extent; a range unit other than `bytes` is ignored and the whole file served; several ranges or an unsatisfiable one answer 416 |
@@ -178,13 +180,14 @@ spawns `serve_listener` before reporting readiness.
   bytes; exports and keyframes reopen beneath the root and require the validated device, inode,
   and at least the validated extent. A file that ends early under a response aborts it with an
   error and a warning instead of ending it cleanly.
-- Raw files stop at the complete extent captured from a bounded, validated sidecar snapshot;
-  later appends cannot lengthen an in-flight full or range response. Sidecar headers bind the
-  fixed timescale, initialization length, known run/sample-entry facts, catalog start, and
-  physical extent. A header run identifier or sample-entry hash of zero, as crash recovery
-  rebuilds them from the media scan, is unknown and accepted; a nonzero mismatch is rejected.
-  Fragment transforms verify CRC, wall/decode time, duration, sample count,
-  and sync state first. Skipped VOD rows produce one discontinuity before the next emitted row.
+- Raw files stop at the complete extent captured from a bounded, validated sidecar snapshot; later
+  appends cannot lengthen an in-flight full or range response. Sidecar headers bind the fixed
+  timescale, initialization length, known run/sample-entry facts, catalog start, and physical
+  extent. A header run identifier or sample-entry hash of zero, as crash recovery rebuilds them from
+  the media scan, is unknown and accepted; a nonzero mismatch is rejected. A record with a flag
+  outside those the writer sets (`iris_mp4::index::WRITER_ONLY_FLAGS` and the sync flag) is
+  rejected. Fragment transforms verify CRC, wall/decode time, duration, sample count, and sync state
+  first. Skipped VOD rows produce one discontinuity before the next emitted row.
 - One request admits at most 4,096 segment rows, 131,072 records per sidecar
   (`iris_mp4::index::MAX_PERSISTED_INDEX_RECORDS`), 100,000 selected records, a 16 MiB
   playlist, a 4 MiB initialization section, and a 66 MiB stored fragment.

@@ -13,12 +13,14 @@ env:
 
 jobs:
   check:
-    name: Format, clippy, tests, rustdoc, vendored tests
+    name: Format, clippy, tests, rustdoc, vendored tests, standards
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          # The whole history: the standards check reads the messages of the pushed range.
+          fetch-depth: 0
       - name: GTK and GStreamer development libraries (iris-gui)
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends $GTK_PACKAGES
       - name: Allow unprivileged user namespaces (the full-filesystem test mounts a tmpfs in one)
@@ -40,6 +42,21 @@ jobs:
           cargo fetch --locked --manifest-path third_party/retina/Cargo.toml
       - name: just check
         run: just check
+      - name: Commit messages of the pushed range
+        env:
+          BEFORE: ${{ github.event.before }}
+          BASE: ${{ github.base_ref }}
+        # What a message fails to say of its change is reported and does not fail: the
+        # commit-msg hook holds a commit to that as it is made.
+        run: |
+          if [ -n "$BASE" ]; then
+            range="origin/$BASE..HEAD"
+          elif git cat-file -e "$BEFORE^{commit}" 2>/dev/null; then
+            range="$BEFORE..HEAD"
+          else
+            range="HEAD^!"
+          fi
+          cargo run --quiet --locked -p iris-tools -- standards commits "$range" --lenient
 
   msrv:
     name: Minimum supported Rust version
@@ -121,14 +138,14 @@ jobs:
         run: just cross-check
 
   cross-test:
-    name: aarch64 tests under emulation
-    runs-on: ubuntu-latest
+    name: aarch64 tests
+    # A 64-bit ARM runner: the store's tests call openat2, which the user-mode
+    # emulator packaged for the x86-64 runners does not implement.
+    runs-on: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - name: User-mode emulation for 64-bit ARM
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends qemu-user-static
       - name: Install the pinned toolchain and the target
         run: |
           rustup show active-toolchain || rustup toolchain install

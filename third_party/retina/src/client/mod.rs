@@ -1986,7 +1986,13 @@ impl Session<Described> {
                         timeline: Timeline::new(
                             initial_rtptime,
                             s.clock_rate_hz,
-                            policy.enforce_timestamps_with_max_jump_secs,
+                            // irisd: the policy protects the video timeline. Cameras
+                            // step audio timestamps backwards by a fraction of a
+                            // frame, which must not end the session that carries
+                            // the picture, so other media are not enforced.
+                            policy
+                                .enforce_timestamps_with_max_jump_secs
+                                .filter(|_| &*s.media == "video"),
                         )
                         .map_err(|description| {
                             wrap!(ErrorInt::RtspResponseError {

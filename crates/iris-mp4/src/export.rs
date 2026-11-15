@@ -28,9 +28,13 @@ pub enum ExportError {
     /// not match.
     #[error("malformed {0}")]
     Malformed(&'static str),
-    /// The requested duration is zero or negative.
+    /// The requested duration is zero or negative, or leaves no sample.
     #[error("export duration must be positive")]
     InvalidDuration,
+    /// A fragment that must lose its start has a sample that is not a sync
+    /// sample.
+    #[error("a fragment with a sample that is not a sync sample cannot lose its start")]
+    NotAllSync,
     /// The edit list's media time does not fit the signed 64-bit field.
     #[error("edit list media time must fit a signed 64-bit field")]
     InvalidMediaTime,
@@ -86,6 +90,52 @@ pub fn rebase_fragment(
     }
     if !saw_moof {
         return Err(ExportError::Malformed("moof"));
+    }
+    let mut crc = Crc32c::new();
+    crc.update(&fragment[..body_end]);
+    let len = u32::try_from(fragment.len()).map_err(|_| ExportError::Malformed("length"))?;
+    fragment[body_end..].copy_from_slice(&encode_trailer(crc.finish(), len));
+    Ok(())
+}
+
+/// Moves one complete fragment to track `track_id`, in place: the `tfhd`
+/// track id and the `prft` reference track id become `track_id`, and the
+/// trailer is recomputed. A stored fragment names track 1; the audio track of
+/// a file with two tracks is [`crate::init::AV_AUDIO_TRACK_ID`]. The original
+/// checksum is verified before any bytes are changed.
+///
+/// # Errors
+///
+/// [`ExportError::Malformed`] when the fragment does not parse, its checksum
+/// does not match, or it has no `tfhd`.
+pub fn retrack_fragment(fragment: &mut [u8], track_id: u32) -> Result<(), ExportError> {
+    validated_fragment(fragment)?;
+    let body_end = fragment.len() - TRAILER_LEN;
+    let mut pos = 0usize;
+    let mut saw_tfhd = false;
+    while pos < body_end {
+        let (kind, header_len, size) = header(&fragment[pos..body_end], "fragment")?;
+        match &kind {
+            // version/flags(4) reference_track_ID(4)
+            b"prft" => put_u32(
+                &mut fragment[pos + header_len..pos + size],
+                4,
+                track_id,
+                "prft",
+            )?,
+            b"moof" => {
+                let moof = find_box(fragment, pos + header_len, pos + size, *b"traf", "traf")?;
+                let tfhd = find_box(fragment, moof.body, moof.end, *b"tfhd", "tfhd")?;
+                // version/flags(4) track_ID(4)
+                put_u32(&mut fragment[tfhd.body..tfhd.end], 4, track_id, "tfhd")?;
+                saw_tfhd = true;
+            }
+            _ => {}
+        }
+        pos += size;
+    }
+    if !saw_tfhd {
+        return Err(ExportError::Malformed("tfhd"));
     }
     let mut crc = Crc32c::new();
     crc.update(&fragment[..body_end]);
@@ -156,7 +206,7 @@ pub fn trim_fragment_end(
         samples.push(Sample {
             data: data.slice(offset..end),
             duration,
-            is_sync: index == 0 && info.starts_with_sync,
+            is_sync: info.all_sync || (index == 0 && info.starts_with_sync),
         });
         offset = end;
         remaining -= u64::from(duration);
@@ -169,6 +219,94 @@ pub fn trim_fragment_end(
         out.extend_from_slice(&slice);
     }
     Ok(out)
+}
+
+/// What [`trim_fragment_start`] leaves of a fragment.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TrimmedStart {
+    /// The fragment from its first retained sample on.
+    pub fragment: Vec<u8>,
+    /// The time the omitted samples covered, in 90 kHz ticks.
+    pub omitted_ticks: u64,
+}
+
+/// Rebuilds a checksum-verified fragment from its first sample that starts
+/// at or after `skip` ticks into it, and returns it with the ticks the
+/// omitted samples covered. The remainder keeps the fragment's sequence
+/// number and starts that many ticks later in decode time and in wall time;
+/// retained samples are unchanged. Only a fragment whose samples are all
+/// sync samples, as an audio fragment's are, can lose its start and still
+/// decode.
+///
+/// An edit list would hide the same samples without rewriting the fragment,
+/// but the `ffmpeg` demuxer reads the media time of an AAC track's edit as a
+/// count of audio samples, which it is only when the track's timescale is
+/// its sampling rate (`docs/research/13-audio.md` §9).
+///
+/// # Errors
+///
+/// [`ExportError::Malformed`] for invalid structure, a checksum mismatch, or
+/// a fragment without a wall time; [`ExportError::NotAllSync`] for a
+/// fragment with a sample that is not a sync sample;
+/// [`ExportError::InvalidDuration`] when `skip` is negative or no sample
+/// starts at or after it; and [`ExportError::Encode`] for a remainder the
+/// recording fragment encoder cannot represent.
+pub fn trim_fragment_start(
+    fragment: Vec<u8>,
+    skip: MediaTicks,
+) -> Result<TrimmedStart, ExportError> {
+    let info = validated_fragment(&fragment)?;
+    if !info.all_sync {
+        return Err(ExportError::NotAllSync);
+    }
+    let wall = info.wall.ok_or(ExportError::Malformed("prft"))?;
+    let skip = u64::try_from(skip.get()).map_err(|_| ExportError::InvalidDuration)?;
+    let data = Bytes::from(fragment);
+    let mut offset = usize::try_from(info.payload_offset)
+        .map_err(|_| ExportError::Malformed("payload offset"))?;
+    let mut omitted = 0u64;
+    let mut samples = Vec::with_capacity(usize::from(info.sample_count));
+    for (&size, &duration) in info.sample_sizes.iter().zip(&info.sample_durations) {
+        let end = offset
+            .checked_add(size as usize)
+            .ok_or(ExportError::Malformed("sample size"))?;
+        if end > data.len() {
+            return Err(ExportError::Malformed("sample data"));
+        }
+        if samples.is_empty() && omitted < skip {
+            omitted += u64::from(duration);
+        } else {
+            samples.push(Sample {
+                data: data.slice(offset..end),
+                duration,
+                is_sync: true,
+            });
+        }
+        offset = end;
+    }
+    if samples.is_empty() {
+        return Err(ExportError::InvalidDuration);
+    }
+    let later = i64::try_from(omitted).map_err(|_| ExportError::Malformed("sample duration"))?;
+    let header = FragmentHeader {
+        sequence: info.sequence,
+        decode_time: info
+            .decode_time
+            .checked_add(omitted)
+            .ok_or(ExportError::Malformed("tfdt"))?,
+        wall: wall.offset(MediaTicks::new(later).as_micros()),
+    };
+    let encoded = encode_fragment(&header, &samples)?;
+    let mut out = Vec::with_capacity(
+        usize::try_from(encoded.total_len()).map_err(|_| ExportError::Malformed("length"))?,
+    );
+    for slice in encoded.io_slices(&samples) {
+        out.extend_from_slice(&slice);
+    }
+    Ok(TrimmedStart {
+        fragment: out,
+        omitted_ticks: omitted,
+    })
 }
 
 fn rebase_moof(body: &mut [u8], sequence: u32, decode_time: u64) -> Result<(), ExportError> {
@@ -224,33 +362,80 @@ pub fn with_edit_list(
     media_time: u64,
     duration_ms: u64,
 ) -> Result<Vec<u8>, ExportError> {
-    if i64::try_from(media_time).is_err() {
-        return Err(ExportError::InvalidMediaTime);
-    }
-    let mut w = BoxWriter::with_capacity(48);
-    let edts = w.begin(b"edts");
-    let elst = w.begin_full(b"elst", 1, 0);
-    w.u32(1);
-    w.u64(duration_ms);
-    w.u64(media_time);
-    w.i16(1);
-    w.i16(0);
-    w.end(elst);
-    w.end(edts);
-    let edts = w.into_vec();
+    with_edit_lists(
+        init,
+        &[TrackEdit {
+            media_time,
+            duration_ms,
+        }],
+    )
+}
 
+/// The one edit of a track's edit list, field for field as `elst` holds it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TrackEdit {
+    /// Where presentation starts in the track's media, in 90 kHz ticks.
+    pub media_time: u64,
+    /// How long the presentation lasts, in milliseconds
+    /// ([`MOVIE_TIMESCALE`]).
+    pub duration_ms: u64,
+}
+
+/// Inserts an edit list, as [`with_edit_list`] does, into each of the init
+/// segment's first `tracks.len()` tracks, in the order of the `trak` boxes: one edit
+/// for each.
+///
+/// # Errors
+///
+/// As [`with_edit_list`]; also [`ExportError::Malformed`] when the init
+/// segment has fewer tracks than `tracks`.
+pub fn with_edit_lists(init: &[u8], tracks: &[TrackEdit]) -> Result<Vec<u8>, ExportError> {
     let moov = find_box(init, 0, init.len(), *b"moov", "moov")?;
-    let trak = find_box(init, moov.body, moov.end, *b"trak", "trak")?;
-    if moov.body - moov.start != 8 || trak.body - trak.start != 8 {
+    if moov.body - moov.start != 8 {
         return Err(ExportError::Malformed("extended init parent"));
     }
-    let tkhd = find_box(init, trak.body, trak.end, *b"tkhd", "tkhd")?;
-    let grow = u32::try_from(edts.len()).map_err(|_| ExportError::Malformed("edts"))?;
-    let mut out = Vec::with_capacity(init.len() + edts.len());
-    out.extend_from_slice(&init[..tkhd.end]);
-    out.extend_from_slice(&edts);
-    out.extend_from_slice(&init[tkhd.end..]);
-    for start in [moov.start, trak.start] {
+    let mut out = Vec::with_capacity(init.len() + 48 * tracks.len());
+    let mut copied = 0;
+    let mut from = moov.body;
+    let mut grown_by = 0u32;
+    // Where each rewritten `trak` starts in `out`, and by how much it grew.
+    let mut grown = Vec::with_capacity(tracks.len());
+    for &TrackEdit {
+        media_time,
+        duration_ms,
+    } in tracks
+    {
+        if i64::try_from(media_time).is_err() {
+            return Err(ExportError::InvalidMediaTime);
+        }
+        let trak = find_box(init, from, moov.end, *b"trak", "trak")?;
+        if trak.body - trak.start != 8 {
+            return Err(ExportError::Malformed("extended init parent"));
+        }
+        let tkhd = find_box(init, trak.body, trak.end, *b"tkhd", "tkhd")?;
+        let mut w = BoxWriter::with_capacity(48);
+        let edts = w.begin(b"edts");
+        let elst = w.begin_full(b"elst", 1, 0);
+        w.u32(1);
+        w.u64(duration_ms);
+        w.u64(media_time);
+        w.i16(1);
+        w.i16(0);
+        w.end(elst);
+        w.end(edts);
+        let edts = w.into_vec();
+        let grow = u32::try_from(edts.len()).map_err(|_| ExportError::Malformed("edts"))?;
+        grown.push((trak.start + grown_by as usize, grow));
+        out.extend_from_slice(&init[copied..tkhd.end]);
+        out.extend_from_slice(&edts);
+        copied = tkhd.end;
+        from = trak.end;
+        grown_by = grown_by
+            .checked_add(grow)
+            .ok_or(ExportError::Malformed("size"))?;
+    }
+    out.extend_from_slice(&init[copied..]);
+    for (start, grow) in grown.into_iter().chain([(moov.start, grown_by)]) {
         let size = be_u32(&out, start).ok_or(ExportError::Malformed("size"))?;
         let grown = size
             .checked_add(grow)
@@ -573,5 +758,218 @@ mod tests {
             assert!(init_tree_valid(&bytes));
             assert!(with_edit_list(&bytes, 0, 33).is_err());
         }
+    }
+
+    /// The offset of the first box of `kind` at any depth of `buf`.
+    fn box_offset(buf: &[u8], kind: [u8; 4]) -> usize {
+        buf.windows(4).position(|window| window == kind).unwrap() - 4
+    }
+
+    /// Moving a fragment to track 2 changes the two track ids and the
+    /// trailer and nothing else, and the result still parses with its
+    /// checksum; a corrupt fragment is refused untouched.
+    #[test]
+    fn retracking_changes_the_track_ids_and_the_trailer_alone() {
+        let original = fragment(7, 90_000);
+        let mut moved = original.clone();
+        retrack_fragment(&mut moved, 2).unwrap();
+        assert_eq!(moved.len(), original.len());
+        let tfhd = box_offset(&original, *b"tfhd") + 12;
+        let prft = box_offset(&original, *b"prft") + 12;
+        assert_eq!(original[tfhd..tfhd + 4], [0, 0, 0, 1]);
+        assert_eq!(moved[tfhd..tfhd + 4], [0, 0, 0, 2]);
+        assert_eq!(moved[prft..prft + 4], [0, 0, 0, 2]);
+        let body_end = original.len() - TRAILER_LEN;
+        let changed: Vec<usize> = (0..body_end)
+            .filter(|&at| original[at] != moved[at])
+            .collect();
+        assert_eq!(changed, [prft + 3, tfhd + 3]);
+        assert_ne!(original[body_end..], moved[body_end..], "the checksum");
+        let info = parse_fragment(&moved).expect("the moved fragment parses");
+        assert_eq!(
+            (info.sequence, info.decode_time, info.sample_count),
+            (7, 90_000, 2)
+        );
+        validated_fragment(&moved).expect("its checksum holds");
+        // Moving it back restores the original bytes.
+        retrack_fragment(&mut moved, 1).unwrap();
+        assert_eq!(moved, original);
+
+        let mut corrupt = original.clone();
+        corrupt[body_end - 1] ^= 1;
+        let before = corrupt.clone();
+        assert_eq!(
+            retrack_fragment(&mut corrupt, 2),
+            Err(ExportError::Malformed("checksum"))
+        );
+        assert_eq!(corrupt, before);
+    }
+
+    /// Each track of a two-track init segment gets its own edit list after
+    /// its `tkhd`, and the sizes of both tracks and of the movie grow by them.
+    #[test]
+    fn every_track_of_a_two_track_init_gets_its_edit_list() {
+        use crate::init::{SampleEntry, build_av_init_segment};
+        let video = SampleEntry::new(
+            Bytes::from_static(b"\0\0\0\x10hvc1\0\0\0\0\0\0\0\0"),
+            "hvc1".into(),
+            16,
+            16,
+        );
+        let audio = SampleEntry::audio(
+            Bytes::from_static(b"\0\0\0\x10mp4a\0\0\0\0\0\0\0\0"),
+            "mp4a.40.2".into(),
+        );
+        let init = build_av_init_segment(&video, &audio);
+        let edit = |media_time, duration_ms| TrackEdit {
+            media_time,
+            duration_ms,
+        };
+        let edited = with_edit_lists(&init, &[edit(3_000, 2_000), edit(1_440, 1_984)]).unwrap();
+        assert_eq!(edited.len(), init.len() + 2 * 44);
+        let moov = find_box(&edited, 0, edited.len(), *b"moov", "moov").unwrap();
+        assert_eq!(moov.end, edited.len());
+        let mut from = moov.body;
+        for (media_time, duration_ms) in [(3_000_u64, 2_000_u64), (1_440, 1_984)] {
+            let trak = find_box(&edited, from, moov.end, *b"trak", "trak").unwrap();
+            let tkhd = find_box(&edited, trak.body, trak.end, *b"tkhd", "tkhd").unwrap();
+            let edts = find_box(&edited, trak.body, trak.end, *b"edts", "edts").unwrap();
+            assert_eq!(
+                edts.start, tkhd.end,
+                "the edit list follows the track header"
+            );
+            let elst = &edited[edts.body + 8..edts.end];
+            // version 1, one entry: duration, media time, rate 1.0.
+            assert_eq!(elst[..8], [1, 0, 0, 0, 0, 0, 0, 1]);
+            assert_eq!(elst[8..16], duration_ms.to_be_bytes());
+            assert_eq!(elst[16..24], media_time.to_be_bytes());
+            assert_eq!(elst[24..], [0, 1, 0, 0]);
+            find_box(&edited, trak.body, trak.end, *b"mdia", "mdia").unwrap();
+            from = trak.end;
+        }
+        find_box(&edited, from, moov.end, *b"mvex", "mvex").unwrap();
+        // One edit touches the first track alone; three are one too many.
+        let one = with_edit_lists(&init, &[edit(3_000, 2_000)]).unwrap();
+        assert_eq!(one, with_edit_list(&init, 3_000, 2_000).unwrap());
+        assert_eq!(
+            with_edit_lists(&init, &[edit(0, 1), edit(0, 1), edit(0, 1)]),
+            Err(ExportError::Malformed("trak"))
+        );
+    }
+
+    /// A fragment of `count` sync samples of 1,440 ticks, each one byte
+    /// holding its index, as an audio fragment is.
+    fn sound(count: u8) -> (Vec<u8>, FragmentHeader) {
+        let samples: Vec<Sample> = (0..count)
+            .map(|index| Sample {
+                data: Bytes::copy_from_slice(&[index]),
+                duration: 1440,
+                is_sync: true,
+            })
+            .collect();
+        let header = FragmentHeader {
+            sequence: 9,
+            decode_time: 90_000,
+            wall: WallUs::new(1_700_000_000_000_000),
+        };
+        let encoded = encode_fragment(&header, &samples).unwrap();
+        let mut bytes = encoded.prefix.to_vec();
+        for sample in &samples {
+            bytes.extend_from_slice(&sample.data);
+        }
+        bytes.extend_from_slice(&encoded.trailer);
+        (bytes, header)
+    }
+
+    /// The sample bytes of a fragment whose samples are one byte each.
+    fn payload(fragment: &[u8]) -> Vec<u8> {
+        let info = parse_fragment(fragment).unwrap();
+        let from = usize::try_from(info.payload_offset).unwrap();
+        fragment[from..from + usize::from(info.sample_count)].to_vec()
+    }
+
+    /// The start of an all-sync fragment is cut at a sample boundary: the
+    /// first sample kept is the first that starts at or after the skip, and
+    /// the remainder starts later by what was left out, in decode time and
+    /// in wall time, with every sample still a sync sample.
+    #[test]
+    fn head_trimming_keeps_the_samples_that_start_at_or_after_the_skip() {
+        let (bytes, header) = sound(5);
+        for (skip, omitted, kept) in [
+            (0, 0, &[0u8, 1, 2, 3, 4][..]),
+            (1, 1440, &[1, 2, 3, 4]),
+            (1440, 1440, &[1, 2, 3, 4]),
+            (1441, 2880, &[2, 3, 4]),
+            (5760, 5760, &[4]),
+        ] {
+            let TrimmedStart {
+                fragment: rest,
+                omitted_ticks: left_out,
+            } = trim_fragment_start(bytes.clone(), MediaTicks::new(skip)).unwrap();
+            assert_eq!(left_out, omitted, "skip {skip}");
+            assert_eq!(payload(&rest), kept, "skip {skip}");
+            let info = parse_fragment(&rest).unwrap();
+            assert_eq!(info.sequence, header.sequence);
+            assert_eq!(info.decode_time, header.decode_time + omitted);
+            assert_eq!(
+                info.wall,
+                Some(
+                    header
+                        .wall
+                        .offset(i64::try_from(omitted).unwrap() * 100 / 9)
+                ),
+                "skip {skip}"
+            );
+            assert_eq!(info.duration, 7200 - u32::try_from(omitted).unwrap());
+            assert!(info.all_sync && info.starts_with_sync, "skip {skip}");
+            validated_fragment(&rest).expect("the remainder's checksum holds");
+        }
+        // No sample starts at or after the last one's start plus a tick.
+        for skip in [5761, 7200, 90_000] {
+            assert_eq!(
+                trim_fragment_start(bytes.clone(), MediaTicks::new(skip)),
+                Err(ExportError::InvalidDuration),
+                "skip {skip}"
+            );
+        }
+        assert_eq!(
+            trim_fragment_start(bytes.clone(), MediaTicks::new(-1)),
+            Err(ExportError::InvalidDuration)
+        );
+        // A decode time that the cut would carry past the field is refused.
+        let mut late = bytes.clone();
+        rebase_fragment(&mut late, 9, u64::MAX - 1_000).unwrap();
+        assert_eq!(
+            trim_fragment_start(late.clone(), MediaTicks::new(1)),
+            Err(ExportError::Malformed("tfdt"))
+        );
+        assert!(trim_fragment_start(late, MediaTicks::new(0)).is_ok());
+        // A fragment that starts a group of pictures cannot lose its start.
+        assert_eq!(
+            trim_fragment_start(fragment(1, 0), MediaTicks::new(3000)),
+            Err(ExportError::NotAllSync)
+        );
+        let mut corrupt = bytes;
+        let last = corrupt.len() - TRAILER_LEN - 1;
+        corrupt[last] ^= 1;
+        assert_eq!(
+            trim_fragment_start(corrupt, MediaTicks::new(1440)),
+            Err(ExportError::Malformed("checksum"))
+        );
+    }
+
+    /// Cutting the end of an all-sync fragment leaves every sample a sync
+    /// sample; cutting the end of a group of pictures leaves the first alone.
+    #[test]
+    fn tail_trimming_keeps_the_sync_samples_of_the_fragment() {
+        let (bytes, header) = sound(5);
+        let cut = trim_fragment_end(bytes, header, MediaTicks::new(4000)).unwrap();
+        let info = parse_fragment(&cut).unwrap();
+        assert_eq!((info.sample_count, info.duration), (3, 4000));
+        assert!(info.all_sync);
+        let pictures = trim_fragment_end(fragment(1, 0), header, MediaTicks::new(6000)).unwrap();
+        let info = parse_fragment(&pictures).unwrap();
+        assert_eq!(info.sample_count, 2);
+        assert!(info.starts_with_sync && !info.all_sync);
     }
 }

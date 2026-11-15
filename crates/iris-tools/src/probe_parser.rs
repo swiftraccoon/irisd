@@ -813,6 +813,131 @@ mod tests {
     }
 
     #[test]
+    fn the_response_limits_are_64_kib_and_4_mib() {
+        assert_eq!((MAX_RTSP_HEADER, MAX_RTSP_BODY), (65_536, 4_194_304));
+    }
+
+    #[test]
+    fn an_element_opens_after_a_bracket_or_a_short_prefix() {
+        assert!(opens_element(b"<"));
+        assert!(opens_element(b"x <tt:"));
+        let longest = format!("<{}:", "p".repeat(MAX_XML_PREFIX));
+        assert!(opens_element(longest.as_bytes()));
+        for closed in [&b""[..], b"x", b"</tt:", b"tt:", b":", b"< tt:", b"a tt:"] {
+            assert!(!opens_element(closed), "{closed:?}");
+        }
+        let too_long = format!("<{}:", "p".repeat(MAX_XML_PREFIX + 1));
+        assert!(!opens_element(too_long.as_bytes()));
+    }
+
+    #[test]
+    fn camera_utc_rejects_each_field_out_of_range_alone() {
+        for (field, valid, invalid) in [
+            ("Hour", "1", "24"),
+            ("Minute", "2", "60"),
+            ("Second", "3", "60"),
+            ("Year", "1970", "0"),
+            ("Month", "1", "13"),
+        ] {
+            let response = UTC.replace(
+                &format!("<tt:{field}>{valid}<"),
+                &format!("<tt:{field}>{invalid}<"),
+            );
+            assert_ne!(response, UTC, "{field}");
+            assert_eq!(camera_utc(&response), None, "{field}");
+        }
+    }
+
+    /// Two CSRCs, a one-word extension, three payload bytes, two of padding.
+    #[test]
+    fn rtp_packet_steps_over_csrcs_extension_and_padding() {
+        let mut packet = vec![0x80 | 0x20 | 0x10 | 2, 96, 0, 1, 0, 0, 0, 2, 0, 0, 0, 3];
+        packet.extend_from_slice(&[0xff; 8]);
+        packet.extend_from_slice(&[0xbe, 0xde, 0, 1, 9, 9, 9, 9]);
+        packet.extend_from_slice(&[1, 2, 3, 0, 2]);
+        let read = rtp_packet(&packet).unwrap();
+        assert!(read.extension && read.padded && !read.marker);
+        assert_eq!(read.payload, 28..31);
+        // Padding may take everything after the header, and no more.
+        let mut all_padding = rtp(0xa0, 14);
+        all_padding[13] = 2;
+        assert_eq!(rtp_packet(&all_padding).unwrap().payload, 12..12);
+        all_padding[13] = 3;
+        assert!(rtp_packet(&all_padding).is_err());
+        // An extension header cut short is refused before it is read.
+        assert!(rtp_packet(&rtp(0x90, 14)).is_err());
+    }
+
+    #[test]
+    fn a_response_head_is_found_up_to_the_limit_and_refused_past_it() {
+        let response = |head_len: usize| {
+            let mut head = b"RTSP/1.0 200 OK\r\nX: ".to_vec();
+            head.resize(head_len, b'a');
+            head.extend_from_slice(b"\r\n\r\n");
+            head
+        };
+        let frame = rtsp_response(&response(MAX_RTSP_HEADER)).unwrap().unwrap();
+        assert_eq!(frame.head_end, MAX_RTSP_HEADER);
+        assert!(rtsp_response(&response(MAX_RTSP_HEADER + 1)).is_err());
+    }
+
+    #[test]
+    fn demultiplex_takes_whole_items_at_their_exact_lengths() {
+        assert_eq!(
+            demultiplex(b"$\x01\x00\x00").unwrap(),
+            Interleaved::Data {
+                channel: 1,
+                payload: 4..4
+            }
+        );
+        assert_eq!(
+            demultiplex(b"$\x02\x00\x02ab").unwrap(),
+            Interleaved::Data {
+                channel: 2,
+                payload: 4..6
+            }
+        );
+        // Four bytes of noise may be the start of a response split across reads.
+        assert_eq!(demultiplex(b"abcd").unwrap(), Interleaved::Incomplete);
+        assert_eq!(demultiplex(b"abcde").unwrap(), Interleaved::Skip(1));
+    }
+
+    #[test]
+    fn challenge_parameters_may_be_separated_by_spaces_alone() {
+        let head =
+            "RTSP/1.0 401 Unauthorized\r\nWWW-Authenticate: Digest realm=\"a=b\" nonce=\"n\"";
+        assert_eq!(
+            digest_challenge(head),
+            Some(DigestChallenge {
+                realm: "a=b".into(),
+                nonce: "n".into()
+            })
+        );
+    }
+
+    #[test]
+    fn aggregation_units_are_stepped_by_their_sizes() {
+        let payload = [48 << 1, 1, 0, 3, 32 << 1, 1, 7, 0, 4, 33 << 1, 1, 7, 7];
+        assert_eq!(h265_payload(&payload).unwrap().nal_types, [32, 33]);
+    }
+
+    #[test]
+    fn only_a_sender_report_long_enough_carries_its_fields() {
+        // A sender report of two words, then a 28-byte packet of another type.
+        let mut data = vec![0x80, 200, 0, 1, 0, 0, 0, 1];
+        data.extend_from_slice(&[0x80, 204, 0, 6]);
+        data.extend_from_slice(&[0xff; 24]);
+        let packets = rtcp_packets(&data).unwrap();
+        assert_eq!(
+            packets
+                .iter()
+                .map(|packet| (packet.packet_type, packet.sender_report.is_some()))
+                .collect::<Vec<_>>(),
+            [(200, false), (204, false)]
+        );
+    }
+
+    #[test]
     fn timestamps_wrap_forward_and_step_back() {
         let mut timeline = TimestampUnwrapper::default();
         assert_eq!(timeline.extend(u32::MAX - 1), i64::from(u32::MAX) - 1);

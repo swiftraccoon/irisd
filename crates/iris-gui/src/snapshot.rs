@@ -1,5 +1,6 @@
-//! A private HTTP endpoint for one immutable VOD playlist. Only the manifest is
-//! local: the body's init and media URIs are absolute URLs on the API origin
+//! A private HTTP endpoint for one immutable VOD playlist, or for a video and
+//! an audio playlist under a multivariant one. Only the manifests are local:
+//! a body's init and media URIs are absolute URLs on the API origin
 //! ([`crate::api::VodPlaylist::body`]), so GStreamer fetches media from the
 //! daemon.
 
@@ -18,6 +19,8 @@ use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
 use url::Url;
 
+use crate::vod;
+
 /// Serves the same playlist on every fetch until the playback owner drops it.
 ///
 /// The loopback route has a 256-bit OS-random capability because its body can
@@ -26,6 +29,8 @@ use url::Url;
 pub struct Snapshot {
     url: Url,
     server: JoinHandle<()>,
+    /// Whether the snapshot names an audio playlist beside the video's.
+    audio: bool,
 }
 
 impl fmt::Debug for Snapshot {
@@ -41,6 +46,32 @@ impl Snapshot {
     /// URI in `body` must be absolute: a relative one would resolve against the
     /// loopback endpoint, which serves nothing but the playlist.
     pub async fn new(body: String) -> anyhow::Result<Self> {
+        Self::serve(body, Vec::new()).await
+    }
+
+    /// Starts a listener for a video playlist played with an audio playlist:
+    /// the snapshot's URL is a multivariant playlist that names the two
+    /// bodies beside it ([`vod::multivariant_playlist`]). Every URI in either
+    /// body must be absolute, as for [`Snapshot::new`].
+    pub async fn with_audio(video: String, audio: String) -> anyhow::Result<Self> {
+        let multivariant = vod::multivariant_playlist(&video, &audio);
+        let mut snapshot = Self::serve(
+            multivariant,
+            vec![(vod::VIDEO_PLAYLIST, video), (vod::AUDIO_PLAYLIST, audio)],
+        )
+        .await?;
+        snapshot.audio = true;
+        Ok(snapshot)
+    }
+
+    /// Whether the snapshot plays with audio ([`Snapshot::with_audio`]).
+    pub fn has_audio(&self) -> bool {
+        self.audio
+    }
+
+    /// Serves `body` at the snapshot's URL and each of `beside` under its
+    /// name in the same private directory.
+    async fn serve(body: String, beside: Vec<(&'static str, String)>) -> anyhow::Result<Self> {
         let mut random = [0; 32];
         getrandom::fill(&mut random).context("creating a private playback route")?;
         let mut capability = String::with_capacity(64);
@@ -56,14 +87,23 @@ impl Snapshot {
         let path = format!("/{capability}/vod.m3u8");
         let url = Url::parse(&format!("http://{address}{path}"))
             .context("building the playback snapshot URL")?;
-        let app = Router::new()
-            .route(&path, routing::get(playlist))
-            .with_state(Bytes::from(body));
+        let mut app =
+            Router::new().route(&path, routing::get(playlist).with_state(Bytes::from(body)));
+        for (name, body) in beside {
+            app = app.route(
+                &format!("/{capability}/{name}"),
+                routing::get(playlist).with_state(Bytes::from(body)),
+            );
+        }
         let server = tokio::spawn(async move {
             // A listener failure reaches GStreamer as a failed playlist request.
             let _ = axum::serve(listener, app).await;
         });
-        Ok(Self { url, server })
+        Ok(Self {
+            url,
+            server,
+            audio: false,
+        })
     }
 
     /// The capability URL given only to the media player.
@@ -156,5 +196,39 @@ mod tests {
             .unwrap()
             .to_owned();
         assert!(!shown.contains(&capability), "{shown}");
+    }
+
+    /// With audio, the snapshot's URL is a multivariant playlist and the two
+    /// media playlists it names are served beside it, and nothing else is.
+    #[tokio::test]
+    async fn a_snapshot_with_audio_serves_the_multivariant_playlist_and_both_bodies() {
+        let video = "#EXTM3U\n#EXTINF:2.00000,\nhttp://192.0.2.1/v.mp4?token=video-token\n";
+        let audio = "#EXTM3U\n#EXTINF:2.00000,\nhttp://192.0.2.1/a.mp4?token=audio-token\n";
+        let snapshot = Snapshot::with_audio(video.to_owned(), audio.to_owned())
+            .await
+            .unwrap();
+        let fetch = |url: Url| async move {
+            let response = http().get(url).send().await.unwrap();
+            (response.status(), response.text().await.unwrap())
+        };
+        let (status, multivariant) = fetch(snapshot.url().clone()).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            multivariant.contains("URI=\"audio.m3u8\""),
+            "{multivariant}"
+        );
+        assert!(multivariant.ends_with("video.m3u8\n"), "{multivariant}");
+        assert!(!multivariant.contains("token"), "{multivariant}");
+        for (name, body) in [("video.m3u8", video), ("audio.m3u8", audio)] {
+            let (status, text) = fetch(snapshot.url().join(name).unwrap()).await;
+            assert_eq!((status, text.as_str()), (StatusCode::OK, body), "{name}");
+        }
+        let (status, text) = fetch(snapshot.url().join("other.m3u8").unwrap()).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert!(!text.contains("token"));
+        // A video-only snapshot serves neither name.
+        let alone = Snapshot::new(video.to_owned()).await.unwrap();
+        let (status, _) = fetch(alone.url().join("audio.m3u8").unwrap()).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
     }
 }

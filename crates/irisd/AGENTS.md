@@ -43,8 +43,9 @@ Scope: this crate only. Read the root `AGENTS.md` first.
   `capability::load_or_create` then reads or creates), and `cameras.toml`; it must run before any
   SQLite connection, because SQLite copies the database file's mode to the WAL and shared-memory
   files it creates.
-- The watchdog ping is gated on every stream having made progress since the last check
-  (`all_streams_progressed`); never ping unconditionally.
+- The watchdog ping is gated on every stream's task having noted that it is alive since the
+  last check (`all_streams_progressed`, `StreamStats::beats`); never ping unconditionally,
+  and never gate it on what a camera does (frames, reconnections).
 - Retention order and bounds (event maintenance, free-space floor, quota, age; oldest sealed first;
   at most 512 attempts, 64 pages, 1,024 raw scanned candidate rows, or one second per pass) follow
   `docs/research/04-storage-format.md §8`. Event protection is the catalog's: the candidate SQL
@@ -109,7 +110,7 @@ Scope: this crate only. Read the root `AGENTS.md` first.
 - `main.rs` — command line and subcommand dispatch.
 - `run.rs` — the daemon: start-up, task spawning, the monitor loop, statistics lines, shutdown.
 - `record.rs` — `irisd record`, ingest to disk without the catalog or API.
-- `inspect.rs`, `recover.rs`, `hls.rs`, `serve.rs` — the offline subcommands.
+- `inspect.rs`, `clocks.rs`, `recover.rs`, `hls.rs`, `serve.rs` — the offline subcommands.
 - `adopt.rs` — start-up reconciliation of the catalog with the files on disk.
 - `catalog_observer.rs` — store notifications and camera events into the catalog.
 - `retention.rs` — the retention pass and its report.
@@ -160,7 +161,7 @@ A change to the statistics lines is checked by feeding a log to
   whole struct will not compile.
 - A camera opens one RTSP session per recorded stream (at most two), started by
   `StreamSpawner::spawn` for configured and added cameras alike; the limit is three per camera,
-  and the family of cameras described in `docs/research/01-camera-probe.md §5b` drops its sub
+  and a camera of the kind described in `docs/research/01-camera-probe.md §5b` drops its sub
   stream when another session opens.
 - `add_camera` awaits one catalog round trip and one store rewrite on the blocking pool, both
   bounded (the catalog busy timeout, the disk); nothing else in the control handlers awaits.

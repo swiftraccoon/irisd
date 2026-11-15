@@ -25,9 +25,11 @@
 //! `--allow-insecure-http` is given.
 
 mod api;
+mod fragment;
 mod live;
 mod playback;
 mod snapshot;
+mod sound;
 mod stage;
 mod thumbs;
 mod tile;
@@ -122,6 +124,10 @@ struct Args {
     /// With `--focus`, open the playback view instead of the live view.
     #[arg(long, requires = "focus")]
     playback: bool,
+    /// Discard a camera's audio in playback and in the focused live view
+    /// instead of playing it.
+    #[arg(long)]
+    mute: bool,
     /// Length of the playback window in minutes, 1 to 10,080 (seven days, the
     /// API's longest range), ending at the time the view opens.
     #[arg(
@@ -151,6 +157,7 @@ impl fmt::Debug for Args {
             .field("live_budget_mib", &self.live_budget_mib)
             .field("focus", &self.focus)
             .field("playback", &self.playback)
+            .field("mute", &self.mute)
             .field("window", &self.window)
             .field("export_to", &self.export_to)
             .finish()
@@ -183,6 +190,8 @@ enum Event {
     AddCamera,
     /// The "Remove camera" button of the focused view.
     RemoveFocused,
+    /// The "Sound" button of the focused view changed.
+    SoundToggled,
     /// Show the grid.
     Grid,
 }
@@ -211,6 +220,9 @@ struct Views {
     cameras: Vec<Camera>,
     /// The focused view's "Remove camera" button, shown for added cameras.
     remove_button: gtk::Button,
+    /// The focused view's "Sound" button: whether the view plays the
+    /// camera's sound with its picture.
+    sound_button: gtk::ToggleButton,
 }
 
 /// The GTK renderer the viewer runs on. The GL renderer shows the sink's GL
@@ -329,6 +341,9 @@ fn select_renderer() {
 fn main() -> glib::ExitCode {
     select_renderer();
     let args = Args::parse();
+    if args.mute {
+        sound::mute();
+    }
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
     tracing_subscriber::registry()
         .with(filter)
@@ -386,7 +401,8 @@ fn build_window(
     tls: &Arc<ClientConfig>,
 ) {
     let (tx, rx) = async_channel::unbounded::<Event>();
-    let (column, stack, grid, focus_box, focus_title, status, remove_button) = build_widgets(&tx);
+    let (column, stack, grid, focus_box, focus_title, status, remove_button, sound_button) =
+        build_widgets(&tx);
     let window = gtk::ApplicationWindow::builder()
         .application(app)
         .title("irisd")
@@ -426,6 +442,7 @@ fn build_window(
         tls: Arc::clone(tls),
         cameras: Vec::new(),
         remove_button,
+        sound_button,
     }));
     glib::spawn_future_local(run_events(views, args.clone(), rx));
 }
@@ -490,6 +507,7 @@ async fn run_events(views: Rc<RefCell<Views>>, args: Args, rx: Receiver<Event>) 
             }
             Event::Status(text) => views.borrow().status.set_label(&text),
             Event::Focus(camera) => focus(&mut views.borrow_mut(), &camera, &args),
+            Event::SoundToggled => start_focused(&views.borrow(), &args),
             Event::PlaybackFocused => {
                 let camera = views
                     .borrow()
@@ -1294,6 +1312,7 @@ fn build_widgets(
     gtk::Label,
     gtk::Label,
     gtk::Button,
+    gtk::ToggleButton,
 ) {
     let grid = gtk::Grid::builder()
         .column_homogeneous(true)
@@ -1317,9 +1336,20 @@ fn build_widgets(
     let back = button("Back to grid", || Event::Grid);
     let playback = button("Playback", || Event::PlaybackFocused);
     let remove = button("Remove camera", || Event::RemoveFocused);
+    // On: the view plays the camera's sound and holds the picture with it.
+    // Off: the picture alone, shown as it is decoded.
+    let sound = gtk::ToggleButton::with_label("Sound");
+    sound.set_active(true);
+    sound.connect_toggled({
+        let tx = tx.clone();
+        move |_| {
+            let _ = tx.try_send(Event::SoundToggled);
+        }
+    });
     let focus_title = gtk::Label::builder().xalign(0.0).hexpand(true).build();
     focus_header.append(&back);
     focus_header.append(&playback);
+    focus_header.append(&sound);
     focus_header.append(&remove);
     focus_header.append(&focus_title);
     focus_box.append(&focus_header);
@@ -1342,7 +1372,16 @@ fn build_widgets(
     let column = gtk::Box::new(gtk::Orientation::Vertical, 0);
     column.append(&stack);
     column.append(&status);
-    (column, stack, grid, focus_box, focus_title, status, remove)
+    (
+        column,
+        stack,
+        grid,
+        focus_box,
+        focus_title,
+        status,
+        remove,
+        sound,
+    )
 }
 
 fn feed(args: &Args, tls: &Arc<ClientConfig>, camera: &CameraId, kind: StreamKind) -> Feed {
@@ -1352,6 +1391,32 @@ fn feed(args: &Args, tls: &Arc<ClientConfig>, camera: &CameraId, kind: StreamKin
         camera: camera.clone(),
         kind,
         tls: Arc::clone(tls),
+    }
+}
+
+/// Whether the daemon lists `camera` with recorded audio.
+fn has_audio(cameras: &[Camera], camera: &CameraId) -> bool {
+    cameras
+        .iter()
+        .any(|known| &known.id == camera && known.has_audio)
+}
+
+/// Starts the focused tile, or starts it over: with the camera's sound while
+/// the "Sound" button is on, and the picture alone while it is off or the
+/// camera has no audio.
+fn start_focused(views: &Views, args: &Args) {
+    let Some(tile) = views.focused.as_ref() else {
+        return;
+    };
+    let camera = tile.camera();
+    let picture = feed(args, &views.tls, camera, args.focus_kind);
+    let started = if views.sound_button.is_active() && has_audio(&views.cameras, camera) {
+        tile.start_with_sound(picture, feed(args, &views.tls, camera, StreamKind::Audio))
+    } else {
+        tile.start(picture)
+    };
+    if let Err(error) = started {
+        error!(camera = %camera, error = %format!("{error:#}"), "cannot start the focused tile");
     }
 }
 
@@ -1433,6 +1498,10 @@ fn focus(views: &mut Views, camera: &CameraId, args: &Args) {
         .iter()
         .any(|known| &known.id == camera && known.provisioned);
     views.remove_button.set_visible(provisioned);
+    // The "Sound" button is for a camera that has sound to play.
+    views
+        .sound_button
+        .set_visible(has_audio(&views.cameras, camera));
     let tile = Tile::new(
         camera,
         &name,
@@ -1444,10 +1513,8 @@ fn focus(views: &mut Views, camera: &CameraId, args: &Args) {
         .focus_title
         .set_label(&format!("{name} ({camera}), {} stream", args.focus_kind));
     views.focus_box.append(tile.widget());
-    if let Err(error) = tile.start(feed(args, &views.tls, camera, args.focus_kind)) {
-        error!(camera = %camera, error = %format!("{error:#}"), "cannot start the focused tile");
-    }
     views.focused = Some(tile);
+    start_focused(views, args);
     views.stack.set_visible_child_name("focus");
     info!(camera = %camera, kind = %args.focus_kind, "camera focused");
 }
@@ -1482,6 +1549,7 @@ mod tests {
         navigation_event_cancels_a_stalled_playback_request();
         grid_decodes_at_most_max_tiles_feeds();
         the_remove_button_shows_only_for_provisioned_cameras();
+        the_sound_button_starts_the_focused_view_with_or_without_sound();
         closing_the_add_camera_dialog_releases_it_and_its_form();
     }
 
@@ -1494,6 +1562,7 @@ mod tests {
             id: camera(id),
             name: format!("Camera {id}"),
             provisioned,
+            has_audio: true,
         }
     }
 
@@ -1940,7 +2009,8 @@ mod tests {
 
     /// Views over fresh widgets whose client and feeds talk to `api`.
     fn test_views(runtime: &Arc<Runtime>, api: &Url, tx: Sender<Event>) -> Views {
-        let (_, stack, grid, focus_box, focus_title, status, remove_button) = build_widgets(&tx);
+        let (_, stack, grid, focus_box, focus_title, status, remove_button, sound_button) =
+            build_widgets(&tx);
         Views {
             stack,
             grid,
@@ -1960,6 +2030,7 @@ mod tests {
             tls: iris_tls::client_config(None).unwrap(),
             cameras: Vec::new(),
             remove_button,
+            sound_button,
         }
     }
 
@@ -2012,6 +2083,50 @@ mod tests {
         assert!(views.remove_button.is_visible());
         focus(&mut views, &camera("configured"), &args);
         assert!(!views.remove_button.is_visible());
+        leave_views(&mut views);
+    }
+
+    /// Under a display: the focused view plays the camera's sound while its
+    /// "Sound" button is on, and starts over with the picture alone when the
+    /// button is turned off, and with the sound when it is turned on again.
+    fn the_sound_button_starts_the_focused_view_with_or_without_sound() {
+        init_gtk_and_gstreamer();
+        let runtime = Arc::new(Runtime::new().unwrap());
+        let api = Url::parse("http://127.0.0.1:9").unwrap();
+        let (tx, rx) = async_channel::unbounded();
+        let mut views = test_views(&runtime, &api, tx);
+        let mut args = Args::try_parse_from(["iris-gui"]).unwrap();
+        args.api = api;
+        let cameras = [listed("cam1", false)];
+        views.cameras = cameras.to_vec();
+        populate_grid(&mut views, &cameras, &args);
+        focus(&mut views, &camera("cam1"), &args);
+        let has_sound = |views: &Views| views.focused.as_ref().map(Tile::has_sound);
+        assert_eq!(has_sound(&views), Some(true));
+        while rx.try_recv().is_ok() {}
+        views.sound_button.set_active(false);
+        assert!(matches!(rx.try_recv(), Ok(Event::SoundToggled)));
+        start_focused(&views, &args);
+        assert_eq!(has_sound(&views), Some(false));
+        assert!(views.focused.as_ref().is_some_and(Tile::is_running));
+        views.sound_button.set_active(true);
+        start_focused(&views, &args);
+        assert_eq!(has_sound(&views), Some(true));
+        // Another camera is focused with the button as it stands.
+        views.sound_button.set_active(false);
+        focus(&mut views, &camera("cam1"), &args);
+        assert_eq!(has_sound(&views), Some(false));
+        assert!(views.sound_button.is_visible());
+        // A camera without audio has no button and no sound, whatever the
+        // button was left at.
+        views.sound_button.set_active(true);
+        views.cameras = vec![Camera {
+            has_audio: false,
+            ..listed("cam1", false)
+        }];
+        focus(&mut views, &camera("cam1"), &args);
+        assert!(!views.sound_button.is_visible());
+        assert_eq!(has_sound(&views), Some(false));
         leave_views(&mut views);
     }
 

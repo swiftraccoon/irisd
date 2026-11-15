@@ -1,6 +1,12 @@
 //! End-to-end tests over the router with a real catalog and recording in a
 //! temporary directory.
 
+#![expect(
+    clippy::missing_assert_message,
+    clippy::unwrap_used,
+    reason = "a helper of a test fails as the test does, by panicking"
+)]
+
 use std::collections::HashMap;
 use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
 use std::path::{Path, PathBuf};
@@ -18,7 +24,7 @@ use iris_core::event::{Event, EventKind, EventSource, EventState};
 use iris_core::id::{CameraId, StreamKey, StreamKind};
 use iris_core::time::WallUs;
 use iris_ingest::{LiveFrame, LiveRing};
-use iris_mp4::fragment::{Fragment, Sample};
+use iris_mp4::fragment::{Fragment, FrameSteps, Sample};
 use iris_mp4::index::{MAX_PERSISTED_INDEX_RECORDS, read_index_bounded};
 use iris_mp4::init::SampleEntry;
 use iris_store::{ApprovedRoot, RootExpectation, StoragePolicy, WriterHandle};
@@ -73,6 +79,7 @@ fn fragment(index: u64, entry: &Arc<SampleEntry>) -> Fragment {
         wall: wall(index),
         raw_rtp: 42,
         new_run: index == 0,
+        steps: FrameSteps::default(),
         sample_entry: Arc::clone(entry),
     }
 }
@@ -2241,12 +2248,24 @@ async fn camera_detail_reports_stream_health() {
     let stream_stats = Arc::new(iris_ingest::StreamStats::default());
     state.live.insert(key(), LiveRing::new(8));
     state.live.insert_stats(key(), stream_stats);
+    let live = Arc::clone(&state.live);
     let app = router(state);
     let response = get(&app, "/api/cameras/cam1".into(), None).await;
     assert_eq!(response.status(), StatusCode::OK);
     let text = body_string(response).await;
     assert!(text.contains("\"id\":\"cam1\""), "{text}");
     assert!(text.contains("\"name\":\"front\""), "{text}");
+    // A camera has audio when the daemon has a live ring for it.
+    assert!(text.contains("\"has_audio\":false"), "{text}");
+    live.insert(
+        StreamKey {
+            kind: StreamKind::Audio,
+            ..key()
+        },
+        LiveRing::new(8),
+    );
+    let listed = body_string(get(&app, "/api/cameras".into(), None).await).await;
+    assert!(listed.contains("\"has_audio\":true"), "{listed}");
     assert!(text.contains("\"kind\":\"main\""), "{text}");
     assert!(text.contains("\"connected\":false"), "{text}");
     assert!(text.contains("\"live_viewers\":0"), "{text}");
@@ -2521,4 +2540,827 @@ async fn event_http_cursor_crosses_an_equal_timestamp_page_boundary() {
         );
     }
     catalog.shutdown();
+}
+
+/// An `mp4a` sample entry through its sampling rate: one channel, 16 bits,
+/// 64 kHz.
+fn audio_entry() -> Arc<SampleEntry> {
+    Arc::new(SampleEntry::audio(
+        Bytes::from_static(
+            b"\0\0\0\x24mp4a\0\0\0\0\0\0\0\x01\0\0\0\0\0\0\0\0\0\x01\0\x10\0\0\0\0\xfa\0\0\0",
+        ),
+        "mp4a.40.2".into(),
+    ))
+}
+
+/// Two seconds of audio that starts 5 ms into video fragment `index`: 125
+/// frames of 16 ms on the video's timeline.
+fn audio_fragment(index: u64, entry: &Arc<SampleEntry>) -> Fragment {
+    Fragment {
+        samples: (0..125)
+            .map(|_| Sample {
+                data: Bytes::from_static(&[0x21, 0x10, 0x04, 0x60, 0x8c, 0x1c]),
+                duration: 1_440,
+                is_sync: true,
+            })
+            .collect(),
+        decode_time: index * 180_000 + 450,
+        wall: wall(index).offset(5_000),
+        raw_rtp: 7,
+        new_run: index == 0,
+        steps: FrameSteps::default(),
+        sample_entry: Arc::clone(entry),
+    }
+}
+
+/// Records video fragments and, beside them, audio fragments of the same
+/// camera through one writer, and registers every sealed file under the
+/// stream its directory names.
+async fn record_camera(
+    dir: &Path,
+    catalog: &CatalogHandle,
+    video: Vec<Fragment>,
+    audio: Vec<Fragment>,
+) {
+    let root = recording_root(dir);
+    let root = root.path();
+    let audio_key = StreamKey {
+        camera: key().camera,
+        kind: StreamKind::Audio,
+    };
+    let entries: HashMap<u32, Arc<SampleEntry>> = video
+        .iter()
+        .chain(&audio)
+        .map(|f| (f.sample_entry.hash, Arc::clone(&f.sample_entry)))
+        .collect();
+    let writer = WriterHandle::spawn(
+        root.to_owned(),
+        StoragePolicy {
+            sync_interval: Duration::from_secs(5),
+            preallocate_bytes: 1 << 20,
+            rotate_bytes: 1 << 30,
+            rotate_age: Duration::from_secs(3600),
+        },
+        16,
+    )
+    .unwrap();
+    for fragment in video {
+        writer.try_send(key(), fragment).unwrap();
+    }
+    for fragment in audio {
+        writer.try_send(audio_key.clone(), fragment).unwrap();
+    }
+    tokio::task::spawn_blocking(move || writer.shutdown())
+        .await
+        .unwrap()
+        .unwrap();
+    for path in find_mp4s(root) {
+        let (header, records) = read_index_bounded(
+            &iris_store::layout::index_path(&path),
+            MAX_PERSISTED_INDEX_RECORDS,
+        )
+        .unwrap();
+        let is_audio = path.components().any(|part| part.as_os_str() == "audio");
+        catalog.notify(Change::SegmentOpened {
+            key: if is_audio { audio_key.clone() } else { key() },
+            path: path.clone(),
+            run_seq: header.run_id,
+            discontinuity: records[0].flags & iris_mp4::index::FLAG_DISCONTINUITY_BEFORE != 0,
+            wall_start: records[0].wall,
+            media_start: records[0].decode_time,
+            init_len: header.init_len,
+            sample_entry: Arc::clone(&entries[&header.sample_entry_hash]),
+        });
+        let last = records.last().unwrap();
+        catalog.notify(Change::SegmentSealed {
+            path,
+            len: last.end(),
+            fragments: u32::try_from(records.len()).unwrap(),
+            wall_end: last
+                .wall
+                .offset(iris_core::time::MediaTicks::new(i64::from(last.duration)).as_micros()),
+            media_end: last.decode_time + u64::from(last.duration),
+        });
+    }
+    catalog.total_bytes().await.unwrap();
+}
+
+/// A camera with recorded audio gets a multivariant playlist that declares
+/// the audio as a rendition of the main stream and names both streams' own
+/// playlists for the range; without audio it declares the variant alone.
+#[tokio::test]
+async fn a_camera_playlist_declares_recorded_audio_as_a_rendition() {
+    let dir = tempfile::tempdir().unwrap();
+    let catalog = CatalogHandle::open(&dir.path().join("c.db")).unwrap();
+    catalog
+        .ensure_camera(&key().camera, "Example", None)
+        .await
+        .unwrap();
+    let video_entry = entry();
+    let sound_entry = audio_entry();
+    record_camera(
+        dir.path(),
+        &catalog,
+        (0..3).map(|i| fragment(i, &video_entry)).collect(),
+        (0..3).map(|i| audio_fragment(i, &sound_entry)).collect(),
+    )
+    .await;
+    let app = router(state(dir.path(), catalog.clone(), vec!["t".into()]));
+    let (from, to) = (wall(0).get(), wall(3).get());
+
+    let response = get(
+        &app,
+        format!("/api/cameras/cam1/hls/vod.m3u8?from={from}&to={to}"),
+        None,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers()[header::CONTENT_TYPE],
+        "application/vnd.apple.mpegurl"
+    );
+    let text = body_string(response).await;
+    let lines: Vec<&str> = text.lines().collect();
+    let video_uri = format!("/api/streams/cam1/main/hls/vod.m3u8?from={from}&to={to}");
+    let audio_uri = format!("/api/streams/cam1/audio/hls/vod.m3u8?from={from}&to={to}");
+    assert_eq!(lines[..2], ["#EXTM3U", "#EXT-X-VERSION:7"]);
+    assert_eq!(
+        lines[2],
+        format!(
+            "#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"audio\",NAME=\"camera\",LANGUAGE=\"und\",\
+             DEFAULT=YES,AUTOSELECT=YES,CHANNELS=\"1\",URI=\"{audio_uri}\""
+        )
+    );
+    assert!(
+        lines[3].starts_with("#EXT-X-STREAM-INF:BANDWIDTH="),
+        "{text}"
+    );
+    assert!(
+        lines[3]
+            .ends_with(",CODECS=\"hvc1.1.6.L150.B0,mp4a.40.2\",RESOLUTION=640x480,AUDIO=\"audio\""),
+        "{text}"
+    );
+    assert_eq!(lines[4..], [video_uri.as_str()]);
+
+    // The declared bit rate covers both playlists: 2 s fragments of 810
+    // bytes of video and 750 bytes of audio, with their boxes.
+    let bandwidth: u64 = lines[3]
+        .split_once("BANDWIDTH=")
+        .and_then(|(_, rest)| rest.split(',').next())
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!((6_000..20_000).contains(&bandwidth), "{bandwidth}");
+
+    // Each named playlist is the stream's own, and both list six seconds.
+    for uri in [video_uri, audio_uri] {
+        let child = get(&app, uri.clone(), None).await;
+        assert_eq!(child.status(), StatusCode::OK, "{uri}");
+        let child = body_string(child).await;
+        assert!(child.contains("#EXT-X-PLAYLIST-TYPE:VOD"), "{child}");
+        let seconds: f64 = child
+            .lines()
+            .filter_map(|line| line.strip_prefix("#EXTINF:"))
+            .map(|value| value.trim_end_matches(',').parse::<f64>().unwrap())
+            .sum();
+        assert!((seconds - 6.0).abs() < 0.001, "{uri}: {seconds}");
+    }
+
+    // A range without recordings has no playlist.
+    let empty = get(
+        &app,
+        format!(
+            "/api/cameras/cam1/hls/vod.m3u8?from={}&to={}",
+            wall(100).get(),
+            wall(101).get()
+        ),
+        None,
+    )
+    .await;
+    assert_eq!(empty.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn a_camera_playlist_without_audio_declares_the_variant_alone() {
+    let dir = tempfile::tempdir().unwrap();
+    let catalog = CatalogHandle::open(&dir.path().join("c.db")).unwrap();
+    catalog
+        .ensure_camera(&key().camera, "Example", None)
+        .await
+        .unwrap();
+    populate(dir.path(), &catalog).await;
+    let app = router(state(dir.path(), catalog.clone(), vec!["t".into()]));
+    let (from, to) = (wall(0).get(), wall(3).get());
+    let response = get(
+        &app,
+        format!("/api/cameras/cam1/hls/vod.m3u8?from={from}&to={to}"),
+        None,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let text = body_string(response).await;
+    assert!(!text.contains("EXT-X-MEDIA"), "{text}");
+    assert!(
+        text.contains(",CODECS=\"hvc1.1.6.L150.B0\",RESOLUTION=640x480\n"),
+        "{text}"
+    );
+    assert!(text.ends_with(&format!(
+        "/api/streams/cam1/main/hls/vod.m3u8?from={from}&to={to}\n"
+    )));
+
+    // The playlist is behind the token like the others.
+    let bare = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!(
+                    "/api/cameras/cam1/hls/vod.m3u8?from={from}&to={to}"
+                ))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(bare.status(), StatusCode::UNAUTHORIZED);
+}
+
+/// The track id each fragment of an exported body names in its `tfhd`.
+fn track_ids(body: &[u8]) -> Vec<u32> {
+    body.windows(4)
+        .enumerate()
+        .filter(|(_, window)| window == b"tfhd")
+        .map(|(at, _)| u32::from_be_bytes(body[at + 8..at + 12].try_into().unwrap()))
+        .collect()
+}
+
+/// The media time of each edit list in an exported body, in track order.
+fn edit_media_times(body: &[u8]) -> Vec<u64> {
+    body.windows(4)
+        .enumerate()
+        .filter(|(_, window)| window == b"elst")
+        // The type, version and flags, the count, the duration, the time.
+        .map(|(at, _)| u64::from_be_bytes(body[at + 20..at + 28].try_into().unwrap()))
+        .collect()
+}
+
+fn count_of(body: &[u8], kind: [u8; 4]) -> usize {
+    body.windows(4).filter(|window| *window == kind).count()
+}
+
+/// A camera with three fragments of picture and, 5 ms into each, of sound,
+/// behind a router; the directory lives as long as the recordings must.
+async fn camera_with_sound() -> (tempfile::TempDir, axum::Router) {
+    camera_with_sound_flagged(true).await
+}
+
+/// [`camera_with_sound`], with every audio frame flagged a sync sample or,
+/// as a muxer for pictures would write them, only the first of a fragment.
+async fn camera_with_sound_flagged(every_frame_sync: bool) -> (tempfile::TempDir, axum::Router) {
+    camera_with_audio(|_, sound| {
+        for sample in sound.samples.iter_mut().skip(1) {
+            sample.is_sync = every_frame_sync;
+        }
+    })
+    .await
+}
+
+/// A camera with three fragments of picture and three of sound, each of the
+/// sound's as [`audio_fragment`] gives it and `adjust` leaves it.
+async fn camera_with_audio(
+    adjust: impl Fn(u64, &mut Fragment),
+) -> (tempfile::TempDir, axum::Router) {
+    camera_recording(&[0, 1, 2], adjust).await
+}
+
+/// A camera with the picture fragments `pictures`, each after a gap
+/// starting a run, and three fragments of sound, each as
+/// [`audio_fragment`] gives it and `adjust` leaves it.
+async fn camera_recording(
+    pictures: &[u64],
+    adjust: impl Fn(u64, &mut Fragment),
+) -> (tempfile::TempDir, axum::Router) {
+    let dir = tempfile::tempdir().unwrap();
+    let catalog = CatalogHandle::open(&dir.path().join("c.db")).unwrap();
+    catalog
+        .ensure_camera(&key().camera, "Example", None)
+        .await
+        .unwrap();
+    let (video_entry, sound_entry) = (entry(), audio_entry());
+    let video = pictures
+        .iter()
+        .enumerate()
+        .map(|(at, &index)| {
+            let mut picture = fragment(index, &video_entry);
+            picture.new_run = at == 0 || pictures[at - 1] + 1 != index;
+            picture
+        })
+        .collect();
+    record_camera(
+        dir.path(),
+        &catalog,
+        video,
+        (0..3)
+            .map(|i| {
+                let mut sound = audio_fragment(i, &sound_entry);
+                adjust(i, &mut sound);
+                sound
+            })
+            .collect(),
+    )
+    .await;
+    let app = router(state(dir.path(), catalog, vec!["t".into()]));
+    (dir, app)
+}
+
+/// The scan of an exported body, with every checksum verified.
+fn scan_of(bytes: &[u8]) -> iris_mp4::reader::ScanReport {
+    iris_mp4::reader::scan(
+        std::io::Cursor::new(bytes.to_vec()),
+        iris_mp4::reader::ScanOptions {
+            verify_crc: true,
+            collect_samples: false,
+        },
+    )
+    .unwrap()
+}
+
+/// A camera's export holds its main stream as track 1 and its recorded audio
+/// as track 2: each video fragment is followed by the audio that starts
+/// inside it, on one continuous timeline, with sequence numbers over both
+/// tracks; the end of the range trims both.
+#[tokio::test]
+async fn a_camera_export_interleaves_recorded_audio_as_a_second_track() {
+    let (_dir, app) = camera_with_sound().await;
+
+    let (from, to) = (wall(0).get(), wall(3).get());
+    let response = get(
+        &app,
+        format!("/api/cameras/cam1/export.mp4?from={from}&to={to}"),
+        None,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()[header::CONTENT_TYPE], "video/mp4");
+    let disposition = response.headers()[header::CONTENT_DISPOSITION]
+        .to_str()
+        .unwrap()
+        .to_owned();
+    assert!(
+        disposition.starts_with("attachment; filename=\"cam1-2"),
+        "{disposition}"
+    );
+    let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let report = scan_of(&bytes);
+    assert_eq!(report.stop, None);
+    let init = &bytes[..report.init_len as usize];
+    assert_eq!((count_of(init, *b"trak"), count_of(init, *b"trex")), (2, 2));
+    assert_eq!((count_of(init, *b"elst"), count_of(init, *b"mp4a")), (2, 1));
+    let facts: Vec<(u32, u64, u16)> = report
+        .fragments
+        .iter()
+        .map(|f| (f.sequence, f.decode_time, f.sample_count))
+        .collect();
+    assert_eq!(
+        facts,
+        [
+            (1, 0, 2),
+            (2, 450, 125),
+            (3, 180_000, 2),
+            (4, 180_450, 125),
+            (5, 360_000, 2),
+            (6, 360_450, 125),
+        ]
+    );
+    // The sound of a fragment runs 450 ticks past its picture and is cut
+    // only where the export ends, with the last picture.
+    let durations: Vec<u32> = report.fragments.iter().map(|f| f.duration).collect();
+    assert_eq!(
+        durations,
+        [180_000, 180_000, 180_000, 180_000, 180_000, 179_550]
+    );
+    assert_eq!(track_ids(&bytes), [1, 2, 1, 2, 1, 2]);
+
+    // Ending one second into the third video fragment: the picture keeps
+    // one of its two frames and the audio the frames that start before then.
+    let to = wall(2).offset(1_000_000).get();
+    let response = get(
+        &app,
+        format!("/api/cameras/cam1/export.mp4?from={from}&to={to}"),
+        None,
+    )
+    .await;
+    let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let report = scan_of(&bytes);
+    assert_eq!(report.stop, None);
+    let (video_tail, audio_tail) = (&report.fragments[4], &report.fragments[5]);
+    assert_eq!((video_tail.sample_count, video_tail.duration), (1, 90_000));
+    // The audio starts 450 ticks in, so 89,550 ticks are left: 62 whole
+    // frames and one cut short.
+    assert_eq!(
+        (audio_tail.decode_time, audio_tail.sample_count),
+        (360_450, 63)
+    );
+    assert_eq!(audio_tail.duration, 89_550);
+    assert_eq!(track_ids(&bytes), [1, 2, 1, 2, 1, 2]);
+
+    // The stream's own export is the picture alone, as before.
+    let alone = get(
+        &app,
+        format!("/api/streams/cam1/main/export.mp4?from={from}&to={to}"),
+        None,
+    )
+    .await;
+    let alone = to_bytes(alone.into_body(), usize::MAX).await.unwrap();
+    assert_eq!(count_of(&alone, *b"trak"), 1);
+    assert_eq!(track_ids(&alone), [1, 1, 1]);
+}
+
+/// An export that starts inside a fragment hides the picture's start with
+/// an edit list and cuts the sound's: the audio loses the frames that start
+/// before the export does, and its timeline starts at zero there with no
+/// media time in its edit list, as a second track or as a stream alone.
+#[tokio::test]
+async fn an_export_cuts_the_start_of_its_sound() {
+    let (_dir, app) = camera_with_sound().await;
+    // Half a second into the first video fragment.
+    let from = wall(0).offset(500_000).get();
+    let to = wall(3).get();
+    let response = get(
+        &app,
+        format!("/api/cameras/cam1/export.mp4?from={from}&to={to}"),
+        None,
+    )
+    .await;
+    let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let report = scan_of(&bytes);
+    assert_eq!(report.stop, None);
+    assert_eq!(edit_media_times(&bytes), [45_000, 0]);
+    let facts: Vec<(u64, u16, bool)> = report
+        .fragments
+        .iter()
+        .map(|f| (f.decode_time, f.sample_count, f.all_sync))
+        .collect();
+    // The audio starts 450 ticks into the video: 44,550 ticks before the
+    // export does. Its frame 31 is the first to start at or after that, 90
+    // ticks into the export.
+    assert_eq!(
+        facts,
+        [
+            (0, 2, false),
+            (90, 94, true),
+            (180_000, 2, false),
+            (135_450, 125, true),
+            (360_000, 2, false),
+            (315_450, 125, true),
+        ]
+    );
+    assert_eq!(track_ids(&bytes), [1, 2, 1, 2, 1, 2]);
+    assert_eq!(
+        report.fragments[1].wall,
+        Some(wall(0).offset(5_000 + 31 * 16_000))
+    );
+
+    // The audio stream's own export starts the same way, as its one track.
+    let sound = get(
+        &app,
+        format!("/api/streams/cam1/audio/export.mp4?from={from}&to={to}"),
+        None,
+    )
+    .await;
+    assert_eq!(sound.status(), StatusCode::OK);
+    let sound = to_bytes(sound.into_body(), usize::MAX).await.unwrap();
+    let report = scan_of(&sound);
+    assert_eq!(report.stop, None);
+    assert_eq!(edit_media_times(&sound), [0]);
+    let facts: Vec<(u32, u64, u16, u32)> = report
+        .fragments
+        .iter()
+        .map(|f| (f.sequence, f.decode_time, f.sample_count, f.duration))
+        .collect();
+    // The last fragment is cut at the range's end, 5 ms before its own.
+    assert_eq!(
+        facts,
+        [
+            (1, 90, 94, 135_360),
+            (2, 135_450, 125, 180_000),
+            (3, 315_450, 125, 179_550),
+        ]
+    );
+    assert!(report.fragments.iter().all(|f| f.all_sync));
+    assert_eq!(track_ids(&sound), [1, 1, 1]);
+}
+
+/// A sound fragment that flags a frame as not a sync sample cannot lose its
+/// start: an export that starts inside one leaves it out and starts its
+/// sound with the next fragment, as a second track and as a stream alone.
+#[tokio::test]
+async fn an_export_leaves_out_a_sound_fragment_it_cannot_cut() {
+    let (_dir, app) = camera_with_sound_flagged(false).await;
+    let from = wall(0).offset(500_000).get();
+    let to = wall(3).get();
+    let response = get(
+        &app,
+        format!("/api/cameras/cam1/export.mp4?from={from}&to={to}"),
+        None,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let report = scan_of(&bytes);
+    assert_eq!(report.stop, None);
+    let facts: Vec<(u32, u64, u16)> = report
+        .fragments
+        .iter()
+        .map(|f| (f.track_id, f.decode_time, f.sample_count))
+        .collect();
+    assert_eq!(
+        facts,
+        [
+            (1, 0, 2),
+            (1, 180_000, 2),
+            (2, 135_450, 125),
+            (1, 360_000, 2),
+            (2, 315_450, 125),
+        ]
+    );
+
+    let sound = get(
+        &app,
+        format!("/api/streams/cam1/audio/export.mp4?from={from}&to={to}"),
+        None,
+    )
+    .await;
+    assert_eq!(sound.status(), StatusCode::OK);
+    let sound = to_bytes(sound.into_body(), usize::MAX).await.unwrap();
+    let report = scan_of(&sound);
+    assert_eq!(report.stop, None);
+    let facts: Vec<(u32, u64, u16)> = report
+        .fragments
+        .iter()
+        .map(|f| (f.sequence, f.decode_time, f.sample_count))
+        .collect();
+    assert_eq!(facts, [(1, 135_450, 125), (2, 315_450, 125)]);
+    // From the start of a fragment nothing is cut, and all of it is there.
+    let whole = get(
+        &app,
+        format!(
+            "/api/cameras/cam1/export.mp4?from={}&to={to}",
+            wall(0).get()
+        ),
+        None,
+    )
+    .await;
+    let whole = to_bytes(whole.into_body(), usize::MAX).await.unwrap();
+    assert_eq!(track_ids(&whole), [1, 2, 1, 2, 1, 2]);
+}
+
+/// The track, decode time, and sample count of each fragment of an export.
+async fn export_shape(app: &axum::Router, uri: String) -> Vec<(u32, u64, u16)> {
+    let response = get(app, uri, None).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let report = scan_of(&bytes);
+    assert_eq!(report.stop, None);
+    report
+        .fragments
+        .iter()
+        .map(|f| (f.track_id, f.decode_time, f.sample_count))
+        .collect()
+}
+
+/// Sound is as far into an export as into the video by the stored decode
+/// times, which are exact on one run's timeline, and by the wall times when
+/// the two disagree by more than a millisecond.
+#[tokio::test]
+async fn sound_is_placed_by_stored_decode_times_that_agree_with_the_walls() {
+    let (from, to) = (wall(0).get(), wall(3).get());
+    let uri = format!("/api/cameras/cam1/export.mp4?from={from}&to={to}");
+    // Stored a tick before where the wall times put it: the stored time.
+    let (_dir, app) = camera_with_audio(|_, sound| sound.decode_time -= 1).await;
+    assert_eq!(
+        export_shape(&app, uri.clone()).await,
+        [
+            (1, 0, 2),
+            (2, 449, 125),
+            (1, 180_000, 2),
+            (2, 180_449, 125),
+            (1, 360_000, 2),
+            (2, 360_449, 125),
+        ]
+    );
+    // Stored a millisecond and a tick away, as on another run's timeline:
+    // the wall times.
+    let (_dir, app) = camera_with_audio(|_, sound| sound.decode_time += 91).await;
+    assert_eq!(
+        export_shape(&app, uri.clone()).await[1],
+        (2, 450, 125),
+        "91 ticks later"
+    );
+    let (_dir, app) = camera_with_audio(|_, sound| sound.decode_time += 90).await;
+    assert_eq!(
+        export_shape(&app, uri.clone()).await[1],
+        (2, 540, 125),
+        "90 ticks later"
+    );
+    let (_dir, app) = camera_with_audio(|_, sound| sound.decode_time += 1_000_000).await;
+    assert_eq!(export_shape(&app, uri).await[1], (2, 450, 125));
+}
+
+/// Sound has a place in an export only beside its picture: what was heard
+/// before the first video fragment, or in a gap of the video, which the
+/// export closes, is left out; sound that starts with its video fragment
+/// to the tick is kept from its first frame.
+#[tokio::test]
+async fn sound_without_its_picture_is_left_out_of_an_export() {
+    let (from, to) = (wall(0).get(), wall(3).get());
+    let uri = format!("/api/cameras/cam1/export.mp4?from={from}&to={to}");
+    // No picture for the second of the three fragments of sound.
+    let (_dir, app) = camera_recording(&[0, 2], |_, _| {}).await;
+    assert_eq!(
+        export_shape(&app, uri.clone()).await,
+        [(1, 0, 2), (2, 450, 125), (1, 180_000, 2), (2, 180_450, 125),]
+    );
+    // No picture for the first.
+    let (_dir, app) = camera_recording(&[1, 2], |_, _| {}).await;
+    assert_eq!(
+        export_shape(&app, uri.clone()).await,
+        [(1, 0, 2), (2, 450, 125), (1, 180_000, 2), (2, 180_450, 125),]
+    );
+    // Sound that starts where its video fragment does.
+    let (_dir, app) = camera_with_audio(|index, sound| {
+        sound.decode_time = index * 180_000;
+        sound.wall = wall(index);
+    })
+    .await;
+    assert_eq!(
+        export_shape(&app, uri).await,
+        [
+            (1, 0, 2),
+            (2, 0, 125),
+            (1, 180_000, 2),
+            (2, 180_000, 125),
+            (1, 360_000, 2),
+            (2, 360_000, 125),
+        ]
+    );
+}
+
+/// The playlist of a camera's audio is cut where the main stream's is: a
+/// gap in the video starts a segment and a discontinuity in both, where
+/// the audio alone, in one file, would be one segment.
+#[tokio::test]
+async fn the_audio_playlist_is_served_following_the_main_streams() {
+    let (_dir, app) = camera_recording(&[0, 2], |_, _| {}).await;
+    let (from, to) = (wall(0).get(), wall(3).get());
+    let shape = |text: &str| -> Vec<String> {
+        text.lines()
+            .filter(|line| line.starts_with("#EXTINF") || *line == "#EXT-X-DISCONTINUITY")
+            .map(str::to_owned)
+            .collect()
+    };
+    let playlist = |kind: &'static str| {
+        let app = app.clone();
+        async move {
+            let response = get(
+                &app,
+                format!("/api/streams/cam1/{kind}/hls/vod.m3u8?from={from}&to={to}"),
+                None,
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK, "{kind}");
+            body_string(response).await
+        }
+    };
+    let video = playlist("main").await;
+    assert_eq!(
+        shape(&video),
+        [
+            "#EXTINF:2.00000,",
+            "#EXT-X-DISCONTINUITY",
+            "#EXTINF:2.00000,"
+        ]
+    );
+    // The sound of the gap belongs to the segment before it.
+    let audio = playlist("audio").await;
+    assert_eq!(
+        shape(&audio),
+        [
+            "#EXTINF:4.00000,",
+            "#EXT-X-DISCONTINUITY",
+            "#EXTINF:2.00000,"
+        ]
+    );
+    assert_eq!(audio.matches("#EXT-X-MAP").count(), 1, "{audio}");
+}
+
+/// Sound in two files, the second from a run of its own, follows the video
+/// through both.
+#[tokio::test]
+async fn sound_in_two_files_is_exported_through_both() {
+    let (_dir, app) = camera_with_audio(|index, sound| sound.new_run = index != 1).await;
+    let (from, to) = (wall(0).get(), wall(3).get());
+    assert_eq!(
+        export_shape(
+            &app,
+            format!("/api/cameras/cam1/export.mp4?from={from}&to={to}")
+        )
+        .await,
+        [
+            (1, 0, 2),
+            (2, 450, 125),
+            (1, 180_000, 2),
+            (2, 180_450, 125),
+            (1, 360_000, 2),
+            (2, 360_450, 125),
+        ]
+    );
+    assert_eq!(
+        export_shape(
+            &app,
+            format!("/api/streams/cam1/audio/export.mp4?from={from}&to={to}")
+        )
+        .await
+        .len(),
+        3
+    );
+}
+
+/// A range inside one fragment cuts the sound at both ends: the frames
+/// that start in the range, the last one shortened, with the wall time of
+/// the first kept frame.
+#[tokio::test]
+async fn an_export_inside_one_fragment_cuts_the_sound_at_both_ends() {
+    let (_dir, app) = camera_with_sound().await;
+    let from = wall(0).offset(500_000).get();
+    let to = wall(0).offset(1_500_000).get();
+    // Frame 31 is the first to start in the range, at 501 ms; 999 ms are
+    // left: 62 whole frames and one of 630 ticks.
+    let first_kept = wall(0).offset(5_000 + 31 * 16_000);
+    for (uri, track) in [
+        (
+            format!("/api/cameras/cam1/export.mp4?from={from}&to={to}"),
+            2,
+        ),
+        (
+            format!("/api/streams/cam1/audio/export.mp4?from={from}&to={to}"),
+            1,
+        ),
+    ] {
+        let response = get(&app, uri.clone(), None).await;
+        assert_eq!(response.status(), StatusCode::OK, "{uri}");
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let report = scan_of(&bytes);
+        assert_eq!(report.stop, None);
+        let sound = report.fragments.last().unwrap();
+        assert_eq!(sound.track_id, track, "{uri}");
+        assert_eq!(
+            (sound.decode_time, sound.sample_count, sound.duration),
+            (90, 63, 89_910),
+            "{uri}"
+        );
+        assert_eq!(sound.wall, Some(first_kept), "{uri}");
+        assert!(sound.all_sync);
+    }
+}
+
+/// A camera without recorded audio exports its picture alone, and a range
+/// without recordings has no export.
+#[tokio::test]
+async fn a_camera_export_without_audio_is_the_main_stream_alone() {
+    let dir = tempfile::tempdir().unwrap();
+    let catalog = CatalogHandle::open(&dir.path().join("c.db")).unwrap();
+    catalog
+        .ensure_camera(&key().camera, "Example", None)
+        .await
+        .unwrap();
+    populate(dir.path(), &catalog).await;
+    let app = router(state(dir.path(), catalog.clone(), vec!["t".into()]));
+    let (from, to) = (wall(0).get(), wall(3).get());
+    let camera = get(
+        &app,
+        format!("/api/cameras/cam1/export.mp4?from={from}&to={to}"),
+        None,
+    )
+    .await;
+    assert_eq!(camera.status(), StatusCode::OK);
+    let camera = to_bytes(camera.into_body(), usize::MAX).await.unwrap();
+    let stream = get(
+        &app,
+        format!("/api/streams/cam1/main/export.mp4?from={from}&to={to}"),
+        None,
+    )
+    .await;
+    let stream = to_bytes(stream.into_body(), usize::MAX).await.unwrap();
+    assert_eq!(camera, stream);
+    let empty = get(
+        &app,
+        format!(
+            "/api/cameras/cam1/export.mp4?from={}&to={}",
+            wall(100).get(),
+            wall(101).get()
+        ),
+        None,
+    )
+    .await;
+    assert_eq!(empty.status(), StatusCode::NOT_FOUND);
 }

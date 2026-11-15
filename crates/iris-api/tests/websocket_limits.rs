@@ -448,3 +448,86 @@ async fn a_crc_colliding_sample_entry_resends_the_init_segment() {
     let (kind, fragment) = next_binary(&mut client).await;
     assert_eq!((kind, decode_time(&fragment)), (MSG_FRAGMENT, 3_000));
 }
+
+/// A camera's recorded audio is a live stream in the protocol of the video
+/// streams: the `mp4a` init segment, then one fragment of one sync sample
+/// for each frame, with the decode time the ring gave it. It has no
+/// low-latency playlist.
+#[tokio::test]
+async fn the_audio_of_a_camera_is_a_live_stream_of_single_frames() {
+    let server = server().await;
+    let audio_key = StreamKey {
+        kind: StreamKind::Audio,
+        ..key(1)
+    };
+    let audio_entry = Arc::new(SampleEntry::audio(
+        Bytes::from_static(
+            b"\0\0\0\x24mp4a\0\0\0\0\0\0\0\x01\0\0\0\0\0\0\0\0\0\x01\0\x10\0\0\0\0\xfa\0\0\0",
+        ),
+        "mp4a.40.2".into(),
+    ));
+    let ring = LiveRing::new(16);
+    server.state.live.insert(audio_key.clone(), ring.clone());
+    let mut client = connect(server.address, "/api/streams/cam1/audio/live").await;
+    wait_until(|| ring.subscriber_count() == 1).await;
+    // The run was placed 450 ticks into the video's timeline.
+    for index in 0..3_u64 {
+        ring.publish(Arc::new(LiveFrame {
+            key: audio_key.clone(),
+            sample_entry: Arc::clone(&audio_entry),
+            data: Bytes::from(vec![0x21, 0x10, u8::try_from(index).expect("small")]),
+            duration: 1_440,
+            is_sync: true,
+            decode_time: 450 + index * 1_440,
+            wall: WallUs::new(
+                1_700_000_000_005_000 + i64::try_from(index).expect("small") * 16_000,
+            ),
+        }));
+    }
+    let (kind, init) = next_binary(&mut client).await;
+    assert_eq!(kind, MSG_INIT);
+    assert_eq!(
+        iris_mp4::init::sample_entry_bytes(&init),
+        Some(&audio_entry.bytes[..])
+    );
+    assert_eq!(
+        iris_mp4::init::sample_entry_bytes(&init).and_then(iris_mp4::init::audio_channel_count),
+        Some(1)
+    );
+    for index in 0..3_u64 {
+        let (kind, fragment) = next_binary(&mut client).await;
+        assert_eq!(kind, MSG_FRAGMENT);
+        let info = iris_mp4::reader::parse_fragment(&fragment).expect("a valid fragment");
+        assert_eq!(info.decode_time, 450 + index * 1_440);
+        assert_eq!((info.sample_count, info.duration), (1, 1_440));
+        assert!(info.all_sync);
+        assert_eq!(
+            info.wall,
+            Some(WallUs::new(
+                1_700_000_000_005_000 + i64::try_from(index).expect("small") * 16_000
+            ))
+        );
+        let payload = usize::try_from(info.payload_offset).expect("small");
+        assert_eq!(fragment[payload..payload + 3], [0x21, 0x10, index as u8]);
+    }
+
+    // The low-latency playlist is for streams with pictures.
+    let playlist = |kind: &'static str| {
+        let address = server.address;
+        async move {
+            let mut stream = TcpStream::connect(address).await.expect("connect");
+            let request = format!(
+                "GET /api/streams/cam1/{kind}/hls/live.m3u8 HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\n"
+            );
+            tokio::io::AsyncWriteExt::write_all(&mut stream, request.as_bytes())
+                .await
+                .expect("request");
+            let mut head = [0_u8; 12];
+            tokio::io::AsyncReadExt::read_exact(&mut stream, &mut head)
+                .await
+                .expect("status line");
+            String::from_utf8_lossy(&head).into_owned()
+        }
+    };
+    assert_eq!(playlist("audio").await, "HTTP/1.1 404");
+}

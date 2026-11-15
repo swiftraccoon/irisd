@@ -1,0 +1,47 @@
+# The exceptions to the checks of `iris-tools standards tree` (STANDARDS.md §1), each with its
+# reason. A waiver covers the count it states: one breach more fails the check, and so does one
+# fewer.
+
+# Texts of published sources that the installation patterns of AGENTS.md rule 9 would refuse.
+
+[[allowed]]
+text = "testrealm@host.com"
+reason = "the realm of the worked example in RFC 7616 section 3.9.1, which the digest tests reproduce"
+
+[[allowed]]
+text = "blink-dev@chromium.org"
+reason = "the public list a cited Chromium announcement was posted to"
+
+[[allowed]]
+text = "/media/frigate/"
+reason = "the recording path another recorder documents, quoted in the prior-art survey"
+
+[[waiver]]
+rule = "timeless"
+path = "STANDARDS.md"
+count = 9
+reason = "states the rule: the words are its subject"
+
+[[waiver]]
+rule = "timeless"
+path = "AGENTS.md"
+count = 6
+reason = "states the rule: the words are its subject"
+
+[[waiver]]
+rule = "bool-parameter"
+path = "crates/iris-api/src/state.rs"
+count = 2
+reason = "the two flags of a camera's configuration, which every caller passes as its named fields"
+
+[[waiver]]
+rule = "bare-tuple"
+path = "crates/iris-tools/src/probe_parser.rs"
+count = 1
+reason = "the RTP and RTCP channel numbers of a Transport header: protocol values, not quantities"
+
+[[waiver]]
+rule = "bare-tuple"
+path = "crates/iris-tools/src/summary.rs"
+count = 1
+reason = "a rate and a count that the function's name states in order"

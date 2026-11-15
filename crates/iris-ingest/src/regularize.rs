@@ -5,9 +5,16 @@
 //! frames, and bunches frames by up to 100 ms, while its clock as a whole runs
 //! within a few ppm of the NVR. Using those deltas verbatim makes players
 //! stutter. The regulariser assigns each frame the nominal duration, keeps a
-//! slow lock on the camera's long-term timeline, renders camera-dropped frames
-//! as frame-long holds, and snaps to the camera's timeline only when the
-//! remaining error exceeds the tolerance.
+//! slow lock on the camera's long-term timeline, renders the frame slots a
+//! camera leaves empty as frame-long holds, and snaps to the camera's
+//! timeline only when the remaining error exceeds the tolerance.
+//!
+//! A camera that delivers fewer frames than it declares is not a camera at
+//! a lower rate: its frames are on the declared grid and some slots are
+//! empty (`docs/research/11-multi-camera-results.md`, "What decides whether
+//! a GOP loses a slot"). Such a fragment keeps the declared rate and ends
+//! in a hold of its empty slots. Only a fragment that lacks more than an
+//! eighth of its slots counts as off the declared rate.
 
 use std::collections::VecDeque;
 
@@ -22,15 +29,18 @@ const HISTORY_LEN: usize = 64;
 const WARMUP_FRAMES: u64 = 480;
 /// Fragments the estimate must cover before it may override a declared rate.
 const WARMUP_FRAGMENTS: usize = 16;
-/// Relative difference between the typical (median) delivered frame span and
-/// the declared one above which the delivered rate replaces the declared one.
-/// It equals the per-fragment correction limit: a camera whose typical
-/// fragment is on rate but drops frames in bursts (0.6 % of frames, bunched)
-/// stays on the declared rate with holds for the drops; one whose every
-/// fragment runs long (an encoder delivering 29.3 fps under a 30 fps
-/// declaration, or the probed camera during the minutes its encoder slows)
-/// is re-timed, because a hold at every GOP boundary would stutter on playback.
+/// Relative difference between the typical (median) frame span of the
+/// fragments and the declared one above which the delivered rate replaces
+/// the declared one. It equals the per-fragment correction limit. Under a
+/// declared rate, a fragment's frame span leaves out the slots it holds
+/// when they are few ([`EMPTY_SLOT_SHARE`]).
 const OVERRIDE_RATIO: f64 = 0.01;
+/// The share of a fragment's frame time (one in this many) up to which its
+/// holds are empty slots of the declared grid and not a sign of another
+/// rate. The test cameras leave up to four slots in sixty empty (7 %), and
+/// the nearest rate a camera may really run at under a wrong declaration is
+/// a sixth away (25 fps under 30), so an eighth separates the two.
+const EMPTY_SLOT_SHARE: i64 = 8;
 /// Per-fragment correction limit, in parts per thousand of the fragment's
 /// nominal duration. One percent (20 ms over a 2 s fragment at 30 fps) absorbs
 /// sub-frame jitter and backward timestamp steps over one or two fragments,
@@ -59,12 +69,11 @@ const RESTART_AFTER_SNAPS: u32 = 3;
 /// after which the rate estimate restarts. One timestamp step saturates the
 /// correction for a fragment or two (20 ms each at a 2 s GOP); four in a row
 /// mean the nominal itself is off, as when a camera returns to its declared
-/// rate while the estimate still averages two minutes of a slower one.
+/// rate while the estimate still averages two minutes of another.
 /// Restarting keeps the error that builds meanwhile under the tolerance: at
-/// a 5.7 % mismatch (28.3 fps adopted, 30 delivered) it reaches 380 ms. A
-/// restart cuts the history to these fragments and keeps the warm-up, so
-/// the estimate moves to what the camera delivers at this moment and never
-/// falls back to a declared rate the camera has already been measured off.
+/// a 5.7 % mismatch it reaches 380 ms. A restart cuts the history to these
+/// fragments and keeps the warm-up, so the estimate is at once what the
+/// camera delivers at this moment.
 const RESTART_AFTER_SATURATED: u32 = 4;
 /// Fragments whose average frame span deviates from the nominal by more than
 /// this ratio are left out of the rate estimate.
@@ -398,14 +407,21 @@ impl Regularizer {
     }
 
     /// Measured frame duration in ticks. The delivered rate (holes included)
-    /// when the typical fragment's delivered frame span differs by more than
+    /// when the typical fragment's frame span differs by more than
     /// [`OVERRIDE_RATIO`] from the declared duration, or from the cadence
     /// when none is declared: the camera then really runs at another rate.
-    /// Otherwise the cadence (holes excluded), so that occasional dropped
-    /// frames and stalls stay holds instead of slowing the clock. The share
-    /// of time spent in holes does not decide: a camera that stalls for a
-    /// second now and then spends much of its time in holes while every
-    /// other fragment is on rate.
+    /// Otherwise the cadence (holes excluded), so that empty slots, dropped
+    /// frames, and stalls stay holds instead of slowing the clock.
+    ///
+    /// Under a declared rate, a fragment that holds at most one slot in
+    /// [`EMPTY_SLOT_SHARE`] is on the declared grid with those slots empty,
+    /// and its frame span leaves them out; one that holds more has its
+    /// frames further apart than declared and counts by its whole span.
+    /// Without a declared rate there is no grid to hold a slot of, and every
+    /// fragment counts by its whole span. The share of time spent in holes
+    /// does not decide: a camera that stalls for a second now and then
+    /// spends much of its time in holes while every other fragment is on
+    /// rate.
     fn measured(&self) -> Option<u32> {
         if self.history.is_empty() {
             return None;
@@ -427,8 +443,11 @@ impl Regularizer {
             .iter()
             .filter(|window| window.frames > 0)
             .map(|window| {
+                let unheld = window.span - window.hold;
+                let empty_slots = self.hint.is_some() && window.hold * EMPTY_SLOT_SHARE <= unheld;
+                let ticks = if empty_slots { unheld } else { window.span };
                 (
-                    window.span as f64 / f64::from(window.frames),
+                    ticks as f64 / f64::from(window.frames),
                     u64::from(window.frames),
                 )
             })
@@ -635,12 +654,10 @@ mod tests {
         (raw, exact)
     }
 
-    /// What the test cameras do: the encoder slows for minutes and returns
-    /// to its declared rate. Going slow costs holds until the delivered rate
-    /// is adopted; coming back, the adopted rate is stale, the correction
-    /// saturates, and the estimate restarts before the error reaches the
-    /// tolerance. No fragment snaps, and while the camera holds its slow
-    /// rate the adopted one is not disturbed.
+    /// A camera that delivers fewer frames than it declares for minutes and
+    /// then all of them again, stamped at 10 ms resolution. The missing
+    /// slots are holds while they last, the declared rate stays in use
+    /// throughout, and no fragment snaps going in or coming back.
     #[test]
     fn a_camera_that_slows_and_returns_to_its_declared_rate_never_snaps() {
         for fps in [28.3, 28.9, 29.4] {
@@ -663,19 +680,14 @@ mod tests {
                     let a = r.assign(&previous, raw[0]);
                     assert!(!a.snapped, "{fps} fps: snap in phase {phase} at {fragment}");
                     assert!(
-                        r.error_ticks().abs() < 45_000,
+                        r.error_ticks().abs() < 3000,
                         "{fps} fps: error {} in phase {phase} at {fragment}",
                         r.error_ticks()
                     );
-                    if phase == 1 && fragment >= 100 {
-                        let nominal = f64::from(r.nominal().unwrap());
-                        assert!(
-                            (nominal - slow).abs() / slow < 0.005,
-                            "{fps} fps: nominal {nominal} at {fragment} of the slow phase"
-                        );
-                    }
-                    if phase == 2 && fragment >= 100 {
-                        assert_eq!(r.nominal(), Some(3000), "{fps} fps at {fragment}");
+                    assert_eq!(r.nominal(), Some(3000), "{fps} fps at {fragment}");
+                    assert_eq!(a.holes > 0, a.hold_ticks > 0, "{fps} fps at {fragment}");
+                    if phase != 1 && fragment >= 1 {
+                        assert_eq!(a.holes, 0, "{fps} fps: on rate at {fragment}");
                     }
                 }
             }
@@ -705,38 +717,199 @@ mod tests {
         assert_eq!(r.error_ticks(), 0);
     }
 
+    /// What the test cameras do when their picture is cheap: sixty frames on
+    /// the declared grid, then one to three empty slots before the next
+    /// keyframe, in some GOPs and not in others. The declared rate stays in
+    /// use, a GOP on the grid is left as the camera sent it, and the last
+    /// frame of the others holds for the empty slots.
     #[test]
-    fn a_uniformly_slow_camera_is_retimed_instead_of_held_every_gop() {
-        // An encoder delivering 29.29 fps under a 30 fps declaration: 3073 ticks per frame,
-        // 2.4 % slow, beyond the 1 % the per-fragment correction absorbs.
+    fn a_camera_that_leaves_slots_empty_keeps_its_declared_rate_and_holds_them() {
         let mut r = Regularizer::new(TimestampMode::Regularize, Some(3000), tolerance());
-        let mut holes_after_warmup = 0u32;
-        let mut durations_after_warmup = Vec::new();
-        for gop in 0..40i64 {
-            let start = gop * 60 * 3073;
-            let raw: Vec<i64> = (0..60).map(|i| start + i * 3073).collect();
-            let a = r.assign(&raw, start + 60 * 3073);
-            assert!(!a.snapped, "snapped at GOP {gop}");
+        let mut start = 0i64;
+        for gop in 0..120usize {
+            let empty = [0, 1, 0, 1, 1, 0, 2, 3][gop % 8];
+            let raw: Vec<i64> = (0..60).map(|i| start + i * 3000).collect();
+            start += (60 + empty) * 3000;
+            let a = r.assign(&raw, start);
+            assert!(!a.snapped, "GOP {gop}");
+            assert_eq!(i64::from(a.holes), empty, "GOP {gop}");
+            assert_eq!(a.hold_ticks, empty * 3000, "GOP {gop}");
+            let (last, body) = a.durations.split_last().unwrap();
+            assert!(body.iter().all(|&d| d == 3000), "GOP {gop}: {body:?}");
+            assert_eq!(i64::from(*last), 3000 + empty * 3000, "GOP {gop}");
+            assert_eq!(r.nominal(), Some(3000), "GOP {gop}");
+            assert_eq!(r.error_ticks(), 0, "GOP {gop}");
+        }
+    }
+
+    /// Every GOP one slot short of its sixty-one, for longer than the
+    /// warm-up: 1.6 % under the declared rate by its frame count, and on the
+    /// declared rate by its frames.
+    #[test]
+    fn a_slot_empty_in_every_gop_is_not_another_rate() {
+        let mut r = Regularizer::new(TimestampMode::Regularize, Some(3000), tolerance());
+        let mut start = 0i64;
+        for gop in 0..80 {
+            let raw: Vec<i64> = (0..60).map(|i| start + i * 3000).collect();
+            start += 61 * 3000;
+            let a = r.assign(&raw, start);
+            assert_eq!((a.holes, a.snapped), (1, false), "GOP {gop}");
+            assert_eq!(r.nominal(), Some(3000), "GOP {gop}");
+        }
+    }
+
+    /// A camera at 25 fps under a 30 fps declaration lacks a sixth of its
+    /// slots: too many to be empty slots of the declared grid. Its frames
+    /// are further apart than declared, and the delivered rate takes over.
+    #[test]
+    fn a_rate_a_sixth_under_the_declared_one_is_replaced() {
+        let mut r = Regularizer::new(TimestampMode::Regularize, Some(3000), tolerance());
+        let mut start = 0i64;
+        let mut late_holds = 0;
+        for gop in 0..40 {
+            let raw: Vec<i64> = (0..60).map(|i| start + i * 3600).collect();
+            start += 60 * 3600;
+            let a = r.assign(&raw, start);
+            assert!(!a.snapped, "GOP {gop}");
             if gop >= 24 {
-                holes_after_warmup += a.holes;
-                durations_after_warmup.extend(a.durations.iter().copied());
+                late_holds += a.hold_ticks;
             }
         }
+        assert_eq!(r.nominal(), Some(3600));
+        assert_eq!(late_holds, 0, "frames at their own rate need no hold");
+    }
+
+    /// The share of a fragment that may be empty slots is an eighth of its
+    /// frame time, that eighth included.
+    #[test]
+    fn empty_slots_are_at_most_an_eighth_of_a_fragment() {
+        let estimate = |hold: i64, declared: Option<u32>| {
+            let mut r = Regularizer::new(TimestampMode::Regularize, declared, tolerance());
+            r.history.extend(
+                [Window {
+                    span: 180_000 + hold,
+                    hold,
+                    frames: 60,
+                }; 20],
+            );
+            r.measured()
+        };
+        // Seven and a half slots of sixty: the frames are on the declared grid.
+        assert_eq!(estimate(22_500, Some(3000)), Some(3000));
+        // One tick more: the fragment counts by its span, 12.5 % over.
+        assert_eq!(estimate(22_501, Some(3000)), Some(3375));
+        // Without a declared rate there is no grid, and one empty slot in
+        // sixty already puts the typical fragment off the cadence.
+        assert_eq!(estimate(3000, None), Some(3050));
+        assert_eq!(estimate(0, None), Some(3000));
+    }
+
+    /// The delivered rate takes over when the typical fragment is more than
+    /// 1 % off, not at 1 %: frames 1 % apart from the declared period, with
+    /// one slot held, leave the estimate at the cadence and the declared
+    /// rate in use.
+    #[test]
+    fn a_typical_fragment_exactly_one_percent_off_keeps_the_declared_rate() {
+        let mut r = Regularizer::new(TimestampMode::Regularize, Some(3000), tolerance());
+        r.history.extend(
+            [Window {
+                span: 60 * 3030 + 3000,
+                hold: 3000,
+                frames: 60,
+            }; 20],
+        );
+        assert_eq!(r.measured(), Some(3030), "the cadence, holds left out");
+        assert_eq!(r.nominal(), Some(3000));
+        r.history.back_mut().unwrap().span += 20 * 60;
+        r.history.iter_mut().for_each(|window| window.span += 60);
         assert_eq!(
-            holes_after_warmup, 0,
-            "a slow encoder must not be padded with holds"
+            r.measured(),
+            Some(3082),
+            "the delivered rate, holds included"
         );
+        assert_eq!(r.nominal(), Some(3082));
+    }
+
+    /// Without a declared rate the cadence, holds left out, is what the
+    /// typical fragment is held against: one stall among fragments on rate
+    /// leaves the estimate there.
+    #[test]
+    fn a_stall_does_not_move_an_undeclared_rate() {
+        let mut r = Regularizer::new(TimestampMode::Regularize, None, tolerance());
+        let on_rate = Window {
+            span: 180_000,
+            hold: 0,
+            frames: 60,
+        };
+        r.history.extend([on_rate; 19]);
+        r.history.push_back(Window {
+            span: 270_000,
+            hold: 90_000,
+            frames: 60,
+        });
+        assert_eq!(r.measured(), Some(3000));
+    }
+
+    /// A fragment whose frames are more than 20 % off the nominal is left
+    /// out of the estimate, and one exactly 20 % off is not.
+    #[test]
+    fn a_fragment_a_fifth_off_the_nominal_is_the_last_the_estimate_takes() {
+        let wide = MediaTicks::from_millis(5000);
+        for (per_frame, taken) in [(2400, 1), (2399, 0), (3000, 1)] {
+            let mut r = Regularizer::new(TimestampMode::Regularize, Some(3000), wide);
+            let raw: Vec<i64> = (0..60).map(|i| i * per_frame).collect();
+            let a = r.assign(&raw, 60 * per_frame);
+            assert!(!a.snapped, "{per_frame} ticks a frame");
+            assert_eq!(r.history.len(), taken, "{per_frame} ticks a frame");
+        }
+    }
+
+    /// A fragment snaps when the error left after its correction is over the
+    /// tolerance, not at it. One that runs ahead has its shorter time spread
+    /// evenly and reports what it took off the nominal durations.
+    #[test]
+    fn a_snap_starts_past_the_tolerance_and_spreads_a_shorter_span_evenly() {
+        let limit = tolerance().get();
+        // The 1 % correction of a 60-frame fragment takes 1800 ticks off.
+        let at = 180_000 - limit - 1800;
+        let raw: Vec<i64> = (0..60).map(|i| i * 3000).collect();
+        let mut r = Regularizer::new(TimestampMode::Regularize, Some(3000), tolerance());
+        let a = r.assign(&raw, at);
+        assert!(!a.snapped);
+        assert_eq!(r.error_ticks(), limit);
+        let mut r = Regularizer::new(TimestampMode::Regularize, Some(3000), tolerance());
+        let a = r.assign(&raw, at - 1);
+        assert!(a.snapped);
+        assert_eq!(r.error_ticks(), 0);
+        let mut r = Regularizer::new(TimestampMode::Regularize, Some(3000), tolerance());
+        let a = r.assign(&raw, 120_000);
+        assert!(a.snapped);
         assert!(
-            (3070..=3076).contains(&r.nominal().unwrap()),
-            "nominal {:?}",
-            r.nominal()
+            a.durations.iter().all(|&d| d == 2000),
+            "{:?}",
+            &a.durations[..4]
         );
-        assert!(
-            durations_after_warmup
-                .iter()
-                .all(|&d| (3040..=3110).contains(&d)),
-            "durations stay near the delivered rate"
-        );
+        assert_eq!((a.correction, a.holes, a.hold_ticks), (-60_000, 0, 0));
+    }
+
+    /// Three snaps in a row mean the camera is not at the rate assumed: the
+    /// declared rate and the history are forgotten, and the next fragment
+    /// seeds the estimate.
+    #[test]
+    fn three_consecutive_snaps_forget_the_declared_rate() {
+        let mut r = Regularizer::new(TimestampMode::Regularize, Some(3000), tolerance());
+        let mut start = 0i64;
+        for snaps in 1..=3 {
+            let raw: Vec<i64> = (0..60).map(|i| start + i * 2000).collect();
+            start += 120_000;
+            assert!(r.assign(&raw, start).snapped, "snap {snaps}");
+            let expected = if snaps < 3 { Some(3000) } else { None };
+            assert_eq!(r.nominal(), expected, "after snap {snaps}");
+        }
+        let raw: Vec<i64> = (0..60).map(|i| start + i * 2000).collect();
+        let a = r.assign(&raw, start + 120_000);
+        assert!(!a.snapped);
+        assert_eq!(r.nominal(), Some(2000));
     }
 
     #[test]
@@ -1012,12 +1185,12 @@ mod tests {
             let mut r = Regularizer::new(TimestampMode::Regularize, Some(3000), tolerance());
             let mut start = 0;
             for _ in 0..fragments {
-                // 2.4 % slower than declared.
-                let raw: Vec<i64> = (0..frames).map(|i| start + i * 3073).collect();
-                start += frames * 3073;
+                // A sixth slower than declared: more than empty slots explain.
+                let raw: Vec<i64> = (0..frames).map(|i| start + i * 3600).collect();
+                start += frames * 3600;
                 let _ = r.assign(&raw, start);
             }
-            let expected = if warmed { 3073 } else { 3000 };
+            let expected = if warmed { 3600 } else { 3000 };
             assert_eq!(
                 r.nominal(),
                 Some(expected),
@@ -1281,14 +1454,12 @@ mod tests {
         (163_739, 55),
     ];
 
-    /// A camera whose every GOP runs slow, by an amount that varies from GOP
-    /// to GOP by more than the 1 % correction: the correction is often at
-    /// its limit several fragments running while the error stays small, and
-    /// the delivered rate stays in use. Returning to the declared rate
-    /// would end every GOP in a hold of two to five frames until the next
-    /// warm-up.
+    /// A camera whose every GOP lacks slots, two to six of them and a
+    /// different number from GOP to GOP. The declared rate stays in use, each
+    /// GOP ends in a hold of its empty slots, and the timeline stays within
+    /// a frame of the camera's.
     #[test]
-    fn a_slow_camera_whose_rate_varies_by_gop_keeps_the_delivered_rate() {
+    fn a_camera_whose_every_gop_lacks_slots_holds_them_at_its_declared_rate() {
         let mut r = Regularizer::new(
             TimestampMode::Regularize,
             Some(3000),
@@ -1297,6 +1468,7 @@ mod tests {
         let mut start = 0i64;
         let mut fragments = 0;
         let mut held = 0;
+        let (mut frames_seen, mut holes_seen) = (0i64, 0i64);
         // Half an hour: the five minutes six times over.
         for _ in 0..6 {
             for (span, frames) in VARYING_SLOW_CAMERA {
@@ -1306,25 +1478,30 @@ mod tests {
                 fragments += 1;
                 assert!(!a.snapped, "fragment {fragments}");
                 assert!(
-                    r.error_ticks().abs() < 13_500,
+                    r.error_ticks().abs() < 3000,
                     "fragment {fragments}: error {} ticks",
                     r.error_ticks()
                 );
-                if fragments > 20 {
-                    let nominal = r.nominal().unwrap();
-                    assert!(
-                        (3080..=3200).contains(&nominal),
-                        "fragment {fragments}: nominal {nominal}"
-                    );
-                    held += i32::from(a.hold_ticks > 0);
-                }
+                assert_eq!(r.nominal(), Some(3000), "fragment {fragments}");
+                assert!(a.holes <= 7, "fragment {fragments}: {} holes", a.holes);
+                let (_, body) = a.durations.split_last().unwrap();
+                assert!(
+                    body.iter().all(|d| (2970..=3030).contains(d)),
+                    "fragment {fragments}: {body:?}"
+                );
+                held += i32::from(a.hold_ticks > 0);
+                frames_seen += frames;
+                holes_seen += i64::from(a.holes);
             }
         }
-        // A GOP more than 1 % slower than the estimate still ends in a
-        // one-frame hold: about one GOP in four.
+        // Nearly every GOP lacks a slot, and the holds are the slots the
+        // camera's span has beyond its frames, to a part in a thousand: a
+        // hold is a whole slot, and the correction takes up the fraction.
+        assert!(held * 10 >= fragments * 9, "{held} of {fragments} held");
+        let slots = start / 3000;
         assert!(
-            held * 100 <= fragments * 28,
-            "{held} of {fragments} fragments held"
+            (frames_seen + holes_seen - slots).abs() * 1000 <= slots,
+            "{frames_seen} frames and {holes_seen} holds over {slots} slots"
         );
     }
 

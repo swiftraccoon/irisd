@@ -3,6 +3,11 @@
 //! end before the damage, with a sidecar bound to it, and recovering again
 //! changes nothing.
 
+#![expect(
+    clippy::unwrap_used,
+    reason = "a helper of a test fails as the test does, by panicking"
+)]
+
 use std::fs::{self, File, OpenOptions};
 use std::os::unix::fs::FileExt as _;
 use std::path::{Path, PathBuf};
@@ -12,9 +17,10 @@ use std::time::Duration;
 use bytes::Bytes;
 use iris_core::id::{CameraId, StreamKey, StreamKind};
 use iris_core::time::WallUs;
-use iris_mp4::fragment::{Fragment, Sample};
+use iris_mp4::fragment::{Fragment, FrameSteps, Sample};
 use iris_mp4::index::{
-    FLAG_DISCONTINUITY_BEFORE, MAX_PERSISTED_INDEX_RECORDS, read_index_file_bound_to_media,
+    FLAG_DISCONTINUITY_BEFORE, FLAG_FRAMES_LEFT_OUT, FLAG_FRAMES_TWICE, IndexRecord,
+    MAX_PERSISTED_INDEX_RECORDS, WRITER_ONLY_FLAGS, read_index_file_bound_to_media,
 };
 use iris_mp4::init::SampleEntry;
 use iris_mp4::reader::{self, FragmentInfo, ScanOptions, ScanReport};
@@ -86,6 +92,10 @@ fn fragment(index: u64, rng: &mut Rng, entry: &Arc<SampleEntry>) -> Fragment {
         wall: WallUs::new((1_793_460_958 + i64::try_from(index).unwrap()) * 1_000_000),
         raw_rtp: 42,
         new_run: index == 0,
+        steps: FrameSteps {
+            left_out: index % 3 == 1,
+            twice: index % 4 == 2,
+        },
         sample_entry: Arc::clone(entry),
     }
 }
@@ -208,6 +218,29 @@ fn check_report_bounds(report: &RecoveryReport, expected: &[&FragmentInfo], cont
     );
 }
 
+/// The writer's sidecar holds what only the writer knows: the run boundary,
+/// the raw RTP timestamps, and the steps of the fragments that were given
+/// them.
+fn check_writer_only_facts(written: &[IndexRecord], seed: u64) {
+    assert_ne!(
+        written[0].flags & FLAG_DISCONTINUITY_BEFORE,
+        0,
+        "seed {seed}"
+    );
+    assert!(
+        written.iter().all(|record| record.raw_rtp == 42),
+        "seed {seed}"
+    );
+    assert_ne!(written[1].flags & FLAG_FRAMES_LEFT_OUT, 0, "seed {seed}");
+    assert_eq!(
+        written.len() > 2,
+        written
+            .iter()
+            .any(|record| record.flags & FLAG_FRAMES_TWICE != 0),
+        "seed {seed}"
+    );
+}
+
 #[test]
 fn a_damaged_recording_recovers_to_the_fragments_before_the_damage() {
     for seed in 1..=300 {
@@ -228,15 +261,7 @@ fn a_damaged_recording_recovers_to_the_fragments_before_the_damage() {
         )
         .unwrap()
         .expect("the writer's sidecar is bound");
-        assert_ne!(
-            written[0].flags & FLAG_DISCONTINUITY_BEFORE,
-            0,
-            "seed {seed}"
-        );
-        assert!(
-            written.iter().all(|record| record.raw_rtp == 42),
-            "seed {seed}"
-        );
+        check_writer_only_facts(&written, seed);
 
         // Damage from an offset at or after the initialization segment.
         let offset = init_len + rng.below(len - init_len);
@@ -296,15 +321,16 @@ fn a_damaged_recording_recovers_to_the_fragments_before_the_damage() {
             expected_len < damaged.len() as u64,
             "{context}"
         );
-        // What only the sidecar knows (the run boundary and the raw RTP
-        // timestamps) survives when the sidecar did, and is absent when a
-        // scan alone rebuilt the records.
+        // What only the sidecar knows (the run boundary, the steps, and the
+        // raw RTP timestamps) survives when the sidecar did, and is absent
+        // when a scan alone rebuilt the records.
         match sidecar {
             Sidecar::Intact => assert_eq!(records, written[..records.len()], "{context}"),
             Sidecar::Missing => {
                 assert!(
-                    records.iter().all(|record| record.raw_rtp == 0
-                        && record.flags & FLAG_DISCONTINUITY_BEFORE == 0),
+                    records
+                        .iter()
+                        .all(|record| record.raw_rtp == 0 && record.flags & WRITER_ONLY_FLAGS == 0),
                     "{context}"
                 );
             }

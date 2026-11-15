@@ -1,5 +1,6 @@
 //! One RTSP session at a time per stream, reconnecting forever.
 
+use std::num::NonZeroU16;
 use std::num::NonZeroU32;
 use std::pin::Pin;
 use std::sync::{Arc, OnceLock};
@@ -9,11 +10,11 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 use futures::Stream as _;
 use futures::StreamExt as _;
-use iris_core::id::StreamKey;
+use iris_core::id::{StreamKey, StreamKind};
 use iris_core::text::LogSafe;
 use iris_core::time::WallUs;
 use iris_mp4::fragment::Fragment;
-use iris_mp4::init::{SampleEntry, build_init_segment};
+use iris_mp4::init::{SampleEntry, audio_frame_ticks, build_init_segment};
 use retina::client::{
     Credentials, Demuxed, PlayOptions, Session, SessionOptions, SetupOptions, TcpTransportOptions,
     TeardownPolicy, Transport,
@@ -27,16 +28,23 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use crate::assembler::{FragmentAssembler, Frame};
-use crate::live::LiveFrame;
+use crate::audio::{AudioAssembler, AudioFrame, Pushed, VideoSpan};
+use crate::cadence::{self, Cadence};
+use crate::live::{LiveFrame, LiveRing};
 use crate::regularize::{Regularizer, SNAP_TOLERANCE};
 use crate::sink::FragmentSink;
 use crate::source::{IngestOptions, StreamSource};
 use crate::stats::StreamStats;
+use crate::steer::{Rule, Side, Verdict};
+use crate::sync::{LeastWatch, Place, epoch_us, near};
 
 /// Longest pause between reconnection attempts.
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
 /// How long a DESCRIBE, SETUP, or PLAY may take before the session is abandoned.
 const SETUP_TIMEOUT: Duration = Duration::from_secs(15);
+/// The longest a task waits on a quiet camera, or rests between attempts,
+/// before it notes that it is alive ([`StreamStats::beats`]).
+const LIVENESS_SLICE: Duration = Duration::from_secs(5);
 /// A session that lasted this long resets the backoff.
 const HEALTHY_SESSION: Duration = Duration::from_secs(60);
 /// A hold of at least this many ticks (one second) is logged as a gap.
@@ -79,6 +87,7 @@ pub async fn run_stream(
         if shutdown.is_cancelled() {
             return;
         }
+        stats.beat();
         let started = Instant::now();
         // The session owns cancellation once it starts so its pending fragment
         // is flushed before the session state can be dropped.
@@ -102,9 +111,24 @@ pub async fn run_stream(
             &mut attempt,
             started.elapsed() >= HEALTHY_SESSION,
         );
+        if !rest(delay, &stats, &shutdown).await {
+            return;
+        }
+    }
+}
+
+/// Rests `delay` between attempts, noting every [`LIVENESS_SLICE`] of it
+/// that the task is alive; `false` when shutdown ends the rest.
+async fn rest(delay: Duration, stats: &StreamStats, shutdown: &CancellationToken) -> bool {
+    let until = tokio::time::Instant::now() + delay;
+    loop {
+        let left = until.saturating_duration_since(tokio::time::Instant::now());
+        if left.is_zero() {
+            return true;
+        }
         tokio::select! {
-            () = shutdown.cancelled() => return,
-            () = tokio::time::sleep(delay) => {}
+            () = shutdown.cancelled() => return false,
+            () = tokio::time::sleep(left.min(LIVENESS_SLICE)) => stats.beat(),
         }
     }
 }
@@ -157,7 +181,8 @@ async fn run_session(
         mut demuxed,
         nominal,
         stream_index,
-    }) = start_session(source, options, shutdown).await?
+        audio_index,
+    }) = start_session(source, options, stats, shutdown).await?
     else {
         return Ok(());
     };
@@ -174,39 +199,42 @@ async fn run_session(
         stream_index,
         sink_loss: false,
         last_live_decode_time: None,
+        cadence: Cadence::default(),
+        audio: audio_index.map(|index| AudioTrack {
+            index,
+            key: StreamKey {
+                camera: source.key.camera.clone(),
+                kind: StreamKind::Audio,
+            },
+            assembler: None,
+            refused: false,
+            cadence: Cadence::default(),
+            frames: 0,
+            live: options.audio_live.clone(),
+        }),
+        watches: Watches::new(options.watch_window, options.audio_steps),
     };
 
     let mut last_item = Instant::now();
-    let outcome = 'session: loop {
+    let outcome = loop {
         if shutdown.is_cancelled() {
             break Ok(());
         }
-        let item = if let Some(interval) = options.read_interval {
-            let Poll::Ready(item) = poll_now(&mut demuxed) else {
-                tokio::select! {
-                    () = shutdown.cancelled() => break 'session Ok(()),
-                    () = next_tick(options.ticker.as_ref(), interval) => {}
-                }
+        let left = options
+            .inactivity_timeout
+            .saturating_sub(last_item.elapsed());
+        let item = match read_item(&mut demuxed, options, left, shutdown).await {
+            Read::Item(item) => item,
+            Read::Shutdown => break Ok(()),
+            Read::Quiet => {
+                stats.beat();
                 if last_item.elapsed() >= options.inactivity_timeout {
                     break Err(SessionError::Inactivity(options.inactivity_timeout));
                 }
                 continue;
-            };
-            item
-        } else {
-            tokio::select! {
-                () = shutdown.cancelled() => break 'session Ok(()),
-                item = tokio::time::timeout(
-                    options.inactivity_timeout,
-                    demuxed.next(),
-                ) => match item {
-                    Ok(item) => item,
-                    Err(_elapsed) => {
-                        break 'session Err(SessionError::Inactivity(options.inactivity_timeout));
-                    }
-                },
             }
         };
+        stats.beat();
         last_item = Instant::now();
         let Some(item) = item else {
             break Err(SessionError::EndOfStream);
@@ -219,7 +247,11 @@ async fn run_session(
             CodecItem::VideoFrame(frame) => {
                 session_state.on_frame(frame, &demuxed, source, options, sink, stats)
             }
-            CodecItem::Rtcp(packet) => session_state.on_rtcp(&packet, &source.key, stats),
+            CodecItem::AudioFrame(frame) => {
+                session_state.on_audio(&frame, &demuxed, stats);
+                Ok(())
+            }
+            CodecItem::Rtcp(packet) => session_state.on_rtcp(&packet, &demuxed, &source.key, stats),
             _ => Ok(()),
         };
         if let Err(error) = result {
@@ -234,12 +266,15 @@ struct StartedSession {
     demuxed: Demuxed,
     nominal: Option<u32>,
     stream_index: usize,
+    /// The AAC stream set up beside the video, when audio is recorded.
+    audio_index: Option<usize>,
 }
 
 /// Returns no stream when cancellation interrupts setup.
 async fn start_session(
     source: &StreamSource,
     options: &IngestOptions,
+    stats: &StreamStats,
     shutdown: &CancellationToken,
 ) -> Result<Option<StartedSession>, SessionError> {
     let session_options = SessionOptions::default()
@@ -259,11 +294,37 @@ async fn start_session(
         ) => described,
     }
     .map_err(|_| SessionError::SetupTimeout("DESCRIBE"))??;
+    stats.beat();
     let stream_index = session
         .streams()
         .iter()
         .position(|s| s.media() == "video" && s.encoding_name().eq_ignore_ascii_case("h265"))
         .ok_or(SessionError::NoH265Stream)?;
+    let audio_index = if options.audio {
+        session.streams().iter().position(|s| {
+            s.media() == "audio" && s.encoding_name().eq_ignore_ascii_case("mpeg4-generic")
+        })
+    } else {
+        None
+    };
+    // What else the camera offers (audio, metadata) is not set up; one line
+    // each records it, for at most a few.
+    for (_, offered) in session
+        .streams()
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| *index != stream_index && Some(*index) != audio_index)
+        .take(MAX_OFFERED_LOGGED)
+    {
+        info!(
+            stream = %source.key,
+            media = %LogSafe(&clipped(offered.media())),
+            encoding = %LogSafe(&clipped(offered.encoding_name())),
+            clock_rate = offered.clock_rate_hz(),
+            channels = offered.channels().map_or(0, NonZeroU16::get),
+            "offered, not recorded"
+        );
+    }
     let declared_nominal = session.streams()[stream_index]
         .framerate()
         .and_then(nominal_from_fps);
@@ -280,6 +341,23 @@ async fn start_session(
         ) => setup,
     }
     .map_err(|_| SessionError::SetupTimeout("SETUP"))??;
+    stats.beat();
+    if let Some(index) = audio_index {
+        tokio::select! {
+            () = shutdown.cancelled() => return Ok(None),
+            setup = tokio::time::timeout(
+                SETUP_TIMEOUT,
+                session.setup(
+                    index,
+                    SetupOptions::default()
+                        .transport(Transport::Tcp(TcpTransportOptions::default()))
+                        .frame_format(FrameFormat::MP4),
+                ),
+            ) => setup,
+        }
+        .map_err(|_| SessionError::SetupTimeout("SETUP"))??;
+        stats.beat();
+    }
     let max_jump_secs = u32::try_from(options.max_jump.as_secs()).unwrap_or(u32::MAX);
     let max_jump = NonZeroU32::new(max_jump_secs.max(1)).expect("at least one second");
     let mut play_options = PlayOptions::default().enforce_timestamps_with_max_jump_secs(max_jump);
@@ -296,10 +374,12 @@ async fn start_session(
         played = tokio::time::timeout(SETUP_TIMEOUT, session.play(play_options)) => played,
     }
     .map_err(|_| SessionError::SetupTimeout("PLAY"))??;
+    stats.beat();
     Ok(Some(StartedSession {
         demuxed: playing.demuxed()?,
         nominal: declared_nominal,
         stream_index,
+        audio_index,
     }))
 }
 
@@ -312,8 +392,47 @@ async fn next_tick(ticker: Option<&ReadTicker>, interval: Duration) {
     }
 }
 
+/// What one read of a session gave.
+enum Read {
+    /// An item, or the end of the stream.
+    Item(Option<Result<CodecItem, retina::Error>>),
+    /// Nothing within the wait: a read tick, or [`LIVENESS_SLICE`] of a
+    /// camera that sends nothing.
+    Quiet,
+    /// Shutdown ended the wait.
+    Shutdown,
+}
+
+/// Reads the next item of a session in the read mode of `options`, with
+/// `left` of the inactivity timeout to go. A wait on a quiet camera ends
+/// within [`LIVENESS_SLICE`], so the task notes that it is alive while it
+/// waits out that timeout.
+async fn read_item(
+    demuxed: &mut Demuxed,
+    options: &IngestOptions,
+    left: Duration,
+    shutdown: &CancellationToken,
+) -> Read {
+    if let Some(interval) = options.read_interval {
+        if let Poll::Ready(item) = poll_now(demuxed) {
+            return Read::Item(item);
+        }
+        tokio::select! {
+            () = shutdown.cancelled() => Read::Shutdown,
+            () = next_tick(options.ticker.as_ref(), interval) => Read::Quiet,
+        }
+    } else {
+        tokio::select! {
+            () = shutdown.cancelled() => Read::Shutdown,
+            item = tokio::time::timeout(left.min(LIVENESS_SLICE), demuxed.next()) => {
+                item.map_or(Read::Quiet, Read::Item)
+            }
+        }
+    }
+}
+
 /// Polls the demuxer once without arming a wake-up: whatever is already
-/// readable comes out, and `Pending` means the socket is drained for now.
+/// readable comes out, and `Pending` means the socket is drained until more arrives.
 fn poll_now(demuxed: &mut Demuxed) -> Poll<Option<Result<CodecItem, retina::Error>>> {
     let mut cx = Context::from_waker(futures::task::noop_waker_ref());
     Pin::new(demuxed).poll_next(&mut cx)
@@ -399,6 +518,146 @@ struct SessionState {
     sink_loss: bool,
     /// Decode time used to keep live publication moving while recording waits for sync.
     last_live_decode_time: Option<u64>,
+    /// The per-frame steps of the group being received, when they are logged.
+    cadence: Cadence,
+    /// The audio stream recorded beside the video, if any.
+    audio: Option<AudioTrack>,
+    watches: Watches,
+}
+
+/// Logs what the drift rule named for a window, unless it is to hold: as
+/// made where the stream's steps are made, and as what would be made where
+/// they are only said.
+fn log_verdict(key: &StreamKey, makes: bool, verdict: Verdict) {
+    match verdict {
+        Verdict::Hold => {}
+        Verdict::Step {
+            side,
+            frames,
+            error,
+        } => {
+            let step = match side {
+                Side::Late => "left out",
+                Side::Early => "recorded twice",
+            };
+            if makes {
+                info!(
+                    stream = %key,
+                    frames,
+                    step,
+                    error_us = error,
+                    "a step of the audio is made"
+                );
+            } else {
+                info!(
+                    stream = %key,
+                    frames,
+                    step,
+                    error_us = error,
+                    "a step of the audio would be made"
+                );
+            }
+        }
+        Verdict::Stop(why) if makes => info!(
+            stream = %key,
+            reason = why.as_str(),
+            "no further step of the audio is made in this run"
+        ),
+        Verdict::Stop(why) => info!(
+            stream = %key,
+            reason = why.as_str(),
+            "no further step of the audio would be made in this run"
+        ),
+    }
+}
+
+/// The session's watches of parted clocks (`docs/research/14-drift.md`).
+/// Each reports once a window; the audio's place goes to the drift rule,
+/// whose steps are made where the stream's options say so.
+struct Watches {
+    /// The length of a window in 90 kHz ticks.
+    window_ticks: u64,
+    /// The video's receipt times against its timestamps.
+    video_clock: LeastWatch,
+    /// The audio's receipt times against its timestamps.
+    audio_clock: LeastWatch,
+    /// The recorded audio against the video, by the sender reports and by
+    /// arrival.
+    place: Place,
+    /// What takes a drift of the audio out; made at the first window of
+    /// each audio run.
+    rule: Option<Rule>,
+    /// Whether the steps the rule names are made on the recording.
+    makes_steps: bool,
+    /// The whole timestamp of the video frame received last.
+    video_stamp: i64,
+    /// Whether the lack of sender reports for both streams was said.
+    unmeasured_said: bool,
+}
+
+impl Watches {
+    fn new(window: Duration, makes_steps: bool) -> Self {
+        let micros = u64::try_from(window.as_micros()).unwrap_or(u64::MAX);
+        let window_ticks = micros.saturating_mul(9) / 100;
+        Self {
+            window_ticks,
+            video_clock: LeastWatch::new(micros),
+            audio_clock: LeastWatch::new(micros),
+            place: Place::new(window_ticks),
+            rule: None,
+            makes_steps,
+            video_stamp: 0,
+            unmeasured_said: false,
+        }
+    }
+
+    /// Notes a video frame received at `wall` whose place in the recording
+    /// is `decode_time`, if it has one yet.
+    fn arrived(&mut self, wall: WallUs, decode_time: Option<u64>) {
+        if let Some(decode_time) = decode_time {
+            self.place.video_frame(wall.get() - ticks_us(decode_time));
+        }
+    }
+
+    /// Starts the audio's place and its rule over: a run is placed anew,
+    /// so where it stands is read from its own first window.
+    fn start_run(&mut self) {
+        self.place = Place::new(self.place.span());
+        self.rule = None;
+    }
+
+    /// Notes a frame of `key` received at `wall` whose timestamp is
+    /// `stamp_us` on the camera's clock, and reports a window that closes.
+    fn clock(watch: &mut LeastWatch, key: &StreamKey, wall: WallUs, stamp_us: i64) -> Option<i64> {
+        let position = u64::try_from(wall.get()).unwrap_or(0);
+        let window = watch.note(position, wall.get().saturating_sub(stamp_us))?;
+        info!(
+            stream = %key,
+            moved_us = window.moved,
+            spread_us = window.greatest - window.least,
+            frames = window.samples,
+            "timestamps against the recorder's clock"
+        );
+        Some(window.moved)
+    }
+}
+
+/// The session's audio stream and what assembles its frames.
+struct AudioTrack {
+    /// The stream's index in the session.
+    index: usize,
+    /// The camera's `audio` stream key.
+    key: StreamKey,
+    /// Created at the first frame, from the stream's parameters.
+    assembler: Option<AudioAssembler>,
+    /// Whether the stream's parameters were refused; said once.
+    refused: bool,
+    /// The per-frame steps of the frames received, when they are logged.
+    cadence: Cadence,
+    /// Frames received, for the cadence log's groups of 125.
+    frames: u64,
+    /// Where the frames are published for live listeners.
+    live: Option<LiveRing>,
 }
 
 impl SessionState {
@@ -406,6 +665,138 @@ impl SessionState {
     fn flush(&mut self, sink: &dyn FragmentSink, source: &StreamSource, stats: &StreamStats) {
         if let Some(fragment) = self.assembler.as_mut().and_then(FragmentAssembler::flush) {
             self.close_fragment(fragment, sink, source, stats);
+        }
+        if let Some(audio) = self.audio.as_mut()
+            && let Some(fragment) = audio.assembler.as_mut().and_then(AudioAssembler::flush)
+        {
+            send_audio(sink, &audio.key, fragment);
+        }
+    }
+
+    /// Cuts the audio that accompanies a closed video fragment's
+    /// predecessor and hands it to the sink.
+    fn cut_audio(&mut self, span: VideoSpan, sink: &dyn FragmentSink) {
+        let Some(audio) = self.audio.as_mut() else {
+            return;
+        };
+        let Some(assembler) = audio.assembler.as_mut() else {
+            return;
+        };
+        if let Some(fragment) = assembler.video_fragment(span) {
+            debug!(
+                target: "iris_ingest::cadence",
+                stream = %audio.key,
+                frames = fragment.samples.len(),
+                drift_us = assembler.drift_ticks().saturating_mul(100) / 9,
+                "audio fragment"
+            );
+            if fragment.new_run {
+                self.watches.start_run();
+            }
+            send_audio(sink, &audio.key, fragment);
+        }
+    }
+
+    /// Takes one audio frame of the recorded audio stream; its fragments are
+    /// cut as video fragments close (`cut_audio`). Audio never ends the
+    /// session: a stream whose parameters cannot be stored is left unrecorded.
+    fn on_audio(
+        &mut self,
+        frame: &retina::codec::AudioFrame,
+        demuxed: &Demuxed,
+        stats: &StreamStats,
+    ) {
+        let Some(audio) = self.audio.as_mut().filter(|a| a.index == frame.stream_id()) else {
+            return;
+        };
+        if audio.refused {
+            return;
+        }
+        let Ok(wall) = self.clock.wall_at(frame.ctx().received()) else {
+            return;
+        };
+        if audio.assembler.is_none() {
+            match audio_assembler(demuxed, audio.index, frame.frame_length().get()) {
+                Ok(assembler) => {
+                    let assembler = assembler.with_watch_window(self.watches.window_ticks);
+                    info!(stream = %audio.key, "recording audio");
+                    if let Some(live) = &audio.live {
+                        live.set_init_segment(build_init_segment(assembler.entry()));
+                    }
+                    audio.assembler = Some(assembler);
+                }
+                Err(reason) => {
+                    info!(stream = %audio.key, reason, "audio not recorded");
+                    audio.refused = true;
+                    return;
+                }
+            }
+        }
+        let Some(assembler) = audio.assembler.as_mut() else {
+            return;
+        };
+        // The cadence log takes 90 kHz ticks and reports a group at a sync
+        // frame; audio has none, so every 125th frame closes one.
+        let rate = i64::from(demuxed.streams()[audio.index].clock_rate_hz().max(1));
+        audio.cadence.frame(
+            &audio.key,
+            frame.timestamp().timestamp().saturating_mul(90_000) / rate,
+            wall,
+            frame.data().len(),
+            audio.frames.is_multiple_of(125),
+        );
+        audio.frames += 1;
+        let stamp_us = frame.timestamp().timestamp().saturating_mul(1_000_000) / rate;
+        let _ = Watches::clock(&mut self.watches.audio_clock, &audio.key, wall, stamp_us);
+        let data = Bytes::copy_from_slice(frame.data());
+        let pushed = assembler.push(AudioFrame {
+            data: data.clone(),
+            raw_ts: frame.timestamp().timestamp(),
+            wall,
+            lost: frame.loss() > 0,
+        });
+        if let Some(side) = assembler.last_step() {
+            stats.record_sound_step_made(side);
+        }
+        // A frame is noted and published as often as it is recorded, with
+        // the times each record of it gets.
+        for (decode_time, recorded) in assembler.last_pushed() {
+            let decode_us = ticks_us(decode_time);
+            self.watches
+                .place
+                .audio_frame(stamp_us - decode_us, wall.get() - decode_us);
+            if let Some(live) = &audio.live {
+                live.publish(Arc::new(LiveFrame {
+                    key: audio.key.clone(),
+                    sample_entry: Arc::clone(assembler.entry()),
+                    data: data.clone(),
+                    duration: assembler.frame_ticks(),
+                    is_sync: true,
+                    decode_time,
+                    wall: recorded,
+                }));
+            }
+        }
+        if let Some(window) = assembler.take_stamp_window() {
+            let micros = |ticks: i64| ticks.saturating_mul(100) / 9;
+            stats.record_audio_stamps_moved(micros(window.moved));
+            info!(
+                stream = %audio.key,
+                least_us = micros(window.least),
+                greatest_us = micros(window.greatest),
+                moved_us = micros(window.moved),
+                frames = window.samples,
+                "audio timestamps against the count"
+            );
+        }
+        if pushed == Pushed::Broke {
+            self.watches.start_run();
+            // Both streams break at the same point: the video starts a run
+            // at its next sync frame.
+            info!(stream = %audio.key, "audio continuity lost; starting a run");
+            if let Some(video) = self.assembler.as_mut() {
+                video.mark_discontinuity();
+            }
         }
     }
 
@@ -432,6 +823,7 @@ impl SessionState {
             &source.key,
             stats,
         );
+        let span = VideoSpan::of(&fragment);
         if deliver_fragment(sink, &source.key, fragment, stats) {
             self.sink_loss = false;
         } else {
@@ -442,6 +834,99 @@ impl SessionState {
             self.sink_loss = true;
             assembler.mark_sink_rejection();
         }
+        self.place_audio(&span, stats);
+        self.cut_audio(span, sink);
+    }
+
+    /// Notes a closed video fragment for the audio's place against the
+    /// video, and when it closes a window reports the place and the step
+    /// the drift rule names for it (`docs/research/13-audio.md` §5.3.4).
+    /// The step is made on the frames received next where the stream's
+    /// steps are made, and only said where they are not.
+    fn place_audio(&mut self, span: &VideoSpan, stats: &StreamStats) {
+        let Some(audio) = self.audio.as_mut() else {
+            return;
+        };
+        let Some(assembler) = audio.assembler.as_mut() else {
+            return;
+        };
+        let frame_ticks = assembler.frame_ticks();
+        if span.new_run {
+            self.watches.start_run();
+        }
+        let stamp_us = near(span.raw_rtp, self.watches.video_stamp).saturating_mul(100) / 9;
+        let decode_us = ticks_us(span.decode_time);
+        let Some(placed) = self
+            .watches
+            .place
+            .video_fragment(span.decode_time, stamp_us - decode_us)
+        else {
+            return;
+        };
+        if let Some(reading) = placed.by_reports {
+            stats.record_audio_sync(reading.late, reading.moved);
+            info!(
+                stream = %audio.key,
+                late_us = reading.late,
+                moved_us = reading.moved,
+                pairs = placed.pairs,
+                fragments = placed.fragments,
+                "audio against video by sender reports"
+            );
+        } else if !self.watches.unmeasured_said {
+            self.watches.unmeasured_said = true;
+            info!(
+                stream = %audio.key,
+                audio_reports = placed.audio_reports,
+                video_reports = placed.video_reports,
+                pairs = placed.pairs,
+                "audio against video is not read by sender reports: too few pairs of them"
+            );
+        }
+        if let Some(reading) = placed.by_arrival {
+            stats.record_audio_arrival_moved(reading.moved);
+            info!(
+                stream = %audio.key,
+                moved_us = reading.moved,
+                apart_us = reading.late,
+                stamps_moved_us = placed.by_stamps.map_or(0, |stamps| stamps.moved),
+                fragments = placed.fragments,
+                "audio against video by arrival"
+            );
+        }
+        let window_ticks = self.watches.window_ticks.max(1);
+        let makes = self.watches.makes_steps;
+        let rule = self.watches.rule.get_or_insert_with(|| {
+            let rule = Rule::new(
+                i64::from(frame_ticks) * 100 / 9,
+                (3_600 * 90_000 / window_ticks).max(1),
+            );
+            if makes { rule.making_steps() } else { rule }
+        });
+        let verdict = rule.judge(&placed);
+        if let Verdict::Step { side, frames, .. } = verdict {
+            stats.record_sound_step_said(side, frames);
+            if makes {
+                assembler.step(side, frames);
+            }
+        }
+        log_verdict(&audio.key, makes, verdict);
+    }
+
+    /// Notes a video frame's receipt against its timestamp for the watch of
+    /// the camera's clock against the recorder's.
+    fn watch_video_clock(
+        &mut self,
+        key: &StreamKey,
+        wall: WallUs,
+        raw_ts: i64,
+        stats: &StreamStats,
+    ) {
+        self.watches.video_stamp = raw_ts;
+        let stamp_us = raw_ts.saturating_mul(100) / 9;
+        if let Some(moved) = Watches::clock(&mut self.watches.video_clock, key, wall, stamp_us) {
+            stats.record_clock_moved(moved);
+        }
     }
 
     /// Records the camera clock offset carried by RTCP sender reports. A
@@ -449,15 +934,42 @@ impl SessionState {
     fn on_rtcp(
         &mut self,
         packet: &ReceivedCompoundPacket,
+        demuxed: &Demuxed,
         key: &StreamKey,
         stats: &StreamStats,
     ) -> Result<(), SessionError> {
         let nvr = self.clock.wall_at(packet.ctx().received())?;
+        // The report's stream: the audio stream's reports go under its key.
+        let audio_key = self
+            .audio
+            .as_ref()
+            .filter(|audio| audio.index == packet.stream_id())
+            .map(|audio| &audio.key);
         for pkt in packet.pkts() {
             match pkt.as_sender_report() {
                 Ok(Some(report)) => {
                     let camera = WallUs::from_ntp64(report.ntp_timestamp().0);
-                    stats.record_sender_report(camera.micros_since(nvr));
+                    if audio_key.is_none() {
+                        stats.record_sender_report(camera.micros_since(nvr));
+                    }
+                    if let (Some(rtp), Some(stream)) = (
+                        packet.rtp_timestamp(),
+                        demuxed.streams().get(packet.stream_id()),
+                    ) {
+                        let epoch = epoch_us(camera, rtp.timestamp(), stream.clock_rate_hz());
+                        if audio_key.is_some() {
+                            self.watches.place.audio_report(epoch, nvr);
+                        } else {
+                            self.watches.place.video_report(epoch, nvr);
+                        }
+                        cadence::sender_report(
+                            audio_key.unwrap_or(key),
+                            camera,
+                            rtp.timestamp(),
+                            stream.clock_rate_hz(),
+                            nvr,
+                        );
+                    }
                 }
                 Ok(None) => {}
                 Err(error) => {
@@ -490,6 +1002,9 @@ impl SessionState {
         }
         let data = framed_data(&source.key, frame.into_data());
         stats.record_frame(data.len() as u64, wall, lost);
+        self.cadence
+            .frame(&source.key, raw_ts, wall, data.len(), is_sync);
+        self.watch_video_clock(&source.key, wall, raw_ts, stats);
 
         let mut retarget_nominal = None;
         if self.assembler.is_none() || has_new_parameters {
@@ -547,6 +1062,8 @@ impl SessionState {
             assembler.retarget_timing(nominal);
             self.nominal = Some(nominal);
         }
+        self.watches
+            .arrived(wall, assembler.last_provisional_decode_time());
         let live_decode_time = live_decode_time(
             assembler.last_provisional_decode_time(),
             self.last_live_decode_time,
@@ -684,6 +1201,53 @@ fn framed_data(key: &StreamKey, data: Vec<u8>) -> Bytes {
     }
 }
 
+/// Hands an audio fragment to the sink; a rejected one is dropped and said.
+fn send_audio(sink: &dyn FragmentSink, key: &StreamKey, fragment: Fragment) {
+    if sink.send(key, fragment).is_err() {
+        debug!(stream = %key, "audio fragment rejected by the sink");
+    }
+}
+
+/// The assembler for the session's audio stream, or why its audio cannot be
+/// stored: no AAC parameters, no sample entry, or a sampling rate whose
+/// frames are not whole 90 kHz ticks.
+fn audio_assembler(
+    demuxed: &Demuxed,
+    index: usize,
+    frame_samples: u32,
+) -> Result<AudioAssembler, &'static str> {
+    let Some(ParametersRef::Audio(parameters)) = demuxed
+        .streams()
+        .get(index)
+        .and_then(retina::client::Stream::parameters)
+    else {
+        return Err("no audio parameters");
+    };
+    let Some(codecs) = parameters.rfc6381_codec() else {
+        return Err("no codec string");
+    };
+    let Ok(entry) = parameters.mp4_sample_entry().build() else {
+        return Err("no MP4 sample entry for the codec");
+    };
+    let Some(frame_ticks) = audio_frame_ticks(parameters.clock_rate(), frame_samples) else {
+        return Err("frames are not whole 90 kHz ticks at the sampling rate");
+    };
+    Ok(AudioAssembler::new(
+        Arc::new(SampleEntry::audio(Bytes::from(entry), codecs.to_owned())),
+        parameters.clock_rate(),
+        frame_samples,
+        frame_ticks,
+    ))
+}
+
+/// Streams other than the recorded one that a session start logs.
+const MAX_OFFERED_LOGGED: usize = 4;
+
+/// The first 32 characters of camera text, for a log field.
+fn clipped(text: &str) -> String {
+    text.chars().take(32).collect()
+}
+
 fn video_parameters(demuxed: &Demuxed, stream_index: usize) -> Option<&VideoParameters> {
     match demuxed.streams().get(stream_index)?.parameters()? {
         ParametersRef::Video(video) => Some(video),
@@ -775,6 +1339,11 @@ impl WallClock {
     }
 }
 
+/// 90 kHz ticks of a timeline as microseconds.
+fn ticks_us(ticks: u64) -> i64 {
+    i64::try_from(ticks.saturating_mul(100) / 9).unwrap_or(i64::MAX)
+}
+
 fn signed_micros(at: Instant, anchor: Instant) -> i64 {
     if at >= anchor {
         i64::try_from(at.duration_since(anchor).as_micros()).unwrap_or(i64::MAX)
@@ -799,7 +1368,7 @@ mod tests {
     fn stream_key(camera: &str) -> StreamKey {
         StreamKey {
             camera: camera.parse().expect("camera id"),
-            kind: iris_core::id::StreamKind::Main,
+            kind: StreamKind::Main,
         }
     }
 
@@ -849,6 +1418,9 @@ mod tests {
             stream_index: 0,
             sink_loss: false,
             last_live_decode_time: None,
+            cadence: Cadence::default(),
+            audio: None,
+            watches: Watches::new(options.watch_window, options.audio_steps),
         }
     }
 
@@ -859,6 +1431,12 @@ mod tests {
             username: String::new(),
             password: String::new(),
         }
+    }
+
+    #[test]
+    fn camera_text_in_the_offer_line_is_clipped_to_32_characters() {
+        assert_eq!(clipped("mpeg4-generic"), "mpeg4-generic");
+        assert_eq!(clipped(&"é".repeat(40)), "é".repeat(32));
     }
 
     #[test]
@@ -928,7 +1506,7 @@ mod tests {
         let source = StreamSource {
             key: StreamKey {
                 camera: "cam1".parse().unwrap(),
-                kind: iris_core::id::StreamKind::Main,
+                kind: StreamKind::Main,
             },
             url: format!("rtsp://{address}/video").parse().unwrap(),
             username: String::new(),
@@ -936,7 +1514,10 @@ mod tests {
         };
         let task = tokio::spawn({
             let shutdown = shutdown.clone();
-            async move { start_session(&source, &IngestOptions::default(), &shutdown).await }
+            async move {
+                let stats = StreamStats::default();
+                start_session(&source, &IngestOptions::default(), &stats, &shutdown).await
+            }
         });
         tokio::time::timeout(Duration::from_secs(2), request_received)
             .await
@@ -1034,10 +1615,7 @@ mod tests {
         // together: their first delays differ.
         let mut first_delays = HashSet::new();
         for camera in 1..=7 {
-            for kind in [
-                iris_core::id::StreamKind::Main,
-                iris_core::id::StreamKind::Sub,
-            ] {
+            for kind in [StreamKind::Main, StreamKind::Sub] {
                 let key = StreamKey {
                     camera: format!("cam{camera}").parse().expect("camera id"),
                     kind,
@@ -1046,6 +1624,31 @@ mod tests {
             }
         }
         assert!(first_delays.len() >= 12, "{first_delays:?}");
+    }
+
+    /// A rest between attempts notes that the task is alive every five
+    /// seconds of it and at its end, and ends early at shutdown.
+    #[tokio::test(start_paused = true)]
+    async fn a_rest_between_attempts_beats_every_slice_and_ends_at_shutdown() {
+        let stats = StreamStats::default();
+        let shutdown = CancellationToken::new();
+        let began = tokio::time::Instant::now();
+        assert!(rest(Duration::from_secs(36), &stats, &shutdown).await);
+        assert_eq!(began.elapsed(), Duration::from_secs(36));
+        // Seven slices of five seconds and the second that is left.
+        assert_eq!(stats.beats(), 8);
+        assert!(rest(Duration::ZERO, &stats, &shutdown).await);
+        assert_eq!(stats.beats(), 8);
+
+        let ending = shutdown.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(7)).await;
+            ending.cancel();
+        });
+        let began = tokio::time::Instant::now();
+        assert!(!rest(Duration::from_secs(36), &stats, &shutdown).await);
+        assert_eq!(began.elapsed(), Duration::from_secs(7));
+        assert_eq!(stats.beats(), 9);
     }
 
     #[test]

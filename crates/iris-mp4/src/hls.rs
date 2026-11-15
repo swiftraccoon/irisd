@@ -250,10 +250,129 @@ pub fn master_playlist(
     Ok(out)
 }
 
+/// An audio rendition that a multivariant playlist declares beside its
+/// variant (`docs/research/13-audio.md` §8).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AudioRendition<'a> {
+    /// The URI of the rendition's media playlist.
+    pub uri: &'a str,
+    /// RFC 6381 codecs string of the audio, for example `mp4a.40.2`.
+    pub codecs: &'a str,
+    /// The bit rates of the rendition's media playlist.
+    pub rates: VariantBitRates,
+    /// Channel count, declared as `CHANNELS` when known.
+    pub channels: Option<u16>,
+}
+
+/// Builds a multivariant playlist with one variant and one audio rendition
+/// in a group of its own: an `EXT-X-MEDIA` line of type `AUDIO` with
+/// `LANGUAGE="und"` (a camera's sound has no declared language), and a
+/// variant whose `CODECS` lists both sample formats and whose bit rates are
+/// the sums of both playlists', since the two always play together.
+///
+/// # Errors
+///
+/// Returns [`InvalidPlaylistText`] when a URI or a codecs string holds a
+/// quotation mark, a line break, another control character, or, for a
+/// codecs string, a comma.
+pub fn master_playlist_with_audio(
+    media_playlist_uri: &str,
+    codecs: &str,
+    rates: VariantBitRates,
+    width: u16,
+    height: u16,
+    audio: &AudioRendition<'_>,
+) -> Result<String, InvalidPlaylistText> {
+    for text in [media_playlist_uri, codecs, audio.uri, audio.codecs] {
+        check_text(text)?;
+    }
+    if codecs.contains(',') || audio.codecs.contains(',') {
+        return Err(InvalidPlaylistText);
+    }
+    let mut out = String::from("#EXTM3U\n#EXT-X-VERSION:7\n");
+    out.push_str(
+        "#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"audio\",NAME=\"camera\",LANGUAGE=\"und\",\
+         DEFAULT=YES,AUTOSELECT=YES,",
+    );
+    if let Some(channels) = audio.channels {
+        let _ = write!(out, "CHANNELS=\"{channels}\",");
+    }
+    let _ = writeln!(out, "URI=\"{}\"", audio.uri);
+    let _ = writeln!(
+        out,
+        "#EXT-X-STREAM-INF:BANDWIDTH={},AVERAGE-BANDWIDTH={},CODECS=\"{codecs},{}\",\
+         RESOLUTION={width}x{height},AUDIO=\"audio\"",
+        rates.peak.saturating_add(audio.rates.peak),
+        rates.average.saturating_add(audio.rates.average),
+        audio.codecs
+    );
+    out.push_str(media_playlist_uri);
+    out.push('\n');
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::index::FLAG_STARTS_WITH_SYNC;
+
+    /// The audio rendition is declared as the HLS draft and Apple's
+    /// authoring specification require: its own group, a language, and a
+    /// variant that names the group, both codecs, and the summed bit rates.
+    #[test]
+    fn a_multivariant_playlist_declares_its_audio_rendition() {
+        let audio = AudioRendition {
+            uri: "audio.m3u8?from=1&to=2",
+            codecs: "mp4a.40.2",
+            rates: VariantBitRates {
+                peak: 130_000,
+                average: 125_000,
+            },
+            channels: Some(1),
+        };
+        let rates = VariantBitRates {
+            peak: 9_000_000,
+            average: 8_000_000,
+        };
+        let text =
+            master_playlist_with_audio("video.m3u8", "hvc1.1.6.L150.B0", rates, 3840, 2160, &audio)
+                .unwrap();
+        assert_eq!(
+            text,
+            "#EXTM3U\n#EXT-X-VERSION:7\n\
+             #EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"audio\",NAME=\"camera\",LANGUAGE=\"und\",\
+             DEFAULT=YES,AUTOSELECT=YES,CHANNELS=\"1\",URI=\"audio.m3u8?from=1&to=2\"\n\
+             #EXT-X-STREAM-INF:BANDWIDTH=9130000,AVERAGE-BANDWIDTH=8125000,\
+             CODECS=\"hvc1.1.6.L150.B0,mp4a.40.2\",RESOLUTION=3840x2160,AUDIO=\"audio\"\n\
+             video.m3u8\n"
+        );
+        let unknown = AudioRendition {
+            channels: None,
+            ..audio
+        };
+        let text = master_playlist_with_audio("v.m3u8", "hvc1", rates, 16, 16, &unknown).unwrap();
+        assert!(
+            text.contains("AUTOSELECT=YES,URI=\"audio.m3u8?from=1&to=2\"\n"),
+            "{text}"
+        );
+        for (video_codecs, audio_codecs, audio_uri) in [
+            ("hvc1,x", "mp4a.40.2", "a.m3u8"),
+            ("hvc1", "mp4a,x", "a.m3u8"),
+            ("hvc1", "mp4a.40.2", "a\".m3u8"),
+            ("hvc1", "mp4a.40.2", "a\n.m3u8"),
+        ] {
+            let bad = AudioRendition {
+                uri: audio_uri,
+                codecs: audio_codecs,
+                ..audio
+            };
+            assert_eq!(
+                master_playlist_with_audio("v.m3u8", video_codecs, rates, 16, 16, &bad),
+                Err(InvalidPlaylistText),
+                "{video_codecs} {audio_codecs} {audio_uri:?}"
+            );
+        }
+    }
 
     fn record(offset: u64, len: u32, sync: bool) -> IndexRecord {
         IndexRecord {

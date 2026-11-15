@@ -1,16 +1,16 @@
 # 05 — Camera ingest, timing, and events
 
-Full research notes with citations: `appendix/D-camera-integration.md`. Measurements on cam1:
+Full research notes with citations: `appendix/D-camera-integration.md`. Measurements:
 `01-camera-probe.md`.
 
 ## 1. RTSP session policy (retina 0.4.21, feature `h265`)
 
 | Setting | Value | Reason |
 |---|---|---|
-| Transport | TCP interleaved | zero loss on a LAN (0 sequence gaps in 90 s on cam1), kernel retransmit, no reorder buffer needed; retina's UDP is experimental with no reorder buffer; Moonfire, go2rtc and Frigate all default to TCP. Head-of-line blocking only adds latency, irrelevant for recording |
+| Transport | TCP interleaved | zero loss on a LAN (0 sequence gaps in 90 s on a test camera), kernel retransmit, no reorder buffer needed; retina's UDP is experimental with no reorder buffer; Moonfire, go2rtc and Frigate all default to TCP. Head-of-line blocking only adds latency, irrelevant for recording |
 | Frame format | 4-byte length-prefixed NALs, no parameter-set insertion | matches the `hvc1` sample format byte-for-byte; parameter sets come from `Stream::parameters()` and `VideoFrame::has_new_parameters()` |
 | Control messages | 1 MiB maximum for one RTSP head plus body, enforced while parsing and reading; camera-supplied fields bounded while parsing: `Content-Base`, `Content-Location`, and joined control URLs 2,048 bytes, `Session` id 512, `WWW-Authenticate` 4,096, 64 SDP media sections; a longer field fails the session with an error naming it | a setup deadline is not an allocation bound; every message is rejected before retained parser state or the connection read buffer crosses the declared limit; keepalives and `TEARDOWN` repeat these fields, so the bounds keep every request small |
-| Keepalive | retina default: `GET_PARAMETER` every `min(timeout, 60)/2` s (cam1 timeout = 60 s) | ONVIF accepts any non-TEARDOWN request as keepalive; `SET_PARAMETER` breaks Tapo cameras |
+| Keepalive | retina default: `GET_PARAMETER` every `min(timeout, 60)/2` s (a 60 s session timeout on a test camera) | ONVIF accepts any non-TEARDOWN request as keepalive; `SET_PARAMETER` breaks Tapo cameras |
 | Teardown | `TeardownPolicy::Always`; a fresh-connection `TEARDOWN` goes to the address the session reached, the advertised `Content-Base` serving only as its Request-URI; a background `TEARDOWN` retries for the session timeout or 60 s, whichever is shorter; at most 64 run in the process, and a session dropped beyond that is not torn down (a warning); the daemon's `process` line reports the running count as `teardowns` | every setup or playing-session outcome releases camera-side state; a camera cannot direct requests or credentials to another host, keep a task alive for its 136-year maximum timeout, or make dropped sessions accumulate tasks, sockets, and memory |
 | RTCP | `ReceiverReportPolicy::Never`; SRs consumed for diagnostics | TCP needs no RR; SR NTP minus receipt time is reported per stream (`cam_offset_ms`), never stored or used as the time base |
 | Timestamps | `enforce_timestamps_with_max_jump_secs(10)` | large jumps become run boundaries instead of corrupt timelines |
@@ -24,7 +24,7 @@ Full research notes with citations: `appendix/D-camera-integration.md`. Measurem
 | Reconnect | 1 s → ×2 → 30 s cap, deterministic ±20 % jitter mixed from stream identity and retry attempt; reset after a 60 s healthy session; separate run; resume recording at the next IRAP | decorrelated streams and attempts avoid a synchronized retry burst; Moonfire retries after 1 s; Frigate uses a 10 s socket timeout |
 | Credentials | passed to retina, never in the URL; `Debug` output of `StreamSource` and retina `Credentials` redacts them | Moonfire rule; URLs are logged |
 | Diagnostics | camera-supplied text reaches the log only escaped and bounded: retina logs at most one warning per `DESCRIBE` (a count and the first problem) and quotes at most 512-byte escaped excerpts, never the whole SDP; `iris-ingest` logs a session error through an adapter that escapes line breaks and control characters and stops at 512 characters | one hostile `DESCRIBE` once logged its SDP once per media section, gigabytes in a minute on the runtime thread, and a raw line break let a camera start a log line, including a journal priority prefix |
-| URLs | main `subtype=0`; sub `subtype=1` (the derived default), or `subtype=2` (the third stream) on a family whose sub stream stops beside a second session; keep `proto=Onvif` for Dahua compatibility | measured on cam1 (01 §5b) |
+| URLs | main `subtype=0`; sub `subtype=1` (the derived default), or `subtype=2` (the third stream) on a camera whose sub stream stops beside a second session; keep `proto=Onvif` for Dahua compatibility | measured on a test camera (01 §5b) |
 
 What retina already handles so irisd does not have to: RFC 7798 single/AP/FU
 depacketisation (SRST only, no DONL, which is what every IPC emits), AU assembly on marker
@@ -40,7 +40,7 @@ and the diagnostic bounds above. Its writes on a detached socket never block, an
 `sdp-types` no SDP line outside `type=value` form, on which that parser panics. The
 application repeats the 64 MiB frame bound at fragment assembly as defense in depth.
 
-cam1 specifics confirmed in 01: FUs only, AP never, marker on every AU, VPS/SPS/PPS as single
+Confirmed in 01: FUs only, AP never, marker on every AU, VPS/SPS/PPS as single
 NAL packets before each IDR, no RTP extensions, no padding, session timeout 60 s, SR every 5 s.
 
 ## 2. Per-stream pipeline
@@ -96,10 +96,10 @@ retina Demuxed ──VideoFrame──▶ fragment assembler ──┬──▶ l
   compares its bytes with the open file's (the CRC-32C is only a hint), and on a change it seals
   the file, the catalog inserts a `sample_entry`, live clients get a replacement init segment,
   and the effective-rate rule above applies.
-- **Audio**: unsupported in the 0.1 alpha. Configuration accepts only the `main` and `sub`
-  video kinds for recording. An audio implementation needs AAC `mp4a`/`esds`, fixed
-  1024-sample durations, its own file and fragment cadence, and alignment per 04 §7.5;
-  G.711 and L16 are unsuitable for the HLS path.
+- **Audio**: `audio` in a camera's `record` list, beside `main`, sets up the AAC stream of
+  the main stream's session and records it as received (`mp4a`/`esds`, fixed 1,024-sample
+  durations, its own files and fragment cadence, alignment per 04 §7.5). G.711 and L16 are
+  not recorded: HLS cannot carry them and the recorder does not transcode (`13-audio.md`).
 
 ## 3. Events
 
@@ -108,7 +108,7 @@ camera_time_us, nvr_time_us, data JSON}` with `kind ∈ {motion, human, vehicle,
 intrusion, tamper, audio, face, video_loss, time_change, …}`. Configurable subscriptions are
 `dahua_cgi` and `onvif_pull_point`; other enum values remain available for stored/test data but
 configuration rejects them. Event-to-video alignment uses NVR receipt time directly, never the
-camera's clock (cam1's ONVIF UTC is off by 1 h).
+camera's clock (the test camera's ONVIF UTC is off by 1 h).
 Camera-controlled event strings share one storage boundary: data is valid JSON text at most
 64 KiB and an unmapped vendor kind code is at most 1 KiB. Invalid vendor text becomes a JSON
 string, and a valid encoding beyond the data limit becomes `{"truncated":true}` instead of a
@@ -137,7 +137,7 @@ Implemented sources for Dahua-family cameras:
    `LeftDetection`, `TakenAwayDetection`, `FaceDetection`, `AudioMutation`, `AudioAnomaly`,
    `VideoLoss`, `VideoBlind`, `AlarmLocal`, `NewFile`, `TimeChange`, `NTPAdjustTime`; filter
    locally rather than passing long `codes=` lists (some firmware returns 400/500). Carries
-   IVS object metadata in `data={}` JSON. Validated on cam1 with real motion: `VideoMotion`
+   IVS object metadata in `data={}` JSON. Validated on a test camera with real motion: `VideoMotion`
    Start/Stop, `VideoMotionInfo` State pulses while active, `NewFile` when the camera's SD
    recording rolls (coincides with a forced IDR), `RtspSessionDisconnect` when a client vanishes
    without TEARDOWN (01 §7).
@@ -161,7 +161,7 @@ Implemented sources for Dahua-family cameras:
    on the subscription URL. Camera text in an ONVIF error or topic, or in a CGI code or action,
    reaches the log only through `iris_core::text::LogSafe`: one escaped line of at most 512
    characters, the same adapter as `iris-ingest` (§1).
-   Topics on cam1 include `tns1:VideoSource/MotionAlarm`,
+   Topics on a test camera include `tns1:VideoSource/MotionAlarm`,
    `tns1:RuleEngine/CellMotionDetector/Motion`, `FieldDetector/ObjectsInside`,
    `LineDetector/Crossed`, `TamperDetector/Tamper`, `AudioAnalytics/Audio/DetectedSound`.
    CGI and ONVIF both apply the endpoint's `tls_verify` policy to HTTPS requests. ONVIF service
@@ -186,8 +186,8 @@ Phase-5 source candidates, not accepted by 0.1 configuration:
 
 - **ONVIF metadata RTP track** (`vnd.onvif.metadata`, retina `MessageFrame`): XML
    `tt:MetadataStream` with analytics frames and events stamped on the video RTP clock, so
-   frame-accurate alignment is possible. SETUP works on cam1 but the track stayed silent through
-   four motion episodes, so on this firmware it apparently carries only IVS rule results
+   frame-accurate alignment is possible. SETUP works but the track stayed silent through
+   motion episodes, so it apparently carries only IVS rule results
    (tripwire/intrusion); unvalidated until an IVS rule is enabled (01 §10).
 - **RPC2 JSON-RPC polling** only as a last resort for firmware that 404s `/cgi-bin/`.
 
@@ -225,12 +225,12 @@ An explicit opt-in provisioning design may use the following policy:
 Dahua CGI `configManager.cgi?action=setConfig&…` (ONVIF Media2 `SetVideoEncoderConfiguration`
 for other vendors):
 
-- `Encode[0].MainFormat[0].Video`: `Compression=H.265`, `GOP ≤ 2×FPS` (cam1: 60 at 30 fps,
+- `Encode[0].MainFormat[0].Video`: `Compression=H.265`, `GOP ≤ 2×FPS` (60 at 30 fps,
   already right), `BitRateControl=CBR` (or VBR with a cap), `Profile=Main`, smart codec off
-  (`SmartEncode[0].Enable=false`, already off on cam1). Smart/"+" modes produce multi-second
+  (`SmartEncode[0].Enable=false`). Smart/"+" modes produce multi-second
   irregular GOPs and long-term references, which stretch segment and seek granularity and
   break mid-GOP cuts; Blue Iris and SecuritySpy both tell users to disable them.
-- Audio: `Audio.Compression=AAC` (cam1 ships L16 PCM at 1 Mbps on main and sub).
+- Audio: `Audio.Compression=AAC` (L16 PCM costs 1 Mbps).
 - Disable `ExtraFormat[1]` (the 1080p third stream) unless a client uses it or it serves as
   the secondary stream because the sub stream stops beside a second session (01 §5b); in that
   case lower its resolution and bitrate to what a grid tile needs.
@@ -258,7 +258,7 @@ tasks beside the monitor loop, at most four at a time:
   most 64 distinct cameras are listed, one per host and port, so unusable or repeated answers
   do not use up the list. Nothing follows an advertised URL. The systemd unit's
   `IPAddressAllow=` must include `multicast` for the probe to leave the host. 3702/tcp is
-  closed on cam1, as expected (discovery is UDP).
+  closed on a test camera, as expected (discovery is UDP).
 - `POST /api/onvif/streams` takes a host, port, scheme, and credentials and asks that camera's Media
   service for `GetProfiles` and one `GetStreamUri` (RTP-Unicast over RTSP) per profile, at most
   eight. Every URL is moved onto the given host, keeping the advertised port, path, and query, so
@@ -285,4 +285,4 @@ tasks beside the monitor loop, at most four at a time:
 2. Dahua CGI keys for `Video.Profile` and smart codec on current firmware (diff `getConfig`
    before/after a UI toggle).
 3. Backpressure tolerance of the camera (how long a stalled reader keeps the session).
-4. Whether cam1 ever changes SPS without a reconnect (resolution change test).
+4. Whether a camera ever changes SPS without a reconnect (resolution change test).

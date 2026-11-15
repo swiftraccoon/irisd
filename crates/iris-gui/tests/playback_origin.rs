@@ -2,6 +2,11 @@
 //! daemon does not emit, is refused before GStreamer sees it; the optional
 //! display tools are not required for unit tests.
 
+#![expect(
+    clippy::unwrap_used,
+    reason = "a helper of a test fails as the test does, by panicking"
+)]
+
 use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::process::Command;

@@ -12,6 +12,14 @@ Scope: this crate only. Read the root `AGENTS.md` first.
   implementations only with the cross-check test green.
 - Export rebasing verifies the input checksum before modifying any bytes.
 - Edit insertion rejects extended-size `moov`/`trak` parents instead of patching their sentinel.
+- A fragment whose samples are all sync samples says so in its `tfhd` default (an audio
+  fragment, a lone keyframe); any other marks its first sample alone. `FragmentInfo::all_sync`
+  reports it, and only such a fragment may lose its start (`trim_fragment_start`), at a sample
+  boundary. An end trim keeps the flags it found.
+- A recording has one track, id 1. Track 2 exists only in an export's init segment
+  (`build_av_init_segment`) and in fragments moved to it (`retrack_fragment`); the edit of an
+  audio track has no media time, because a player in wide use reads it as a count of samples
+  (`docs/research/13-audio.md` §9).
 - Export tail trimming verifies the original checksum, preserves retained sample bytes,
   omits samples starting at or after the cutoff, and shortens a crossing sample's duration.
   Keep sync preroll at the start; end clipping must not depend on edit-list support.
@@ -36,8 +44,10 @@ Scope: this crate only. Read the root `AGENTS.md` first.
   under all three and takes the same record budget. The bounded reader checks metadata before
   allocation, rejects growth beyond the ceiling, and retains the format's
   trailing-partial-record ignore rule.
-- The sidecar's `raw_rtp`, `run_id`, and discontinuity and new-parameter flags exist nowhere in
-  the media; a rebuild from a scan loses them unless a prior sidecar's records match.
+- The sidecar's `raw_rtp`, `run_id`, and discontinuity, new-parameter, and step flags exist
+  nowhere in the media; a rebuild from a scan loses them unless a prior sidecar's records
+  match. A record flag that only the writer knows belongs in `index::WRITER_ONLY_FLAGS`, which
+  is what a rebuild keeps.
 - `scan` accepts at most the same 131,072 fragments; `ScanStop::FragmentLimit` reports a complete
   fragment beyond the limit and must never be treated as a truncation point.
 

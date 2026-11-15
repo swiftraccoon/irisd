@@ -947,7 +947,7 @@ mod tests {
 
     use bytes::Bytes;
     use iris_catalog::{CatalogRootExpectation, CatalogRootRegistry};
-    use iris_mp4::fragment::{Fragment, Sample};
+    use iris_mp4::fragment::{Fragment, FrameSteps, Sample};
     use iris_mp4::init::SampleEntry;
     use iris_store::{RootExpectation, StoragePolicy, WriterHandle, admit_recording_root};
 
@@ -1500,6 +1500,7 @@ mod tests {
                 wall: WallUs::new(1_700_000_000_000_000 + i64::try_from(i).unwrap() * 66_667),
                 raw_rtp: 42,
                 new_run: i == 0,
+                steps: FrameSteps::default(),
                 sample_entry: Arc::clone(&entry),
             };
             writer.try_send(key.clone(), fragment).unwrap();
@@ -1688,6 +1689,8 @@ mod tests {
             duration,
             sample_count: 1,
             starts_with_sync: true,
+            all_sync: false,
+            track_id: 1,
             wall: None,
             sample_durations: Vec::new(),
             sample_sizes: Vec::new(),

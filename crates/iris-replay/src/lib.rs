@@ -5,8 +5,10 @@
 //! Each mount serves one recording: its samples are re-packetized per RFC 7798
 //! (single NAL unit packets and fragmentation units), parameter sets from the
 //! file's `hvcC` are sent in-band before every sync sample as cameras do, RTCP
-//! sender reports go out every five seconds, and frames are paced by their
-//! decode times. Every connection gets its own session, so one process stands
+//! sender reports go out every five seconds unless another interval is set,
+//! and frames are paced by their decode times. A mount can carry synthetic
+//! AAC audio beside its video (RFC 3640), with faults of its clocks, its
+//! timestamps, and its sender reports. Every connection gets its own session, so one process stands
 //! in for as many cameras as there are connections.
 //!
 //! # Modules
@@ -18,7 +20,7 @@
 //! - [`sdp`] — the session description.
 //! - [`server`] — [`Server`](server::Server) and the delivery [`Options`](server::Options):
 //!   per-packet writes, pacing, or bursts ([`Delivery`](server::Delivery)), dropped packets,
-//!   stalls.
+//!   stalls, the audio stream, and the clocks' faults ([`Clocks`](server::Clocks)).
 //! - [`synth`] — fallible [`recording`](synth::recording) construction from a
 //!   bounded [`Plan`](synth::Plan).
 //!

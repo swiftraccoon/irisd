@@ -103,7 +103,11 @@ vendor = "dahua"            # optional vendor label returned by the API and stor
 http_port = 80              # vendor CGI and ONVIF port; default 80, or 443 with https
 https = false               # use HTTPS for CGI and ONVIF
 tls_verify = true           # verify camera TLS certificates; false permits self-signed devices
-record = ["main", "sub"]    # supported video kinds, each at most once; this is the default
+record = ["main", "sub"]    # kinds to record, each at most once; this is the default.
+                            # "audio" adds the AAC audio of the main stream's session.
+audio_steps = false         # hold recorded audio to the video by whole frames: a frame left
+                            # out or recorded twice where the sound has moved; false (the
+                            # default) logs each step and makes none. Needs "audio" above.
 timestamp_mode = "regularize" # regularize camera jitter, or "passthrough" for diagnostics
 retention_days = 21         # range 1..=106751991; default unset: no age limit
 events = ["dahua_cgi"]      # distinct event sources: dahua_cgi, onvif_pull_point; default []

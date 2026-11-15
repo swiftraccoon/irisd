@@ -144,8 +144,8 @@ struct StreamTask {
     key: StreamKey,
     stats: Arc<StreamStats>,
     handle: JoinHandle<()>,
-    /// Counters at the last watchdog check.
-    last_progress: (u64, u64),
+    /// The task's count of beats at the last watchdog check.
+    last_progress: u64,
 }
 
 struct EventTask {
@@ -265,6 +265,17 @@ struct MonitorState {
 impl MonitorState {
     fn try_new(config: &Config, args: &Args, shutdown: &CancellationToken) -> anyhow::Result<Self> {
         Self::try_new_with_cpu(config, args, shutdown, CpuMeter::try_new)
+    }
+
+    /// Starts every period over, as recording starts. The state is made
+    /// before the start-up's recovery, which can outlast a period; a tick
+    /// left due by it would have the watchdog judge streams that have not
+    /// had a period to make progress in.
+    fn begin(&mut self) {
+        self.stats_ticker.reset();
+        self.watchdog_ticker.reset();
+        self.retention_ticker.reset();
+        self.selfcheck_ticker.reset();
     }
 
     /// Points the self-check at `streams`, the streams recording after a
@@ -529,6 +540,7 @@ where
     };
     let mut maintenance = MaintenanceJobs::new(&daemon);
 
+    monitor_state.begin();
     systemd::ready();
     systemd::status("recording");
     info!(
@@ -875,6 +887,14 @@ struct StreamSpawner {
     recv_low_water: Option<u32>,
 }
 
+/// Whether the session of `kind` records the camera's audio, which arrives
+/// with the main stream, and whether the drift rule's steps are made on it
+/// (`docs/research/13-audio.md` §5.3).
+fn audio_policy(camera: &CameraConfig, kind: StreamKind) -> (bool, bool) {
+    let audio = kind == StreamKind::Main && camera.record.contains(&StreamKind::Audio);
+    (audio, audio && camera.audio_steps)
+}
+
 impl StreamSpawner {
     /// Starts one task per entry of `sources`, the camera's parsed stream
     /// URLs ([`parsed_sources`]); the tasks end when `shutdown` is cancelled.
@@ -892,6 +912,18 @@ impl StreamSpawner {
             };
             let ring = LiveRing::new(LIVE_RING_FRAMES);
             self.live.insert(key.clone(), ring.clone());
+            // The audio a main stream's session records has a ring of its
+            // own, under the camera's `audio` key.
+            let (audio, audio_steps) = audio_policy(camera, kind);
+            let audio_live = audio.then(|| {
+                let ring = LiveRing::new(LIVE_RING_FRAMES);
+                let key = StreamKey {
+                    camera: camera.id.clone(),
+                    kind: StreamKind::Audio,
+                };
+                self.live.insert(key, ring.clone());
+                ring
+            });
             let source = StreamSource {
                 key: key.clone(),
                 url,
@@ -902,6 +934,9 @@ impl StreamSpawner {
                 max_fragment: self.max_fragment,
                 timestamp_mode: camera.timestamp_mode,
                 live: Some(ring),
+                audio,
+                audio_live,
+                audio_steps,
                 read_interval: self.read_interval,
                 ticker: self.ticker.clone(),
                 recv_low_water: self.recv_low_water,
@@ -921,7 +956,7 @@ impl StreamSpawner {
                 key,
                 stats,
                 handle,
-                last_progress: (0, 0),
+                last_progress: 0,
             });
         }
         tasks
@@ -932,6 +967,10 @@ impl StreamSpawner {
 fn camera_sources(camera: &CameraConfig) -> Vec<(StreamKind, String)> {
     let mut sources = Vec::new();
     for &kind in &camera.record {
+        // Audio has no session of its own: the main stream's carries it.
+        if kind == StreamKind::Audio {
+            continue;
+        }
         if let Some(url) = camera.url_for(kind) {
             sources.push((kind, url));
         } else {
@@ -2052,11 +2091,15 @@ async fn retention_tick(job: &mut RetentionJobState) {
     }
 }
 
-/// True when every stream produced frames or reconnected since the last call.
+/// Whether every ingest task has noted that it is alive since the last
+/// check ([`StreamStats::beats`]) and none has ended. A task notes it at
+/// every item it reads and through every bounded wait, so a camera that is
+/// down or sends nothing does not hold the watchdog's ping back; a task
+/// that is stuck does.
 fn all_streams_progressed(streams: &mut [StreamTask]) -> bool {
     let mut all = true;
     for task in streams {
-        let now = (task.stats.frames(), task.stats.reconnects());
+        let now = task.stats.beats();
         if now == task.last_progress && !task.handle.is_finished() {
             all = false;
         }
@@ -2744,12 +2787,12 @@ mod tests {
         assert!(validate_period("period", Duration::ZERO).is_err());
     }
 
-    /// The watchdog is fed only while every ingest task is alive and has
-    /// moved since the last check: frames or reconnects. One task that
-    /// stands still, or one that has ended, withholds it.
+    /// The watchdog is fed only while every ingest task is running and has
+    /// noted that it is alive since the last check. One task whose count
+    /// of beats stands still, or one that has ended, withholds it.
     #[tokio::test]
     async fn the_watchdog_needs_every_stream_alive_and_moving() {
-        let task = |last_progress: (u64, u64), running: bool| {
+        let task = |last_progress: u64, running: bool| {
             let handle = if running {
                 tokio::spawn(std::future::pending::<()>())
             } else {
@@ -2765,15 +2808,15 @@ mod tests {
                 last_progress,
             }
         };
-        // The counters stand at (0, 0): a remembered (9, 0) means progress.
-        let moved = (9, 0);
-        let mut streams = vec![task(moved, true), task((0, 7), true)];
+        // The count stands at 0: a remembered 9 means it has moved.
+        let moved = 9;
+        let mut streams = vec![task(moved, true), task(7, true)];
         assert!(all_streams_progressed(&mut streams));
-        // The check remembered the counters, and nothing moved since.
-        assert_eq!(streams[0].last_progress, (0, 0));
+        // The check remembered the counts, and nothing moved since.
+        assert_eq!(streams[0].last_progress, 0);
         assert!(!all_streams_progressed(&mut streams));
 
-        let mut one_still = vec![task(moved, true), task((0, 0), true)];
+        let mut one_still = vec![task(moved, true), task(0, true)];
         assert!(!all_streams_progressed(&mut one_still));
 
         let mut one_ended = vec![task(moved, true), task(moved, false)];
@@ -2968,6 +3011,32 @@ mod tests {
         assert!(text.contains("no cameras configured"), "{text}");
     }
 
+    /// A start-up that outlasts the watchdog's period leaves no tick due
+    /// when recording starts: the first check comes a whole period later.
+    #[tokio::test(start_paused = true)]
+    async fn the_monitors_periods_count_from_the_start_of_recording() {
+        let config = Config::default();
+        let mut monitor = monitor_for_test(&config, &CancellationToken::new());
+        tokio::time::advance(DEFAULT_WATCHDOG_INTERVAL * 3).await;
+        monitor.begin();
+        let began = tokio::time::Instant::now();
+        for ticker in [
+            &mut monitor.watchdog_ticker,
+            &mut monitor.stats_ticker,
+            &mut monitor.retention_ticker,
+            &mut monitor.selfcheck_ticker,
+        ] {
+            assert!(
+                tokio::time::timeout(Duration::ZERO, ticker.tick())
+                    .await
+                    .is_err(),
+                "a tick was due as recording started"
+            );
+        }
+        monitor.watchdog_ticker.tick().await;
+        assert_eq!(began.elapsed(), DEFAULT_WATCHDOG_INTERVAL);
+    }
+
     #[tokio::test(start_paused = true)]
     async fn delayed_root_assignment_emits_reconciliation_heartbeats() {
         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -3128,7 +3197,7 @@ mod tests {
             },
             stats: Arc::new(StreamStats::default()),
             handle: tokio::spawn(std::future::pending::<()>()),
-            last_progress: (0, 0),
+            last_progress: 0,
         };
         let feed = |camera: &str| EventTask {
             camera: camera.parse().unwrap(),
@@ -3637,7 +3706,7 @@ mod tests {
 
     fn writer_fragment() -> Fragment {
         use bytes::Bytes;
-        use iris_mp4::fragment::Sample;
+        use iris_mp4::fragment::{FrameSteps, Sample};
         use iris_mp4::init::SampleEntry;
 
         Fragment {
@@ -3650,6 +3719,7 @@ mod tests {
             wall: WallUs::new(1_700_000_000_000_000),
             raw_rtp: 0,
             new_run: true,
+            steps: FrameSteps::default(),
             sample_entry: Arc::new(SampleEntry::new(
                 Bytes::from_static(b"\0\0\0\x10hvc1\0\0\0\0\0\0\0\0"),
                 "hvc1".into(),
@@ -3787,7 +3857,7 @@ mod tests {
                     Arc::clone(&producer_clock),
                     Arc::clone(&producer_latest_ms),
                 ),
-                last_progress: (0, 0),
+                last_progress: 0,
             })
             .collect();
         let events = (0..2)
@@ -3915,7 +3985,7 @@ mod tests {
                 },
                 stats: Arc::new(StreamStats::default()),
                 handle: blocked,
-                last_progress: (0, 0),
+                last_progress: 0,
             }],
             Vec::new(),
             api,
@@ -4056,7 +4126,7 @@ mod tests {
                 },
                 stats: Arc::new(StreamStats::default()),
                 handle: stream,
-                last_progress: (0, 0),
+                last_progress: 0,
             }],
             vec![EventTask {
                 camera: "event".parse().unwrap(),
@@ -4127,7 +4197,7 @@ mod tests {
     #[tokio::test]
     async fn records_on_an_alternative_when_the_first_root_rejects_writes() {
         use bytes::Bytes;
-        use iris_mp4::fragment::Sample;
+        use iris_mp4::fragment::{FrameSteps, Sample};
         use iris_mp4::init::SampleEntry;
         use std::os::unix::fs::PermissionsExt as _;
 
@@ -4166,6 +4236,7 @@ mod tests {
             wall: WallUs::new(1_700_000_000_000_000),
             raw_rtp: 0,
             new_run: true,
+            steps: FrameSteps::default(),
             sample_entry: Arc::new(SampleEntry::new(
                 Bytes::from_static(b"\0\0\0\x10hvc1\0\0\0\0\0\0\0\0"),
                 "hvc1".into(),
@@ -4190,6 +4261,26 @@ mod tests {
              rtsp_url=\"{url}\"\nusername=\"u\"\npassword=\"p\"\nhttp_port={port}\n"
         );
         Config::from_toml_str(&text).unwrap().cameras.remove(0)
+    }
+
+    /// Audio is recorded by the main stream's session of a camera that
+    /// lists it, and its steps are made only where the camera sets them.
+    #[test]
+    fn audio_and_its_steps_go_to_the_main_streams_session_alone() {
+        let camera = |extra: &str| {
+            let text = format!(
+                "[api]\nallow_unauthenticated=true\n[[camera]]\nid=\"cam1\"\nname=\"n\"\n\
+                 rtsp_url=\"rtsp://192.0.2.10/x\"\nusername=\"u\"\npassword=\"p\"\n{extra}"
+            );
+            Config::from_toml_str(&text).unwrap().cameras.remove(0)
+        };
+        let plain = camera("");
+        let sound = camera("record=['main','sub','audio']\n");
+        let stepped = camera("record=['main','sub','audio']\naudio_steps=true\n");
+        assert_eq!(audio_policy(&plain, StreamKind::Main), (false, false));
+        assert_eq!(audio_policy(&sound, StreamKind::Main), (true, false));
+        assert_eq!(audio_policy(&stepped, StreamKind::Main), (true, true));
+        assert_eq!(audio_policy(&stepped, StreamKind::Sub), (false, false));
     }
 
     #[test]

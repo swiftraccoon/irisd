@@ -18,7 +18,14 @@ subcommands work on recordings offline. Nothing in the record path decodes video
   The configuration is validated in full, so a camera-only file still states its API
   authentication (a token, or `api.allow_unauthenticated = true` on the loopback default).
 - `irisd inspect FILE [--verify] [--samples]` — scan a recording and report its fragments,
-  timing, and, with `--verify`, every trailer checksum.
+  timing, and, with `--verify`, every trailer checksum. An export with sound has two
+  tracks, and the report times each.
+- `irisd clocks [--audio] [--frame-samples N] [--window DURATION] [--bound-ms N] SIDECAR...` —
+  report from the sidecars of one stream, run by run and window by window, how far the camera's
+  timestamps and the wall time moved against the recording's timeline (`docs/research/14-drift.md`
+  §4.1); `--audio` reads an audio stream, whose timeline is its frame count, and `--bound-ms` fails
+  when a run moved further. Each window lists how many of its fragments are marked as holding a step
+  of the audio, which moves that count by whole frames.
 - `irisd recover FILE` — truncate a recording at its last valid fragment and rewrite its
   sidecar index, keeping the prior header's known run id and sample-entry hash. A FIFO or
   symlink in place of the sidecar is replaced without blocking or being followed, and a file
@@ -129,13 +136,17 @@ cameras for cost measurements (`crates/iris-tools/README.md`).
   when missing) and the `irisd.db`, `-wal`, `-shm`, `capability.key`, and `cameras.toml` files must
   belong to the daemon's user and be a directory or a regular file with one link; symbolic links,
   hard links, and special files fail startup, and group or other permission bits are removed (0700
-  and 0600) with a warning naming the old mode. The configuration file, which holds camera passwords
-  and API tokens, draws a warning when users other than root and the daemon's account and group can
-  read or write it.
+  and 0600) with a warning naming the mode they had. The configuration file, which holds camera
+  passwords and API tokens, draws a warning when users other than root and the daemon's account
+  and group can read or write it.
 - Descriptors: startup raises the soft `RLIMIT_NOFILE` to the hard limit and logs both values;
   the unit sets `LimitNOFILE=65536`.
-- Watchdog: the systemd ping is withheld whenever an ingest task made no progress in the
-  interval, so a wedged daemon is restarted within `WatchdogSec`.
+- Watchdog: the systemd ping is withheld whenever an ingest task has not noted that it is
+  alive in the interval (`StreamStats::beats`) or has ended, so a wedged daemon is
+  restarted within `WatchdogSec`. A task notes it at every item it reads and within every
+  15 s of a wait on its camera: a camera that is down, or connected and silent, withholds
+  nothing. The first interval starts as recording does, after the start-up's recovery of
+  segments left open.
 - Readiness: startup binds the configured API listener before recording tasks start and before
   `READY=1`. An occupied address fails startup without a false-ready notification; the already
   bound listener is handed to the API task for graceful shutdown. A stop signal that arrives
@@ -234,8 +245,8 @@ before deletion, start-up reconciliation (deletion intents, recovery, adoption, 
 walk, heartbeat cadence), the self-check comparison and its cancellation, the process sampler
 parsers, and the offline subcommands' argument checks. `tests/startup.rs` runs the binary:
 readiness only after the listener binds, an occupied port, invalid periods, no sources, and a
-signal right after readiness. Recording end to end is measured rather than tested: six and seven
-live cameras over hours and the systemd soak in `docs/research/11-multi-camera-results.md`, kill
+signal right after readiness. Recording end to end is measured rather than tested: live cameras
+over hours and the systemd soak in `docs/research/11-multi-camera-results.md`, kill
 and recovery in `10-phase2-results.md`, and CPU per megabit against replayed cameras in
 `12-ingest-cost.md`.
 

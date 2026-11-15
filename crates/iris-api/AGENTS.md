@@ -58,6 +58,12 @@ Scope: this crate only. Read the root `AGENTS.md` first.
   malformed cursor pairs map to HTTP 400. Full admission budgets are `ApiError::Busy`: HTTP 503
   with `Retry-After: 1`. HTTP 500 bodies are generic with a `request_id`; never put internal
   detail in a 500 body.
+- Audio follows the video in every serving path (`docs/research/13-audio.md` §8.1, §9, §10): the
+  VOD playlist of an `audio` stream takes its segments, discontinuities, and target duration
+  from the main stream's; a camera's export places each audio fragment by the stored decode
+  times, cuts the audio's start instead of hiding it with an edit, and leaves out sound that
+  has no picture; the low-latency playlist refuses `audio`. A change to one of these keeps
+  the checks that section names.
 - Range clipping includes sync preroll, so VOD and export never start with a dependent
   fragment. Export uses `elst` for start preroll and removes encoded tail samples at the
   requested end, shortening a crossing sample's duration. The exclusive end rounds up to

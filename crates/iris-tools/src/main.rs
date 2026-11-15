@@ -7,6 +7,8 @@
 //! - `rtsp-probe` and `onvif-call` characterise a camera.
 //! - `gh-commit` commits the difference from the remote branch through the
 //!   GitHub API, which signs the commit.
+//! - `standards` checks the tree, a range of commits, or a commit message
+//!   against the mechanical rules of `STANDARDS.md` and `AGENTS.md`.
 //!
 //! No tool changes the recording service or a camera's configuration:
 //! `onvif-call` sends only `Get` operations and the PullPoint subscription
@@ -21,6 +23,7 @@ mod report;
 mod rtsp_probe;
 mod sample;
 mod secret;
+mod standards;
 mod stats;
 mod summary;
 mod time;
@@ -51,6 +54,8 @@ enum Command {
     OnvifCall(onvif_call::Args),
     /// Commit the difference from the remote branch through the GitHub API, which signs it.
     GhCommit(gh_commit::Args),
+    /// Check the tree or commits against the mechanical rules of `STANDARDS.md`.
+    Standards(standards::Args),
 }
 
 fn main() -> anyhow::Result<()> {
@@ -62,5 +67,6 @@ fn main() -> anyhow::Result<()> {
         Command::RtspProbe(args) => rtsp_probe::run(&args),
         Command::OnvifCall(args) => onvif_call::run(&args),
         Command::GhCommit(args) => gh_commit::run(&args),
+        Command::Standards(args) => standards::run(&args),
     }
 }

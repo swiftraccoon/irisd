@@ -9,8 +9,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use iris_core::time::{MediaTicks, WallUs};
 use iris_mp4::index::{
-    FLAG_DISCONTINUITY_BEFORE, FLAG_NEW_PARAMETERS, HEADER_LEN, IndexError, IndexHeader,
-    IndexRecord, IndexWriter, MAX_PERSISTED_INDEX_RECORDS, read_index_file_bounded,
+    HEADER_LEN, IndexError, IndexHeader, IndexRecord, IndexWriter, MAX_PERSISTED_INDEX_RECORDS,
+    WRITER_ONLY_FLAGS, read_index_file_bounded,
 };
 use iris_mp4::reader::{ScanOptions, ScanReport, ScanStop, scan_with_limit};
 use rustix::fs::{AtFlags, CWD, FileType, Mode, OFlags};
@@ -377,7 +377,7 @@ fn recover_open(
     for info in &report.fragments {
         let mut record = IndexRecord::from_scan(info);
         if let Some(old) = old_records.get(&record.offset) {
-            record.flags |= old.flags & (FLAG_DISCONTINUITY_BEFORE | FLAG_NEW_PARAMETERS);
+            record.flags |= old.flags & WRITER_ONLY_FLAGS;
             record.raw_rtp = old.raw_rtp;
         }
         rebuilt.push(record);
@@ -528,8 +528,14 @@ fn publish_rebuilt_index(
     mut publication_step: impl FnMut(RecoveryPublicationStep) -> io::Result<()>,
 ) -> io::Result<()> {
     let (temporary, temporary_file) = create_index_temporary(directory, index_name)?;
-    let temporary_claimed = match rustix::fs::fstat(&temporary_file) {
-        Ok(stat) => (stat.st_dev, stat.st_ino),
+    // The claim is the temporary's device and inode, and the second handle
+    // keeps that inode in use until the claim's last check: a file put under
+    // the name in its place cannot be given the same number.
+    let claim = rustix::fs::fstat(&temporary_file)
+        .map_err(io::Error::from)
+        .and_then(|stat| Ok(((stat.st_dev, stat.st_ino), temporary_file.try_clone()?)));
+    let (temporary_claimed, held) = match claim {
+        Ok(claim) => claim,
         Err(error) => {
             // The temporary was created exclusively a moment ago and nothing
             // else refers to it; unlinking the name is the complete rollback.
@@ -538,7 +544,7 @@ fn publish_rebuilt_index(
             {
                 warn!(%unlink, "recovery temporary could not be removed");
             }
-            return Err(error.into());
+            return Err(error);
         }
     };
     let mut temporary_owned = true;
@@ -563,6 +569,7 @@ fn publish_rebuilt_index(
     if result.is_err() && temporary_owned {
         remove_claimed_temporary(directory, &temporary, temporary_claimed);
     }
+    drop(held);
     result
 }
 

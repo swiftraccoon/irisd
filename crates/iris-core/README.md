@@ -10,9 +10,9 @@ reading a TOML file.
 
 - `id::CameraId` — a validated camera identifier (1 to 32 characters of `[a-z0-9_-]`), safe
   as a directory name and a URL path component.
-- `id::StreamKind` and `id::StreamKey` — the main/sub video kinds, the reserved audio kind
-  used by catalog data types, and the camera-plus-kind pair that names a stream (serialized
-  as `{camera, kind}`). Configuration rejects audio recording.
+- `id::StreamKind` and `id::StreamKey` — the main/sub video kinds, the audio kind (the AAC
+  audio of the main stream's session), and the camera-plus-kind pair that names a stream
+  (serialized as `{camera, kind}`).
 - `time::WallUs` — microseconds since the Unix epoch on the NVR's clock, with NTP64 (both
   eras) and RFC 3339 conversions; the only wall clock the system trusts.
 - `time::days_from_civil` and `time::days_in_month` — the civil-date arithmetic the API's and
@@ -79,7 +79,8 @@ most 4,096, `ingest.read_interval_ms` at most 1,000, `ingest.recv_low_water_kib`
 `api.max_connections` 16..=65,536, `api.max_streaming_media` and `api.max_bounded_media`
 1..=1,024, `provisioning.max_cameras` 1..=64, and camera `retention_days` 1..=106,751,991. Core
 also rejects unknown keys, duplicate camera ids, malformed camera ids, repeated recorded kinds
-or event sources within a camera, audio in the recorded-stream list, the non-subscribable
+or event sources within a camera, audio recorded without the main stream, `audio_steps` on a
+camera that records no audio, the non-subscribable
 `onvif_metadata` and `manual` event sources, a camera URL that is not `rtsp://` with a valid
 host or that embeds credentials, port 0 in `provisioning.connect_ports`, and an empty
 `connect_ports` with provisioning enabled. The API needs at least one bearer token of 32 or more

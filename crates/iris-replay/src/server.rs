@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 use std::error::Error;
 use std::fmt;
+use std::fmt::Write as _;
 use std::io;
 use std::mem;
 use std::net::SocketAddr;
@@ -20,7 +21,7 @@ use tokio::sync::{Semaphore, mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
-use crate::media::{Media, Ticks};
+use crate::media::{Frame, Media, Ticks};
 use crate::rtp::{self, Packetizer, RtpError, RtpTimestamp, Ssrc};
 use crate::rtsp::{self, InterleavedChannels, MountName, Parsed, Request};
 use crate::sdp;
@@ -52,6 +53,116 @@ pub enum Delivery {
     Paced,
 }
 
+/// What stamps a frame of the synthetic audio stream.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum AudioStamps {
+    /// The sample clock: frame `n` is stamped `n × 1,024`, whatever the
+    /// instant it is sent at (RFC 3550 §5.1).
+    #[default]
+    SampleClock,
+    /// The camera's media clock at the instant the frame starts, as a
+    /// camera that stamps its audio from its system clock does.
+    CameraClock,
+}
+
+/// Sound the synthetic camera leaves out at once, as a camera does that
+/// loses what it had taken: the frames are never packed, so sequence
+/// numbers run on and every later frame is sent in its own time.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LeftOut {
+    /// The number of the first frame left out.
+    pub at: u64,
+    /// How many frames are left out.
+    pub frames: u64,
+}
+
+/// How the synthetic camera's clocks run against each other and against
+/// true time, for checks of what detects their parting. Every clock is
+/// exact by default.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Clocks {
+    /// How fast the camera's media clock runs against true time, in parts
+    /// per million: frames keep their timestamps and are delivered that
+    /// much sooner, and sender reports pair true time with the fast clock.
+    pub camera_fast_ppm: i32,
+    /// How fast the audio's sample clock runs against the camera's media
+    /// clock, in parts per million: audio frames are produced that much
+    /// faster than their nominal rate.
+    pub audio_fast_ppm: i32,
+    /// What stamps an audio frame.
+    pub audio_stamps: AudioStamps,
+    /// Whether the audio stream sends sender reports of its own, each
+    /// pairing true time with the clock that stamps its frames.
+    pub audio_reports: bool,
+    /// Whether the sender reports are stamped in the ways a camera's are
+    /// (`docs/research/14-drift.md` §3), the rarer ways more often than
+    /// measured. The two reports made together are behind their clocks by
+    /// the same part of the time between two video frames, every sixteenth
+    /// in turn. The video's is behind by up to 6 ms more, in one pair of
+    /// five by 60 ms more, and in one of fifteen 20 ms ahead instead. One
+    /// pair in three carries a wall time 50 ms behind, as a camera's does
+    /// whose clock moves against its media clocks.
+    pub late_reports: bool,
+}
+
+/// How far ahead of the audio's the video's sender report is stamped in
+/// one pair of fifteen under [`Clocks::late_reports`].
+const EARLY_REPORT: Duration = Duration::from_millis(20);
+/// How far behind the audio's the video's is stamped in one pair of five.
+const FAR_LATE_REPORT: Duration = Duration::from_millis(60);
+/// How far behind true time the wall time of one pair in three is.
+const WALL_BEHIND_US: i64 = 50_000;
+
+/// What the pair of sender reports numbered `index` carries under
+/// [`Clocks::late_reports`], for clocks that read `elapsed` and a wall
+/// time of `wall`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct LatePair {
+    /// The reading of the clock the video's report is stamped with.
+    video: Duration,
+    /// The reading the audio's report is stamped with.
+    audio: Duration,
+    /// The wall time of both.
+    wall: WallUs,
+}
+
+impl LatePair {
+    fn new(elapsed: Duration, wall: WallUs, index: u64, video_period: Duration) -> Self {
+        let audio = elapsed.saturating_sub(video_period * (index * 7 % 16) as u32 / 16);
+        let video = if index % 15 == 14 {
+            audio + EARLY_REPORT
+        } else if index % 5 == 3 {
+            audio.saturating_sub(FAR_LATE_REPORT)
+        } else {
+            audio.saturating_sub(Duration::from_millis(index % 4 * 2))
+        };
+        let wall = if index % 3 == 1 {
+            WallUs::new(wall.get() - WALL_BEHIND_US)
+        } else {
+            wall
+        };
+        Self { video, audio, wall }
+    }
+}
+
+/// What a clock that runs `fast_ppm` fast reads after `duration` of the
+/// clock it is set against.
+fn fast_clock(duration: Duration, fast_ppm: i32) -> Duration {
+    scaled(duration, 1_000_000 + i64::from(fast_ppm), 1_000_000)
+}
+
+/// The time, on the clock it is set against, at which a clock that runs
+/// `fast_ppm` fast reads `duration`.
+fn slow_clock(duration: Duration, fast_ppm: i32) -> Duration {
+    scaled(duration, 1_000_000, 1_000_000 + i64::from(fast_ppm))
+}
+
+fn scaled(duration: Duration, numerator: i64, denominator: i64) -> Duration {
+    let (numerator, denominator) = (numerator.max(1) as u128, denominator.max(1) as u128);
+    let nanos = duration.as_nanos() * numerator / denominator;
+    Duration::from_nanos(u64::try_from(nanos).unwrap_or(u64::MAX))
+}
+
 /// Replay behaviour shared by all sessions.
 #[derive(Clone, Debug)]
 pub struct Options {
@@ -70,6 +181,30 @@ pub struct Options {
     pub stall_for: Duration,
     /// How packets reach the socket.
     pub delivery: Delivery,
+    /// The RTP timestamp of the first frame of every session; a value drawn
+    /// per session when `None`. A value just below 2^32 puts the 32-bit wrap
+    /// inside the stream.
+    pub base_rtp: Option<RtpTimestamp>,
+    /// Offer a synthetic mono AAC audio stream at this sampling rate beside
+    /// the video, as `trackID=1`: frames of [`audio_frame`] bytes, one every
+    /// 1,024 samples. A rate MPEG-4 audio has no index for offers none.
+    pub audio_sample_rate: Option<u32>,
+    /// Stamp some audio frames early, as cameras do: every seventh frame so
+    /// that its RTP timestamp is 384 units of the sampling clock before the
+    /// frame ahead of it, and every thirty-first a whole frame before.
+    pub audio_timestamp_wander: bool,
+    /// Leave out the audio frame with this number, once: its packet is never
+    /// sent, so the sequence number and the timestamp skip it, as a packet
+    /// the camera lost does.
+    pub audio_lose_frame: Option<u64>,
+    /// Leave sound out, once. Stamped by the camera's clock, the frames
+    /// after it carry the timestamps of their own instants; stamped by the
+    /// sample clock, they carry on the count of what was sent.
+    pub audio_leave_out: Option<LeftOut>,
+    /// How the camera's clocks run.
+    pub clocks: Clocks,
+    /// The time between the sender reports of a stream.
+    pub report_interval: Duration,
     /// Connections served at once; the listener closes further connections
     /// as it accepts them.
     pub max_connections: usize,
@@ -93,6 +228,13 @@ impl Default for Options {
             stall_after: None,
             stall_for: Duration::from_secs(10),
             delivery: Delivery::PerPacket,
+            base_rtp: None,
+            audio_sample_rate: None,
+            audio_timestamp_wander: false,
+            audio_lose_frame: None,
+            audio_leave_out: None,
+            clocks: Clocks::default(),
+            report_interval: SENDER_REPORT_INTERVAL,
             max_connections: DEFAULT_MAX_CONNECTIONS,
             request_timeout: Duration::from_secs(10),
             idle_timeout: Duration::from_secs(120),
@@ -312,6 +454,8 @@ struct Connection {
     mount: Option<String>,
     media: Option<Arc<Media>>,
     channels: Option<InterleavedChannels>,
+    /// The channels of the audio stream, when it was set up.
+    audio_channels: Option<InterleavedChannels>,
     ssrc: Ssrc,
     seq: u16,
     base_rtp: RtpTimestamp,
@@ -351,9 +495,12 @@ async fn serve(
         mount: None,
         media: None,
         channels: None,
+        audio_channels: None,
         ssrc: Ssrc::new((random >> 32) as u32),
         seq: (random & 0xffff) as u16,
-        base_rtp: RtpTimestamp::new((next_random(counter) & 0xffff_ffff) as u32),
+        base_rtp: options
+            .base_rtp
+            .unwrap_or_else(|| RtpTimestamp::new((next_random(counter) & 0xffff_ffff) as u32)),
         player: None,
     };
     let result = request_loop(
@@ -552,8 +699,8 @@ fn handle(
             )],
             b"",
         ),
-        "DESCRIBE" => describe(request, connection, mounts),
-        "SETUP" => setup(request, connection, mounts, session),
+        "DESCRIBE" => describe(request, connection, mounts, options),
+        "SETUP" => setup(request, connection, mounts, options, session),
         "PLAY" => {
             if let Some(reply) = session_error(request, connection) {
                 return reply;
@@ -583,9 +730,13 @@ fn setup(
     request: &Request,
     connection: &mut Connection,
     mounts: &Mounts,
+    options: &Options,
     session: (&str, &str),
 ) -> Vec<u8> {
     let cseq = request.cseq;
+    if is_audio_control(&request.url) {
+        return setup_audio(request, connection, options, session);
+    }
     if connection.channels.is_some() {
         return not_valid_in_this_state(cseq);
     }
@@ -618,6 +769,51 @@ fn setup(
     rtsp::response(cseq, 200, "OK", &[("Transport", &transport), session], b"")
 }
 
+/// Whether a `SETUP` URL names the audio stream's control, `trackID=1`.
+fn is_audio_control(url: &str) -> bool {
+    url.split('?')
+        .next()
+        .unwrap_or(url)
+        .trim_end_matches('/')
+        .ends_with("/trackID=1")
+}
+
+/// Sets up the offered audio stream: after the video's `SETUP`, on its
+/// mount, in the same session, before `PLAY`, and once.
+fn setup_audio(
+    request: &Request,
+    connection: &mut Connection,
+    options: &Options,
+    session: (&str, &str),
+) -> Vec<u8> {
+    let cseq = request.cseq;
+    if options.audio_sample_rate.is_none() {
+        return not_found(cseq);
+    }
+    if connection.channels.is_none()
+        || connection.audio_channels.is_some()
+        || connection.player.is_some()
+        || rtsp::mount_name(&request.url) != connection.mount.as_deref()
+    {
+        return not_valid_in_this_state(cseq);
+    }
+    if !session_matches(request, connection) {
+        return rtsp::response(cseq, 454, "Session Not Found", &[], b"");
+    }
+    let Some(channels) = request
+        .header("transport")
+        .and_then(rtsp::interleaved_transport)
+    else {
+        return rtsp::response(cseq, 461, "Unsupported Transport", &[], b"");
+    };
+    connection.audio_channels = Some(channels);
+    let transport = format!(
+        "RTP/AVP/TCP;unicast;interleaved={}-{}",
+        channels.rtp, channels.rtcp
+    );
+    rtsp::response(cseq, 200, "OK", &[("Transport", &transport), session], b"")
+}
+
 fn session_error(request: &Request, connection: &Connection) -> Option<Vec<u8>> {
     if connection.channels.is_none() {
         return Some(not_valid_in_this_state(request.cseq));
@@ -633,7 +829,12 @@ fn session_matches(request: &Request, connection: &Connection) -> bool {
         .is_some_and(|session| session == connection.session_id)
 }
 
-fn describe(request: &Request, connection: &mut Connection, mounts: &Mounts) -> Vec<u8> {
+fn describe(
+    request: &Request,
+    connection: &mut Connection,
+    mounts: &Mounts,
+    options: &Options,
+) -> Vec<u8> {
     let cseq = request.cseq;
     let Some(name) = rtsp::mount_name(&request.url) else {
         return not_found(cseq);
@@ -654,7 +855,10 @@ fn describe(request: &Request, connection: &mut Connection, mounts: &Mounts) -> 
     let frame_rate = media.frames().first().map_or(30.0, |frame| {
         f64::from(TIMESCALE) / frame.duration.get().max(1) as f64
     });
-    let body = sdp::describe(media.parameter_sets(), frame_rate);
+    let mut body = sdp::describe(media.parameter_sets(), frame_rate);
+    if let Some(audio) = options.audio_sample_rate.and_then(sdp::describe_audio) {
+        body.push_str(&audio);
+    }
     let base = format!(
         "{}/",
         request
@@ -701,15 +905,25 @@ fn start_play(
         Packetizer::new(connection.ssrc, connection.seq),
         connection.base_rtp,
         channels,
+        connection.audio_channels,
     ));
     connection.player = Some(player);
     info!(session = %connection.session_id, "playing");
-    let rtp_info = format!(
+    let mut rtp_info = format!(
         "url={}/trackID=0;seq={};rtptime={}",
         request.url.trim_end_matches('/'),
         connection.seq,
         connection.base_rtp.get()
     );
+    if connection.audio_channels.is_some() {
+        // The audio stream starts at sequence number and timestamp zero.
+        write!(
+            rtp_info,
+            ",url={}/trackID=1;seq=0;rtptime=0",
+            request.url.trim_end_matches('/')
+        )
+        .expect("writing to a String cannot fail");
+    }
     rtsp::response(
         cseq,
         200,
@@ -719,10 +933,166 @@ fn start_play(
     )
 }
 
-/// The absolute replay timestamp and pacing deadline for one frame.
-fn frame_due(start: Instant, decode_time: Ticks, loop_offset: Ticks) -> Option<(Ticks, Instant)> {
+/// The NAL units sent for `frame`: the parameter sets before a sync frame,
+/// then the stored access unit's. `None`, with a warning, when the frame
+/// lies outside the recording or is not completely framed.
+fn frame_nals<'media>(media: &'media Media, frame: &Frame) -> Option<Vec<&'media [u8]>> {
+    let Some(sample) = media.sample(frame) else {
+        warn!("a frame lies outside its recording");
+        return None;
+    };
+    let mut nals: Vec<&[u8]> = Vec::with_capacity(4);
+    if frame.is_sync {
+        nals.extend(media.parameter_sets().iter().map(Vec::as_slice));
+    }
+    for nal in LengthPrefixedNals::new(sample) {
+        match nal {
+            Ok(nal) => nals.push(nal),
+            Err(error) => {
+                warn!(%error, "a stored access unit is not completely framed");
+                return None;
+            }
+        }
+    }
+    Some(nals)
+}
+
+/// The bytes of synthetic audio frame `index`: its number, eight times over.
+/// A recorder stores them as received, so a test can tell every frame apart.
+#[must_use]
+pub fn audio_frame(index: u64) -> Vec<u8> {
+    index.to_be_bytes().repeat(8)
+}
+
+/// The synthetic audio stream of one playing session.
+struct AudioPlayer {
+    sample_rate: u32,
+    channels: InterleavedChannels,
+    ssrc: Ssrc,
+    /// Whether some frames are stamped early.
+    wander: bool,
+    /// The frame that is never sent.
+    lose: Option<u64>,
+    /// How fast the sample clock runs against the camera's media clock.
+    fast_ppm: i32,
+    stamps: AudioStamps,
+    /// The sound that is left out.
+    leave_out: Option<LeftOut>,
+    /// Frames left out so far.
+    left_out: u64,
+    /// Frames sent or lost on the way: the next sequence number. With
+    /// those left out it numbers the next frame, and frame `n` starts
+    /// `n × 1,024` samples after `PLAY`.
+    sent: u64,
+}
+
+impl AudioPlayer {
+    /// The audio stream of a session that set it up, when one is offered.
+    fn new(
+        options: &Options,
+        channels: Option<InterleavedChannels>,
+        video_ssrc: Ssrc,
+    ) -> Option<Self> {
+        Some(Self {
+            sample_rate: options.audio_sample_rate?,
+            channels: channels?,
+            ssrc: Ssrc::new(!video_ssrc.get()),
+            wander: options.audio_timestamp_wander,
+            lose: options.audio_lose_frame,
+            fast_ppm: options.clocks.audio_fast_ppm,
+            stamps: options.clocks.audio_stamps,
+            leave_out: options.audio_leave_out,
+            left_out: 0,
+            sent: 0,
+        })
+    }
+
+    /// The reading of the clock that stamps the frames, `elapsed` of the
+    /// camera's media clock after `PLAY`: what a sender report pairs with
+    /// the wall time.
+    fn report_timestamp(&self, elapsed: Duration) -> RtpTimestamp {
+        let stamping = match self.stamps {
+            AudioStamps::SampleClock => fast_clock(elapsed, self.fast_ppm),
+            AudioStamps::CameraClock => elapsed,
+        };
+        let units = stamping.as_nanos() * u128::from(self.sample_rate) / 1_000_000_000;
+        RtpTimestamp::new(units as u32)
+    }
+
+    /// Queues the frames due `elapsed` of the camera's media clock after
+    /// `PLAY`; `false` when the session is over.
+    async fn send_due(&mut self, elapsed: Duration, tx: &mpsc::Sender<Outgoing>) -> bool {
+        let Some(frames) = self.frames_due(elapsed) else {
+            warn!("audio framing failed");
+            return false;
+        };
+        frames.is_empty() || tx.send(Outgoing::Media(frames)).await.is_ok()
+    }
+
+    /// How many units before its place the next frame is stamped.
+    fn early(&self) -> u32 {
+        match (self.wander, self.sent % 31, self.sent % 7) {
+            (true, 5, _) => 2 * rtp::AAC_FRAME_SAMPLES,
+            (true, _, 3) => rtp::AAC_FRAME_SAMPLES + 384,
+            _ => 0,
+        }
+    }
+
+    /// The interleaved packets of every frame that starts at or before
+    /// `elapsed` of the camera's media clock since `PLAY` and was not sent;
+    /// `None` when framing fails. A frame starts when the sample clock,
+    /// which may run fast against the camera's, has counted its samples.
+    fn frames_due(&mut self, elapsed: Duration) -> Option<Vec<u8>> {
+        let mut out = Vec::new();
+        let frame_samples = u64::from(rtp::AAC_FRAME_SAMPLES);
+        loop {
+            let frame = self.sent.checked_add(self.left_out)?;
+            let samples = frame.checked_mul(frame_samples)?;
+            let counted = Duration::from_micros(
+                samples.checked_mul(1_000_000)? / u64::from(self.sample_rate.max(1)),
+            );
+            let starts = slow_clock(counted, self.fast_ppm);
+            if starts > elapsed {
+                return Some(out);
+            }
+            if let Some(leave_out) = self.leave_out.take_if(|leave_out| leave_out.at == frame) {
+                self.left_out += leave_out.frames;
+                continue;
+            }
+            if self.lose == Some(self.sent) {
+                self.sent += 1;
+                continue;
+            }
+            let stamp = match self.stamps {
+                AudioStamps::SampleClock => self.sent.checked_mul(frame_samples)? as u32,
+                AudioStamps::CameraClock => {
+                    (starts.as_nanos() * u128::from(self.sample_rate) / 1_000_000_000) as u32
+                }
+            };
+            let packet = rtp::aac_packet(
+                self.ssrc,
+                self.sent as u16,
+                RtpTimestamp::new(stamp.wrapping_sub(self.early())),
+                &audio_frame(frame),
+            )
+            .ok()?;
+            rtp::interleave(&mut out, self.channels.rtp, &packet).ok()?;
+            self.sent += 1;
+        }
+    }
+}
+
+/// The absolute replay timestamp and pacing deadline for one frame of a
+/// camera whose media clock runs `fast_ppm` fast: the frame is due when
+/// that clock reads its timestamp.
+fn frame_due(
+    start: Instant,
+    decode_time: Ticks,
+    loop_offset: Ticks,
+    fast_ppm: i32,
+) -> Option<(Ticks, Instant)> {
     let ticks = decode_time.checked_add(loop_offset)?;
-    let due = start.checked_add(ticks.to_duration()?)?;
+    let due = start.checked_add(slow_clock(ticks.to_duration()?, fast_ppm))?;
     Some((ticks, due))
 }
 
@@ -748,14 +1118,96 @@ fn next_loop_offset(loop_offset: Ticks, total_ticks: Ticks) -> Option<Ticks> {
     (next > loop_offset).then_some(next)
 }
 
-/// RTP clock value sampled at the same monotonic instant as an RTCP wall time.
+/// RTP clock value `elapsed` of true time after `PLAY`, sampled at the same
+/// monotonic instant as an RTCP wall time, for a camera whose media clock
+/// runs `fast_ppm` fast.
 fn replay_clock_timestamp(
     base_rtp: RtpTimestamp,
-    start: Instant,
-    sampled_at: Instant,
+    elapsed: Duration,
+    fast_ppm: i32,
 ) -> RtpTimestamp {
-    let ticks = sampled_at.duration_since(start).as_nanos() * u128::from(TIMESCALE) / 1_000_000_000;
+    let camera = fast_clock(elapsed, fast_ppm);
+    let ticks = camera.as_nanos() * u128::from(TIMESCALE) / 1_000_000_000;
     base_rtp.after(Ticks::new(ticks as u64))
+}
+
+/// When a pair of sender reports is made.
+#[derive(Clone, Copy)]
+struct ReportAt {
+    /// True time since `PLAY`.
+    elapsed: Duration,
+    /// The wall time then.
+    wall: WallUs,
+    /// How many pairs were made before this one.
+    index: u64,
+    /// The time between two video frames.
+    video_period: Duration,
+}
+
+/// The sender reports a session has made.
+#[derive(Default)]
+struct Reports {
+    last: Option<Instant>,
+    made: u64,
+}
+
+impl Reports {
+    /// When the next pair of reports is made, if `interval` has passed
+    /// since the last, for a session that began at `start` with video
+    /// frames `video_period` apart. The first pair precedes the first RTP
+    /// packet, so its mapping uses the correlation of the session's start.
+    fn due(
+        &mut self,
+        interval: Duration,
+        start: (Instant, WallUs),
+        video_period: Duration,
+    ) -> Option<ReportAt> {
+        if self.last.is_some_and(|last| last.elapsed() < interval) {
+            return None;
+        }
+        let (sampled_at, wall) = self.last.map_or(start, |_| (Instant::now(), WallUs::now()));
+        let at = ReportAt {
+            elapsed: sampled_at.duration_since(start.0),
+            wall,
+            index: self.made,
+            video_period,
+        };
+        self.last = Some(sampled_at);
+        self.made += 1;
+        Some(at)
+    }
+}
+
+/// Appends the sender reports made at `at`: the video's, and the audio's
+/// when it sends its own. Both sides of each mapping are sampled on the
+/// delivery clock, so a fault-injection stall does not pair a delayed wall
+/// time with an earlier frame timestamp.
+fn append_reports(
+    out: &mut Vec<u8>,
+    video: (&Packetizer, RtpTimestamp, InterleavedChannels),
+    audio: Option<&AudioPlayer>,
+    clocks: Clocks,
+    at: ReportAt,
+) -> Result<(), RtpError> {
+    let (packetizer, base_rtp, channels) = video;
+    let pair = if clocks.late_reports {
+        LatePair::new(at.elapsed, at.wall, at.index, at.video_period)
+    } else {
+        LatePair {
+            video: at.elapsed,
+            audio: at.elapsed,
+            wall: at.wall,
+        }
+    };
+    let stamp = replay_clock_timestamp(base_rtp, pair.video, clocks.camera_fast_ppm);
+    let report = packetizer.sender_report(pair.wall, stamp);
+    rtp::interleave(out, channels.rtcp, &report)?;
+    if let Some(audio) = audio.filter(|_| clocks.audio_reports) {
+        let stamp = audio.report_timestamp(fast_clock(pair.audio, clocks.camera_fast_ppm));
+        let report = rtp::sender_report(audio.ssrc, pair.wall, stamp, audio.sent as u32, 0);
+        rtp::interleave(out, audio.channels.rtcp, &report)?;
+    }
+    Ok(())
 }
 
 /// Sends the media paced by its decode times until the connection goes away.
@@ -766,16 +1218,21 @@ async fn play(
     mut packetizer: Packetizer,
     base_rtp: RtpTimestamp,
     channels: InterleavedChannels,
+    audio_channels: Option<InterleavedChannels>,
 ) {
     let start = Instant::now();
     let start_wall = WallUs::now();
+    let mut audio = AudioPlayer::new(&options, audio_channels, packetizer.ssrc());
     let mut loop_offset = Ticks::ZERO;
-    let mut last_report: Option<Instant> = None;
+    let mut reports = Reports::default();
     let mut stalled = false;
     let mut packet_index = 0u64;
+    let clocks = options.clocks;
+    let fast_ppm = clocks.camera_fast_ppm;
     loop {
         for frame in media.frames() {
-            let Some((ticks, due)) = frame_due(start, frame.decode_time, loop_offset) else {
+            let Some((ticks, due)) = frame_due(start, frame.decode_time, loop_offset, fast_ppm)
+            else {
                 warn!("replay timeline exceeds the pacing clock");
                 return;
             };
@@ -788,41 +1245,25 @@ async fn play(
                 tokio::time::sleep(options.stall_for).await;
             }
             tokio::time::sleep_until(due.into()).await;
+            let camera_elapsed = ticks.to_duration().unwrap_or(Duration::MAX);
+            if let Some(audio) = audio.as_mut()
+                && !audio.send_due(camera_elapsed, &tx).await
+            {
+                return;
+            }
             let timestamp = base_rtp.after(ticks);
             let mut out = Vec::new();
-            if last_report.is_none_or(|t| t.elapsed() >= SENDER_REPORT_INTERVAL) {
-                // Sample both sides of the SR mapping on the delivery clock. The
-                // initial report precedes the first RTP packet, so its mapping
-                // uses the PLAY-start correlation; later reports use the current
-                // correlation. A fault-injection stall therefore does not pair
-                // delayed wall time with an earlier frame timestamp.
-                let (sampled_at, wall) =
-                    last_report.map_or((start, start_wall), |_| (Instant::now(), WallUs::now()));
-                let report_timestamp = replay_clock_timestamp(base_rtp, start, sampled_at);
-                let report = packetizer.sender_report(wall, report_timestamp);
-                if let Err(error) = rtp::interleave(&mut out, channels.rtcp, &report) {
+            let period = frame.duration.to_duration().unwrap_or_default();
+            if let Some(at) = reports.due(options.report_interval, (start, start_wall), period) {
+                let video = (&packetizer, base_rtp, channels);
+                if let Err(error) = append_reports(&mut out, video, audio.as_ref(), clocks, at) {
                     warn!(%error, "sender report framing failed");
                     return;
                 }
-                last_report = Some(sampled_at);
             }
-            let Some(sample) = media.sample(frame) else {
-                warn!("a frame lies outside its recording");
+            let Some(nals) = frame_nals(&media, frame) else {
                 return;
             };
-            let mut nals: Vec<&[u8]> = Vec::with_capacity(4);
-            if frame.is_sync {
-                nals.extend(media.parameter_sets().iter().map(Vec::as_slice));
-            }
-            for nal in LengthPrefixedNals::new(sample) {
-                match nal {
-                    Ok(nal) => nals.push(nal),
-                    Err(error) => {
-                        warn!(%error, "a stored access unit is not completely framed");
-                        return;
-                    }
-                }
-            }
             let packets = match packetizer.access_unit(&nals, timestamp, options.mtu) {
                 Ok(packets) => packets,
                 Err(error) => {
@@ -911,6 +1352,7 @@ mod tests {
             mount: None,
             media: None,
             channels: None,
+            audio_channels: None,
             ssrc: Ssrc::new(7),
             seq: 11,
             base_rtp: RtpTimestamp::new(13),
@@ -977,6 +1419,98 @@ mod tests {
     }
 
     const SESSION: [(&str, &str); 1] = [("session", "session-1")];
+
+    /// Handles `request` on `connection` of a server that offers audio.
+    fn answer_with_audio(
+        connection: &mut Connection,
+        tx: &mpsc::Sender<Outgoing>,
+        method: &str,
+        url: &str,
+        headers: &[(&str, &str)],
+    ) -> Vec<u8> {
+        let options = Arc::new(Options {
+            audio_sample_rate: Some(64_000),
+            ..Options::default()
+        });
+        handle(
+            &request(method, url, headers),
+            tx,
+            connection,
+            &mounts(),
+            &options,
+        )
+    }
+
+    const AUDIO_SETUP: [(&str, &str); 2] = [
+        ("session", "session-1"),
+        ("transport", "RTP/AVP/TCP;unicast;interleaved=6-7"),
+    ];
+
+    /// The offered audio is set up once, after the video, on the video's
+    /// mount, in its session, and before `PLAY`; a server that offers none
+    /// has no such stream.
+    #[tokio::test]
+    async fn audio_is_set_up_once_after_the_video_on_its_mount_and_before_play() {
+        let (tx, _rx) = mpsc::channel(16);
+        let audio = "rtsp://host/a/trackID=1";
+        // Before the video's SETUP.
+        let mut early = connection();
+        let reply = answer_with_audio(&mut early, &tx, "SETUP", audio, &AUDIO_SETUP);
+        assert_eq!(status(&reply), 455);
+        assert!(early.audio_channels.is_none());
+
+        let mut connection = set_up(&tx);
+        // Not offered.
+        let reply = answer(&mut connection, &tx, "SETUP", audio, &AUDIO_SETUP);
+        assert_eq!(status(&reply), 404);
+        // Another mount, and no mount.
+        for url in ["rtsp://host/b/trackID=1", "rtsp://host/trackID=1"] {
+            let reply = answer_with_audio(&mut connection, &tx, "SETUP", url, &AUDIO_SETUP);
+            assert_eq!(status(&reply), 455, "{url}");
+        }
+        // Another session.
+        let other = [("session", "session-2"), AUDIO_SETUP[1]];
+        let reply = answer_with_audio(&mut connection, &tx, "SETUP", audio, &other);
+        assert_eq!(status(&reply), 454);
+        // Another transport.
+        let udp = [AUDIO_SETUP[0], ("transport", "RTP/AVP;unicast")];
+        let reply = answer_with_audio(&mut connection, &tx, "SETUP", audio, &udp);
+        assert_eq!(status(&reply), 461);
+        assert!(connection.audio_channels.is_none());
+
+        let reply = answer_with_audio(&mut connection, &tx, "SETUP", audio, &AUDIO_SETUP);
+        assert_eq!(status(&reply), 200);
+        assert!(
+            String::from_utf8(reply)
+                .unwrap()
+                .contains("interleaved=6-7")
+        );
+        assert_eq!(
+            connection.audio_channels,
+            Some(InterleavedChannels { rtp: 6, rtcp: 7 })
+        );
+        // Once.
+        let reply = answer_with_audio(&mut connection, &tx, "SETUP", audio, &AUDIO_SETUP);
+        assert_eq!(status(&reply), 455);
+    }
+
+    /// Audio is not added to a session that plays.
+    #[tokio::test]
+    async fn audio_is_not_set_up_after_play() {
+        let (tx, _rx) = mpsc::channel(16);
+        let mut connection = set_up(&tx);
+        let reply = answer_with_audio(&mut connection, &tx, "PLAY", "rtsp://host/a", &SESSION);
+        assert_eq!(status(&reply), 200);
+        let reply = answer_with_audio(
+            &mut connection,
+            &tx,
+            "SETUP",
+            "rtsp://host/a/trackID=1",
+            &AUDIO_SETUP,
+        );
+        assert_eq!(status(&reply), 455);
+        assert!(connection.audio_channels.is_none());
+    }
 
     #[tokio::test]
     async fn options_does_not_advertise_pause() {
@@ -1114,6 +1648,79 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn options_lists_the_methods_and_parameters_need_the_session() {
+        let (tx, _rx) = mpsc::channel(16);
+        let reply = answer(&mut connection(), &tx, "OPTIONS", "rtsp://host/a", &[]);
+        assert_eq!(status(&reply), 200);
+        assert!(
+            String::from_utf8(reply)
+                .unwrap()
+                .contains("Public: OPTIONS, DESCRIBE, SETUP, PLAY, TEARDOWN, GET_PARAMETER")
+        );
+        let mut connection = set_up(&tx);
+        for method in ["GET_PARAMETER", "SET_PARAMETER"] {
+            let reply = answer(&mut connection, &tx, method, "rtsp://host/a", &SESSION);
+            assert_eq!(status(&reply), 200, "{method}");
+            let reply = answer(&mut connection, &tx, method, "rtsp://host/a", &[]);
+            assert_ne!(status(&reply), 200, "{method} without its session");
+        }
+    }
+
+    /// Before SETUP any mount may be described; after it, only the one set up.
+    #[tokio::test]
+    async fn describe_changes_mount_only_before_setup() {
+        let (tx, _rx) = mpsc::channel(16);
+        let mut fresh = connection();
+        answer(&mut fresh, &tx, "DESCRIBE", "rtsp://host/a", &[]);
+        let reply = answer(&mut fresh, &tx, "DESCRIBE", "rtsp://host/b", &[]);
+        assert_eq!(status(&reply), 200);
+        assert_eq!(fresh.mount.as_deref(), Some("b"));
+
+        let mut bound = set_up(&tx);
+        let same = answer(&mut bound, &tx, "DESCRIBE", "rtsp://host/a", &[]);
+        assert_eq!(status(&same), 200);
+        let other = answer(&mut bound, &tx, "DESCRIBE", "rtsp://host/b", &[]);
+        assert_eq!(status(&other), 455);
+        assert_eq!(bound.mount.as_deref(), Some("a"));
+    }
+
+    #[tokio::test]
+    async fn describe_announces_the_rate_of_the_first_frame() {
+        let (tx, _rx) = mpsc::channel(16);
+        let reply = answer(&mut connection(), &tx, "DESCRIBE", "rtsp://host/a", &[]);
+        let text = String::from_utf8(reply).unwrap();
+        assert!(text.contains("a=framerate:30.000\r\n"), "{text}");
+    }
+
+    #[test]
+    fn an_error_chain_is_written_on_one_line() {
+        let error = ConnectionError::Read(io::Error::other("reset by peer"));
+        assert_eq!(
+            Chain(&error).to_string(),
+            "reading the connection: reset by peer"
+        );
+    }
+
+    /// The generator is `SplitMix64`: from its published constants, the first
+    /// outputs for a zero seed.
+    #[test]
+    fn random_values_follow_splitmix64() {
+        let counter = AtomicU64::new(0x9e37_79b9_7f4a_7c15);
+        assert_eq!(next_random(&counter), 0xe220_a839_7b1d_cdaf);
+        assert_eq!(next_random(&counter), 0x6e78_9e6a_a1b9_65f4);
+    }
+
+    /// The seed mixes the clock into the constant: it is neither the
+    /// constant's bits all set nor nothing outside them.
+    #[test]
+    fn the_seed_mixes_the_clock_with_its_constant() {
+        const MIX: u64 = 0x9e37_79b9_7f4a_7c15;
+        let seed = seed();
+        assert_ne!(seed & MIX, MIX);
+        assert_ne!(seed & !MIX, 0);
+    }
+
+    #[tokio::test]
     async fn pause_is_not_allowed() {
         let (tx, _rx) = mpsc::channel(16);
         let mut connection = set_up(&tx);
@@ -1179,15 +1786,205 @@ mod tests {
 
     #[test]
     fn sender_report_mapping_uses_the_delivery_clock_across_a_stall() {
-        let start = Instant::now();
         let base = RtpTimestamp::new(100);
-        let initial = replay_clock_timestamp(base, start, start);
-        let normal = replay_clock_timestamp(base, start, start + Duration::from_secs(5));
-        let delayed = replay_clock_timestamp(base, start, start + Duration::from_secs(15));
+        let initial = replay_clock_timestamp(base, Duration::ZERO, 0);
+        let normal = replay_clock_timestamp(base, Duration::from_secs(5), 0);
+        let delayed = replay_clock_timestamp(base, Duration::from_secs(15), 0);
         assert_eq!(initial.get(), 100);
         assert_eq!(normal.get(), 450_100);
         assert_eq!(delayed.get(), 1_350_100);
         assert_eq!(delayed.get().wrapping_sub(normal.get()), 900_000);
+    }
+
+    /// A clock 1,000 ppm fast reads a thousandth more, and reaches a reading
+    /// a thousandth sooner; frames keep their timestamps and are due sooner.
+    #[test]
+    fn a_fast_clock_reads_more_and_arrives_sooner() {
+        let second = Duration::from_secs(1);
+        assert_eq!(fast_clock(second, 1_000), Duration::from_millis(1_001));
+        assert_eq!(fast_clock(second, -1_000), Duration::from_millis(999));
+        assert_eq!(slow_clock(Duration::from_millis(1_001), 1_000), second);
+        assert_eq!(
+            (fast_clock(second, 0), slow_clock(second, 0)),
+            (second, second)
+        );
+        let fast = replay_clock_timestamp(RtpTimestamp::new(0), Duration::from_secs(10), 1_000);
+        assert_eq!(fast.get(), 900_900);
+        let start = Instant::now();
+        let exact = frame_due(start, Ticks::new(900_900), Ticks::ZERO, 0).unwrap();
+        let sooner = frame_due(start, Ticks::new(900_900), Ticks::ZERO, 1_000).unwrap();
+        assert_eq!(exact.0, sooner.0);
+        assert_eq!(sooner.1.duration_since(start), Duration::from_secs(10));
+        assert_eq!(exact.1.duration_since(start), Duration::from_millis(10_010));
+    }
+
+    /// The two reports of a late pair are behind their clocks together by
+    /// every sixteenth of a video frame's period in turn; the video's is
+    /// behind the audio's by 0, 2, 4, or 6 ms, by 60 ms in one pair of
+    /// five, and 20 ms ahead of it in one of fifteen; one pair in three has
+    /// its wall time 50 ms behind. The session's reports are numbered from
+    /// its start, where the first is made.
+    #[test]
+    fn late_reports_are_behind_their_clocks_together_and_the_videos_by_more() {
+        let elapsed = Duration::from_secs(10);
+        let wall = WallUs::new(1_000_000);
+        let period = Duration::from_millis(32);
+        let pair = |index| LatePair::new(elapsed, wall, index, period);
+        // Sixteen pairs, one of each sixteenth.
+        let mut behind: Vec<Duration> = (0..16)
+            .map(|index| elapsed.checked_sub(pair(index).audio).expect("behind"))
+            .collect();
+        behind.sort_unstable();
+        let sixteenths: Vec<Duration> = (0..16).map(|n| Duration::from_millis(2 * n)).collect();
+        assert_eq!(behind, sixteenths);
+        // How far the video's report is behind the audio's, in
+        // milliseconds, over thirty pairs.
+        let video_behind: Vec<i128> = (0..30)
+            .map(|index| {
+                let pair = pair(index);
+                pair.audio.as_millis() as i128 - pair.video.as_millis() as i128
+            })
+            .collect();
+        assert_eq!(
+            video_behind,
+            [
+                0, 2, 4, 60, 0, 2, 4, 6, 60, 2, 4, 6, 0, 60, -20, //
+                6, 0, 2, 60, 6, 0, 2, 4, 60, 0, 2, 4, 6, 60, -20
+            ]
+        );
+        let walls: Vec<i64> = (0..6).map(|index| pair(index).wall.get()).collect();
+        assert_eq!(
+            walls,
+            [1_000_000, 950_000, 1_000_000, 1_000_000, 950_000, 1_000_000]
+        );
+        // A clock that has not read a frame yet is not read before zero.
+        let early = LatePair::new(Duration::from_millis(3), wall, 3, period);
+        assert_eq!((early.video, early.audio), (Duration::ZERO, Duration::ZERO));
+
+        let mut reports = Reports::default();
+        let start = (Instant::now(), WallUs::new(1_000_000));
+        let first = reports
+            .due(Duration::from_secs(60), start, period)
+            .expect("the first report is due at once");
+        assert_eq!(
+            (first.elapsed, first.wall, first.index, first.video_period),
+            (Duration::ZERO, start.1, 0, period)
+        );
+        assert!(
+            reports
+                .due(Duration::from_secs(60), start, period)
+                .is_none()
+        );
+        let second = reports
+            .due(Duration::ZERO, start, period)
+            .expect("the interval has passed");
+        assert_eq!(second.index, 1);
+        assert!(second.wall.get() > start.1.get());
+    }
+
+    /// An audio stream of 64 kHz with `stamps` and a sample clock
+    /// `fast_ppm` fast.
+    fn player(stamps: AudioStamps, fast_ppm: i32) -> AudioPlayer {
+        AudioPlayer {
+            sample_rate: 64_000,
+            channels: InterleavedChannels { rtp: 2, rtcp: 3 },
+            ssrc: Ssrc::new(7),
+            wander: false,
+            lose: None,
+            fast_ppm,
+            stamps,
+            leave_out: None,
+            left_out: 0,
+            sent: 0,
+        }
+    }
+
+    /// The sequence number and the timestamp of every packet `audio` has
+    /// due in its first ten seconds. A frame is 16 ms: 10 s hold 625 starts
+    /// and the frame at 10 s itself.
+    fn packets_of(mut audio: AudioPlayer) -> Vec<(u16, u32)> {
+        let bytes = audio.frames_due(Duration::from_secs(10)).unwrap();
+        let mut packets = Vec::new();
+        let mut at = 0;
+        while at + 4 <= bytes.len() {
+            let len = usize::from(u16::from_be_bytes([bytes[at + 2], bytes[at + 3]]));
+            let packet = &bytes[at + 4..at + 4 + len];
+            packets.push((
+                u16::from_be_bytes([packet[2], packet[3]]),
+                u32::from_be_bytes([packet[4], packet[5], packet[6], packet[7]]),
+            ));
+            at += 4 + len;
+        }
+        packets
+    }
+
+    /// Seven frames left out from the hundredth: sequence numbers run on.
+    /// The camera's clock stamps the frames after them with their own
+    /// instants, and the sample clock with the count of what was sent.
+    #[test]
+    fn sound_left_out_skips_no_sequence_number_and_stamps_follow_the_chosen_clock() {
+        for (stamps, after) in [
+            (AudioStamps::CameraClock, 107 * 1_024),
+            (AudioStamps::SampleClock, 100 * 1_024),
+        ] {
+            let packets = packets_of(AudioPlayer {
+                leave_out: Some(LeftOut { at: 100, frames: 7 }),
+                ..player(stamps, 0)
+            });
+            assert_eq!(packets.len(), 626 - 7);
+            assert_eq!(packets[99], (99, 99 * 1_024));
+            assert_eq!(packets[100], (100, after), "{stamps:?}");
+            assert_eq!(packets[101], (101, after + 1_024), "{stamps:?}");
+        }
+    }
+
+    /// With the wander, a frame whose number leaves 5 by 31 is stamped two
+    /// frames early, another whose number leaves 3 by 7 a frame and 384
+    /// units early, backwards from the frame before it, and every other on
+    /// its count; without it every frame is on its count.
+    #[test]
+    fn wandering_stamps_stand_early_of_the_count_and_step_backwards() {
+        let wandering = packets_of(AudioPlayer {
+            wander: true,
+            ..player(AudioStamps::SampleClock, 0)
+        });
+        let steady = packets_of(player(AudioStamps::SampleClock, 0));
+        for (frame, (wandered, on_count)) in wandering.iter().zip(&steady).enumerate() {
+            let early = match (frame % 31, frame % 7) {
+                (5, _) => 2_048,
+                (_, 3) => 1_408,
+                _ => 0,
+            };
+            assert_eq!(on_count.1, frame as u32 * 1_024, "frame {frame}");
+            assert_eq!(wandered.1, on_count.1.wrapping_sub(early), "frame {frame}");
+            assert_eq!(wandered.0, on_count.0, "frame {frame}");
+        }
+        assert!(wandering[3].1 < wandering[2].1, "a step backwards");
+    }
+
+    /// The audio's sample clock, 10,000 ppm fast, has 1 % more frames due;
+    /// stamped by the sample clock a frame's stamp is its count, and stamped
+    /// by the camera's clock it is the instant the frame starts. A sender
+    /// report reads whichever clock stamps the frames.
+    #[test]
+    fn a_fast_sample_clock_makes_more_frames_and_stamps_follow_the_chosen_clock() {
+        let stamps_of = |audio: AudioPlayer| -> Vec<u32> {
+            packets_of(audio)
+                .into_iter()
+                .map(|packet| packet.1)
+                .collect()
+        };
+        let exact = stamps_of(player(AudioStamps::SampleClock, 0));
+        assert_eq!((exact.len(), exact[625]), (626, 640_000));
+        let counted = stamps_of(player(AudioStamps::SampleClock, 10_000));
+        assert_eq!((counted.len(), counted[631]), (632, 631 * 1_024));
+        let clocked = stamps_of(player(AudioStamps::CameraClock, 10_000));
+        assert_eq!(clocked.len(), 632);
+        // Frame 631 starts 631 × 16 ms / 1.01 after PLAY: 9.99604 s.
+        assert_eq!(clocked[631], 639_746);
+        let report = |stamps| player(stamps, 10_000).report_timestamp(Duration::from_secs(10));
+        assert_eq!(report(AudioStamps::SampleClock).get(), 646_400);
+        assert_eq!(report(AudioStamps::CameraClock).get(), 640_000);
     }
 
     #[test]
@@ -1195,7 +1992,7 @@ mod tests {
         let largest_convertible = u64::MAX / 100;
         assert!(Ticks::new(largest_convertible).to_duration().is_some());
         assert!(Ticks::new(largest_convertible + 1).to_duration().is_none());
-        assert!(frame_due(Instant::now(), Ticks::new(u64::MAX), Ticks::new(1)).is_none());
+        assert!(frame_due(Instant::now(), Ticks::new(u64::MAX), Ticks::new(1), 0).is_none());
     }
 
     #[test]
@@ -1735,6 +2532,7 @@ mod tests {
             Packetizer::new(Ssrc::new(1), 100),
             RtpTimestamp::new(0),
             InterleavedChannels { rtp: 0, rtcp: 1 },
+            None,
         ));
         let mut writes = Vec::new();
         while let Some(frame) = tokio::time::timeout(Duration::from_secs(2), rx.recv())
@@ -1798,6 +2596,30 @@ mod tests {
         // quarters of the way through it, 25 ms after the frame.
         let last = writes[3].0.duration_since(started);
         assert!(last >= Duration::from_millis(25), "{last:?}");
+    }
+
+    /// A stall holds the stream once, when its moment has come and not before.
+    #[tokio::test]
+    async fn a_stall_delays_delivery_from_its_moment_on() {
+        let started = Instant::now();
+        let writes = one_pass(Options {
+            stall_after: Some(Duration::ZERO),
+            stall_for: Duration::from_millis(200),
+            ..Options::default()
+        })
+        .await;
+        let first = writes[0].0.duration_since(started);
+        assert!(first >= Duration::from_millis(200), "{first:?}");
+
+        let started = Instant::now();
+        let writes = one_pass(Options {
+            stall_after: Some(Duration::from_secs(3_600)),
+            stall_for: Duration::from_secs(1),
+            ..Options::default()
+        })
+        .await;
+        let last = writes.last().unwrap().0.duration_since(started);
+        assert!(last < Duration::from_secs(1), "{last:?}");
     }
 
     #[tokio::test]

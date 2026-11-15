@@ -8,7 +8,7 @@ repository root is the digest of what irisd adopts from all of them.
 
 | Directory | Documents | License |
 |---|---|---|
-| `ietf/` | RFC 2326 (RTSP 1.0), RFC 3550 (RTP), RFC 7798 (HEVC RTP payload), RFC 8216 (HLS) and draft-pantos-hls-rfc8216bis-22, RFC 6381 (codecs parameter) | IETF Trust |
+| `ietf/` | RFC 2326 (RTSP 1.0), RFC 3550 (RTP), RFC 3551 (the audio and video RTP profile: L16, PCMA), RFC 3640 (MPEG-4 elementary streams over RTP, the `mpeg4-generic` payload of AAC), RFC 7798 (HEVC RTP payload), RFC 8216 (HLS) and draft-pantos-hls-rfc8216bis-22, RFC 6381 (codecs parameter) | IETF Trust |
 
 The files are the published text from `https://www.rfc-editor.org/rfc/rfcNNNN.txt` and
 `https://www.ietf.org/archive/id/draft-pantos-hls-rfc8216bis-22.txt`; a published RFC does

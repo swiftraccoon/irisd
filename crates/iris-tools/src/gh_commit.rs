@@ -25,6 +25,7 @@ use tokio::signal::unix::SignalKind;
 use tokio::time::Instant;
 
 use crate::logs;
+use crate::standards;
 
 const GH_TIMEOUT: Duration = Duration::from_secs(120);
 /// How long a helper's output may stay open after it exits, at least.
@@ -962,6 +963,15 @@ pub fn run(args: &Args) -> anyhow::Result<()> {
     let plan = plan(&target, &branch, &source_oid)?;
     if args.dry_run || matches!(plan, Plan::Publish { .. }) {
         println!("{}", plan.describe(&target, &branch));
+    }
+    if let Plan::Publish { remote_oid, .. } = &plan {
+        // No git hook sees a commit the API makes, so its message is held to
+        // STANDARDS.md §9 here, against everything the commit will hold.
+        let message = expected_message(&args.message, args.body.as_deref().unwrap_or(""));
+        if let Err(error) = standards::check_publication(&message, remote_oid, &source_oid) {
+            delete_temp_refs();
+            return Err(error);
+        }
     }
     if args.dry_run {
         delete_temp_refs();

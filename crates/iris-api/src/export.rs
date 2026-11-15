@@ -1,7 +1,6 @@
 //! Streamed fMP4 export of a time range.
 
 use std::io::{self, SeekFrom};
-use std::os::unix::fs::FileExt as _;
 use std::sync::Arc;
 use std::task::Poll;
 
@@ -11,15 +10,21 @@ use axum::http::header;
 use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
 use iris_catalog::TimeRange;
+use iris_core::id::StreamKind;
 use iris_core::time::{MediaTicks, TIMESCALE, WallUs};
-use iris_mp4::export::{MOVIE_TIMESCALE, rebase_fragment, trim_fragment_end, with_edit_list};
+use iris_mp4::export::{
+    ExportError, MOVIE_TIMESCALE, TrackEdit, TrimmedStart, rebase_fragment, retrack_fragment,
+    trim_fragment_end, trim_fragment_start, with_edit_lists,
+};
 use iris_mp4::fragment::FragmentHeader;
+use iris_mp4::index::IndexRecord;
+use iris_mp4::init::{AV_AUDIO_TRACK_ID, SampleEntry, build_av_init_segment, sample_entry_bytes};
 use tokio::io::{AsyncReadExt as _, AsyncSeekExt as _};
 use tokio::sync::mpsc;
 
 use crate::error::ApiError;
 use crate::hls::{
-    MAX_FRAGMENT_BYTES, MAX_INIT_BYTES, SegmentFragments, load_fragments, validate_fragment_record,
+    MAX_FRAGMENT_BYTES, SegmentFragments, load_fragments, read_init, validate_fragment_record,
 };
 use crate::media_admission::{self, MediaPermit};
 use crate::query::{TimeParams, resolve_range};
@@ -44,12 +49,112 @@ pub(crate) async fn export(
         "{}-{}-{:04}{:02}{:02}T{:02}{:02}{:02}Z.mp4",
         key.camera, key.kind, c.year, c.month, c.day, c.hour, c.minute, c.second
     );
+    let sound = if key.kind == StreamKind::Audio {
+        Sound::Alone
+    } else {
+        Sound::None
+    };
+    Ok(streamed(segments, sound, range, init, &filename, permit))
+}
+
+/// `GET /api/cameras/{camera}/export.mp4`: the camera's main stream for a
+/// range as one MP4 file, with the camera's recorded audio as a second track
+/// when the range holds any (`docs/research/13-audio.md` §9). The video is
+/// what the main stream's own export holds; each audio fragment follows the
+/// video fragment whose span it starts in, on the same continuous timeline.
+pub(crate) async fn camera_export(
+    State(state): State<Arc<ApiState>>,
+    Path(camera): Path<String>,
+    Query(params): Query<TimeParams>,
+) -> Result<Response, ApiError> {
+    let permit = state.stats.admit_media(MediaClass::Streaming)?;
+    let video_key = stream_key(&camera, "main")?;
+    let audio_key = stream_key(&camera, "audio")?;
+    let range = resolve_range(&params, WallUs::now())?;
+    let video = load_fragments(&state, &video_key, range, &permit).await?;
+    let Some(first) = video.first() else {
+        return Err(ApiError::NotFound);
+    };
+    let audio = load_fragments(&state, &audio_key, range, &permit).await?;
+    let mut init = compatible_init(&video, &permit).await?;
+    if let Some(sound) = audio.first() {
+        let audio_init = compatible_init(&audio, &permit).await?;
+        let unreadable =
+            || ApiError::Unavailable("a recording's sample entry is unreadable".into());
+        let video_entry = SampleEntry::new(
+            Bytes::copy_from_slice(sample_entry_bytes(&init).ok_or_else(unreadable)?),
+            first.row.codecs.clone(),
+            first.row.width,
+            first.row.height,
+        );
+        let audio_entry = SampleEntry::audio(
+            Bytes::copy_from_slice(sample_entry_bytes(&audio_init).ok_or_else(unreadable)?),
+            sound.row.codecs.clone(),
+        );
+        init = build_av_init_segment(&video_entry, &audio_entry);
+    }
+    let c = range.from.to_civil();
+    let filename = format!(
+        "{}-{:04}{:02}{:02}T{:02}{:02}{:02}Z.mp4",
+        video_key.camera, c.year, c.month, c.day, c.hour, c.minute, c.second
+    );
+    let sound = if audio.is_empty() {
+        Sound::None
+    } else {
+        Sound::Beside(audio)
+    };
+    Ok(streamed(video, sound, range, init, &filename, permit))
+}
+
+/// What an export holds of sound.
+enum Sound {
+    /// None: the exported stream is pictures.
+    None,
+    /// The exported stream is itself sound: its start is cut where the
+    /// export starts.
+    Alone,
+    /// A camera's audio beside its pictures, as a second track: these
+    /// fragments, of which there is at least one.
+    Beside(Vec<SegmentFragments>),
+}
+
+impl Sound {
+    /// The edit of each track of the export, given the edit of its start: a
+    /// video track's hides what precedes the start, and a sound track,
+    /// which is cut there, says its length alone.
+    fn edits(&self, start: &Edit) -> Vec<TrackEdit> {
+        let hidden = TrackEdit {
+            media_time: start.media_time,
+            duration_ms: start.duration_ms,
+        };
+        let cut = TrackEdit {
+            media_time: 0,
+            duration_ms: start.duration_ms,
+        };
+        match self {
+            Self::None => vec![hidden],
+            Self::Alone => vec![cut],
+            Self::Beside(_) => vec![hidden, cut],
+        }
+    }
+}
+
+/// The response that streams an export of `video` with `sound`, under
+/// `init`.
+fn streamed(
+    video: Vec<SegmentFragments>,
+    sound: Sound,
+    range: TimeRange,
+    init: Bytes,
+    filename: &str,
+    permit: MediaPermit,
+) -> Response {
     // One bounded fragment can wait behind the one being delivered. Combined
     // with the fragment-length and process concurrency limits, slow clients
     // cannot multiply an unbounded byte queue.
     let (tx, mut rx) = mpsc::channel::<Result<Bytes, io::Error>>(1);
     let producer = media_admission::spawn(&permit, async move {
-        if let Err(e) = stream_segments(segments, range, &init, &tx).await {
+        if let Err(e) = stream_segments(video, sound, range, &init, &tx).await {
             let _ = tx.send(Err(e)).await;
         }
     });
@@ -62,7 +167,7 @@ pub(crate) async fn export(
         }
         other => other,
     });
-    Ok((
+    (
         [
             (header::CONTENT_TYPE, "video/mp4".to_owned()),
             (
@@ -73,7 +178,7 @@ pub(crate) async fn export(
         ],
         Body::from_stream(stream),
     )
-        .into_response())
+        .into_response()
 }
 
 /// Checks the actual init bytes because adopted files may lack catalog codec hashes.
@@ -86,26 +191,7 @@ async fn compatible_init(
 ) -> Result<Bytes, ApiError> {
     let mut expected: Option<Vec<u8>> = None;
     for segment in segments {
-        if u64::from(segment.row.init_len) > MAX_INIT_BYTES
-            || u64::from(segment.row.init_len) > segment.media.extent()
-        {
-            return Err(ApiError::Unavailable(
-                "export initialization exceeds the serving budget or published extent".into(),
-            ));
-        }
-        let media = segment.media.clone();
-        let init_len = segment.row.init_len;
-        let init = media_admission::blocking(permit, move || {
-            let file = media.reopen()?;
-            let mut init = Vec::new();
-            init.try_reserve_exact(init_len as usize)
-                .map_err(io::Error::other)?;
-            init.resize(init_len as usize, 0);
-            file.read_exact_at(&mut init, 0)?;
-            Ok::<_, io::Error>(init)
-        })
-        .await
-        .map_err(io::Error::other)??;
+        let init = read_init(segment, permit).await?;
         if expected.as_ref().is_some_and(|expected| expected != &init) {
             return Err(ApiError::BadRequest(
                 "export range crosses a codec configuration change; request one configuration at a time"
@@ -117,16 +203,31 @@ async fn compatible_init(
     expected.map(Bytes::from).ok_or(ApiError::NotFound)
 }
 
-/// Writes the first segment's init section with an edit list trimming the
-/// export's start, then every in-range fragment rebased onto a continuous
-/// timeline. Tail sample bytes outside the range are omitted, with a crossing
-/// sample's duration shortened, so end clipping does not depend on the player.
+/// Writes the init section with an edit list trimming the export's start,
+/// then every in-range fragment rebased onto a continuous timeline. Tail
+/// sample bytes outside the range are omitted, with a crossing sample's
+/// duration shortened, so end clipping does not depend on the player.
 /// The exclusive end rounds up to a media tick to retain a positive tail.
 /// Only the final fragment is trimmed: the wall anchor can step down inside a
 /// run, so an earlier fragment's wall interval may reach past the end, and
 /// the fragments after it need its last samples to decode.
+///
+/// A sound track's start is cut, not hidden by an edit: its samples that
+/// start before the export does are left out and its timeline starts at
+/// zero where the export starts, because a player in wide use misreads the
+/// media time of an AAC track's edit (`docs/research/13-audio.md` §9). That
+/// holds for a stream of sound alone ([`Sound::Alone`]) and for the audio
+/// beside a video ([`Sound::Beside`]).
+///
+/// With audio beside the video, `init` holds two tracks. After a video fragment come the
+/// audio fragments that start inside its span, on track
+/// [`AV_AUDIO_TRACK_ID`], as far into the export as into the video; audio
+/// that starts before the first video fragment or at or after the export's
+/// end is left out, and an audio fragment that crosses the end is trimmed
+/// there.
 async fn stream_segments(
     segments: Vec<SegmentFragments>,
+    sound: Sound,
     range: TimeRange,
     init: &[u8],
     tx: &mpsc::Sender<Result<Bytes, io::Error>>,
@@ -137,8 +238,26 @@ async fn stream_segments(
     let Ok(init_slot) = tx.reserve().await else {
         return Ok(());
     };
-    let init = with_edit_list(init, edit.media_time, edit.duration_ms).map_err(io::Error::other)?;
+    let init = with_edit_lists(init, &sound.edits(&edit)).map_err(io::Error::other)?;
     init_slot.send(Ok(Bytes::from(init)));
+    // The wall time at which each video fragment after the first starts:
+    // where the audio that follows the fragment before it ends.
+    let next_starts: Vec<WallUs> = segments
+        .iter()
+        .flat_map(|seg| seg.records.iter().map(|record| record.wall))
+        .skip(1)
+        .collect();
+    let mut next_starts = next_starts.into_iter();
+    // Ticks of a lone sound track still to leave out before the export starts.
+    let mut lead = match sound {
+        Sound::Alone => edit.media_time,
+        Sound::None | Sound::Beside(_) => 0,
+    };
+    let beside = match sound {
+        Sound::Beside(audio) => audio,
+        Sound::None | Sound::Alone => Vec::new(),
+    };
+    let mut sound = AudioCursor::new(beside, edit.media_time);
     let mut sequence = 1u32;
     let mut decode_time = 0u64;
     let last_segment = segments.len() - 1;
@@ -150,33 +269,37 @@ async fn stream_segments(
             let Ok(fragment_slot) = tx.reserve().await else {
                 return Ok(());
             };
-            let file = match &mut file {
-                Some(file) => file,
-                None => file.insert(seg.media.open().await?),
-            };
-            if u64::from(record.len) > MAX_FRAGMENT_BYTES || record.end() > seg.media.extent() {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "export fragment exceeds serving bounds",
-                ));
-            }
-            file.seek(SeekFrom::Start(record.offset)).await?;
-            let mut fragment = Vec::new();
-            fragment
-                .try_reserve_exact(record.len as usize)
-                .map_err(io::Error::other)?;
-            fragment.resize(record.len as usize, 0);
-            file.read_exact(&mut fragment).await?;
-            validate_fragment_record(&fragment, record)?;
-            let until = ticks_through(record.wall, range.to);
+            let mut fragment = read_fragment(&mut file, &seg, record).await?;
+            let mut wall = record.wall;
             let mut duration = u64::from(record.duration);
-            if is_final && until < u64::from(record.duration) {
+            if lead > 0 {
+                let Some(TrimmedStart {
+                    fragment: rest,
+                    omitted_ticks: omitted,
+                }) = without_start(fragment, lead)?
+                else {
+                    // No sample of it starts at or after the export's start.
+                    decode_time = duration.saturating_sub(lead);
+                    lead = lead.saturating_sub(duration);
+                    continue;
+                };
+                fragment = rest;
+                wall = wall.offset(ticks_as_micros(omitted)?);
+                duration -= omitted;
+                decode_time = omitted - lead;
+                lead = 0;
+            }
+            let until = ticks_through(wall, range.to);
+            if is_final && until < duration {
+                if until == 0 {
+                    break;
+                }
                 fragment = trim_fragment_end(
                     fragment,
                     FragmentHeader {
                         sequence,
                         decode_time,
-                        wall: record.wall,
+                        wall,
                     },
                     MediaTicks::new(i64::try_from(until).map_err(io::Error::other)?),
                 )
@@ -186,11 +309,214 @@ async fn stream_segments(
                 rebase_fragment(&mut fragment, sequence, decode_time).map_err(io::Error::other)?;
             }
             sequence = sequence.wrapping_add(1);
-            decode_time += duration;
             fragment_slot.send(Ok(Bytes::from(fragment)));
+            let span = VideoSpan {
+                wall: record.wall,
+                stored: record.decode_time,
+                decode_time,
+                end: decode_time + duration,
+                next_wall: next_starts.next(),
+            };
+            if !sound.follow(span, &mut sequence, tx).await? {
+                return Ok(());
+            }
+            decode_time += duration;
         }
     }
     Ok(())
+}
+
+/// `fragment` from its first sample that starts at or after `skip` ticks
+/// into it, with the ticks left out; `None` when no sample does, and for a
+/// fragment that flags a sample as not a sync sample, which cannot lose its
+/// start and is left out whole.
+fn without_start(fragment: Vec<u8>, skip_ticks: u64) -> io::Result<Option<TrimmedStart>> {
+    let skip = MediaTicks::new(i64::try_from(skip_ticks).map_err(io::Error::other)?);
+    match trim_fragment_start(fragment, skip) {
+        Ok(cut) => Ok(Some(cut)),
+        Err(ExportError::InvalidDuration | ExportError::NotAllSync) => Ok(None),
+        Err(error) => Err(io::Error::other(error)),
+    }
+}
+
+/// Media ticks as microseconds of wall time.
+fn ticks_as_micros(ticks: u64) -> io::Result<i64> {
+    let ticks = i64::try_from(ticks).map_err(io::Error::other)?;
+    Ok(MediaTicks::new(ticks).as_micros())
+}
+
+/// Reads and validates the stored fragment `record` names, opening the
+/// segment's file at its first use.
+async fn read_fragment(
+    file: &mut Option<tokio::fs::File>,
+    seg: &SegmentFragments,
+    record: &IndexRecord,
+) -> io::Result<Vec<u8>> {
+    let file = match file {
+        Some(file) => file,
+        None => file.insert(seg.media.open().await?),
+    };
+    if u64::from(record.len) > MAX_FRAGMENT_BYTES || record.end() > seg.media.extent() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "export fragment exceeds serving bounds",
+        ));
+    }
+    file.seek(SeekFrom::Start(record.offset)).await?;
+    let mut fragment = Vec::new();
+    fragment
+        .try_reserve_exact(record.len as usize)
+        .map_err(io::Error::other)?;
+    fragment.resize(record.len as usize, 0);
+    file.read_exact(&mut fragment).await?;
+    validate_fragment_record(&fragment, record)?;
+    Ok(fragment)
+}
+
+/// One exported video fragment, for placing the audio that follows it.
+#[derive(Clone, Copy, Debug)]
+struct VideoSpan {
+    /// Wall time of its first frame.
+    wall: WallUs,
+    /// Its decode time as stored.
+    stored: u64,
+    /// Its decode time in the export.
+    decode_time: u64,
+    /// Where it ends in the export, after trimming.
+    end: u64,
+    /// Wall time at which the next video fragment starts; `None` for the last.
+    next_wall: Option<WallUs>,
+}
+
+impl VideoSpan {
+    /// How far into this fragment `audio` starts, in ticks. Audio is stored
+    /// on its video run's timeline, so the difference of the stored decode
+    /// times is exact; when that disagrees with the wall times by more than
+    /// a millisecond the two are not of one run, and the wall times decide.
+    fn offset_of(&self, audio: &IndexRecord) -> u64 {
+        let by_wall = ticks_between(self.wall, audio.wall);
+        match audio.decode_time.checked_sub(self.stored) {
+            Some(by_time) if by_time.abs_diff(by_wall) <= RUN_AGREEMENT_TICKS => by_time,
+            _ => by_wall,
+        }
+    }
+}
+
+/// How far the stored decode times of a video fragment and an audio fragment
+/// may disagree with their wall times and still be of one run: a millisecond.
+const RUN_AGREEMENT_TICKS: u64 = 90;
+
+/// The audio fragments of an export, taken in order as the video advances.
+struct AudioCursor {
+    segments: Vec<SegmentFragments>,
+    segment: usize,
+    record: usize,
+    file: Option<tokio::fs::File>,
+    /// Where the export starts on the video's export timeline, which is
+    /// zero on the audio's.
+    start: u64,
+    /// Where the audio sent so far ends on its own timeline.
+    end: u64,
+}
+
+impl AudioCursor {
+    fn new(segments: Vec<SegmentFragments>, start: u64) -> Self {
+        Self {
+            segments,
+            segment: 0,
+            record: 0,
+            file: None,
+            start,
+            end: 0,
+        }
+    }
+
+    /// The next audio fragment's record, moving to the next file when one
+    /// is exhausted.
+    fn peek(&mut self) -> Option<IndexRecord> {
+        loop {
+            let seg = self.segments.get(self.segment)?;
+            if let Some(record) = seg.records.get(self.record) {
+                return Some(*record);
+            }
+            self.segment += 1;
+            self.record = 0;
+            self.file = None;
+        }
+    }
+
+    /// Sends the audio fragments that start inside `span`, moved to the
+    /// audio track, as far into the export as into the video. The start of
+    /// a fragment that crosses the export's start is cut there, and where
+    /// the video closes a gap between runs the audio follows what was sent
+    /// before it. Returns `false` when the receiver is gone.
+    async fn follow(
+        &mut self,
+        span: VideoSpan,
+        sequence: &mut u32,
+        tx: &mpsc::Sender<Result<Bytes, io::Error>>,
+    ) -> io::Result<bool> {
+        while let Some(record) = self.peek() {
+            if span.next_wall.is_some_and(|next| record.wall >= next) {
+                break;
+            }
+            self.record += 1;
+            if record.wall < span.wall {
+                // Before the first video fragment.
+                continue;
+            }
+            let mut at = span.decode_time + span.offset_of(&record);
+            let mut duration = u64::from(record.duration);
+            if at >= span.end || at + duration <= self.start {
+                // Past the video it would follow, or before the export starts.
+                continue;
+            }
+            let Ok(slot) = tx.reserve().await else {
+                return Ok(false);
+            };
+            let seg = &self.segments[self.segment];
+            let mut fragment = read_fragment(&mut self.file, seg, &record).await?;
+            let mut wall = record.wall;
+            if at < self.start {
+                let Some(TrimmedStart {
+                    fragment: rest,
+                    omitted_ticks: omitted,
+                }) = without_start(fragment, self.start - at)?
+                else {
+                    continue;
+                };
+                fragment = rest;
+                wall = wall.offset(ticks_as_micros(omitted)?);
+                at += omitted;
+                duration -= omitted;
+                if at >= span.end {
+                    continue;
+                }
+            }
+            let decode_time = (at - self.start).max(self.end);
+            let room = span.end - at;
+            if span.next_wall.is_none() && room < duration {
+                fragment = trim_fragment_end(
+                    fragment,
+                    FragmentHeader {
+                        sequence: *sequence,
+                        decode_time,
+                        wall,
+                    },
+                    MediaTicks::new(i64::try_from(room).map_err(io::Error::other)?),
+                )
+                .map_err(io::Error::other)?;
+                duration = room;
+            } else {
+                rebase_fragment(&mut fragment, *sequence, decode_time).map_err(io::Error::other)?;
+            }
+            retrack_fragment(&mut fragment, AV_AUDIO_TRACK_ID).map_err(io::Error::other)?;
+            *sequence = sequence.wrapping_add(1);
+            self.end = decode_time + duration;
+            slot.send(Ok(Bytes::from(fragment)));
+        }
+        Ok(true)
+    }
 }
 
 /// The edit list of an export: how far into the first fragment presentation
@@ -245,7 +571,7 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
-    use crate::hls::ValidatedMedia;
+    use crate::hls::{MAX_INIT_BYTES, ValidatedMedia};
     use iris_catalog::{SegmentId, SegmentRow};
     use iris_core::id::{CameraId, StreamKey, StreamKind};
     use iris_mp4::index::IndexRecord;
@@ -318,7 +644,7 @@ mod tests {
         // The producer waits for queue room, so it runs beside the reader.
         let (tx, mut rx) = mpsc::channel(1);
         let produce = async move {
-            stream_segments(vec![segment], range, init, &tx)
+            stream_segments(vec![segment], Sound::None, range, init, &tx)
                 .await
                 .unwrap();
         };
@@ -448,7 +774,7 @@ mod tests {
                 discontinuity_before: true,
             };
             let (tx, mut rx) = mpsc::channel(8);
-            let outcome = stream_segments(vec![published], range, &init, &tx).await;
+            let outcome = stream_segments(vec![published], Sound::None, range, &init, &tx).await;
             drop(tx);
             let mut sent = 0;
             while rx.recv().await.is_some() {
@@ -613,8 +939,9 @@ mod tests {
         let source = segment(directory.path(), vec![record]);
         std::fs::remove_file(source.media.path()).expect("remove the validated recording");
         let (tx, mut rx) = mpsc::channel(1);
-        let mut producer =
-            tokio::spawn(async move { stream_segments(vec![source], range, &init, &tx).await });
+        let mut producer = tokio::spawn(async move {
+            stream_segments(vec![source], Sound::None, range, &init, &tx).await
+        });
 
         // Under paused time the deadline fires as soon as the producer is idle,
         // so this proves it is blocked on the queue and not on time.

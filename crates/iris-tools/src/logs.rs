@@ -358,6 +358,57 @@ mod tests {
     }
 
     #[test]
+    fn a_last_line_of_exactly_the_limit_needs_no_newline() {
+        let exact = vec![b'x'; MAX_LINE_BYTES];
+        let mut reader = LineReader::new(exact.as_slice());
+        let line = reader.next_line().unwrap().unwrap();
+        assert_eq!((line.bytes.len(), line.terminated), (MAX_LINE_BYTES, false));
+    }
+
+    #[test]
+    fn each_part_of_the_daemon_prefix_is_required() {
+        for line in [
+            "2026-1Z INFO short",
+            "xxxxxxxxxxxxxxxxxxxxxxxxxxZ INFO no date",
+            "2026-11-02T01:45:23.123456+00:00 INFO not utc",
+        ] {
+            assert!(split(line).is_none(), "{line}");
+        }
+    }
+
+    #[test]
+    fn a_quoted_value_is_skipped_whole() {
+        let fields = kv("a=\"kk=vv\" b=2 c=3");
+        assert_eq!(
+            fields.iter().collect::<Vec<_>>(),
+            [
+                (&"a".to_owned(), &"kk=vv".to_owned()),
+                (&"b".to_owned(), &"2".to_owned()),
+                (&"c".to_owned(), &"3".to_owned())
+            ]
+        );
+    }
+
+    #[test]
+    fn control_strings_end_at_a_string_terminator_or_a_bell() {
+        assert_eq!(strip_ansi("ab\x1b]0;title\x1b\\tail"), "abtail");
+        // An escape inside the string that is not the terminator does not end it.
+        assert_eq!(strip_ansi("ab\x1b]0;ti\x1bXtle\x07tail"), "abtail");
+        // A two-character escape takes its one final byte.
+        assert_eq!(strip_ansi("ab\x1bcXY"), "abXY");
+    }
+
+    /// A control string is removed when its terminator lies within the scan
+    /// limit, and kept as text when it lies one byte past it.
+    #[test]
+    fn a_control_string_is_scanned_only_to_the_limit() {
+        let string = |payload: usize| format!("\x1b]{}\x07tail", "p".repeat(payload));
+        assert_eq!(strip_ansi(&string(MAX_ESCAPE_BYTES - 1)), "tail");
+        let kept = strip_ansi(&string(MAX_ESCAPE_BYTES));
+        assert!(kept.starts_with("\\u{1b}]ppp") && kept.ends_with("\\u{7}tail"));
+    }
+
+    #[test]
     fn splits_the_timestamp_and_level_off_a_coloured_line() {
         let line = strip_ansi(
             "\x1b[2m2026-11-02T01:45:23.123456Z\x1b[0m \x1b[32m INFO\x1b[0m stream \
@@ -482,6 +533,14 @@ mod tests {
             classify("2026-11-01T00:00:00Z INFO catalog open path=/srv/state/irisd.db"),
             Some(Statistics::Malformed("catalog"))
         );
+        assert_eq!(
+            classify("2026-11-01T00:00:00Z INFO catalog segments=4 events=2"),
+            Some(Statistics::Malformed("catalog"))
+        );
+        assert!(matches!(
+            classify("2026-11-01T00:00:00Z INFO catalog segments=4 gib=1.5"),
+            Some(Statistics::Row(Series::Catalog, _))
+        ));
     }
 
     #[test]

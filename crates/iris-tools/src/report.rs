@@ -1744,8 +1744,7 @@ fn report_api(
 type Criterion = (&'static str, String, &'static str);
 
 /// The criteria about runs, streams, and feeds. The targets come from
-/// `docs/research/08-roadmap.md` (phase 2: a 7-day soak with 6 cameras × 2
-/// streams) and the budgets in `docs/research/07-architecture.md §7`.
+/// `docs/research/08-roadmap.md` (phase 2: a 7-day soak with twelve streams) and the budgets in `docs/research/07-architecture.md §7`.
 fn availability_criteria(runs: &[Run], host: &HostFigures, api_problems: usize) -> Vec<Criterion> {
     let gaps = notable(runs, Notable::Gap).len();
     let disconnected = |windows: fn(&Run) -> Box<dyn Iterator<Item = &Window> + '_>| {
@@ -2714,5 +2713,86 @@ mod tests {
         let figures =
             report_host(&samples, Completeness::Complete, &[], &mut Vec::<u8>::new()).unwrap();
         assert_eq!(figures.restarts, Some(1.0));
+    }
+
+    fn valued(t: f64, key: &str, value: f64) -> Row {
+        (t, Fields::from([(key.to_owned(), value.to_string())]))
+    }
+
+    /// A value that rises 2.0 a day has that slope whatever the offset and
+    /// spacing; rows without the key are skipped; fewer than three points,
+    /// or points at one instant, have none.
+    #[test]
+    fn the_slope_is_the_least_squares_rise_per_day() {
+        let day = 86_400.0;
+        let rows: Vec<Row> = [0.0, 0.25, 1.0, 3.0]
+            .iter()
+            .map(|days| valued(1_000.0 + days * day, "rss_mib", 60.0 + 2.0 * days))
+            .collect();
+        let slope = slope_per_day(&rows, "rss_mib").unwrap();
+        assert!((slope - 2.0).abs() < 1e-9, "{slope}");
+        // A point off the line: least squares over (0,0), (1,3), (2,0) is flat.
+        let bent = [
+            valued(0.0, "v", 0.0),
+            valued(day, "v", 3.0),
+            valued(2.0 * day, "v", 0.0),
+        ];
+        assert!(slope_per_day(&bent, "v").unwrap().abs() < 1e-9);
+        let falling = [
+            valued(0.0, "v", 9.0),
+            valued(day, "other", 100.0),
+            valued(day, "v", 6.0),
+            valued(2.0 * day, "v", 3.0),
+        ];
+        assert!((slope_per_day(&falling, "v").unwrap() + 3.0).abs() < 1e-9);
+        assert_eq!(slope_per_day(&rows[..2], "rss_mib"), None);
+        assert!(slope_per_day(&rows[..3], "rss_mib").is_some());
+        let at_once = [
+            valued(5.0, "v", 1.0),
+            valued(5.0, "v", 2.0),
+            valued(5.0, "v", 3.0),
+        ];
+        assert_eq!(slope_per_day(&at_once, "v"), None);
+    }
+
+    #[test]
+    fn interpolation_is_linear_inside_and_flat_outside() {
+        let points = [(10.0, 100.0), (20.0, 200.0), (20.0, 300.0), (40.0, 500.0)];
+        assert_eq!(interpolate(&points, 15.0), Some(150.0));
+        assert_eq!(interpolate(&points, 30.0), Some(400.0));
+        assert_eq!(interpolate(&points, 5.0), Some(100.0));
+        assert_eq!(interpolate(&points, 10.0), Some(100.0));
+        assert_eq!(interpolate(&points, 40.0), Some(500.0));
+        assert_eq!(interpolate(&points, 99.0), Some(500.0));
+        // At a repeated instant the later value stands.
+        assert_eq!(interpolate(&points, 20.0), Some(300.0));
+        assert_eq!(interpolate(&[], 1.0), None);
+    }
+
+    #[test]
+    fn growth_between_two_instants_ignores_a_counter_reset() {
+        let points = [(0.0, 0.0), (10.0, 100.0), (20.0, 10.0), (30.0, 40.0)];
+        // 50 to 100, the reset to 10, then 10 to 25.
+        assert_eq!(growth_between(&points, 5.0, 25.0), 65.0);
+        assert_eq!(growth_between(&points, 0.0, 10.0), 100.0);
+        assert_eq!(growth_between(&[], 0.0, 10.0), 0.0);
+    }
+
+    #[test]
+    fn amplification_needs_payload_and_covered_time() {
+        let figures = |written, payload, covered, span| Amplification {
+            written,
+            payload,
+            covered,
+            span,
+        };
+        assert_eq!(figures(202.0, 200.0, 60.0, 120.0).ratio(), Some(1.01));
+        assert_eq!(figures(202.0, 0.0, 60.0, 120.0).ratio(), None);
+        assert_eq!(figures(202.0, 200.0, 0.0, 120.0).ratio(), None);
+        assert_eq!(
+            figures(202.0, 200.0, 60.0, 120.0).coverage_pct(),
+            Some(50.0)
+        );
+        assert_eq!(figures(202.0, 200.0, 60.0, 0.0).coverage_pct(), None);
     }
 }

@@ -14,7 +14,7 @@ root applies to all of them.
 | `iris-catalog` | SQLite catalog on its own thread: segments, runs, events, retention queries |
 | `iris-events` | camera event feeds: vendor CGI push and ONVIF pull-point |
 | `iris-api` | HTTP API: HLS, live WebSocket, export, snapshots, events, metrics |
-| `irisd` | the binary: `run`, `record`, `inspect`, `recover`, `hls`, `serve` |
+| `irisd` | the binary: `run`, `record`, `inspect`, `clocks`, `recover`, `hls`, `serve` |
 | `iris-replay` | RTSP replay server: recordings as synthetic cameras for benchmarks and fault injection |
 | `iris-tls` | the TLS client trust the viewer and the tools share: platform roots plus an optional CA file |
 | `iris-gui` | Linux viewer: GTK 4 live grid, focus, playback timeline, event retention, thumbnails, export |

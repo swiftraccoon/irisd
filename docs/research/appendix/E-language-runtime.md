@@ -26,9 +26,10 @@ https://github.blog/security/vulnerability-research/uncovering-gstreamer-secrets
 https://cveawg.mitre.org/api/cve/CVE-2025-66177 ·
 https://thehackernews.com/2025/07/critical-dahua-camera-flaws-enable.html **VP**
 
-**1.2 Rust is the only non-GC language with every required library existing and maintained.** retina
-(RTSP; in production in Moonfire NVR; H.265 since 0.4.12, 2025-01-28; in-tree VPS/SPS/PPS parsing
-and hvcC builder in `src/codec/h265/record.rs`; IRAP detection; ring-buffer reads since 0.4.20),
+**1.2 Rust is the only non-GC language with every required library available and maintained.**
+retina (RTSP; in production in Moonfire NVR; H.265 since 0.4.12, 2025-01-28; in-tree VPS/SPS/PPS
+parsing and hvcC builder in `src/codec/h265/record.rs`; IRAP detection; ring-buffer reads since
+0.4.20),
 hyper/h2/axum, quinn/h3, rustls, tokio-tungstenite, str0m/webrtc, rusqlite bundled,
 quick-xml/yaserde + onvif-rs, sd-notify, landlock. Prior art: Moonfire NVR "handles six 1080p/30fps
 streams on a Raspberry Pi 2, using less than 10% of the machine's total CPU" (tokio+retina+rusqlite,

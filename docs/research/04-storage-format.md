@@ -12,7 +12,7 @@ Full research notes with citations: `appendix/B-storage.md`. Measurements: `01-c
 | R4 | Serve live, timeline playback, export, thumbnails without transcoding | byte-range serving; MP4 export assembled, not re-muxed |
 | R5 | Retention is O(1) per deleted unit; no fragmentation growth | delete whole files; preallocated extents |
 | R6 | Wall-clock-correct, drift-corrected, searchable by time | ≤ 1 s absolute error, ≤ 500 ppm drift correction |
-| R7 | Video-only alpha record path | reject unsupported audio configuration |
+| R7 | Video as received; audio as received when it is AAC | no transcoding; other audio codecs are not recorded |
 | R8 | Files readable by standard tools | `ffprobe`, `mpv`, AVPlayer open them directly |
 
 ## 2. Options considered
@@ -88,9 +88,12 @@ unregistered root in a catalog created with the root registry (v9 or later) can 
 automatically only when
 it has no catalog ownership and is absent or empty, using the same durable order.
 
-One file per configured video stream: main and sub. The 0.1 alpha rejects audio recording
-configuration. An audio extension could use a separate elementary-stream file so video `mdat`
-ranges remain contiguous, but no audio layout or serving contract is part of this format.
+One file per recorded stream: main, sub, and audio. A camera's AAC audio is a stream of its
+own (`audio` in the directory layout) with the same file format: an initialization segment
+whose one track is a sound track (`mp4a`), then fragments cut where the video's are, every
+sample a sync sample, in the same 90 kHz timescale and on the video run's timeline
+(`13-audio.md` §5.2). Video `mdat` ranges stay
+contiguous. Serving audio with its picture is not part of this format.
 
 A file (a *segment* in the catalog) is sealed and a new one started at the first IRAP after
 any of: 1 hour elapsed, 1 GiB written, 126,976 fragments (4,096 below the 131,072-record
@@ -99,10 +102,8 @@ ceiling of every sidecar reader), parameter-set (VPS/SPS/PPS) change, or a new *
 entry bytes; the CRC-32C is a hint and consistency check, so two entries that share a CRC still
 rotate. A file that holds 131,072 fragments takes no further fragment: dependent fragments are
 dropped and counted until the next IRAP opens a new file as a new run, so the writer never
-produces a recording its own readers reject. Dahua cam1 at 8 Mbps rotates every ≈ 18 min by
-size; on that family the secondary stream recorded is the third stream (01 §5b), about 6 Mbps,
-which rotates by size roughly every 24 min, and a D1 sub stream at 1.3 Mbps rotates hourly by
-time.
+produces a recording its own readers reject. A stream at 8 Mbps rotates every ≈ 18 min by
+size, one at 6 Mbps roughly every 24 min, and one at 1.3 Mbps hourly by time.
 
 ## 4. Byte-level layout of a video file
 
@@ -128,10 +129,12 @@ repeat per fragment (one GOP, ≤ 1.25 × max_fragment_ms of frames):
     mfhd  sequence_number (monotonic per file)
     traf
       tfhd  track 1, flags default-base-is-moof | default-sample-flags-present,
-            default_sample_flags 0x01010000 (non-sync, depends)
+            default_sample_flags 0x01010000 (non-sync, depends), or 0x02000000
+            (sync) when every sample is a sync sample, as in an audio fragment
       tfdt  v1, baseMediaDecodeTime (90 kHz, continuous within a run)
       trun  v0 flags data-offset | first-sample-flags | sample-duration | sample-size,
-            first_sample_flags 0x02000000 when the fragment starts with an IRAP,
+            first_sample_flags 0x02000000 when the fragment starts with an IRAP and
+            the default does not already say so,
             N × { duration u32, size u32 }
   mdat  N access units, each NAL 4-byte-length-prefixed; VPS/SPS/PPS stripped (they
         live in hvcC), AUD and SEI kept
@@ -141,12 +144,12 @@ repeat per fragment (one GOP, ≤ 1.25 × max_fragment_ms of frames):
 
 - Sample entry `hvc1` with parameter sets only in `hvcC`: Apple's HLS authoring spec says
   fMP4 is a MUST for HEVC and parameter sets in the sample description (`hvc1`) is a SHOULD
-  (Frigate's `force_record_hvc1` exists for the same reason). cam1's parameter sets are
+  (Frigate's `force_record_hvc1` exists for the same reason). the test camera's parameter sets are
   byte-identical across GOPs; the writer compares each fragment's sample entry with the open
   file's and seals the file when the bytes change.
 - The `CODECS` string comes from retina's `rfc6381_codec()`, which derives it from the SPS
   `profile_tier_level` per ISO/IEC 14496-15 Annex E; it is stored with each sample entry and in
-  the catalog's `codecs` column, and cam1's main stream reports `hvc1.1.6.L150.00` (the
+  the catalog's `codecs` column, and the test camera's main stream reports `hvc1.1.6.L150.00` (the
   `stream` line's `codec` field).
 - Version-1 (64-bit) `mvhd`/`tkhd`/`mdhd`/`tfdt` avoid the 13.26 h overflow of 32-bit
   90 kHz fields. `trun` per-sample durations are 32-bit, which is fine.
@@ -174,13 +177,13 @@ below 32 as VCL, including reserved codes 24..=31. A framing error reports the s
 the offending length prefix even when fewer than four prefix bytes remain; the walk stops
 after that error. These helper contracts do not add codec decoding or alter sync decisions.
 
-Measured cost on cam1: ≈ 700 B per 2 MB fragment (0.03 %).
+Measured cost on a test camera: ≈ 700 B per 2 MB fragment (0.03 %).
 
 ## 5. Sidecar index (`.idx`)
 
 Fixed-size records, appended per fragment, synced on the same cadence as the data. The file
 caches what the fragment boxes say plus facts only the writer knows: `raw_rtp`, `run_id`, and
-the discontinuity and new-parameter flags. A scan of the `.mp4` (forward via box sizes,
+the discontinuity, new-parameter, and step flags. A scan of the `.mp4` (forward via box sizes,
 backward via trailers) rebuilds the box-derived fields; a rebuild leaves `raw_rtp` zero and
 keeps the writer-only facts only from a prior sidecar whose records match (§9).
 
@@ -192,10 +195,15 @@ header (64 B): magic 'IRIX', version u16 = 1, record_size u16 = 40, timescale u3
 record (40 B): offset u64 (prft start), decode_time u64 (tfdt), wall_us i64,
                len u32 (prft → trailer end), duration u32 (sum of sample durations),
                sample_count u16,
-               flags u8 (bit0 starts-with-sync, bit1 discontinuity-before, bit2 new-parameters),
+               flags u8 (bit0 starts-with-sync, bit1 discontinuity-before, bit2 new-parameters,
+               bit3 frames-left-out, bit4 frames-twice),
                reserved u8, raw_rtp u32 (low 32 bits of the camera RTP timestamp of the
                first sample)
 ```
+
+Bits 3 and 4 mark a fragment that holds a step of its stream (`13-audio.md` §5.3.5): frames
+received just before one of its samples were left out of the recording, or one of its
+samples is a frame recorded a second time. Neither changes how the fragment is read.
 
 A zero `run_id` or `sample_entry_hash` means unknown. The sample-entry CRC-32C is a hint and a
 consistency check against the catalog, not an identity: the writer compares entry bytes, the
@@ -359,7 +367,7 @@ numeric exclusive-create suffixes for a true equal-time collision.
 Units: wall time in microseconds since the Unix epoch (NVR `CLOCK_REALTIME`); media time in
 90 kHz ticks, continuous within a run; RTP timestamps unwrapped to i64 by retina.
 
-1. **The NVR clock is the authority** for search, retention, and `prft`. cam1 proves why: its
+1. **The NVR clock is the authority** for search, retention, and `prft`. A camera shows why: its
    ONVIF UTC is off by one hour while its RTCP NTP time is right; other cameras do the
    opposite. Camera clocks are observed (each RTCP sender report's NTP time minus its receipt
    wall time, reported as the `stream` line's `cam_offset_ms` and the camera detail's
@@ -372,31 +380,40 @@ Units: wall time in microseconds since the Unix epoch (NVR `CLOCK_REALTIME`); me
    start, so transport backlog changes the delay observation rather than the recording
    timeline. Receipt time is retina's per-packet `start_ctx()` wall clock of the first packet
    of the access unit, the least-delayed signal available (a 650 KB IDR arrives over ≈ 50 ms
-   on cam1's uplink). Raw receipt observations still enforce receipt-time fragment caps.
+   on the test camera's uplink). Raw receipt observations still enforce receipt-time fragment caps.
    Monotonic packet instants are mapped through fresh recorder realtime/monotonic
    correlations. A run boundary resets the anchor. An offset step over two seconds flushes
    the pending fragment and ends the RTSP session; reconnect anchors a separate run at a sync
    frame.
-3. **Frame durations come from a CFR regulariser**, not from raw RTP deltas, because cam1
+3. **Frame durations come from a CFR regulariser**, not from raw RTP deltas, because a test camera
    stamps frames at 10 ms resolution with 6 % duplicates over 15 minutes and 90–100 ms bunches
    (01 §5):
-   - nominal duration = declared rate (SDP `a=framerate`, SPS VUI) until a measured estimate
-     over ≥ 16 fragments and ≥ 480 frames exists; the delivered rate replaces the declared
-     one while the typical fragment runs more than 1 % off it, which is what a uniformly
-     slow encoder does (the probed cameras declare 30 fps and deliver 28.3 to 30 depending
-     on scene load), whereas bursty drops leave the typical fragment on rate. Typical is
-     the median over frames, so the few-frame remainder that a GOP longer than the cap
-     leaves, whose span per frame is mostly stamp quantisation, does not count like a full
-     fragment. Without a declared rate the first fragment seeds the estimate and the same
-     comparison runs against the cadence (holds excluded);
+   - nominal duration = declared rate (SDP `a=framerate`, SPS VUI). A camera that delivers
+     fewer frames than it declares is not a camera at a lower rate: its frames are on the
+     declared grid and some slots are empty (test cameras of one model declare 30 fps and
+     deliver 28.3 to 30: sixty frames, then one to four empty slots before the next
+     keyframe, in the GOPs whose picture is cheap; `11`, "What decides whether a GOP loses a
+     slot"). A fragment that lacks up to an eighth of its slots is therefore on the declared
+     rate, and its empty slots are holds (below). The delivered rate replaces the declared
+     one only once a measured estimate over ≥ 16 fragments and ≥ 480 frames exists and the
+     typical fragment is more than 1 % off the declared rate: faster, or lacking more than
+     that eighth, which is what a wrong declaration does (25 fps under 30 lacks a sixth,
+     and the cameras' empty slots reach 7 %). Typical is the median over frames, so the
+     few-frame remainder that a GOP longer than the cap leaves, whose span per frame is
+     mostly stamp quantisation, does not count like a full fragment. Without a declared
+     rate there is no grid to leave a slot of: the first fragment seeds the estimate, every
+     fragment counts by its whole span, and the same comparison runs against the cadence
+     (holds excluded);
    - a parameter-set epoch carrying a different valid effective frame rate retargets the
      nominal immediately and clears the estimator's history and current error. Decode time
      and cumulative hold, hole, and snap diagnostics continue. Repeated parameter bytes, an
      unchanged rate, or an absent or invalid rate preserve the estimator;
-   - camera-dropped frames leave whole-frame holes in the camera timeline (cam1 drops about
-     one frame in 170, in bursts of more than one per GOP); each hole is rendered as a
-     frame-long hold on the fragment's last sample, which is what the viewer saw and keeps
-     the assigned timeline locked no matter the drop rate;
+   - empty slots and camera-dropped frames leave whole-frame holes in the camera timeline
+     (a test camera drops about one frame in 170, in bursts of more than one per GOP, beside
+     the slots it leaves empty before a keyframe); each hole is rendered as a frame-long
+     hold on the fragment's last sample, which is what the camera showed and keeps the
+     assigned timeline locked no matter how many there are. A GOP that the camera sent on
+     the grid keeps its sixty declared periods;
    - a lead of the camera timeline over the assigned one of 0.6 frame or more is read as
      dropped frames and rendered as whole-frame holds (above); the residual (IDR timestamp
      steps of 10–40 ms, sub-frame jitter, backward steps) is corrected by at most 1 % of the
@@ -407,9 +424,9 @@ Units: wall time in microseconds since the Unix epoch (NVR `CLOCK_REALTIME`); me
      for a second now and then spends a tenth of its time in holds while every other
      fragment is on rate, and re-timing it to the mean would put those fragments off by
      that tenth and snap every few of them. A camera declaring 30 fps and delivering 20 is
-     caught by its typical fragment, so a hold still never recurs at every GOP boundary,
-     which would stutter on playback; a fragment whose average frame span deviates more
-     than 20 % from the nominal is left out of the estimate;
+     caught by its typical fragment, which lacks a third of its slots; a fragment whose
+     average frame span deviates more than 20 % from the nominal is left out of the
+     estimate;
    - when the error that remains after holds and the correction exceeds the tolerance
      (500 ms) in either direction, the fragment snaps: it lasts its camera span less the
      error carried into it, so the assigned timeline is back on the camera's. A camera that
@@ -423,16 +440,14 @@ Units: wall time in microseconds since the Unix epoch (NVR `CLOCK_REALTIME`); me
      backwards step;
    - four consecutive fragments corrected by the full 1 % in one direction, with at least an
      eighth of the tolerance (62 ms) of error left after them, also restart the estimate,
-     because the nominal itself is then off: a camera that slowed for minutes and returns to
-     its declared rate would otherwise run against the two-minute average of the slower one
-     until it snapped. The estimate restarts from those four fragments, so it is what the
-     camera delivers at that moment, and the error that builds meanwhile stays under the
-     tolerance (380 ms from 28.3 fps back to 30). The error condition is there for a camera
-     whose GOPs each run a few percent faster or slower than its mean: its corrections are
-     often at the limit several fragments running while the error stays small, and
-     restarting on those would keep re-centring a good estimate. A restart never returns to
-     the declared rate: a camera measured 5 % off it would end every GOP in a hold of
-     several frames until the next warm-up. Any jump > `max_jump` (10 s) ends the session
+     because the nominal itself is then off: a camera whose adopted rate stops being the one
+     it delivers would otherwise run against the two-minute average of the other until it
+     snapped. The estimate restarts from those four fragments, so it is what the camera
+     delivers at that moment, and the error that builds meanwhile stays under the tolerance
+     (380 ms at a mismatch of 5.7 %). The error condition is there for a camera whose GOPs
+     each run a little faster or slower than its mean: its corrections are often at the
+     limit several fragments running while the error stays small, and restarting on those
+     would keep re-centring a good estimate. Any jump > `max_jump` (10 s) ends the session
      and starts a separate run;
    - `timestamp_mode = "passthrough"` keeps raw RTP deltas for cameras with trustworthy clocks
      or for diagnostics. The raw RTP timestamp of each fragment's first sample is kept in the
@@ -443,9 +458,12 @@ Units: wall time in microseconds since the Unix epoch (NVR `CLOCK_REALTIME`); me
    `CLOCK_REALTIME − CLOCK_MONOTONIC`; camera reboot) → seal the file, separate run,
    `EXT-X-DISCONTINUITY` in playlists. Moonfire lists NVR clock steps as unhandled; RTC-less
    SBCs make this common.
-5. **Audio extension**: audio is outside the 0.1 alpha format. An audio implementation must
-   define receipt-based alignment and may use RTCP SR pairs diagnostically; it must not stretch
-   audio timestamps to hide clock disagreement.
+5. **Audio**: an audio run is placed on its video run's timeline by the least receipt delay
+   of its frames, and its frames keep their own duration; a run ends with its video run, at
+   packet loss, or at a timestamp half a second off the frame count (`13-audio.md` §5.2).
+   Audio timestamps are never stretched to hide clock disagreement. Where a camera's
+   `audio_steps` is set, whole frames are left out or recorded twice to hold the sound to the
+   picture, judged by pairs of RTCP sender reports (`13-audio.md` §5.3).
 6. Leap seconds are assumed smeared by the NVR's NTP configuration (chrony default).
 
 ## 8. I/O policy
@@ -464,7 +482,7 @@ Units: wall time in microseconds since the Unix epoch (NVR `CLOCK_REALTIME`); me
   carry-less-multiply implementation (`iris_mp4::crc`); the table-driven one cost more than
   the RTSP depacketizer (12 §5).
   It records write and `fdatasync` latency histograms, queue depth and queued bytes with
-  their peaks, and warns about any write or sync over 1 s. On the soak's HDD single syncs took
+  their peaks, and warns about any write or sync over 1 s. On a slow disk single syncs took
   up to 6.1 s (`11-multi-camera-results.md`, second soak window); the queue absorbs such
   stalls, and the peak queued bytes field shows their size.
 - **Preallocation**: `fallocate(FALLOC_FL_KEEP_SIZE)` 256 MiB ahead when < 64 MiB remain;
@@ -736,4 +754,4 @@ seconds, when read for diagnostics or from `prft`.
 2. `prft` flag semantics per ISO/IEC 14496-12:2022 (irisd writes 0x18 like ffmpeg) and
    acceptance by ffprobe/AVFoundation.
 3. ext4 vs XFS multi-week soak at 12 streams: extent counts, unlink latency, journal writes.
-4. How long cam1 tolerates a stalled TCP reader (sizes `max_queued_fragments`).
+4. How long a camera tolerates a stalled TCP reader (sizes `max_queued_fragments`).

@@ -68,6 +68,13 @@ over them.
   even without a `stopped` line. Keep recovery and cumulative counters separate per run;
   an unclean stop's unobserved interval is not an exact downtime measurement. Arbitrary
   warnings cannot establish a restart, and `catalog open` is not a catalog statistics row.
+- `standards` is how `STANDARDS.md` and the root `AGENTS.md` are held to: a rule one of them
+  states and a program can decide has its check, and a change to such a rule changes the check
+  and `STANDARDS.md` §1 in the same commit. A rule that reads a fact (a width, an address, a
+  path that must exist) takes no waiver; only the rules that read meaning from words or shapes
+  do, and a waiver is a line in `standards.toml` with its reason, never a pattern loosened to
+  let one text pass. Every rule has a test with a text that breaks it and texts that must
+  pass. The checks add no dependency: they scan text with `text.rs`.
 
 ## Where things are
 
@@ -81,6 +88,10 @@ over them.
 - `stats.rs`, `report.rs`, `sample.rs`, `bench.rs`, `rtsp_probe.rs`, `onvif_call.rs`,
   `gh_commit.rs` — one subcommand each, with `Args` and `run`.
 - `secret.rs` — `Password` and the `--password-env` value parser the camera tools share.
+- `standards.rs` and `standards/` — the checks of `STANDARDS.md` §1: `command.rs` (the three
+  modes and their git calls), `finding.rs` (the rules' names), `config.rs` (`standards.toml`),
+  `installation.rs`, `prose.rs`, `markdown.rs`, `rust.rs`, `layout.rs`, and `commits.rs` (one
+  family of rules each), and `text.rs` (scanning without a pattern library).
 
 ## Testing
 

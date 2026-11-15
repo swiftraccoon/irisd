@@ -1,7 +1,8 @@
 //! Fuzzes the viewer's VOD playlist rules (`crates/iris-gui/src/vod.rs`): any
 //! body gives fragment timing or a refusal, never a panic, and an accepted
 //! rewrite holds only `#EXT` tags the daemon emits and absolute references on
-//! the API origin without userinfo, with the same fragment timing as its input.
+//! the API origin without userinfo, with the same fragment timing as its input;
+//! and the multivariant playlist built over an accepted body is five fixed lines.
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
@@ -63,6 +64,18 @@ fuzz_target!(|data: &[u8]| {
         return;
     };
     assert!(body.len() <= vod::MAX_VOD_PLAYLIST_BYTES);
+    // The multivariant playlist over an accepted body carries nothing of it:
+    // five fixed lines that name the two local playlists and a positive rate.
+    let multivariant = vod::multivariant_playlist(&body, &body);
+    let lines: Vec<&str> = multivariant.lines().collect();
+    assert_eq!(lines.len(), 5, "{multivariant}");
+    assert!(lines[2].ends_with(&format!("URI=\"{}\"", vod::AUDIO_PLAYLIST)));
+    let rate = lines[3]
+        .strip_prefix("#EXT-X-STREAM-INF:BANDWIDTH=")
+        .and_then(|rest| rest.strip_suffix(",AUDIO=\"audio\""))
+        .and_then(|rate| rate.parse::<u64>().ok());
+    assert!(rate.is_some_and(|rate| rate > 0), "{multivariant}");
+    assert_eq!(lines[4], vod::VIDEO_PLAYLIST);
     for line in body.lines() {
         if let Some(attributes) = line.strip_prefix("#EXT-X-MAP:URI=\"") {
             let (uri, _) = attributes

@@ -229,7 +229,22 @@
                  options,
                  requested_auth,
                  presentation,
-@@ -1931,6 +2012,18 @@
+@@ -1905,7 +1986,13 @@
+                         timeline: Timeline::new(
+                             initial_rtptime,
+                             s.clock_rate_hz,
+-                            policy.enforce_timestamps_with_max_jump_secs,
++                            // irisd: the policy protects the video timeline. Cameras
++                            // step audio timestamps backwards by a fraction of a
++                            // frame, which must not end the session that carries
++                            // the picture, so other media are not enforced.
++                            policy
++                                .enforce_timestamps_with_max_jump_secs
++                                .filter(|_| &*s.media == "video"),
+                         )
+                         .map_err(|description| {
+                             wrap!(ErrorInt::RtspResponseError {
+@@ -1931,6 +2018,18 @@
              };
          }
          *inner.keepalive_timer = Some(Box::pin(tokio::time::sleep(keepalive_interval(session))));
@@ -248,7 +263,7 @@
          Ok(Session(self.0, Playing(())))
      }
  }
-@@ -2603,10 +2696,23 @@
+@@ -2603,10 +2702,23 @@
                          continue;
                      }
                      msg::Message::Request(request) => {
@@ -276,7 +291,7 @@
                      }
                  },
                  Poll::Ready(Some(Err(e))) => {
-@@ -2683,9 +2789,19 @@
+@@ -2683,9 +2795,19 @@
              None => return,
          };
  
@@ -298,7 +313,7 @@
  
          // Track the session, if there is a group.
          let (teardown_tx, teardown_rx) = tokio::sync::watch::channel(None);
-@@ -2711,9 +2827,10 @@
+@@ -2711,9 +2833,10 @@
              None
          };
  
@@ -310,7 +325,7 @@
              this.presentation.tool.take(),
              session.id,
              just_try_once,
-@@ -2722,10 +2839,31 @@
+@@ -2722,10 +2845,31 @@
              this.conn.take(),
              teardown_tx,
              expires,
@@ -343,7 +358,7 @@
  impl futures::Stream for Session<Playing> {
      type Item = Result<PacketItem, Error>;
  
-@@ -3662,4 +3800,240 @@
+@@ -3662,4 +3806,240 @@
              Some(crate::rtcp::TypedPacketRef::ReceiverReport(_))
          ));
      }

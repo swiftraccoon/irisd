@@ -1,4 +1,5 @@
 # Settings for the clippy lints enabled in Cargo.toml [workspace.lints].
+allow-unwrap-in-tests = true
 too-many-arguments-threshold = 8
 type-complexity-threshold = 300
 doc-valid-idents = ["..", "RTSP", "RTP", "RTCP", "SDP", "ONVIF", "PullPoint", "HEVC", "fMP4", "MP4", "HLS", "LL-HLS", "CMAF", "NAL", "VPS", "SPS", "PPS", "IDR", "IRAP", "GOP", "NTP", "SQLite", "WebSocket", "iOS", "macOS", "AVPlayer", "GStreamer", "NVDEC", "VA-API", "GiB", "MiB", "KiB", "GraphQL"]

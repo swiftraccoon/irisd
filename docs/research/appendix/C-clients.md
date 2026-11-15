@@ -100,7 +100,7 @@ tinyCam (Android-only product): no verifiable statement found **[flag]**.
 **A6. Grid guidance.** Use sub-streams (D1/720p) for the 6-tile grid and switch the selected tile to
 the main stream; keep one `VTDecompressionSession` per visible tile, tear down off-screen tiles,
 prefer `AVSampleBufferDisplayLayer` (gets PiP for free, avoids a Metal copy), set
-`kVTDecompressionPropertyKey_RealTime`, drop to the latest IDR on stall. A-series decoders
+`kVTDecompressionPropertyKey_RealTime`, drop to the most recent IDR on stall. A-series decoders
 comfortably exceed 6×720p30 + 1×4K30 in aggregate; Apple publishes no per-device numbers **[I]**.
 Budget memory as ~1.5× the decoded frame pool per tile (NV12 720p ≈ 1.4 MB/frame) **[I]**.
 
@@ -222,7 +222,7 @@ Chrome-only today.
 4. Real iPhone per-device concurrent `VTDecompressionSession` ceiling and 4K-tile count (needs
    measurement; Apple publishes none).
 5. gtk4paintablesink + NVIDIA proprietary driver on Wayland vs X11/EGL: which GL path is stable on
-   the dev host's distribution and GTK version (needs a spike).
+   the target distribution and GTK version (needs a spike).
 6. Measured Intel iGPU HEVC decode fps per media engine (only Flex-series marketing numbers found).
 7. Whether UniFi Protect/Scrypted iOS apps use fMP4-over-WebSocket or WebRTC (no public
    documentation found).

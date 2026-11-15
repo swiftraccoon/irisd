@@ -6,6 +6,8 @@ use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
 use iris_core::metrics::Peak;
 use iris_core::time::WallUs;
 
+use crate::steer::Side;
+
 /// Counters for one ingest stream, shared between the ingest task and the
 /// daemon's statistics reporter.
 ///
@@ -21,6 +23,7 @@ pub struct StreamStats {
     bytes: AtomicU64,
     loss_events: AtomicU64,
     reconnects: AtomicU64,
+    beats: AtomicU64,
     snaps: AtomicU64,
     dropped_sink: AtomicU64,
     connected: AtomicBool,
@@ -41,6 +44,36 @@ pub struct StreamStats {
     /// Camera clock minus NVR clock at the last sender report; `i64::MIN` while none.
     camera_offset_us: AtomicI64,
     gaps: AtomicU64,
+    /// The watches of parted clocks, in microseconds, each from the window
+    /// that closed last; `i64::MIN` while none has.
+    clock_moved_us: AtomicI64,
+    audio_stamps_moved_us: AtomicI64,
+    audio_sync_us: AtomicI64,
+    audio_sync_moved_us: AtomicI64,
+    audio_arrival_moved_us: AtomicI64,
+    /// Frames the rule of `docs/research/13-audio.md` §5.3.4 named to be
+    /// left out, and frames it named to be recorded twice.
+    sound_steps_said: [AtomicU64; 2],
+    /// Frames left out of the recording and frames recorded twice by steps.
+    sound_steps_made: [AtomicU64; 2],
+}
+
+/// Audio frames of steps of the drift rule
+/// ([`StreamStats::sound_steps_said`], [`StreamStats::sound_steps_made`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SoundSteps {
+    /// Frames left out, where the recording had the sound late.
+    pub left_out: u64,
+    /// Frames recorded twice, where it had the sound early.
+    pub recorded_twice: u64,
+}
+
+/// A gauge that reads `None` until it is set.
+fn gauge(value: &AtomicI64) -> Option<i64> {
+    match value.load(Ordering::Relaxed) {
+        i64::MIN => None,
+        set => Some(set),
+    }
 }
 
 impl Default for StreamStats {
@@ -59,6 +92,7 @@ impl StreamStats {
             bytes: AtomicU64::new(0),
             loss_events: AtomicU64::new(0),
             reconnects: AtomicU64::new(0),
+            beats: AtomicU64::new(0),
             snaps: AtomicU64::new(0),
             dropped_sink: AtomicU64::new(0),
             connected: AtomicBool::new(false),
@@ -72,6 +106,13 @@ impl StreamStats {
             fragment_ticks_peak: Peak::new(),
             sender_reports: AtomicU64::new(0),
             camera_offset_us: AtomicI64::new(i64::MIN),
+            clock_moved_us: AtomicI64::new(i64::MIN),
+            audio_stamps_moved_us: AtomicI64::new(i64::MIN),
+            audio_sync_us: AtomicI64::new(i64::MIN),
+            audio_sync_moved_us: AtomicI64::new(i64::MIN),
+            audio_arrival_moved_us: AtomicI64::new(i64::MIN),
+            sound_steps_said: [AtomicU64::new(0), AtomicU64::new(0)],
+            sound_steps_made: [AtomicU64::new(0), AtomicU64::new(0)],
             gaps: AtomicU64::new(0),
         }
     }
@@ -100,6 +141,17 @@ impl StreamStats {
     /// Sessions that ended with an error and were retried.
     pub fn reconnects(&self) -> u64 {
         self.reconnects.load(Ordering::Relaxed)
+    }
+
+    /// How often the stream's task has noted that it is alive: at every
+    /// item it reads, every bounded wait on a quiet camera that ends, every
+    /// step of a session's set-up, and through every pause between
+    /// attempts. A healthy task goes at most a step of set-up and a slice of a
+    /// pause without one (20 s); a count that stands still through a whole
+    /// check of the daemon's watchdog is a task that is stuck, whatever its
+    /// camera does.
+    pub fn beats(&self) -> u64 {
+        self.beats.load(Ordering::Relaxed)
     }
 
     /// Fragments whose timing was snapped to the camera timeline.
@@ -176,6 +228,70 @@ impl StreamStats {
         }
     }
 
+    /// How far the stream's timestamps have moved against the recorder's
+    /// clock since the session's first window, in microseconds: the least
+    /// receipt time less timestamp of the window that closed last, less
+    /// that of the first. It follows the camera's clock rate against the
+    /// recorder's and any change in how long a frame takes to arrive.
+    pub fn clock_moved_us(&self) -> Option<i64> {
+        gauge(&self.clock_moved_us)
+    }
+
+    /// How far the timestamps of the audio recorded with this stream have
+    /// moved against its frame count since the audio run's first window, in
+    /// microseconds, by the least of each window.
+    pub fn audio_stamps_moved_us(&self) -> Option<i64> {
+        gauge(&self.audio_stamps_moved_us)
+    }
+
+    /// How much later the recording has the audio against the video, in
+    /// microseconds, over the last window that read it: the lower tenth of
+    /// the video's epoch less the audio's by each pair of sender reports,
+    /// plus the median video timestamp against its decode time, less the
+    /// least audio timestamp against its decode time. `None` while no window has
+    /// read it, as for a camera that sends no sender reports for both
+    /// streams.
+    pub fn audio_sync_us(&self) -> Option<i64> {
+        gauge(&self.audio_sync_us)
+    }
+
+    /// [`Self::audio_sync_us`] less that of the audio run's first window.
+    pub fn audio_sync_moved_us(&self) -> Option<i64> {
+        gauge(&self.audio_sync_moved_us)
+    }
+
+    /// How far the audio has moved against the video since the run's first
+    /// window by when the frames of each arrived, in microseconds: the
+    /// least receipt time less decode time of the video's frames, less
+    /// that of the audio's. Positive when the sound has become later. It
+    /// needs no sender reports.
+    pub fn audio_arrival_moved_us(&self) -> Option<i64> {
+        gauge(&self.audio_arrival_moved_us)
+    }
+
+    /// The audio frames the drift rule named to be left out and to be
+    /// recorded twice, whether its steps are made or only said
+    /// (`docs/research/13-audio.md` §5.3.6).
+    pub fn sound_steps_said(&self) -> SoundSteps {
+        SoundSteps {
+            left_out: self.sound_steps_said[0].load(Ordering::Relaxed),
+            recorded_twice: self.sound_steps_said[1].load(Ordering::Relaxed),
+        }
+    }
+
+    /// The audio frames that steps left out of the recording and the frames
+    /// they recorded twice, counted as each arriving frame is left out or
+    /// taken twice; a second record dropped again because the video started
+    /// a run before it was cut stays counted. None where the rule only says
+    /// its steps
+    /// ([`IngestOptions::audio_steps`](crate::IngestOptions::audio_steps)).
+    pub fn sound_steps_made(&self) -> SoundSteps {
+        SoundSteps {
+            left_out: self.sound_steps_made[0].load(Ordering::Relaxed),
+            recorded_twice: self.sound_steps_made[1].load(Ordering::Relaxed),
+        }
+    }
+
     /// Gaps logged: reconnections with frames before them, camera holds of a
     /// second or more, and the first sink rejection of each loss epoch.
     pub fn gaps(&self) -> u64 {
@@ -204,6 +320,10 @@ impl StreamStats {
 
     pub(crate) fn record_reconnect(&self) {
         self.reconnects.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn beat(&self) {
+        self.beats.fetch_add(1, Ordering::Relaxed);
     }
 
     pub(crate) fn set_connected(&self, connected: bool) {
@@ -239,6 +359,40 @@ impl StreamStats {
     pub(crate) fn record_sender_report(&self, offset_us: i64) {
         self.sender_reports.fetch_add(1, Ordering::Relaxed);
         self.camera_offset_us.store(offset_us, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_clock_moved(&self, micros: i64) {
+        self.clock_moved_us.store(micros, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_audio_stamps_moved(&self, micros: i64) {
+        self.audio_stamps_moved_us.store(micros, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_audio_sync(&self, late_us: i64, moved_us: i64) {
+        self.audio_sync_us.store(late_us, Ordering::Relaxed);
+        self.audio_sync_moved_us.store(moved_us, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_audio_arrival_moved(&self, micros: i64) {
+        self.audio_arrival_moved_us.store(micros, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_sound_step_said(&self, side: Side, frames: u32) {
+        let index = match side {
+            Side::Late => 0,
+            Side::Early => 1,
+        };
+        self.sound_steps_said[index].fetch_add(u64::from(frames), Ordering::Relaxed);
+    }
+
+    /// Counts one frame left out (`Side::Late`) or recorded twice.
+    pub(crate) fn record_sound_step_made(&self, side: Side) {
+        let index = match side {
+            Side::Late => 0,
+            Side::Early => 1,
+        };
+        self.sound_steps_made[index].fetch_add(1, Ordering::Relaxed);
     }
 
     pub(crate) fn record_gap(&self) {

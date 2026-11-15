@@ -27,4 +27,5 @@ workspace = true
 [dev-dependencies]
 iris-replay = { workspace = true }
 socket2 = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }
 tracing-subscriber = { workspace = true }

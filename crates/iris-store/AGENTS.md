@@ -17,7 +17,7 @@ Scope: this crate only. Read the root `AGENTS.md` first.
   no logical shortening, before catalog seal. The rebuilt header keeps each nonzero run id and
   sample-entry hash of the prior header, else the caller's `IndexBinding`, else zero. A file over
   `MAX_PERSISTED_INDEX_RECORDS` fragments is refused before any byte changes.
-- Every open of an existing marker, media file, or sidecar beneath an approved root goes
+- Every open of a marker, media file, or sidecar already beneath an approved root goes
   through `fs::open_regular_beneath`: nonblocking, no-follow, beneath, no-cross-mount, regular
   files only. Every creation beneath an approved root goes through `fs::create_file_beneath`
   (`O_CREAT | O_EXCL` with the same resolution) or `openat` on the root descriptor for the
@@ -58,8 +58,6 @@ Scope: this crate only. Read the root `AGENTS.md` first.
 - `src/root_worker.rs` — one root's disk worker: the thread body (write, sync sweep, seal on
   shutdown), slow-I/O warnings, free-space checks, ordered failover, terminal-root retries, and
   cascading shutdown.
-- `src/writer/worker.rs` — one root's disk worker, free-space checks, ordered failover,
-  terminal-root retries, and cascading shutdown.
 - `src/stream.rs` — `StreamWriter`: one stream's open file, rotation decisions, abandon on
   error.
 - `src/segment.rs` — `SegmentFile`: create with init segment, append a fragment, sync,

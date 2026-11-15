@@ -1,5 +1,10 @@
 //! Extreme request timestamps must fail before constructing a keyframe lookup range.
 
+#![expect(
+    clippy::unwrap_used,
+    reason = "a helper of a test fails as the test does, by panicking"
+)]
+
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;

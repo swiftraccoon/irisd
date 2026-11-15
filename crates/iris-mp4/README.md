@@ -11,10 +11,17 @@ in → fMP4 on disk → byte-range serving).
 ## What it provides
 
 - `init::SampleEntry` and `init::build_init_segment` — the `hvc1` sample entry and the
-  `ftyp` + `moov` bytes of a file.
+  `ftyp` + `moov` bytes of a file. An entry whose box is `mp4a` (`SampleEntry::audio`) gives
+  the init segment of one audio track, in the same 90 kHz media timescale;
+  `init::audio_frame_ticks` gives an audio frame's duration in it or refuses a sampling rate
+  whose frames are not whole ticks. `init::build_av_init_segment` gives the init segment of
+  a file with a video track and an audio track (track 2, `init::AV_AUDIO_TRACK_ID`), and
+  `init::sample_entry_bytes` reads the sample entry back from an init segment.
 - `fragment::Sample`, `fragment::Fragment`, `fragment::FragmentHeader`, and
   `fragment::encode_fragment` — one access unit, one assembled GOP, and the `prft`,
   `moof`, `mdat` header, and trailer around its samples (`EncodedFragment`).
+  `fragment::FrameSteps` marks a fragment that holds a step of its stream: frames left out
+  or recorded twice (`docs/research/13-audio.md` §5.3).
 - `fragment::encode_trailer`, `decode_trailer`, and `Trailer` — the 24-byte `free` box with
   magic, CRC-32C, fragment length, and reserved bytes that must be zero.
 - `export::rebase_fragment`, `export::trim_fragment_end`, and `export::with_edit_list` — the
@@ -22,16 +29,23 @@ in → fMP4 on disk → byte-range serving).
   `prft` media time with a recomputed trailer, a tail prefix containing only samples before the
   cutoff, and an `edts`/`elst` spliced into an init segment for start preroll. Tail clipping
   preserves retained sample bytes and shortens a crossing sample's duration.
+  `export::retrack_fragment` moves a fragment to another track id (`tfhd`, `prft`, trailer),
+  and `export::with_edit_lists` splices an edit list into each track of an init segment; the
+  two make the audio track of a two-track export. `export::trim_fragment_start` cuts the
+  start of a fragment whose samples are all sync samples at a sample boundary, which is how
+  an export starts its sound (`docs/research/13-audio.md` §9).
 - `reader::parse_fragment` — one fragment held in memory, with its sample tables, for a
   serving path that has read it out of a file (the keyframe resource).
 - `reader::scan`, `reader::scan_with_limit`, `ScanOptions`, `ScanReport`, `FragmentInfo`, and
   `ScanStop` — a forward walk of a file that reports the valid length and why it stopped.
-- `index::IndexHeader`, `IndexRecord`, `IndexWriter`, `decode_index`, `read_index_bounded`,
+- `index::IndexHeader`, `IndexRecord` with its `FLAG_*` bits and `WRITER_ONLY_FLAGS`,
+  `IndexWriter`, `decode_index`, `read_index_bounded`,
   `read_index_file_bounded`, and `read_index_file_bound_to_media` — the sidecar `.idx` codec,
   the writer, and the bounded readers, which reject a file whose metadata can hold more than the
   caller's record budget before allocating; `IndexWriter::from_claimed_file` initializes an
   exclusively claimed file.
-- `hls::media_playlist`, `hls::master_playlist`, `hls::variant_bit_rates`, `PlaylistOptions`,
+- `hls::media_playlist`, `hls::master_playlist`, `hls::master_playlist_with_audio` (one
+  variant and an audio rendition, `AudioRendition`), `hls::variant_bit_rates`, `PlaylistOptions`,
   `VariantBitRates`, and `InvalidPlaylistText` —
   VOD playlists as byte ranges over one file; a URI or codecs string that would break the
   playlist syntax is refused.
@@ -81,7 +95,7 @@ fragments with `export::rebase_fragment` and `export::trim_fragment_end`.
   through the end of `mdat`, `fragment_len`): `docs/research/04-storage-format.md §4`.
 - Sidecar index: 64-byte header (`IRIX`, version 1, 40-byte records) and record fields:
   `04 §5`. The index caches what the fragment boxes say plus facts only the writer knows
-  (`raw_rtp`, `run_id`, and the discontinuity and new-parameter flags); a scan rebuilds the
+  (`raw_rtp`, `run_id`, and the discontinuity, new-parameter, and step flags); a scan rebuilds the
   box-derived fields, leaves `raw_rtp` zero, and keeps the writer-only facts only from a prior
   sidecar whose records match. A trailing partial record is ignored on read. Complete records
   must describe contiguous ranges from `init_len`, longer than a trailer and with

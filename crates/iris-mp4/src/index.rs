@@ -1,7 +1,8 @@
 //! Sidecar index: a 64-byte header and fixed 40-byte records, one per fragment.
 //!
 //! The index caches what the fragment boxes say plus facts only the writer
-//! knows: `raw_rtp`, `run_id`, and the discontinuity and new-parameter flags.
+//! knows: `raw_rtp`, `run_id`, and the discontinuity, new-parameter, and step
+//! flags.
 //! [`crate::reader::scan`] rebuilds the box-derived fields
 //! ([`IndexRecord::from_scan`]); a rebuild leaves `raw_rtp` zero and keeps the
 //! writer-only facts only from a prior sidecar whose records match.
@@ -42,6 +43,18 @@ pub const FLAG_STARTS_WITH_SYNC: u8 = 0x1;
 pub const FLAG_DISCONTINUITY_BEFORE: u8 = 0x2;
 /// Record flag: the sample entry changed at this fragment.
 pub const FLAG_NEW_PARAMETERS: u8 = 0x4;
+/// Record flag: frames received just before one of the fragment's samples
+/// were left out of the recording, a step of the stream
+/// (`docs/research/13-audio.md` §5.3).
+pub const FLAG_FRAMES_LEFT_OUT: u8 = 0x8;
+/// Record flag: one or more of the fragment's samples are a frame recorded a
+/// second time, a step of the stream.
+pub const FLAG_FRAMES_TWICE: u8 = 0x10;
+/// The record flags that only the writer knows: a scan of the media cannot
+/// rebuild them, so a rebuilt sidecar takes them from a prior sidecar whose
+/// record matches.
+pub const WRITER_ONLY_FLAGS: u8 =
+    FLAG_DISCONTINUITY_BEFORE | FLAG_NEW_PARAMETERS | FLAG_FRAMES_LEFT_OUT | FLAG_FRAMES_TWICE;
 
 /// The 64-byte sidecar header: magic, version, record size, timescale, the
 /// wall time and run of the first fragment, the init segment length, and the
@@ -189,9 +202,9 @@ impl IndexRecord {
     }
 
     /// Builds a record from scanned fragment facts. A scan does not know
-    /// `raw_rtp`, which is left zero, nor the discontinuity and new-parameter
-    /// flags, which are left clear; a fragment without a `prft` gets a zero
-    /// wall time.
+    /// `raw_rtp`, which is left zero, nor the flags of [`WRITER_ONLY_FLAGS`],
+    /// which are left clear; a fragment without a `prft` gets a zero wall
+    /// time.
     #[must_use]
     pub fn from_scan(info: &FragmentInfo) -> Self {
         Self {
@@ -501,6 +514,8 @@ mod tests {
                 duration: 90_000,
                 sample_count: 30,
                 starts_with_sync: true,
+                all_sync: false,
+                track_id: 1,
                 wall: Some(WallUs::new(1_000_000)),
                 sample_durations: Vec::new(),
                 sample_sizes: Vec::new(),
@@ -514,6 +529,8 @@ mod tests {
                 duration: 90_000,
                 sample_count: 30,
                 starts_with_sync: false,
+                all_sync: false,
+                track_id: 1,
                 wall: Some(WallUs::new(2_000_000)),
                 sample_durations: Vec::new(),
                 sample_sizes: Vec::new(),
@@ -527,6 +544,8 @@ mod tests {
                 duration: 45_000,
                 sample_count: 15,
                 starts_with_sync: true,
+                all_sync: false,
+                track_id: 1,
                 wall: Some(WallUs::new(3_000_000)),
                 sample_durations: Vec::new(),
                 sample_sizes: Vec::new(),
@@ -662,6 +681,8 @@ mod tests {
             duration: 180_000,
             sample_count: 60,
             starts_with_sync: true,
+            all_sync: false,
+            track_id: 1,
             wall: Some(WallUs::new(1_700_000_000_000_000)),
             sample_durations: Vec::new(),
             sample_sizes: Vec::new(),

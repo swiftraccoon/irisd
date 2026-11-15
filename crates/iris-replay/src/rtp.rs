@@ -56,6 +56,12 @@ pub enum RtpError {
         /// Packet bytes, excluding the four-byte interleaved header.
         len: usize,
     },
+    /// An AAC frame is longer than an AU header's 13-bit size holds.
+    #[error("AAC frame has {len} bytes; at most 8191 fit an AU header")]
+    AudioFrameTooLarge {
+        /// Frame bytes.
+        len: usize,
+    },
 }
 
 /// An RTP synchronization source identifier (RFC 3550 §5.1).
@@ -234,17 +240,37 @@ impl Packetizer {
     /// and naturally roll over while the public totals continue in `u64`.
     #[must_use]
     pub fn sender_report(&self, wall: WallUs, rtp_timestamp: RtpTimestamp) -> Vec<u8> {
-        let mut p = Vec::with_capacity(28);
-        p.push(0x80); // V=2, no padding, zero report blocks
-        p.push(200); // SR
-        p.extend_from_slice(&6u16.to_be_bytes()); // length in words minus one
-        p.extend_from_slice(&self.ssrc.get().to_be_bytes());
-        p.extend_from_slice(&wall.to_ntp64().to_be_bytes());
-        p.extend_from_slice(&rtp_timestamp.get().to_be_bytes());
-        p.extend_from_slice(&(self.packets as u32).to_be_bytes());
-        p.extend_from_slice(&(self.octets as u32).to_be_bytes());
-        p
+        sender_report(
+            self.ssrc,
+            wall,
+            rtp_timestamp,
+            self.packets as u32,
+            self.octets as u32,
+        )
     }
+}
+
+/// An RTCP sender report of the source `ssrc` that maps the wall time `wall`
+/// (sent as a 64-bit NTP timestamp) to `rtp_timestamp`, with the sender's
+/// packet and octet counts (RFC 3550 §6.4.1).
+#[must_use]
+pub fn sender_report(
+    ssrc: Ssrc,
+    wall: WallUs,
+    rtp_timestamp: RtpTimestamp,
+    packets: u32,
+    octets: u32,
+) -> Vec<u8> {
+    let mut p = Vec::with_capacity(28);
+    p.push(0x80); // V=2, no padding, zero report blocks
+    p.push(200); // SR
+    p.extend_from_slice(&6u16.to_be_bytes()); // length in words minus one
+    p.extend_from_slice(&ssrc.get().to_be_bytes());
+    p.extend_from_slice(&wall.to_ntp64().to_be_bytes());
+    p.extend_from_slice(&rtp_timestamp.get().to_be_bytes());
+    p.extend_from_slice(&packets.to_be_bytes());
+    p.extend_from_slice(&octets.to_be_bytes());
+    p
 }
 
 /// A streaming iterator over one packetized access unit.
@@ -313,6 +339,42 @@ impl fmt::Debug for AccessUnitPackets<'_, '_> {
             .field("remaining", &self.remaining)
             .finish_non_exhaustive()
     }
+}
+
+/// The dynamic payload type the synthetic AAC audio stream is announced with.
+pub const AUDIO_PAYLOAD_TYPE: u8 = 97;
+
+/// Samples in one AAC frame.
+pub const AAC_FRAME_SAMPLES: u32 = 1_024;
+
+/// One RTP packet carrying one whole AAC frame in the `AAC-hbr` mode of
+/// RFC 3640: a 16-bit AU-headers length, one AU header (13 bits of size,
+/// 3 of index), and the frame, with the marker bit set.
+///
+/// # Errors
+///
+/// [`RtpError::AudioFrameTooLarge`] for a frame over 8,191 bytes, the most
+/// the 13-bit size holds.
+pub fn aac_packet(
+    ssrc: Ssrc,
+    seq: u16,
+    timestamp: RtpTimestamp,
+    frame: &[u8],
+) -> Result<Vec<u8>, RtpError> {
+    let size = u16::try_from(frame.len())
+        .ok()
+        .filter(|size| *size < 1 << 13)
+        .ok_or(RtpError::AudioFrameTooLarge { len: frame.len() })?;
+    let mut p = Vec::with_capacity(RTP_HEADER_LEN + 4 + frame.len());
+    p.push(0x80);
+    p.push(AUDIO_PAYLOAD_TYPE | 0x80);
+    p.extend_from_slice(&seq.to_be_bytes());
+    p.extend_from_slice(&timestamp.get().to_be_bytes());
+    p.extend_from_slice(&ssrc.get().to_be_bytes());
+    p.extend_from_slice(&16u16.to_be_bytes()); // one 16-bit AU header follows
+    p.extend_from_slice(&(size << 3).to_be_bytes());
+    p.extend_from_slice(frame);
+    Ok(p)
 }
 
 /// Appends `packet` to `out` as an interleaved frame on `channel`.

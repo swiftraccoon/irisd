@@ -2,6 +2,11 @@
 //! accepts, failures before roots, workers, or readiness, `irisd record`
 //! argument checks before its output root, and ordered shutdown on SIGTERM.
 
+#![expect(
+    clippy::unwrap_used,
+    reason = "a helper of a test fails as the test does, by panicking"
+)]
+
 use std::fs;
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::os::unix::net::UnixDatagram;

@@ -10,7 +10,7 @@
 use libfuzzer_sys::fuzz_target;
 
 #[path = "../../crates/iris-tools/src/time.rs"]
-#[allow(dead_code, reason = "the parsers use only part of the time helpers")]
+#[expect(dead_code, reason = "the parsers use only part of the time helpers")]
 mod time;
 
 #[path = "../../crates/iris-tools/src/probe_parser.rs"]

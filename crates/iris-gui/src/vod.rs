@@ -65,10 +65,18 @@ fn same_origin(base: &Url, reference: &str, origin: &Origin) -> anyhow::Result<U
 /// Rewrites the daemon's VOD body for the player: init and media references
 /// resolve against `base`, the URL the body came from, and become absolute URLs
 /// on `origin` with their queries; the body may hold only the tags in
-/// [`VOD_TAGS`], and the result at most [`MAX_VOD_PLAYLIST_BYTES`].
+/// [`VOD_TAGS`], and the result at most [`MAX_VOD_PLAYLIST_BYTES`]. A line
+/// ends in a line feed, with or without a carriage return before it; a
+/// carriage return anywhere else is refused, because the rewrite ends every
+/// line with a line feed and would make a line ending of it, which changes
+/// what the line says.
 pub fn absolute_playlist(text: &str, base: &Url, origin: &Origin) -> anyhow::Result<String> {
     let mut body = String::new();
     for line in text.lines() {
+        anyhow::ensure!(
+            !line.contains('\r'),
+            "VOD playlist has a carriage return inside a line"
+        );
         if is_tag(line) {
             let name = line.split_once(':').map_or(line, |(name, _)| name);
             anyhow::ensure!(
@@ -100,6 +108,52 @@ pub fn absolute_playlist(text: &str, base: &Url, origin: &Origin) -> anyhow::Res
         );
     }
     Ok(body)
+}
+
+/// The name of the video media playlist beside a multivariant playlist built
+/// by [`multivariant_playlist`].
+pub const VIDEO_PLAYLIST: &str = "video.m3u8";
+/// The name of the audio media playlist beside it.
+pub const AUDIO_PLAYLIST: &str = "audio.m3u8";
+
+/// The bit rate of a resolved VOD body: the bytes its `EXT-X-BYTERANGE` lines
+/// name over the seconds its `EXTINF` lines name, at least one.
+fn bits_per_second(body: &str) -> u64 {
+    let mut bytes = 0_u64;
+    let mut seconds = 0.0_f64;
+    for line in body.lines() {
+        if let Some(range) = line.strip_prefix("#EXT-X-BYTERANGE:") {
+            let len = range.split('@').next().unwrap_or(range);
+            bytes = bytes.saturating_add(len.parse().unwrap_or(0));
+        } else if let Some(duration) = line.strip_prefix("#EXTINF:") {
+            let value = duration.split(',').next().unwrap_or(duration);
+            seconds += value
+                .parse::<f64>()
+                .ok()
+                .filter(|v| v.is_finite())
+                .unwrap_or(0.0);
+        }
+    }
+    if seconds <= 0.0 {
+        return 1;
+    }
+    ((bytes as f64 * 8.0 / seconds) as u64).max(1)
+}
+
+/// A multivariant playlist that plays the resolved VOD body `video` with the
+/// resolved VOD body `audio` as its one audio rendition
+/// (`docs/research/13-audio.md` §8). The two media playlists are named
+/// [`VIDEO_PLAYLIST`] and [`AUDIO_PLAYLIST`], relative to wherever the
+/// multivariant playlist is served; the bit rate is that of both bodies.
+#[must_use]
+pub fn multivariant_playlist(video: &str, audio: &str) -> String {
+    format!(
+        "#EXTM3U\n#EXT-X-VERSION:7\n\
+         #EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"audio\",NAME=\"camera\",LANGUAGE=\"und\",\
+         DEFAULT=YES,AUTOSELECT=YES,URI=\"{AUDIO_PLAYLIST}\"\n\
+         #EXT-X-STREAM-INF:BANDWIDTH={},AUDIO=\"audio\"\n{VIDEO_PLAYLIST}\n",
+        bits_per_second(video).saturating_add(bits_per_second(audio))
+    )
 }
 
 /// The `#IRIS-FRAGMENT:WALL-US=<start>,DURATION-TICKS=<ticks>` timing of a VOD
@@ -231,6 +285,30 @@ mod tests {
         );
     }
 
+    /// A carriage return ends a line only before a line feed. One left at
+    /// the end of the body's last line is part of that line, whose timing
+    /// then does not parse; the rewrite, which ends every line with a line
+    /// feed, refuses the body instead of turning it into one that parses.
+    #[test]
+    fn a_carriage_return_inside_a_line_is_refused() {
+        let (base, origin) = vod_base();
+        let stray = "#2-\n#IRIS-FRAGMENT:WALL-US=17903,DURATION-TICKS=3636\r";
+        assert!(playlist_fragments(stray).is_err());
+        assert!(absolute_playlist(stray, &base, &origin).is_err());
+        assert!(absolute_playlist("#EXTM3U\r#EXT-X-ENDLIST\n", &base, &origin).is_err());
+        // Lines that end in a carriage return and a line feed are lines.
+        let crlf = "#EXTM3U\r\n#IRIS-FRAGMENT:WALL-US=17903,DURATION-TICKS=3636\r\n";
+        let resolved = absolute_playlist(crlf, &base, &origin).unwrap();
+        assert_eq!(
+            resolved,
+            "#EXTM3U\n#IRIS-FRAGMENT:WALL-US=17903,DURATION-TICKS=3636\n"
+        );
+        assert_eq!(
+            playlist_fragments(&resolved).unwrap(),
+            playlist_fragments(crlf).unwrap()
+        );
+    }
+
     #[test]
     fn references_to_another_origin_or_with_userinfo_are_refused() {
         let (base, origin) = vod_base();
@@ -316,5 +394,24 @@ mod tests {
             absolute_playlist(commented, &base, &origin).unwrap(),
             commented
         );
+    }
+
+    /// The local multivariant playlist names the two bodies beside it and
+    /// declares the bit rate of both: here 2,000 bytes over 4 s of video and
+    /// 500 bytes over 4 s of audio, 5,000 bits a second.
+    #[test]
+    fn the_multivariant_playlist_names_both_bodies_and_their_bit_rate() {
+        let video = "#EXTM3U\n#EXTINF:2.00000,\n#EXT-X-BYTERANGE:1500@700\nhttp://h/v.mp4\n\
+                     #EXTINF:2.00000,\n#EXT-X-BYTERANGE:500@2200\nhttp://h/v.mp4\n";
+        let audio = "#EXTM3U\n#EXTINF:4.00000,\n#EXT-X-BYTERANGE:500@600\nhttp://h/a.mp4\n";
+        assert_eq!(
+            multivariant_playlist(video, audio),
+            "#EXTM3U\n#EXT-X-VERSION:7\n\
+             #EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"audio\",NAME=\"camera\",LANGUAGE=\"und\",\
+             DEFAULT=YES,AUTOSELECT=YES,URI=\"audio.m3u8\"\n\
+             #EXT-X-STREAM-INF:BANDWIDTH=5000,AUDIO=\"audio\"\nvideo.m3u8\n"
+        );
+        // A body without durations or sizes still declares a positive rate.
+        assert!(multivariant_playlist("#EXTM3U\n", "#EXTINF:x,\n").contains("BANDWIDTH=2,"));
     }
 }

@@ -37,7 +37,7 @@ irisd must therefore measure its own numbers (07 §7) rather than compare agains
 | Pitfall | Seen in | Handling |
 |---|---|---|
 | Timestamp jumps / backwards | retina allows by default (opt-in max-jump); Moonfire panicked on extreme jumps (#113, #346, fixed); Frigate uses `-use_wallclock_as_timestamps 1 -reset_timestamps 1` | irisd: regulariser + run boundaries (04 §7) |
-| Identical RTP timestamp on consecutive frames | Moonfire #322 (open; proposal: derive from frame rate/arrival) — and **our cam1 does this on 4 % of frames** | irisd: CFR regulariser |
+| Identical RTP timestamp on consecutive frames | Moonfire #322 (open; proposal: derive from frame rate/arrival) — and **a test camera does this on 4 % of frames** | irisd: CFR regulariser |
 | Parameter sets change mid-stream | retina `has_new_parameters()`; Moonfire seals the recording on `video_sample_entry_id` change | irisd: new sample entry → seal file, new init segment |
 | Parameter sets repeated at every IDR | Moonfire #43 (wasted space) | irisd: strip into `hvcC` (hvc1) |
 | Long / irregular GOP (smart codec) | Scrypted asks for 4 s IDR; Frigate tolerates 2 h playlist drift | irisd: provision cameras (GOP ≤ 2× fps, smart codec off); fragment cap 2 s |
@@ -57,7 +57,7 @@ irisd must therefore measure its own numbers (07 §7) rather than compare agains
 4. **Synthesise MP4/fMP4/HLS from byte ranges** (Moonfire) instead of writing playback files.
 5. **NVR clock is the authority, camera clock supplies durations** (Moonfire time.md), with
    the ±500 ppm correction and "least-delayed frame" anchoring, extended with a CFR
-   regulariser because real cameras (cam1) emit 10 ms-quantised, duplicated timestamps.
+   regulariser because real cameras emit 10 ms-quantised, duplicated timestamps.
 6. **Explicit durability order** (write → fsync file → fsync dir → catalog row; delete = mark →
    unlink → fsync dir → drop row) and bounded deletion work.
 7. **Parameter-set epochs** as first-class objects (sample entries), deduplicated.

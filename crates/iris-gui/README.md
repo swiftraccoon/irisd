@@ -49,10 +49,26 @@ provisioning implement the Linux client described in `docs/research/06-clients.m
   shows in the status bar, and the grid is rebuilt from `/api/cameras`. The dialogs' callbacks
   hold the dialog and its form weakly, so a closed dialog releases its widgets.
 - Three views in a stack: the grid with its "Add camera" button; the focused live view of one
-  camera with "Back to grid", "Playback", and "Remove camera" buttons; and the playback view
-  with "Back to grid", "Live", "Play / Pause", "Mark in", "Mark out", "Export", and "Keep
-  event" buttons, the picture, and the timeline. A click on a tile focuses its camera. Only the
-  visible view decodes: leaving a view stops its pipelines and feeds.
+  camera with "Back to grid", "Playback", "Sound", and "Remove camera" buttons; and the
+  playback view with "Back to grid", "Live", "Play / Pause", "Sound", "Mark in", "Mark out",
+  "Export", and "Keep event" buttons, the picture, and the timeline. A click on a tile focuses its
+  camera. Only the visible view decodes: leaving a view stops its pipelines and feeds.
+- Playback of the main stream plays the camera's recorded audio with it: when the window's
+  audio playlist (`/api/streams/{camera}/audio/hls/vod.m3u8`) exists, the viewer checks and
+  rewrites it like the video playlist and gives the player a local multivariant playlist
+  that names the two (`docs/research/13-audio.md` §8). The sub stream plays without audio,
+  whose timeline is the main stream's, and no fault of the audio keeps the picture away.
+  `--mute` discards the audio instead of playing it on the default output, and the view's
+  "Sound" button, shown while the window plays with audio and on at start, mutes the player.
+- The focused live view plays the camera's sound with its picture, from the camera's audio
+  feed (`/api/streams/{camera}/audio/live`); `--mute` discards it, and the grid plays none.
+  Audio frames arrive in bursts, so both media play against the pipeline's clock half a
+  second after their least-delay arrival (`sound::DELAY`), each feed placed by the least of
+  arrival time less media time over ten seconds. The picture is held only from the sound's
+  first frame on: a camera without audio answers the feed with 404, and its picture shows as
+  it is decoded, as the grid's tiles do (`docs/research/13-audio.md` §10.4). The "Sound"
+  button, shown for a camera the daemon lists with `has_audio` and on at start, turns the
+  sound and the hold off and on: the view starts over with the picture alone, or with both.
 - The playback view loads the window's segments (`/api/streams/{camera}/{kind}/segments`)
   and events (`/api/events`) for the timeline, then fetches the HLS VOD playlist
   (`/api/streams/{camera}/{kind}/hls/vod.m3u8`) once for both its fragment timing and
@@ -75,16 +91,18 @@ provisioning implement the Linux client described in `docs/research/06-clients.m
   timeline and are named "(kept)" after a seek.
 - Export from the playback view: "Mark in" and "Mark out" set the range at the playhead
   (drawn on the timeline, and cleared when another window opens), "Export" asks for a file with
-  the system save dialog and streams `/api/streams/{camera}/{kind}/export.mp4` for the range
-  into it, with the bytes written so far in the status line. A dismissed dialog cancels; a
+  the system save dialog and streams the range's export into it, with the bytes written so
+  far in the status line: `/api/cameras/{camera}/export.mp4` for the main stream, which holds
+  the camera's recorded audio as a second track, and `/api/streams/{camera}/{kind}/export.mp4`
+  for another stream. A dismissed dialog cancels; a
   failed dialog or a location without a local path shows in the status line. The download uses
   an exclusive sibling temporary and exposes the final path only through an atomic rename after
   a complete, nonempty MP4 is synced. Before the first byte and after every further 64 MiB it
   reads the destination filesystem's free space with `fstatvfs` on a duplicate of the
   temporary's descriptor, on the blocking pool, and stops, removing the temporary, when less
-  than the larger of 1 GiB and 2 % of the filesystem remains. Progress retains one latest
-  value, so completion cannot be overwritten by stale updates. The suggested file name is
-  `<camera>-<kind>-<UTC start>.mp4`.
+  than the larger of 1 GiB and 2 % of the filesystem remains. Progress retains one
+  value, the last sent, so completion cannot be overwritten by stale updates. The suggested
+  file name is `<camera>-<kind>-<UTC start>.mp4`.
 - `api::Client` — every call the viewer makes, with the root bearer in `Authorization`: the
   camera list, the segment and event lists, the VOD playlist body and fragment timing,
   keyframes (`Client::keyframe`), exports (`Client::export`, a streaming download with a
@@ -127,7 +145,16 @@ provisioning implement the Linux client described in `docs/research/06-clients.m
   `appsrc`, and asks the tile to restart its branch after every session, closed or failed. An
   `https` API gives a `wss` feed, verified with the shared `iris-tls` configuration (the
   platform's store plus any `--ca-file` authorities), so the viewer works through a TLS reverse
-  proxy for both API reads and live video. `Feed`'s `Debug` output redacts the token.
+  proxy for both API reads and live video. `Feed`'s `Debug` output redacts the token. An
+  audio feed that the daemon answers with 404 ends: the camera records no audio.
+- `sound::Pairing` and `sound::Pacer` — the timing that plays a camera's audio feed and its
+  picture against one clock: a pacer is told of every payload its feed pushes, reads the
+  fragment's media time (`fragment::media_time`, the one thing the viewer's own code reads
+  from a live payload; the `live_fragment` fuzz target covers it), and keeps the feed's
+  least delay; the pairing sets each feed's
+  running-time offset on the pad after its demuxer, following the estimate while a feed's
+  first half second is held and after that only when it has moved 80 ms, both feeds then
+  together. `sound::mute` makes the viewer discard audio.
 - `stage::Stage` — one GStreamer pipeline shared by every live tile, playing for the
   viewer's lifetime; tiles are bins added to and removed from it, so they share one GL
   context and one GL thread. Its bus watch routes errors to the branch they came from;
@@ -137,6 +164,8 @@ provisioning implement the Linux client described in `docs/research/06-clients.m
   stage with the feed task that fills it; `tile::Source` is the feed's thread-safe handle
   on the input. Readiness is the first buffer at the branch's sink pad after each start or
   restart; it restores the tile's label after a branch error.
+  `Tile::start_with_sound` adds a second branch for the camera's audio feed, which ends in
+  the default audio output or, muted, in a sink that discards it against the clock.
   Its single producer rejects empty input and checks queued plus incoming bytes against a
   16 MiB limit and queued objects against 512 buffers before copying. WebSocket frames and
   assembled messages are limited to one type byte plus the 16 MiB payload: 16 MiB + 1 bytes,
@@ -244,16 +273,21 @@ because it serializes Authorization.
 - `cargo test -p iris-gui --bin iris-gui -- --ignored --test-threads=1` under `xvfb-run`
   runs `gtk_lifecycle_checks`: the playback lifecycle, the `--max-tiles` grid cap, a window
   holding only a stale open segment showing nothing recorded, the Remove button shown only for
-  provisioned cameras, and a closed Add camera dialog releasing itself and its form.
+  provisioned cameras, the Sound button starting the focused view with and without the sound's
+  branch, and a closed Add camera dialog releasing itself and its form. The same command
+  runs the two checks of live sound that need GStreamer's plugins: both sound branches
+  building, and two feeds on timelines of their own, one sent in bursts, reaching their sinks
+  half a second after capture and together. `just display-test` runs this set and the two
+  below.
 - `cargo test -p iris-gui --test playback_origin -- --ignored` runs the viewer on a virtual
   display against playlists that name a second loopback origin, `file:` URIs, or an
   `EXT-X-KEY` tag, and checks that the playlist is refused and the second origin receives no
   request.
 - `cargo test -p iris-gui --test playback_snapshot -- --ignored` runs a bounded synthetic
   GUI regression with ffmpeg (`libx264`), Xvfb, and GStreamer HLS/H.264 plugins. Its HTTP
-  fixture removes the first fragment on a second VOD selection; the player must fetch the
-  backend playlist once, fetch every fragment from that selection with authentication,
-  and reach EOS.
+  fixture camera has no audio and removes the first fragment on a second VOD selection; the
+  player must fetch the backend playlist once, fetch every fragment from that selection
+  with authentication, and reach EOS.
 - Smoke runs on a virtual display (`xvfb-run`, or `Xvfb` plus `xdotool` for clicks) against a
   running daemon show every tile's pipeline reaching Playing and decoding its first frame,
   the grid, focus, playback, and back transitions stopping and starting the right

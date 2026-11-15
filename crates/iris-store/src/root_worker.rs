@@ -328,7 +328,7 @@ mod tests {
     use bytes::Bytes;
     use iris_core::id::StreamKind;
     use iris_core::time::WallUs;
-    use iris_mp4::fragment::Sample;
+    use iris_mp4::fragment::{FrameSteps, Sample};
     use iris_mp4::init::SampleEntry;
     use rustix::io::Errno;
     use std::fs;
@@ -364,6 +364,7 @@ mod tests {
             wall: WallUs::new(i64::try_from(index).unwrap() * 33_333),
             raw_rtp: 0,
             new_run: false,
+            steps: FrameSteps::default(),
             sample_entry: Arc::new(SampleEntry::new(
                 Bytes::from_static(b"\0\0\0\x10hvc1\0\0\0\0\0\0\0\0"),
                 "hvc1".into(),

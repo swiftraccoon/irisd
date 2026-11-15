@@ -58,7 +58,7 @@ several open questions were answered by the probe in `../01-camera-probe.md`.
    timeout** — caller must wrap `stream.next()` in `tokio::time::timeout`. `src/client/mod.rs`,
    `src/client/parse.rs` [P]
 8. **Documented camera workarounds (CHANGELOG):** Dahua NVR writes `ssrc` decimal in `RTP-Info` but
-   hex in `Transport` (0.4.21, now ignored); Rubetek 16-bit/garbage ssrc; Tapo answers SET_PARAMETER
+   hex in `Transport` (ignored from 0.4.21); Rubetek 16-bit/garbage ssrc; Tapo answers SET_PARAMETER
    with 400 (hence GET_PARAMETER preference); Hikvision whitespace in ssrc; Laureii trailing `;` in
    RTP-Info; empty FU fragments; FU NAL-type change mid-AU; Reolink `pps_scaling_list_data`; Tenda
    SPS; TrailN (type 0) single-NAL bug; Anjvision schemeless `Content-Base`; Ivel MARK bit on SEI;
@@ -123,7 +123,7 @@ several open questions were answered by the probe in `../01-camera-probe.md`.
    min; `Unsubscribe`; `SetSynchronizationPoint` re-emits properties as
    `PropertyOperation="Initialized"`; property messages carry Initialized/Changed/Deleted;
    CurrentTime/TerminationTime in UTC 'Z'.** [P]
-4. **Topic names (consolidated from `onvif_parsers` 2.5.0, the library Home Assistant now uses):**
+4. **Topic names (consolidated from `onvif_parsers` 2.5.0, the library Home Assistant uses):**
    `tns1:VideoSource/MotionAlarm` (State), `tns1:RuleEngine/CellMotionDetector/Motion` (IsMotion),
    `tns1:RuleEngine/MotionRegionDetector/Motion`, `tns1:RuleEngine/FieldDetector/ObjectsInside`
    (IsInside), `tns1:RuleEngine/LineDetector/Crossed` (ObjectId),
@@ -186,8 +186,8 @@ several open questions were answered by the probe in `../01-camera-probe.md`.
    `action=setConfig&Encode[0].MainFormat[0].Video.GOP=30`.** `Video.Profile` and the Smart Codec
    key were not confirmed — diff `getConfig` before/after toggling in the UI. Also
    `encode.cgi?action=getCaps|getConfigCaps`. python-amcrest `utils.py`,
-   https://pkg.go.dev/code.jhot.me/jhot/hats/pkg/amcrest constants [S] *(Probe note: cam1 exposes
-   `Video.Profile=Main` and `SmartEncode[0].Enable`.)*
+   https://pkg.go.dev/code.jhot.me/jhot/hats/pkg/amcrest constants [S] *(Probe note: a test
+   camera exposes `Video.Profile=Main` and `SmartEncode[0].Enable`.)*
 4. **Snapshot/time/NTP: `snapshot.cgi?channel=1` (JPEG); `global.cgi?action=getCurrentTime` →
    `result=YYYY-MM-DD HH:MM:SS` (locale-independent), `setCurrentTime&time=...`; NTP table
    `table.NTP.{Enable,Address,Port,UpdatePeriod,TimeZone}` (NVRs add `NTP.ServerList[n]`).** Auth is
@@ -230,8 +230,8 @@ several open questions were answered by the probe in `../01-camera-probe.md`.
    ONVIF `GetSystemDateAndTime` (HA warns at ≥ 5 s) or `global.cgi?action=getCurrentTime`, and
    apply the measured offset to event times.** [P/S]
 3. **Drift without NTP is anecdotal only: ~1.5 min/month (~3 s/day) reported, worse cases from DST
-   mis-handling (1 h jumps).** No vendor spec found. ipcamtalk threads [S] *(Probe: cam1's ONVIF UTC
-   is exactly 1 h off even with NTP.)*
+   mis-handling (1 h jumps).** No vendor spec found. ipcamtalk threads [S] *(Probe: a test
+   camera's ONVIF UTC is exactly 1 h off even with NTP.)*
 4. **Run chrony on the NVR, serve the LAN, point each camera at it via the NTP table
    (`UpdatePeriod`, forums cite 10 min); disable DST on cameras, prefer UTC.** Users report Dahua
    cameras sync fine to an NVR/NAS NTP server (IPVM, ipcamtalk). [S]
@@ -262,16 +262,16 @@ several open questions were answered by the probe in `../01-camera-probe.md`.
 ### Open questions
 
 1. Exact Dahua CGI key for Smart Codec and `Video.Profile`; whether `BitRateControl` values are
-   `CBR`/`VBR` on current firmware (verify with `getConfig` diff). *(cam1: `SmartEncode[0].Enable`,
-   `Video.Profile=Main`, `BitRateControl=CBR`.)*
+   `CBR`/`VBR` on the firmware probed (verify with `getConfig` diff). *(a test camera:
+   `SmartEncode[0].Enable`, `Video.Profile=Main`, `BitRateControl=CBR`.)*
 2. Official meaning of `proto=Onvif`/`unicast=true` (Dahua HTTP API PDF v2.76/v3.x not accessible;
    Scribd copy of v1.67 unverified).
-3. Whether the 6 cameras' firmware honors `heartbeat=`, serves IVS codes, and which ONVIF
-   `tns1:RuleEngine/*` topics they emit (`GetEventProperties`). *(cam1: heartbeat honoured; 23
-   topics listed in 01.)*
+3. Whether camera firmware honors `heartbeat=`, serves IVS codes, and which ONVIF
+   `tns1:RuleEngine/*` topics they emit (`GetEventProperties`). *(a test camera: heartbeat
+   honoured; 23 topics listed in 01.)*
 4. Dahua RTCP SR interval and NTP accuracy on these models; whether Dahua ever sends
-   `sprop-max-don-diff`/AP packets (retina ignores DON). *(cam1: SR every 5 s, NTP within 100 ms, no
-   DON, no AP.)*
+   `sprop-max-don-diff`/AP packets (retina ignores DON). *(a test camera: SR every 5 s, NTP
+   within 100 ms, no DON, no AP.)*
 5. oxvif behaviour against Dahua PullPoint (Renew semantics, Digest on subscription URL) — needs a
    hardware test.
 6. Backpressure behaviour: how long Dahua tolerates a stalled TCP reader before dropping the session

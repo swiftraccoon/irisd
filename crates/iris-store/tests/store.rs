@@ -1,5 +1,10 @@
 //! End-to-end tests over a temporary directory.
 
+#![expect(
+    clippy::unwrap_used,
+    reason = "a helper of a test fails as the test does, by panicking"
+)]
+
 use std::fs::{self, File, OpenOptions};
 use std::io::Write as _;
 use std::os::unix::fs::FileExt as _;
@@ -12,7 +17,7 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 use iris_core::id::{CameraId, StreamKey, StreamKind};
 use iris_core::time::WallUs;
-use iris_mp4::fragment::{Fragment, Sample};
+use iris_mp4::fragment::{Fragment, FrameSteps, Sample};
 use iris_mp4::index::{
     MAX_PERSISTED_INDEX_RECORDS, read_index_bounded, read_index_file_bound_to_media,
 };
@@ -83,6 +88,7 @@ fn fragment(
         wall: WallUs::new(wall_secs * 1_000_000),
         raw_rtp: 42,
         new_run: run == Run::New,
+        steps: FrameSteps::default(),
         sample_entry: Arc::clone(entry),
     }
 }
@@ -902,6 +908,7 @@ fn the_writer_rotates_before_the_sidecar_record_limit() {
             wall: WallUs::new(1_700_000_000_000_000 + i64::try_from(index).unwrap() * 33_333),
             raw_rtp: 0,
             new_run: index == 0,
+            steps: FrameSteps::default(),
             sample_entry: Arc::clone(&sample_entry),
         };
         writer.try_send(key(), fragment).unwrap();

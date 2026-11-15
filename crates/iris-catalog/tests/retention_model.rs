@@ -3,6 +3,11 @@
 //! (the candidate pages, the per-stream age pages, and the atomic deletion
 //! mark) agrees with one overlap rule written out here.
 
+#![expect(
+    clippy::unwrap_used,
+    reason = "a helper of a test fails as the test does, by panicking"
+)]
+
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::time::Duration;

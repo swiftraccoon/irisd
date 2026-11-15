@@ -160,4 +160,19 @@ mod tests {
         assert_eq!(truncate("é🦀x", 2), "é🦀");
         assert_eq!(truncate("ab", 5), "ab");
     }
+
+    #[test]
+    fn mean_and_extremes_of_a_list() {
+        let values = [4.0, 1.0, 7.0];
+        assert_eq!(mean(&values), Some(4.0));
+        assert_eq!(minimum(&values), Some(1.0));
+        assert_eq!(maximum(&values), Some(7.0));
+    }
+
+    #[test]
+    fn exactly_half_the_median_is_not_a_stall() {
+        assert_eq!(median_and_stalls(&[30.0, 30.0, 15.0]), (30.0, 0));
+        assert_eq!(median_and_stalls(&[30.0, 30.0, 14.9]), (30.0, 1));
+        assert_eq!(median_and_stalls(&[0.0, 0.0]), (0.0, 2));
+    }
 }

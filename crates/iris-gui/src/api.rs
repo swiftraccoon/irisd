@@ -97,6 +97,10 @@ pub struct Camera {
     pub name: String,
     /// Added through the API, so the API may remove it.
     pub provisioned: bool,
+    /// The daemon records the camera's audio and serves it live. A daemon
+    /// that does not say is taken to have none.
+    #[serde(default)]
+    pub has_audio: bool,
 }
 
 /// A catalog event id as `/api/events` lists it; the validated answers hold
@@ -191,6 +195,17 @@ fn filesystem_space(file: &File) -> io::Result<FilesystemSpace> {
         available: stat.f_bavail.saturating_mul(stat.f_frsize),
         total: stat.f_blocks.saturating_mul(stat.f_frsize),
     })
+}
+
+/// The path of the export of a stream. A camera's main stream is exported
+/// through the camera, whose export carries the recorded audio as a second
+/// track and is the stream's own export when no audio was recorded; any
+/// other stream is exported alone.
+fn export_path(camera: &CameraId, kind: StreamKind) -> String {
+    match kind {
+        StreamKind::Main => format!("/api/cameras/{camera}/export.mp4"),
+        _ => format!("/api/streams/{camera}/{kind}/export.mp4"),
+    }
 }
 
 /// The free space an export leaves: the larger of 1 GiB and 2 % of the filesystem.
@@ -455,6 +470,7 @@ impl Client {
 
     /// Downloads the MP4 export of `[from, to)` to `path`, calling `progress`
     /// with the bytes written so far after every chunk; returns the total.
+    /// The export of a main stream holds the camera's recorded audio too.
     /// Before the first byte and after every further 64 MiB it checks the
     /// destination filesystem with `fstatvfs` and stops, removing the partial
     /// file, when free space would fall below the larger of 1 GiB and 2 % of
@@ -473,7 +489,7 @@ impl Client {
 
         const WHAT: &str = "requesting the export";
         validate_range(from, to)?;
-        let mut url = self.url(&format!("/api/streams/{camera}/{kind}/export.mp4"))?;
+        let mut url = self.url(&export_path(camera, kind))?;
         url.query_pairs_mut()
             .append_pair("from", &from.get().to_string())
             .append_pair("to", &to.get().to_string());
@@ -1056,18 +1072,23 @@ impl ExportTemp {
                 name.push(char::from(HEX_DIGITS[usize::from(byte & 0x0f)]));
             }
             let path = parent.join(name).with_extension("tmp");
-            match tokio::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&path)
-                .await
-            {
-                Ok(file) => {
-                    return Ok(Self {
+            // The blocking open returns the guard itself: when the export is
+            // cancelled while the open runs, the runtime drops the guard and
+            // with it the file the open created.
+            let opened = tokio::task::spawn_blocking(move || {
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&path)
+                    .map(|file| Self {
                         path: Some(path),
-                        file: Some(file),
-                    });
-                }
+                        file: Some(tokio::fs::File::from_std(file)),
+                    })
+            })
+            .await
+            .context("creating an export temporary")?;
+            match opened {
+                Ok(temporary) => return Ok(temporary),
                 Err(error) if error.kind() == ErrorKind::AlreadyExists => {}
                 Err(error) => {
                     return Err(error).with_context(|| {
@@ -1248,11 +1269,37 @@ mod tests {
     }
 
     async fn export_server() -> (Url, tokio::task::JoinHandle<()>) {
-        serve_fixture(Router::new().route(
-            "/api/streams/{camera}/{kind}/export.mp4",
-            routing::get(export_fixture),
-        ))
+        serve_fixture(
+            Router::new()
+                .route(
+                    "/api/streams/{camera}/{kind}/export.mp4",
+                    routing::get(export_fixture),
+                )
+                .route(
+                    "/api/cameras/{camera}/export.mp4",
+                    routing::get(export_fixture),
+                ),
+        )
         .await
+    }
+
+    /// The main stream is exported through its camera, with the recorded
+    /// audio; the other streams are exported alone.
+    #[test]
+    fn the_main_stream_is_exported_through_its_camera() {
+        let cam = camera("cam1");
+        assert_eq!(
+            export_path(&cam, StreamKind::Main),
+            "/api/cameras/cam1/export.mp4"
+        );
+        assert_eq!(
+            export_path(&cam, StreamKind::Sub),
+            "/api/streams/cam1/sub/export.mp4"
+        );
+        assert_eq!(
+            export_path(&cam, StreamKind::Audio),
+            "/api/streams/cam1/audio/export.mp4"
+        );
     }
 
     /// Exports the fixture answer that `from` picks to `destination`.
@@ -1692,6 +1739,7 @@ mod tests {
             id: camera(id),
             name: name.into(),
             provisioned: false,
+            has_audio: false,
         }
     }
 
@@ -2074,8 +2122,54 @@ mod tests {
         task.abort();
         let _ = task.await;
         assert_eq!(std::fs::read(&destination).unwrap(), sentinel);
-        assert_eq!(export_temporaries(directory.path()), Vec::<PathBuf>::new());
+        wait_for_no_temporaries(directory.path()).await;
         server.abort();
+    }
+
+    /// Waits until no export temporary is left in `directory`: a cancelled
+    /// export removes its temporary as its blocking open returns.
+    async fn wait_for_no_temporaries(directory: &Path) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !export_temporaries(directory).is_empty() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "temporaries left behind: {:?}",
+                export_temporaries(directory)
+            )
+        });
+    }
+
+    /// An export cancelled after its temporary was opened on the blocking
+    /// thread and before the export saw the result leaves no temporary. The
+    /// runtime has one thread and the test does not yield while it waits for
+    /// the file, so the export cannot run in between.
+    #[tokio::test]
+    async fn a_temporary_cancelled_while_it_is_created_is_removed() {
+        let directory = tempfile::tempdir().unwrap();
+        let destination = directory.path().join("recording.mp4");
+        for _ in 0..20 {
+            let task = tokio::spawn({
+                let destination = destination.clone();
+                async move { ExportTemp::create(&destination).await }
+            });
+            // One turn of the runtime starts the open.
+            tokio::task::yield_now().await;
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while export_temporaries(directory.path()).is_empty() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "no temporary appeared"
+                );
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            task.abort();
+            let _ = task.await;
+            wait_for_no_temporaries(directory.path()).await;
+        }
     }
 
     #[test]

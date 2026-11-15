@@ -4,7 +4,7 @@ use std::fmt;
 use std::fmt::Write as _;
 use std::fs::File;
 use std::io;
-use std::os::unix::fs::MetadataExt as _;
+use std::os::unix::fs::{FileExt as _, MetadataExt as _};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -15,13 +15,15 @@ use axum::http::header;
 use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
 use iris_catalog::{SampleEntryId, SegmentRow, TimeRange};
-use iris_core::id::StreamKey;
+use iris_core::id::{StreamKey, StreamKind};
 use iris_core::time::{TIMESCALE, WallUs};
 use iris_mp4::fragment::{TRAILER_LEN, decode_trailer};
+use iris_mp4::hls::{AudioRendition, VariantBitRates, master_playlist, master_playlist_with_audio};
 use iris_mp4::index::{
-    FLAG_DISCONTINUITY_BEFORE, FLAG_NEW_PARAMETERS, FLAG_STARTS_WITH_SYNC, IndexHeader,
-    IndexRecord, MAX_PERSISTED_INDEX_RECORDS, read_index_file_bounded,
+    FLAG_STARTS_WITH_SYNC, IndexHeader, IndexRecord, MAX_PERSISTED_INDEX_RECORDS,
+    WRITER_ONLY_FLAGS, read_index_file_bounded,
 };
+use iris_mp4::init::{audio_channel_count, sample_entry_bytes};
 use iris_mp4::reader::{FragmentInfo, parse_fragment};
 use iris_store::ApprovedRoot;
 
@@ -48,8 +50,10 @@ pub(crate) const MAX_INIT_BYTES: u64 = 4 * 1024 * 1024;
 /// Maximum complete stored fragment read by serving paths: the 64 MiB
 /// ingest payload ceiling plus the 1 MiB moof ceiling and fixed boxes.
 pub(crate) const MAX_FRAGMENT_BYTES: u64 = 66 * 1024 * 1024;
-const KNOWN_INDEX_FLAGS: u8 =
-    FLAG_STARTS_WITH_SYNC | FLAG_DISCONTINUITY_BEFORE | FLAG_NEW_PARAMETERS;
+/// The record flags a served sidecar may carry. A fragment that holds a step
+/// of its stream is read as any other (`docs/research/04-storage-format.md`
+/// §5).
+const KNOWN_INDEX_FLAGS: u8 = FLAG_STARTS_WITH_SYNC | WRITER_ONLY_FLAGS;
 /// Extra validity after the selected media duration for buffering, pausing,
 /// and transport delay without exposing a root credential.
 const VOD_CAPABILITY_MARGIN: Duration = Duration::from_mins(15);
@@ -291,6 +295,35 @@ fn validate_index_binding(
     Ok((records, extent))
 }
 
+/// Reads the initialization section of a recording, as its catalog row
+/// bounds it.
+pub(crate) async fn read_init(
+    segment: &SegmentFragments,
+    permit: &MediaPermit,
+) -> Result<Vec<u8>, ApiError> {
+    if u64::from(segment.row.init_len) > MAX_INIT_BYTES
+        || u64::from(segment.row.init_len) > segment.media.extent()
+    {
+        return Err(ApiError::Unavailable(
+            "initialization exceeds the serving budget or published extent".into(),
+        ));
+    }
+    let media = segment.media.clone();
+    let init_len = segment.row.init_len;
+    let init = media_admission::blocking(permit, move || {
+        let file = media.reopen()?;
+        let mut init = Vec::new();
+        init.try_reserve_exact(init_len as usize)
+            .map_err(io::Error::other)?;
+        init.resize(init_len as usize, 0);
+        file.read_exact_at(&mut init, 0)?;
+        Ok::<_, io::Error>(init)
+    })
+    .await
+    .map_err(io::Error::other)??;
+    Ok(init)
+}
+
 /// Parses and checksum-verifies one bounded fragment, then cross-checks every
 /// persisted fact used by a transform.
 pub(crate) fn validate_fragment_record(
@@ -422,6 +455,8 @@ struct MediaSegment {
     offset: u64,
     len: u64,
     duration_ticks: u64,
+    /// Wall time of its first fragment.
+    wall: WallUs,
 }
 
 /// Groups fragments into media segments that start at sync fragments.
@@ -439,6 +474,7 @@ fn group(records: &[IndexRecord]) -> Vec<MediaSegment> {
                     offset: r.offset,
                     len: u64::from(r.len),
                     duration_ticks: u64::from(r.duration),
+                    wall: r.wall,
                 },
                 1,
             )),
@@ -504,64 +540,195 @@ fn playlist_budget_error(_: fmt::Error) -> ApiError {
     ApiError::Unavailable("VOD playlist exceeds the serving budget".into())
 }
 
-/// Renders the VOD playlist.
+/// One media segment of a VOD playlist as it is written.
+struct Entry<'a> {
+    /// The recording that holds it.
+    file: &'a SegmentFragments,
+    /// Whether `EXT-X-DISCONTINUITY` precedes it.
+    discontinuity: bool,
+    /// Whether it is the first of its file here: the file's `EXT-X-MAP` and
+    /// the timing of its fragments precede it.
+    opens_file: bool,
+    media: MediaSegment,
+}
+
+/// The media segments of a stream's own playlist: each file's fragments
+/// grouped by [`group`], with a discontinuity before a file that says so or
+/// whose sample entry differs from the one before.
+fn own_entries(segments: &[SegmentFragments]) -> Vec<Entry<'_>> {
+    let mut entries = Vec::new();
+    let mut last_entry: Option<SampleEntryId> = None;
+    for file in segments {
+        // Sample entries are compared by catalog row, which is unique by CRC
+        // and bytes, so a CRC collision between files still gets its marker.
+        let discontinuity = last_entry.is_some()
+            && (file.discontinuity_before || last_entry != Some(file.row.sample_entry_id));
+        for (index, media) in group(&file.records).into_iter().enumerate() {
+            entries.push(Entry {
+                file,
+                discontinuity: discontinuity && index == 0,
+                opens_file: index == 0,
+                media,
+            });
+        }
+        last_entry = Some(file.row.sample_entry_id);
+    }
+    entries
+}
+
+/// The media segments of an audio playlist that follows `video`, the
+/// entries of the main stream's playlist for the same range: an audio
+/// segment holds the audio fragments, contiguous in one file, that start
+/// inside one video segment, and a discontinuity precedes it when the video
+/// has one since the audio segment before it or the audio's sample entry
+/// changes (`docs/research/13-audio.md` §8.1). Audio that starts before the
+/// first video segment joins it.
+fn following_entries<'a>(audio: &'a [SegmentFragments], video: &[Entry<'_>]) -> Vec<Entry<'a>> {
+    let mut entries: Vec<Entry<'a>> = Vec::new();
+    // The video segment the audio is in, and the one the last entry is in.
+    let mut cut = 0usize;
+    let mut entry_cut = 0usize;
+    // Whether the video has a discontinuity since the last entry.
+    let mut crossed = false;
+    let mut last_entry: Option<SampleEntryId> = None;
+    for file in audio {
+        let mut opens_file = true;
+        let changed = last_entry.is_some_and(|entry| entry != file.row.sample_entry_id);
+        for record in &file.records {
+            while video
+                .get(cut + 1)
+                .is_some_and(|next| next.media.wall <= record.wall)
+            {
+                cut += 1;
+                crossed |= video[cut].discontinuity;
+            }
+            match entries.last_mut() {
+                Some(entry) if !opens_file && entry_cut == cut => {
+                    entry.media.len = record.end() - entry.media.offset;
+                    entry.media.duration_ticks += u64::from(record.duration);
+                }
+                last => {
+                    let discontinuity = last.is_some() && (crossed || (opens_file && changed));
+                    entries.push(Entry {
+                        file,
+                        discontinuity,
+                        opens_file,
+                        media: MediaSegment {
+                            offset: record.offset,
+                            len: u64::from(record.len),
+                            duration_ticks: u64::from(record.duration),
+                            wall: record.wall,
+                        },
+                    });
+                    entry_cut = cut;
+                    crossed = false;
+                    opens_file = false;
+                }
+            }
+        }
+        last_entry = Some(file.row.sample_entry_id);
+    }
+    entries
+}
+
+/// The target duration of `entries` in seconds: the longest segment,
+/// rounded up.
+fn target_seconds(entries: &[Entry<'_>]) -> u64 {
+    let longest = entries
+        .iter()
+        .map(|entry| entry.media.duration_ticks)
+        .max()
+        .unwrap_or(0);
+    longest.div_ceil(u64::from(TIMESCALE)).max(1)
+}
+
+/// Renders the VOD playlist of a stream from its own fragments.
 pub(crate) fn vod_playlist(
     segments: &[SegmentFragments],
     auth: &AuthContext,
     capability_lifetime: Duration,
 ) -> Result<String, ApiError> {
+    let entries = own_entries(segments);
+    let target = target_seconds(&entries);
+    render(&entries, target, auth, capability_lifetime)
+}
+
+/// Renders the VOD playlist of an audio stream as a rendition of `video`,
+/// the main stream's fragments for the same range: its segments and
+/// discontinuities follow the video playlist's, and its target duration is
+/// the video's unless its own longest segment, rounded to the nearest
+/// second, is longer (`docs/research/13-audio.md` §8.1).
+pub(crate) fn audio_vod_playlist(
+    audio: &[SegmentFragments],
+    video: &[SegmentFragments],
+    auth: &AuthContext,
+    capability_lifetime: Duration,
+) -> Result<String, ApiError> {
+    let video = own_entries(video);
+    let entries = following_entries(audio, &video);
+    let half = u64::from(TIMESCALE) / 2;
+    let nearest = entries
+        .iter()
+        .map(|entry| (entry.media.duration_ticks + half) / u64::from(TIMESCALE))
+        .max()
+        .unwrap_or(0);
+    let target = target_seconds(&video).max(nearest);
+    render(&entries, target, auth, capability_lifetime)
+}
+
+/// Writes a VOD playlist of `entries` with the target duration `target`.
+fn render(
+    entries: &[Entry<'_>],
+    target: u64,
+    auth: &AuthContext,
+    capability_lifetime: Duration,
+) -> Result<String, ApiError> {
     let mut body = BoundedText::new(MAX_PLAYLIST_BYTES);
-    let mut target_ticks = 0u64;
-    let mut last_entry: Option<SampleEntryId> = None;
-    for seg in segments {
-        if seg
-            .records
-            .iter()
-            .any(|record| record.end() > seg.media.extent())
-        {
-            return Err(ApiError::Unavailable(
-                "VOD byte range exceeds its published extent".into(),
-            ));
-        }
-        let uri = file_uri(seg.row.id.0, auth, capability_lifetime);
-        // Sample entries are compared by catalog row, which is unique by CRC
-        // and bytes, so a CRC collision between files still gets its marker.
-        let discontinuity = last_entry.is_some()
-            && (seg.discontinuity_before || last_entry != Some(seg.row.sample_entry_id));
-        if discontinuity {
+    let mut uri = String::new();
+    for entry in entries {
+        let file = entry.file;
+        if entry.discontinuity {
             body.write_str("#EXT-X-DISCONTINUITY\n")
                 .map_err(playlist_budget_error)?;
         }
+        if entry.opens_file {
+            if file
+                .records
+                .iter()
+                .any(|record| record.end() > file.media.extent())
+            {
+                return Err(ApiError::Unavailable(
+                    "VOD byte range exceeds its published extent".into(),
+                ));
+            }
+            uri = file_uri(file.row.id.0, auth, capability_lifetime);
+            writeln!(
+                body,
+                "#EXT-X-MAP:URI=\"{uri}\",BYTERANGE=\"{}@0\"",
+                file.row.init_len
+            )
+            .map_err(playlist_budget_error)?;
+            for record in &file.records {
+                writeln!(
+                    body,
+                    "#IRIS-FRAGMENT:WALL-US={},DURATION-TICKS={}",
+                    record.wall.get(),
+                    record.duration
+                )
+                .map_err(playlist_budget_error)?;
+            }
+        }
+        let media = &entry.media;
         writeln!(
             body,
-            "#EXT-X-MAP:URI=\"{uri}\",BYTERANGE=\"{}@0\"",
-            seg.row.init_len
+            "#EXTINF:{:.5},",
+            media.duration_ticks as f64 / f64::from(TIMESCALE)
         )
         .map_err(playlist_budget_error)?;
-        for record in &seg.records {
-            writeln!(
-                body,
-                "#IRIS-FRAGMENT:WALL-US={},DURATION-TICKS={}",
-                record.wall.get(),
-                record.duration
-            )
+        writeln!(body, "#EXT-X-BYTERANGE:{}@{}", media.len, media.offset)
             .map_err(playlist_budget_error)?;
-        }
-        for media in group(&seg.records) {
-            target_ticks = target_ticks.max(media.duration_ticks);
-            writeln!(
-                body,
-                "#EXTINF:{:.5},",
-                media.duration_ticks as f64 / f64::from(TIMESCALE)
-            )
-            .map_err(playlist_budget_error)?;
-            writeln!(body, "#EXT-X-BYTERANGE:{}@{}", media.len, media.offset)
-                .map_err(playlist_budget_error)?;
-            writeln!(body, "{uri}").map_err(playlist_budget_error)?;
-        }
-        last_entry = Some(seg.row.sample_entry_id);
+        writeln!(body, "{uri}").map_err(playlist_budget_error)?;
     }
-    let target = target_ticks.div_ceil(u64::from(TIMESCALE)).max(1);
     let mut playlist = BoundedText::new(MAX_PLAYLIST_BYTES);
     write!(
         playlist,
@@ -586,10 +753,112 @@ pub(crate) async fn vod(
     if segments.is_empty() {
         return Err(ApiError::NotFound);
     }
-    let text = media_admission::attach(
-        Bytes::from(vod_playlist(&segments, &auth, capability_lifetime)?),
-        &permit,
-    );
+    // A camera's audio is a rendition of its main stream, whose segments
+    // and discontinuities its playlist follows.
+    let video = if key.kind == StreamKind::Audio {
+        let main = StreamKey {
+            camera: key.camera.clone(),
+            kind: StreamKind::Main,
+        };
+        load_fragments(&state, &main, range, &permit).await?
+    } else {
+        Vec::new()
+    };
+    let playlist = if video.is_empty() {
+        vod_playlist(&segments, &auth, capability_lifetime)?
+    } else {
+        audio_vod_playlist(&segments, &video, &auth, capability_lifetime)?
+    };
+    let text = media_admission::attach(Bytes::from(playlist), &permit);
+    Ok((
+        [
+            (header::CONTENT_TYPE, "application/vnd.apple.mpegurl"),
+            (header::CACHE_CONTROL, "private, no-store"),
+        ],
+        text,
+    )
+        .into_response())
+}
+
+/// The bit rates of the media playlist [`vod_playlist`] builds from
+/// `segments`: the largest rate of one media segment and the rate of all.
+fn playlist_rates(segments: &[SegmentFragments]) -> VariantBitRates {
+    let rate = |bytes: u64, ticks: u64| {
+        let bits = u128::from(bytes) * 8 * u128::from(TIMESCALE);
+        u64::try_from(bits / u128::from(ticks.max(1))).unwrap_or(u64::MAX)
+    };
+    let (mut peak, mut bytes, mut ticks) = (0, 0_u64, 0_u64);
+    for media in segments.iter().flat_map(|seg| group(&seg.records)) {
+        peak = peak.max(rate(media.len, media.duration_ticks));
+        bytes = bytes.saturating_add(media.len);
+        ticks = ticks.saturating_add(media.duration_ticks);
+    }
+    VariantBitRates {
+        peak,
+        average: rate(bytes, ticks),
+    }
+}
+
+/// `GET /api/cameras/{camera}/hls/vod.m3u8`: the multivariant playlist of a
+/// camera for a range: its main stream as the one variant and, when the range
+/// holds recorded audio, the audio as a rendition
+/// (`docs/research/13-audio.md` §8). The media playlists it names are the
+/// streams' own, for the same range.
+pub(crate) async fn camera_vod(
+    State(state): State<Arc<ApiState>>,
+    Path(camera): Path<String>,
+    Query(params): Query<TimeParams>,
+) -> Result<Response, ApiError> {
+    let permit = state.stats.admit_media(MediaClass::Bounded)?;
+    let video_key = stream_key(&camera, "main")?;
+    let audio_key = stream_key(&camera, "audio")?;
+    let range = resolve_range(&params, WallUs::now())?;
+    vod_capability_lifetime(range)?;
+    let video = load_fragments(&state, &video_key, range, &permit).await?;
+    let Some(first) = video.first() else {
+        return Err(ApiError::NotFound);
+    };
+    let audio = load_fragments(&state, &audio_key, range, &permit).await?;
+    let uri = |kind: &str| {
+        format!(
+            "/api/streams/{}/{kind}/hls/vod.m3u8?from={}&to={}",
+            video_key.camera,
+            range.from.get(),
+            range.to.get()
+        )
+    };
+    let rates = playlist_rates(&video);
+    let channels = match audio.first() {
+        Some(sound) => {
+            let init = read_init(sound, &permit).await?;
+            sample_entry_bytes(&init).and_then(audio_channel_count)
+        }
+        None => None,
+    };
+    let playlist = match audio.first() {
+        Some(sound) => master_playlist_with_audio(
+            &uri("main"),
+            &first.row.codecs,
+            rates,
+            first.row.width,
+            first.row.height,
+            &AudioRendition {
+                uri: &uri("audio"),
+                codecs: &sound.row.codecs,
+                rates: playlist_rates(&audio),
+                channels,
+            },
+        ),
+        None => master_playlist(
+            &uri("main"),
+            &first.row.codecs,
+            rates,
+            first.row.width,
+            first.row.height,
+        ),
+    }
+    .map_err(|_| ApiError::Unavailable("a recorded codecs string cannot be listed".into()))?;
+    let text = media_admission::attach(Bytes::from(playlist), &permit);
     Ok((
         [
             (header::CONTENT_TYPE, "application/vnd.apple.mpegurl"),
@@ -881,6 +1150,22 @@ mod tests {
             validate_index_binding(row, header, vec![record], u64::MAX).is_ok()
         };
         assert!(bound(&row, &header, record));
+        // Every flag the writer sets is served, the marks of a step among
+        // them; no other bit is.
+        for flag in [0x2, 0x4, 0x8, 0x10] {
+            let marked = IndexRecord {
+                flags: record.flags | flag,
+                ..record
+            };
+            assert!(bound(&row, &header, marked), "flag {flag:#x}");
+        }
+        for flag in [0x20, 0x40] {
+            let unknown = IndexRecord {
+                flags: record.flags | flag,
+                ..record
+            };
+            assert!(!bound(&row, &header, unknown), "flag {flag:#x}");
+        }
 
         assert!(!bound(&row, &IndexHeader { flags: 1, ..header }, record));
         for bad_record in [
@@ -1197,5 +1482,243 @@ mod tests {
                 to: WallUs::new(i64::MIN + 1),
             }
         ));
+    }
+
+    /// A recording of fragments that start at `walls` (in milliseconds after
+    /// a common origin) and last `duration` ticks each.
+    fn recording(
+        directory: &std::path::Path,
+        id: i64,
+        entry: i64,
+        walls: &[i64],
+        duration: u32,
+    ) -> SegmentFragments {
+        let (row, _, record) = bound_fixture();
+        let records: Vec<IndexRecord> = walls
+            .iter()
+            .enumerate()
+            .map(|(index, &millis)| IndexRecord {
+                offset: 700 + index as u64 * 100,
+                wall: record.wall.offset(millis * 1_000),
+                duration,
+                ..record
+            })
+            .collect();
+        let extent = records.last().map_or(700, IndexRecord::end);
+        SegmentFragments {
+            row: SegmentRow {
+                id: SegmentId(id),
+                sample_entry_id: SampleEntryId(entry),
+                ..row
+            },
+            records,
+            media: ValidatedMedia::for_test(directory, &[], extent),
+            discontinuity_before: false,
+        }
+    }
+
+    /// Each entry as its file, its fragments, and whether a discontinuity
+    /// and the file's map precede it.
+    fn shape(entries: &[Entry<'_>]) -> Vec<(i64, u64, bool, bool)> {
+        entries
+            .iter()
+            .map(|entry| {
+                (
+                    entry.file.row.id.0,
+                    entry.media.len / 100,
+                    entry.discontinuity,
+                    entry.opens_file,
+                )
+            })
+            .collect()
+    }
+
+    /// The audio's segments are cut where the video's are: a video file that
+    /// rotates restarts the video's grouping, and the audio, in one file,
+    /// follows it where its own grouping would run on.
+    #[test]
+    fn audio_segments_follow_the_video_segments_across_a_rotation() {
+        let dir = tempfile::tempdir().expect("temporary directory");
+        let video = [
+            recording(dir.path(), 1, 1, &[0, 2_000, 4_000, 6_000], 180_000),
+            recording(
+                dir.path(),
+                2,
+                1,
+                &[8_000, 10_000, 12_000, 14_000, 16_000],
+                180_000,
+            ),
+        ];
+        // Each audio fragment starts 5 ms into its video fragment.
+        let walls: Vec<i64> = (0..9).map(|index| index * 2_000 + 5).collect();
+        let audio = [recording(dir.path(), 3, 7, &walls, 180_000)];
+        let video_entries = own_entries(&video);
+        assert_eq!(
+            shape(&video_entries),
+            [
+                (1, 3, false, true),
+                (1, 1, false, false),
+                (2, 3, false, true),
+                (2, 2, false, false),
+            ]
+        );
+        assert_eq!(
+            shape(&following_entries(&audio, &video_entries)),
+            [
+                (3, 3, false, true),
+                (3, 1, false, false),
+                (3, 3, false, false),
+                (3, 2, false, false),
+            ]
+        );
+        // Alone, the audio groups three, three, and three.
+        assert_eq!(
+            shape(&own_entries(&audio)),
+            [
+                (3, 3, false, true),
+                (3, 3, false, false),
+                (3, 3, false, false)
+            ]
+        );
+        // Audio that starts before the first video segment joins it.
+        let early = [recording(
+            dir.path(),
+            3,
+            7,
+            &[-40, 2_005, 4_005, 6_005],
+            180_000,
+        )];
+        assert_eq!(
+            shape(&following_entries(&early, &video_entries)),
+            [(3, 3, false, true), (3, 1, false, false)]
+        );
+    }
+
+    /// A discontinuity of the video is one of the audio at the same segment,
+    /// though the audio's file and sample entry do not change; a change of
+    /// the audio's sample entry is one too; an audio file that rotates
+    /// inside a video segment, or a video fragment without audio, is none.
+    #[test]
+    fn audio_discontinuities_follow_the_video_and_the_audio_sample_entry() {
+        let dir = tempfile::tempdir().expect("temporary directory");
+        // The second video file has other parameter sets.
+        let video = [
+            recording(dir.path(), 1, 1, &[0, 2_000, 4_000, 6_000], 180_000),
+            recording(dir.path(), 2, 2, &[8_000, 10_000], 180_000),
+        ];
+        let video_entries = own_entries(&video);
+        assert_eq!(
+            shape(&video_entries),
+            [
+                (1, 3, false, true),
+                (1, 1, false, false),
+                (2, 2, true, true)
+            ]
+        );
+        let audio = [recording(
+            dir.path(),
+            3,
+            7,
+            &[5, 2_005, 4_005, 6_005, 8_005, 10_005],
+            180_000,
+        )];
+        assert_eq!(
+            shape(&following_entries(&audio, &video_entries)),
+            [
+                (3, 3, false, true),
+                (3, 1, false, false),
+                (3, 2, true, false)
+            ]
+        );
+        // The audio rotates inside the first video segment and has nothing
+        // for the video fragment at four seconds; its second file has the
+        // same sample entry, and its third another.
+        let rotated = [
+            recording(dir.path(), 3, 7, &[5], 180_000),
+            recording(dir.path(), 4, 7, &[2_005, 6_005], 180_000),
+            recording(dir.path(), 5, 8, &[8_005, 10_005], 180_000),
+        ];
+        assert_eq!(
+            shape(&following_entries(&rotated, &video_entries)),
+            [
+                (3, 1, false, true),
+                (4, 1, false, true),
+                (4, 1, false, false),
+                (5, 2, true, true),
+            ]
+        );
+        // With the video continuous, the audio's sample entry alone decides.
+        let continuous = [recording(
+            dir.path(),
+            1,
+            1,
+            &[0, 2_000, 4_000, 6_000, 8_000, 10_000],
+            180_000,
+        )];
+        assert_eq!(
+            shape(&following_entries(&rotated, &own_entries(&continuous))),
+            [
+                (3, 1, false, true),
+                (4, 1, false, true),
+                (4, 1, false, false),
+                (5, 2, true, true),
+            ]
+        );
+        let playlist = audio_vod_playlist(
+            &audio,
+            &video,
+            &AuthContext::disabled(),
+            Duration::from_hours(1),
+        )
+        .unwrap();
+        let lines: Vec<&str> = playlist.lines().collect();
+        let at = lines
+            .iter()
+            .position(|line| *line == "#EXT-X-DISCONTINUITY")
+            .unwrap();
+        // Two segments precede it, and the file's map is not repeated.
+        assert_eq!(
+            lines[..at]
+                .iter()
+                .filter(|line| line.starts_with("#EXTINF"))
+                .count(),
+            2
+        );
+        assert_eq!(lines[at + 1], "#EXTINF:4.00000,");
+        assert_eq!(playlist.matches("#EXT-X-MAP").count(), 1);
+        assert_eq!(playlist.matches("#EXT-X-DISCONTINUITY").count(), 1);
+    }
+
+    /// The audio playlist takes the video's target duration: three audio
+    /// fragments of 6.016 s round to the video's six seconds, where the
+    /// audio's own playlist rounds up to seven.
+    #[test]
+    fn the_audio_playlist_has_the_target_duration_of_the_video() {
+        let dir = tempfile::tempdir().expect("temporary directory");
+        let video = [recording(dir.path(), 1, 1, &[0, 2_000, 4_000], 180_000)];
+        let audio = [recording(dir.path(), 3, 7, &[5, 2_010, 4_015], 180_480)];
+        let target = |playlist: &str| {
+            playlist
+                .lines()
+                .find_map(|line| line.strip_prefix("#EXT-X-TARGETDURATION:"))
+                .map(str::to_owned)
+        };
+        let auth = AuthContext::disabled();
+        let hour = Duration::from_hours(1);
+        let following = audio_vod_playlist(&audio, &video, &auth, hour).unwrap();
+        assert!(following.contains("#EXTINF:6.01600,\n"), "{following}");
+        assert_eq!(target(&following).as_deref(), Some("6"));
+        assert_eq!(
+            target(&vod_playlist(&video, &auth, hour).unwrap()).as_deref(),
+            Some("6")
+        );
+        assert_eq!(
+            target(&vod_playlist(&audio, &auth, hour).unwrap()).as_deref(),
+            Some("7")
+        );
+        // An audio segment that rounds above the video's target raises it.
+        let long = [recording(dir.path(), 3, 7, &[5, 2_010, 4_015], 200_000)];
+        let raised = audio_vod_playlist(&long, &video, &auth, hour).unwrap();
+        assert_eq!(target(&raised).as_deref(), Some("7"));
     }
 }

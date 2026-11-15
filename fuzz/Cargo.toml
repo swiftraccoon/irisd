@@ -12,6 +12,7 @@ cargo-fuzz = true
 
 [dependencies]
 anyhow = "1"
+bytes = "1.12"
 iris-core = { path = "../crates/iris-core" }
 iris-events = { path = "../crates/iris-events", features = ["fuzzing"] }
 iris-h265 = { path = "../crates/iris-h265" }
@@ -213,4 +214,11 @@ bench = false
 doc = false
 name = "vod_playlist"
 path = "fuzz_targets/vod_playlist.rs"
+test = false
+
+[[bin]]
+bench = false
+doc = false
+name = "live_fragment"
+path = "fuzz_targets/live_fragment.rs"
 test = false

@@ -18,6 +18,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
 use crate::live::{self, Feed};
+use crate::sound::{self, Medium, Pacer, Pairing};
 use crate::stage::{BranchEvent, Stage};
 
 /// Maximum queued bytes; exceeding it reconnects from an init segment and sync frame.
@@ -120,6 +121,38 @@ const BRANCH: &str = "appsrc name=src is-live=true stream-type=stream \
     ! qtdemux ! decodebin3 ! glupload ! glcolorconvert \
     ! gtk4paintablesink name=sink sync=false async=false";
 
+/// The branch of a picture that plays with the camera's sound: [`BRANCH`]
+/// with a pad after the demuxer (`shift`) where the frames' place on the
+/// clock is set (`crate::sound`). Its sink renders on decode, as the grid's
+/// do, until the sound's first frame arrives, and against the clock from
+/// then on. `max-lateness=-1` shows a late frame at once instead of dropping
+/// it: a feed starts with the frames since the last sync frame, which a
+/// decoder works through for some seconds, and a sink that dropped them
+/// would show nothing until it had.
+const HELD_BRANCH: &str = "appsrc name=src is-live=true stream-type=stream \
+    ! qtdemux ! identity name=shift ! decodebin3 ! glupload ! glcolorconvert \
+    ! gtk4paintablesink name=sink sync=false async=false max-lateness=-1";
+
+/// The branch that plays a camera's audio feed against the clock: on the
+/// default output, or into a sink that discards it when the viewer is muted
+/// ([`sound::silent`]). The output is chosen by `autoaudiosink`, a bin that
+/// handles its sink's wait for the first buffer itself, so the branch joins
+/// the running stage as the picture's does. The queue before the sink is
+/// where the branch can hold what an audio output's own latency asks for:
+/// without it the output reports that the branch cannot.
+fn sound_branch(silent: bool) -> String {
+    let sink = if silent {
+        "fakesink name=sink sync=true async=false"
+    } else {
+        "autoaudiosink name=sink sync=true async-handling=true"
+    };
+    format!(
+        "appsrc name=src is-live=true stream-type=stream \
+         ! qtdemux ! identity name=shift ! decodebin3 ! audioconvert ! audioresample \
+         ! queue ! {sink}"
+    )
+}
+
 /// What a feed asks of its tile.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TileEvent {
@@ -141,6 +174,8 @@ pub enum TileEvent {
 pub struct Source {
     src: gst_app::AppSrc,
     budget: Arc<LiveBudget>,
+    /// Told of every payload, when the feed plays against the clock.
+    pacer: Option<Pacer>,
 }
 
 impl Source {
@@ -168,6 +203,9 @@ impl Source {
             bytes: bytes.to_vec(),
             _reservation: reservation,
         });
+        if let Some(pacer) = &self.pacer {
+            pacer.payload(bytes);
+        }
         self.src
             .push_buffer(buffer)
             .map(|_| ())
@@ -176,6 +214,9 @@ impl Source {
 
     /// Prepares for a fresh byte stream (a reconnection): flushes what is queued.
     pub fn reset(&self) {
+        if let Some(pacer) = &self.pacer {
+            pacer.restart();
+        }
         let _ = self.src.send_event(gst::event::FlushStart::new());
         let _ = self
             .src
@@ -193,6 +234,7 @@ impl Source {
         Self {
             src,
             budget: LiveBudget::new(u64::from(DEFAULT_LIVE_BUDGET_MIB) << 20),
+            pacer: None,
         }
     }
 
@@ -217,6 +259,8 @@ fn oversized_label(name: &str, camera: &CameraId, retry_in: Duration) -> String 
 struct Running {
     bin: gst::Bin,
     feed: CancellationToken,
+    /// The branch and feed of the camera's sound, when the tile plays it.
+    sound: Option<(gst::Bin, CancellationToken)>,
 }
 
 /// A camera tile: a picture, a label, and, while started, a branch and feed.
@@ -289,16 +333,126 @@ impl Tile {
     /// the camera while video flows and the last branch error until it does
     /// again.
     pub fn start(&self, feed: Feed) -> anyhow::Result<()> {
-        self.stop();
-        let bin = gst::parse::bin_from_description(BRANCH, /* ghost_unlinked_pads */ false)
-            .context("building the tile branch")?;
+        self.start_branches(feed, None)
+    }
+
+    /// Starts the tile as [`Tile::start`] does and, beside it, the camera's
+    /// audio feed `sound`: once that feed delivers, sound and picture play
+    /// against one clock, [`sound::DELAY`] after they arrive. A camera
+    /// without audio shows its picture as [`Tile::start`] does.
+    pub fn start_with_sound(&self, feed: Feed, sound: Feed) -> anyhow::Result<()> {
+        self.start_branches(feed, Some(sound))
+    }
+
+    /// Builds one branch of the tile and its feed's input.
+    fn branch(description: &str) -> anyhow::Result<(gst::Bin, gst_app::AppSrc)> {
+        let bin =
+            gst::parse::bin_from_description(description, /* ghost_unlinked_pads */ false)
+                .context("building the tile branch")?;
         let src = bin
             .by_name("src")
             .and_then(|e| e.downcast::<gst_app::AppSrc>().ok())
             .context("appsrc missing")?;
         src.set_max_bytes(SOURCE_QUEUE_BYTES);
         src.set_property("max-buffers", SOURCE_QUEUE_BUFFERS);
+        Ok((bin, src))
+    }
+
+    /// The pad of a branch where its frames' place on the clock is set.
+    fn shift_pad(bin: &gst::Bin) -> anyhow::Result<gst::Pad> {
+        bin.by_name("shift")
+            .and_then(|shift| shift.static_pad("src"))
+            .context("shift pad missing")
+    }
+
+    /// Adds the branch of the camera's sound to the stage and starts its
+    /// feed; the branch restarts with each of the feed's sessions.
+    fn start_sound(
+        &self,
+        feed: Feed,
+        pairing: &Arc<Pairing>,
+    ) -> anyhow::Result<(gst::Bin, CancellationToken)> {
+        let (bin, src) = Self::branch(&sound_branch(sound::silent()))?;
+        let pacer = pairing.pacer(Medium::Sound, Self::shift_pad(&bin)?);
+        let (branch_tx, branch_rx) = async_channel::unbounded::<BranchEvent>();
+        self.stage
+            .add(&format!("sound-{}", self.camera), &bin, branch_tx)?;
+        glib::spawn_future_local({
+            let camera = self.camera.clone();
+            async move {
+                while let Ok(event) = branch_rx.recv().await {
+                    if let BranchEvent::Error(text) = event {
+                        warn!(camera = %camera, error = %text, "sound branch error");
+                    }
+                }
+            }
+        });
+        let cancel = CancellationToken::new();
+        let (events_tx, events_rx) = async_channel::unbounded::<TileEvent>();
+        self.runtime.spawn(live::run(
+            feed,
+            Source {
+                src,
+                budget: Arc::clone(&self.budget),
+                pacer: Some(pacer),
+            },
+            events_tx,
+            cancel.clone(),
+        ));
+        glib::spawn_future_local({
+            let bin = bin.clone();
+            let camera = self.camera.clone();
+            async move {
+                while let Ok(event) = events_rx.recv().await {
+                    if event == TileEvent::Restart
+                        && let Err(error) = Stage::restart(&bin)
+                    {
+                        warn!(
+                            camera = %camera,
+                            error = %format!("{error:#}"),
+                            "sound branch restart failed"
+                        );
+                    }
+                }
+            }
+        });
+        Ok((bin, cancel))
+    }
+
+    /// Pairs the picture branch `bin` with the camera's sound: starts the
+    /// sound's branch and feed, and returns the picture's pacer with them.
+    /// The picture's `sink` renders against the clock from the sound's
+    /// first frame on.
+    fn pair_with_sound(
+        &self,
+        bin: &gst::Bin,
+        sink: &gst::Element,
+        sound: Feed,
+    ) -> anyhow::Result<(Pacer, (gst::Bin, CancellationToken))> {
+        let pairing = Pairing::new(self.stage.pipeline(), {
+            let sink = sink.clone();
+            let camera = self.camera.clone();
+            move || {
+                info!(camera = %camera, "playing with sound");
+                sink.set_property("sync", true);
+            }
+        });
+        let pacer = pairing.pacer(Medium::Picture, Self::shift_pad(bin)?);
+        Ok((pacer, self.start_sound(sound, &pairing)?))
+    }
+
+    fn start_branches(&self, feed: Feed, sound: Option<Feed>) -> anyhow::Result<()> {
+        self.stop();
+        let description = if sound.is_some() { HELD_BRANCH } else { BRANCH };
+        let (bin, src) = Self::branch(description)?;
         let sink = bin.by_name("sink").context("sink missing")?;
+        let (pacer, sound_running) = match sound {
+            Some(sound) => {
+                let (pacer, running) = self.pair_with_sound(&bin, &sink, sound)?;
+                (Some(pacer), Some(running))
+            }
+            None => (None, None),
+        };
         let paintable = sink.property::<gdk::Paintable>("paintable");
         self.picture.set_paintable(Some(&paintable));
         self.label
@@ -349,6 +503,7 @@ impl Tile {
             Source {
                 src,
                 budget: Arc::clone(&self.budget),
+                pacer,
             },
             events_tx,
             cancel.clone(),
@@ -382,7 +537,11 @@ impl Tile {
                 }
             }
         });
-        *self.running.borrow_mut() = Some(Running { bin, feed: cancel });
+        *self.running.borrow_mut() = Some(Running {
+            bin,
+            feed: cancel,
+            sound: sound_running,
+        });
         Ok(())
     }
 
@@ -398,6 +557,15 @@ impl Tile {
         self.running.borrow().is_some()
     }
 
+    /// Whether the tile runs a branch and feed for the camera's sound.
+    #[cfg(test)]
+    pub(crate) fn has_sound(&self) -> bool {
+        self.running
+            .borrow()
+            .as_ref()
+            .is_some_and(|running| running.sound.is_some())
+    }
+
     /// The text under the picture.
     #[cfg(test)]
     pub(crate) fn label_text(&self) -> String {
@@ -409,6 +577,10 @@ impl Tile {
         if let Some(running) = self.running.borrow_mut().take() {
             running.feed.cancel();
             self.stage.remove(&running.bin);
+            if let Some((bin, feed)) = running.sound {
+                feed.cancel();
+                self.stage.remove(&bin);
+            }
         }
     }
 }
@@ -435,6 +607,72 @@ mod tests {
         );
     }
 
+    /// Both sound branches build: into the output `autoaudiosink` chooses,
+    /// and into the sink that discards. Each has the pad where the frames
+    /// are placed on the clock, a queue before the sink, and a sink that
+    /// plays against the clock.
+    #[test]
+    #[ignore = "requires GStreamer's demuxer and audio elements; `just display-test` runs it"]
+    fn both_sound_branches_build() {
+        gst::init().unwrap();
+        for silent in [true, false] {
+            let description = sound_branch(silent);
+            assert!(description.contains("! queue ! "), "{description}");
+            let (bin, _src) = Tile::branch(&description).unwrap();
+            Tile::shift_pad(&bin).unwrap();
+            let sink = bin.by_name("sink").unwrap();
+            assert!(sink.property::<bool>("sync"), "{description}");
+            let factory = sink.factory().unwrap().name();
+            assert_eq!(factory, if silent { "fakesink" } else { "autoaudiosink" });
+        }
+    }
+
+    /// A source that plays against the clock tells its pacer of every
+    /// payload before it is queued, and of a fresh byte stream: the feed's
+    /// first fragment places it, and after a reset the next one does again.
+    #[test]
+    fn a_source_tells_its_pacer_of_payloads_and_of_a_fresh_stream() {
+        gst::init().unwrap();
+        let pipeline = gst::Pipeline::new();
+        pipeline.set_state(gst::State::Playing).unwrap();
+        let (_, state, _) = pipeline.state(gst::ClockTime::from_seconds(5));
+        assert_eq!(state, gst::State::Playing);
+        let pairing = Pairing::new(&pipeline, || {});
+        let pad = gst::Pad::builder(gst::PadDirection::Src).build();
+        let source = Source {
+            src: gst_app::AppSrc::builder()
+                .max_bytes(SOURCE_QUEUE_BYTES)
+                .build(),
+            budget: LiveBudget::new(u64::MAX),
+            pacer: Some(pairing.pacer(Medium::Sound, pad.clone())),
+        };
+        // A live fragment starts with a `prft` box that holds its media time.
+        let fragment = |ticks: u64| {
+            let mut bytes = Vec::new();
+            bytes.extend_from_slice(&32_u32.to_be_bytes());
+            bytes.extend_from_slice(b"prft");
+            bytes.extend_from_slice(&[1, 0, 0, 0x18, 0, 0, 0, 1]);
+            bytes.extend_from_slice(&0_u64.to_be_bytes());
+            bytes.extend_from_slice(&ticks.to_be_bytes());
+            bytes
+        };
+        let delay = i64::try_from(sound::DELAY.as_nanos()).unwrap();
+        source.push(&fragment(90_000_000)).unwrap();
+        let first = pad.offset();
+        assert!(first >= delay, "placed {first} ns in");
+        std::thread::sleep(Duration::from_millis(40));
+        source.push(&fragment(90_003_600)).unwrap();
+        assert!(
+            (pad.offset() - first).abs() < 5_000_000,
+            "the estimate held"
+        );
+        // A fresh byte stream, on another run's timeline.
+        source.reset();
+        source.push(&fragment(9_000)).unwrap();
+        assert!(pad.offset() >= first + 30_000_000, "placed anew");
+        pipeline.set_state(gst::State::Null).unwrap();
+    }
+
     #[test]
     fn a_stalled_source_rejects_payloads_beyond_the_byte_limit() {
         gst::init().unwrap();
@@ -443,6 +681,7 @@ mod tests {
                 .max_bytes(SOURCE_QUEUE_BYTES)
                 .build(),
             budget: LiveBudget::new(u64::MAX),
+            pacer: None,
         };
         let payload = vec![0; 1 << 20];
         for _ in 0..16 {
@@ -458,6 +697,7 @@ mod tests {
                 .max_bytes(SOURCE_QUEUE_BYTES)
                 .build(),
             budget: Arc::clone(budget),
+            pacer: None,
         }
     }
 
@@ -505,6 +745,7 @@ mod tests {
         let source = Source {
             src: gst_app::AppSrc::builder().build(),
             budget: LiveBudget::new(u64::MAX),
+            pacer: None,
         };
         assert!(
             source
@@ -524,6 +765,7 @@ mod tests {
         let source = Source {
             src,
             budget: LiveBudget::new(u64::MAX),
+            pacer: None,
         };
         assert_eq!(
             source.src.property::<u64>("max-buffers"),

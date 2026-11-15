@@ -446,7 +446,7 @@ mod tests {
     use bytes::Bytes;
     use iris_core::id::StreamKind;
     use iris_core::time::WallUs;
-    use iris_mp4::fragment::Sample;
+    use iris_mp4::fragment::{FrameSteps, Sample};
     use iris_mp4::init::SampleEntry;
     use iris_mp4::reader::{ScanOptions, scan};
     use std::fs::{self, File};
@@ -477,6 +477,7 @@ mod tests {
             wall: WallUs::new(1_700_000_000_000_000 + i64::try_from(index).unwrap() * 1_000_000),
             raw_rtp: 0,
             new_run: false,
+            steps: FrameSteps::default(),
             sample_entry: Arc::new(SampleEntry::new(
                 Bytes::from_static(b"\0\0\0\x10hvc1\0\0\0\0\0\0\0\0"),
                 "hvc1".into(),

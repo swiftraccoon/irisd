@@ -271,7 +271,7 @@ impl SegmentFile {
     /// `fdatasync`s data and index when the next sync is due and the file is
     /// dirty. The due time advances by `interval` whether or not a sync ran,
     /// so each stream keeps the phase it was given at creation; a sync that
-    /// finishes after the next due time pushes it to now.
+    /// finishes after the next due time pushes it to `now`.
     pub(crate) fn maybe_sync(&mut self, now: Instant, interval: Duration) -> io::Result<bool> {
         if let Some(error) = self.post_write_error.take() {
             return Err(error);
@@ -902,7 +902,7 @@ mod tests {
     #[test]
     fn completed_media_is_acknowledged_before_a_preallocation_failure() {
         use bytes::Bytes;
-        use iris_mp4::fragment::Sample;
+        use iris_mp4::fragment::{FrameSteps, Sample};
         use iris_mp4::init::{SampleEntry, build_init_segment};
         use iris_mp4::reader::{self, ScanOptions};
         use std::sync::Arc;
@@ -934,6 +934,7 @@ mod tests {
             wall: header().start_wall,
             raw_rtp: 0,
             new_run: true,
+            steps: FrameSteps::default(),
             sample_entry: entry,
         };
         let written = segment.write_fragment_with(&fragment, 1, 0, |_| {
@@ -964,7 +965,7 @@ mod tests {
     #[test]
     fn preallocation_stays_ahead_of_fragments_larger_than_the_reservation() {
         use bytes::Bytes;
-        use iris_mp4::fragment::Sample;
+        use iris_mp4::fragment::{FrameSteps, Sample};
         use iris_mp4::init::{SampleEntry, build_init_segment};
 
         let dir = tempfile::tempdir().unwrap();
@@ -995,6 +996,7 @@ mod tests {
                 wall: header().start_wall,
                 raw_rtp: 0,
                 new_run: sequence == 1,
+                steps: FrameSteps::default(),
                 sample_entry: Arc::clone(&entry),
             };
             segment.write_fragment(&fragment, sequence, 0).unwrap();

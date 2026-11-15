@@ -1,20 +1,21 @@
 //! `irisd`: an H.265 network video recorder whose record path never decodes.
 //!
-//! The binary has six subcommands. `run` is the daemon: it records every
+//! The binary has seven subcommands. `run` is the daemon: it records every
 //! configured camera stream into fragmented MP4 files, keeps the SQLite
 //! catalog, serves the HTTP API, subscribes to camera events, enforces
 //! retention, checks its own recordings, and reports to systemd. The others
 //! work offline: `record` ingests to disk without the catalog or API,
-//! `inspect` scans a recording, `recover` truncates one at its last valid
-//! fragment, `hls` writes static byte-range playlists, and `serve` is a
-//! range-capable file server for playback tests.
+//! `inspect` scans a recording, `clocks` reads how far the clocks of
+//! recordings have parted from their sidecars, `recover` truncates a
+//! recording at its last valid fragment, `hls` writes static byte-range
+//! playlists, and `serve` is a range-capable file server for playback tests.
 //!
 //! # Modules
 //!
 //! - `run` — the daemon: start-up, task spawning, run-time camera
 //!   provisioning, the monitor loop that logs statistics, pings the watchdog,
 //!   runs retention and the self-check, and the ordered shutdown.
-//! - `record`, `inspect`, `recover`, `hls`, `serve` — the offline subcommands.
+//! - `record`, `inspect`, `clocks`, `recover`, `hls`, `serve` — the offline subcommands.
 //! - `adopt` — start-up reconciliation of the catalog with the files on disk.
 //! - `catalog_observer` — store notifications and camera events into the catalog.
 //! - `retention` — the retention pass: free-space floor, size quota, age limits,
@@ -45,6 +46,7 @@
 mod adopt;
 mod capability;
 mod catalog_observer;
+mod clocks;
 mod hls;
 mod inspect;
 mod permissions;
@@ -82,6 +84,8 @@ enum Command {
     Record(record::Args),
     /// Scan a recording and report its structure and timing.
     Inspect(inspect::Args),
+    /// Report from a stream's sidecars how far its clocks parted over each run.
+    Clocks(clocks::Args),
     /// Truncate a recording at its last valid fragment and rebuild its index.
     Recover(recover::Args),
     /// Write static HLS playlists (byte ranges) for one recording.
@@ -125,6 +129,7 @@ async fn main() -> anyhow::Result<()> {
         Command::Run(args) => run::run(args).await,
         Command::Record(args) => record::run(args).await,
         Command::Inspect(args) => inspect::run(&args),
+        Command::Clocks(args) => clocks::run(&args),
         Command::Recover(args) => recover::run(&args),
         Command::Hls(args) => hls::run(&args),
         Command::Serve(args) => serve::run(args).await,

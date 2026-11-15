@@ -10,6 +10,7 @@ use anyhow::{Context, bail};
 use clap::Parser;
 use iris_core::time::TIMESCALE;
 use iris_replay::media::Media;
+use iris_replay::rtp::RtpTimestamp;
 use iris_replay::rtsp::MountName;
 use iris_replay::server::{DEFAULT_MAX_CONNECTIONS, Delivery, Mounts, Options, Server};
 use iris_replay::synth::{self, Plan};
@@ -66,6 +67,10 @@ struct Args {
         value_name = "DURATION"
     )]
     stall_for: Duration,
+    /// RTP timestamp of each session's first frame, instead of a drawn one;
+    /// a value just below 4294967296 puts the 32-bit wrap inside the stream.
+    #[arg(long, value_name = "TICKS")]
+    base_rtp: Option<u32>,
     /// Write each access unit with one system call (cameras write per packet).
     #[arg(long, conflicts_with = "pace")]
     burst: bool,
@@ -75,6 +80,21 @@ struct Args {
 }
 
 impl Args {
+    /// The server options the arguments select.
+    fn options(&self) -> anyhow::Result<Options> {
+        Ok(Options {
+            mtu: self.mtu,
+            repeat: !self.once,
+            drop_every: self.drop_every,
+            stall_after: self.stall_after,
+            stall_for: self.stall_for,
+            delivery: self.delivery(),
+            base_rtp: self.base_rtp.map(RtpTimestamp::new),
+            max_connections: usize::try_from(self.max_connections)?,
+            ..Options::default()
+        })
+    }
+
     /// The delivery `--burst` and `--pace` select; clap refuses both together.
     fn delivery(&self) -> Delivery {
         if self.burst {
@@ -119,16 +139,7 @@ fn main() -> anyhow::Result<()> {
     // Recordings load and synthesize before the runtime starts, so no task
     // waits behind the reads.
     let mounts = load_mounts(&args)?;
-    let options = Options {
-        mtu: args.mtu,
-        repeat: !args.once,
-        drop_every: args.drop_every,
-        stall_after: args.stall_after,
-        stall_for: args.stall_for,
-        delivery: args.delivery(),
-        max_connections: usize::try_from(args.max_connections)?,
-        ..Options::default()
-    };
+    let options = args.options()?;
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -271,6 +282,77 @@ mod tests {
         assert_eq!(delivery("--burst"), Delivery::Burst);
         assert_eq!(delivery("--pace"), Delivery::Paced);
         assert_eq!(delivery("--once"), Delivery::PerPacket);
+    }
+
+    #[test]
+    fn every_argument_reaches_the_server_options() {
+        let defaults = Args::try_parse_from(["iris-replay"])
+            .unwrap()
+            .options()
+            .unwrap();
+        assert!(defaults.repeat);
+        assert_eq!(
+            (defaults.mtu, defaults.drop_every, defaults.stall_after),
+            (1_400, None, None)
+        );
+        assert_eq!(defaults.stall_for, Duration::from_secs(10));
+        assert_eq!(
+            (defaults.delivery, defaults.max_connections),
+            (Delivery::PerPacket, 256)
+        );
+        assert_eq!(defaults.base_rtp, None);
+
+        let chosen = Args::try_parse_from([
+            "iris-replay",
+            "--mtu=1000",
+            "--once",
+            "--drop-every=5",
+            "--stall-after=2s",
+            "--stall-for=3s",
+            "--pace",
+            "--max-connections=7",
+            "--base-rtp=4294960000",
+        ])
+        .unwrap()
+        .options()
+        .unwrap();
+        assert!(!chosen.repeat);
+        assert_eq!(chosen.base_rtp, Some(RtpTimestamp::new(4_294_960_000)));
+        assert_eq!(
+            (chosen.mtu, chosen.drop_every, chosen.max_connections),
+            (1_000, NonZeroU64::new(5), 7)
+        );
+        assert_eq!(
+            (chosen.stall_after, chosen.stall_for, chosen.delivery),
+            (
+                Some(Duration::from_secs(2)),
+                Duration::from_secs(3),
+                Delivery::Paced
+            )
+        );
+    }
+
+    #[test]
+    fn a_synthetic_mount_has_the_number_of_gops_asked_for() {
+        let args =
+            Args::try_parse_from(["iris-replay", "--synth", "two=2", "--synth", "one=1"]).unwrap();
+        let mounts = load_mounts(&args).unwrap();
+        let frames = |name: &str| mounts.get(name).unwrap().frames().len();
+        assert_eq!((frames("one"), frames("two")), (60, 120));
+        let none = Args::try_parse_from(["iris-replay"]).unwrap();
+        assert!(
+            load_mounts(&none)
+                .unwrap_err()
+                .to_string()
+                .contains("no mounts")
+        );
+        let bad = Args::try_parse_from(["iris-replay", "--synth", "a=many"]).unwrap();
+        assert!(
+            load_mounts(&bad)
+                .unwrap_err()
+                .to_string()
+                .contains("bad GOP count")
+        );
     }
 
     #[test]

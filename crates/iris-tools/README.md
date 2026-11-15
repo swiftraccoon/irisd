@@ -160,7 +160,10 @@ into its private root.
   [--hostname HOST] [--dry-run]` — commits the difference between the remote branch head and
   the pinned local `HEAD` through the GitHub GraphQL API (`createCommitOnBranch`, through
   `gh`), so GitHub signs the commit. Each run first plans, changing no branch and no recovery
-  state; `--dry-run` prints what it would publish, recover, or adopt and stops there. Before
+  state; `--dry-run` prints what it would publish, recover, or adopt and stops there. A
+  publication first holds the headline and body to the commit rules of `standards`, against
+  every path and lockfile package the commit will hold, and publishes nothing when a finding
+  stands; `--dry-run` reports the findings too. Before
   adopting a published commit, the tool requires the mutation's answer to show a valid
   signature made by GitHub, exactly one parent equal to the remote head it built on, and the
   requested headline and body; a published commit that fails is reported as published but not
@@ -176,6 +179,18 @@ into its private root.
   until local adoption completes. The working tree and submodules must be clean: commit
   locally first, then publish. The API builds on the remote head, so a root commit cannot be
   made this way.
+- `iris-tools standards tree | commits RANGE [--lenient] | message FILE | hooks` — the rules of
+  `STANDARDS.md` and the root `AGENTS.md` that a program can decide (`STANDARDS.md` §1 lists
+  them). `tree` reads every file git tracks or would track, so a breach is found before it is
+  staged; `commits` reads each commit of a range, its message and the paths and lockfile
+  packages it changes; `message` reads the message of the commit being made against what is
+  staged, for the `commit-msg` hook; `hooks` writes that hook and a `pre-commit` hook that
+  runs `tree` into the clone's git directory, and leaves a hook of another content alone. Each
+  check prints one line a finding, as a compiler does
+  (`path:line: [rule] what is wrong`), and exits non-zero when one stands. `--lenient` prints
+  what a message fails to say of its change as notes and fails only on a message's form.
+  `standards.toml` at the repository's root holds the accepted exceptions; the gitignored
+  `docs/local/denylist.txt` holds, one a line, the names no committed file may hold.
 
 ## How it is used
 
@@ -237,7 +252,9 @@ versions, write amplification over matched intervals), benchmark root/config/clo
 the perf command line, sampler directory modes and the authenticated metrics scrape,
 passwords read from the environment and redacted from `Debug`, metadata output refusing links
 and FIFOs, the `onvif-call` operation check and WS-Security digest, GitHub target/mode
-parsing, the gh-commit plan, signature, parent, and message checks, and the probe's receive
+parsing, the gh-commit plan, signature, parent, and message checks, every rule of `standards`
+with a text that breaks it and texts that must pass, its tree, range, and message modes
+against a git repository made for the test, and the probe's receive
 path end to end against `iris-replay` on loopback, a clean end at the deadline and a stall
 included. Two libFuzzer targets include the parser files by path: `tools_protocol` (the
 probes' camera-facing parsers) and `tools_logs` (the log parsers). Measured results are in

@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use iris_core::time::WallUs;
-use iris_mp4::fragment::{Fragment, Sample};
+use iris_mp4::fragment::{Fragment, FrameSteps, Sample};
 use iris_mp4::init::SampleEntry;
 
 use crate::regularize::{FALLBACK_NOMINAL, Regularizer};
@@ -17,14 +17,25 @@ const MAX_PENDING_BYTES: usize = 64 * 1_024 * 1_024;
 /// Maximum upward movement of the wall-minus-media anchor, in parts per million.
 const WALL_ANCHOR_UPWARD_PPM: i64 = 500;
 
+/// Where a stream's media time sits on the recorder's clock: wall time less
+/// media time by the least-delayed frame, which takes a lower candidate at
+/// once and rises by at most 500 ppm of the media time passed.
 #[derive(Debug)]
-struct WallAnchor {
+pub(crate) struct WallAnchor {
     offset_us: i64,
     media_ticks: u64,
 }
 
 impl WallAnchor {
-    fn update(&mut self, candidate_us: i64, media_ticks: u64) {
+    /// An anchor from its first candidate, taken at `media_ticks`.
+    pub(crate) fn new(offset_us: i64, media_ticks: u64) -> Self {
+        Self {
+            offset_us,
+            media_ticks,
+        }
+    }
+
+    pub(crate) fn update(&mut self, candidate_us: i64, media_ticks: u64) {
         if candidate_us <= self.offset_us {
             self.offset_us = candidate_us;
         } else {
@@ -36,7 +47,7 @@ impl WallAnchor {
         self.media_ticks = media_ticks;
     }
 
-    fn wall_at(&self, media_ticks: u64) -> WallUs {
+    pub(crate) fn wall_at(&self, media_ticks: u64) -> WallUs {
         WallUs::new(self.offset_us.saturating_add(ticks_to_micros(media_ticks)))
     }
 }
@@ -326,6 +337,7 @@ impl FragmentAssembler {
             wall,
             raw_rtp,
             new_run: self.new_run,
+            steps: FrameSteps::default(),
             sample_entry: Arc::clone(&self.pending_entry),
         };
         self.decode_time += total;
@@ -521,9 +533,8 @@ mod tests {
 
     /// A camera that drops a frame and a half in every hundred, so often
     /// that the typical frame sits in a fragment running more than 1 % long:
-    /// the delivered rate takes over and lags when the drops stop, and the
-    /// timeline stays within the 500 ms snap tolerance and one fragment's
-    /// 1 % correction.
+    /// the drops are holds at the declared rate, and the timeline stays
+    /// within the 500 ms snap tolerance and one fragment's 1 % correction.
     #[test]
     fn a_camera_dropping_many_frames_stays_within_the_snap_tolerance() {
         for seed in 1..=200 {

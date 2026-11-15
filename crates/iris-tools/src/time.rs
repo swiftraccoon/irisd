@@ -214,6 +214,63 @@ mod tests {
         }
     }
 
+    /// Each separator is checked on its own, and so is the offset's colon.
+    #[test]
+    fn one_wrong_separator_is_enough_to_reject() {
+        for invalid in [
+            "2026/11-02T01:44:23Z",
+            "2026-11/02T01:44:23Z",
+            "2026-11-02T01.44:23Z",
+            "2026-11-02T01:44.23Z",
+            "2026-11-02T01:44:23+02x00",
+            "2026-11-02T01:44:23+00:60",
+            "2026-04-31T00:00:00Z",
+            "2026-06-31T00:00:00Z",
+            "2026-09-31T00:00:00Z",
+            "2026-11-31T00:00:00Z",
+            "1900-02-29T00:00:00Z",
+            "2100-02-29T00:00:00Z",
+        ] {
+            assert_eq!(parse_seconds(invalid), None, "{invalid}");
+        }
+    }
+
+    #[test]
+    fn the_largest_field_values_parse_to_known_instants() {
+        assert_eq!(parse_seconds("1970-01-01T23:59:59Z"), Some(86_399.0));
+        assert_eq!(parse_seconds("1970-01-02T00:00:00+23:59"), Some(60.0));
+        assert_eq!(parse_seconds("1970-01-01T00:00:00-23:59"), Some(86_340.0));
+        assert_eq!(
+            parse_seconds("2000-02-29T00:00:00Z"),
+            Some(11_016.0 * 86_400.0)
+        );
+        assert_eq!(parse_seconds("1969-12-31T00:00:00Z"), Some(-86_400.0));
+    }
+
+    /// Every day of eight centuries formats to the date that parses back to
+    /// it, one day after the date before.
+    #[test]
+    fn every_day_formats_to_the_date_that_parses_back() {
+        let mut previous = civil_from_days(-150_001);
+        for day in -150_000_i64..150_000 {
+            let seconds = (day * 86_400) as f64;
+            let text = iso(seconds);
+            assert_eq!(parse_seconds(&text), Some(seconds), "{text}");
+            let (y, m, d) = civil_from_days(day);
+            assert!(
+                (y, m, d) > previous && (d == 1 || (y, m, d - 1) == previous),
+                "{text} after {previous:?}"
+            );
+            previous = (y, m, d);
+        }
+        assert_eq!(iso(-150_000.0 * 86_400.0), "1559-04-26T00:00:00Z");
+    }
+
+    #[test]
+    fn the_clock_reads_after_2023() {
+        assert!(now() > 1.7e9);
+    }
+
     #[test]
     fn iso_rounds_down_to_the_whole_second() {
         assert_eq!(iso(0.999), "1970-01-01T00:00:00Z");

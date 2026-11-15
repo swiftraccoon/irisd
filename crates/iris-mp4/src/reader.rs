@@ -38,6 +38,9 @@ pub struct FragmentInfo {
     pub payload_offset: u64,
     /// `mfhd` sequence number.
     pub sequence: u32,
+    /// The track the fragment belongs to, from its `tfhd`: 1 in a recording,
+    /// and 2 for the audio of an export with two tracks.
+    pub track_id: u32,
     /// `tfdt` decode time in 90 kHz ticks.
     pub decode_time: u64,
     /// Sum of sample durations in 90 kHz ticks.
@@ -46,6 +49,8 @@ pub struct FragmentInfo {
     pub sample_count: u16,
     /// Whether the first sample is a sync sample.
     pub starts_with_sync: bool,
+    /// Whether every sample is a sync sample, as in an audio fragment.
+    pub all_sync: bool,
     /// Wall time from `prft`, if present.
     pub wall: Option<WallUs>,
     /// Per-sample durations, when requested.
@@ -389,10 +394,12 @@ fn fragment_at<R: Read + Seek>(
         len: u32::try_from(end - start).expect("the trailer's length field matched"),
         payload_offset,
         sequence: parsed.sequence,
+        track_id: parsed.track_id,
         decode_time: parsed.decode_time,
         duration: parsed.total_duration,
         sample_count: parsed.sample_count,
         starts_with_sync: parsed.starts_with_sync,
+        all_sync: parsed.all_sync,
         wall,
         sample_durations: parsed.durations,
         sample_sizes: parsed.sizes,
@@ -603,10 +610,12 @@ pub fn parse_fragment(buf: &[u8]) -> Option<FragmentInfo> {
         len: trailer.fragment_len,
         payload_offset: payload_offset as u64,
         sequence: parsed.sequence,
+        track_id: parsed.track_id,
         decode_time: parsed.decode_time,
         duration: parsed.total_duration,
         sample_count: parsed.sample_count,
         starts_with_sync: parsed.starts_with_sync,
+        all_sync: parsed.all_sync,
         wall,
         sample_durations: parsed.durations,
         sample_sizes: parsed.sizes,
@@ -616,11 +625,13 @@ pub fn parse_fragment(buf: &[u8]) -> Option<FragmentInfo> {
 struct ParsedMoof {
     data_offset: i32,
     sequence: u32,
+    track_id: u32,
     decode_time: u64,
     total_duration: u32,
     total_size: u64,
     sample_count: u16,
     starts_with_sync: bool,
+    all_sync: bool,
     durations: Vec<u32>,
     sizes: Vec<u32>,
 }
@@ -630,6 +641,9 @@ struct Trun {
     data_offset: i32,
     /// The flags of the first sample, from `first_sample_flags` or the table.
     first_flags: Option<u32>,
+    /// Whether every sample after the first is a sync sample, when the table
+    /// carries flags for each sample; `None` when the `tfhd` default applies.
+    later_sync: Option<bool>,
     total_duration: u32,
     total_size: u64,
     sample_count: u16,
@@ -691,7 +705,7 @@ fn parse_moof(body: &[u8], collect_samples: bool) -> Result<ParsedMoof, &'static
             _ => {}
         }
     }
-    let default_flags = tfhd.ok_or("tfhd missing")?;
+    let (track_id, default_flags) = tfhd.ok_or("tfhd missing")?;
     let trun = trun.ok_or("trun missing")?;
     // irisd writes a tfhd default, so a fragment without any sample flags is
     // not one of its own; the `trex` default is not consulted.
@@ -699,27 +713,34 @@ fn parse_moof(body: &[u8], collect_samples: bool) -> Result<ParsedMoof, &'static
         .first_flags
         .or(default_flags)
         .ok_or("sample flags missing")?;
+    let starts_with_sync = first_flags & SAMPLE_IS_NON_SYNC == 0;
+    let later_sync = trun
+        .later_sync
+        .unwrap_or(default_flags.is_some_and(|flags| flags & SAMPLE_IS_NON_SYNC == 0));
     Ok(ParsedMoof {
         data_offset: trun.data_offset,
         sequence: sequence.ok_or("mfhd missing")?,
+        track_id,
         decode_time: decode_time.ok_or("tfdt missing")?,
         total_duration: trun.total_duration,
         total_size: trun.total_size,
         sample_count: trun.sample_count,
-        starts_with_sync: first_flags & SAMPLE_IS_NON_SYNC == 0,
+        starts_with_sync,
+        all_sync: starts_with_sync && (trun.sample_count == 1 || later_sync),
         durations: trun.durations,
         sizes: trun.sizes,
     })
 }
 
 /// Parses a `tfhd` body: requires `default-base-is-moof` without a base data
-/// offset, and returns the default sample flags when declared. Every declared
-/// field must fit.
-fn parse_tfhd(body: &[u8]) -> Result<Option<u32>, &'static str> {
+/// offset, and returns the track id and the default sample flags when
+/// declared. Every declared field must fit.
+fn parse_tfhd(body: &[u8]) -> Result<(u32, Option<u32>), &'static str> {
     let flags = be_u32(body, 0).ok_or("short tfhd")? & 0x00ff_ffff;
     if flags & TFHD_DEFAULT_BASE_IS_MOOF == 0 || flags & TFHD_BASE_DATA_OFFSET_PRESENT != 0 {
         return Err("unsupported trun data base");
     }
+    let track_id = be_u32(body, 4).ok_or("short tfhd")?;
     let mut pos = 8; // version/flags, track_ID
     for optional in [
         TFHD_SAMPLE_DESCRIPTION_INDEX_PRESENT,
@@ -740,7 +761,7 @@ fn parse_tfhd(body: &[u8]) -> Result<Option<u32>, &'static str> {
     if body.len() < pos {
         return Err("tfhd truncated");
     }
-    Ok(default_flags)
+    Ok((track_id, default_flags))
 }
 
 /// The decode time of a `tfdt` body, 64 bits in version 1 and 32 in version 0.
@@ -768,6 +789,7 @@ fn parse_trun(body: &[u8], collect_samples: bool) -> Result<Trun, &'static str> 
     let data_offset = be_u32(body, pos).ok_or("trun truncated")? as i32;
     pos += 4;
     let mut first_flags = None;
+    let mut later_sync = (flags & TRUN_SAMPLE_FLAGS_PRESENT != 0).then_some(true);
     if flags & TRUN_FIRST_SAMPLE_FLAGS_PRESENT != 0 {
         first_flags = Some(be_u32(body, pos).ok_or("trun truncated")?);
         pos += 4;
@@ -789,6 +811,9 @@ fn parse_trun(body: &[u8], collect_samples: bool) -> Result<Trun, &'static str> 
             if index == 0 && first_flags.is_none() {
                 first_flags = Some(sample_flags);
             }
+            if index > 0 && sample_flags & SAMPLE_IS_NON_SYNC != 0 {
+                later_sync = Some(false);
+            }
             pos += 4;
         }
         if flags & TRUN_COMPOSITION_OFFSETS_PRESENT != 0 {
@@ -807,6 +832,7 @@ fn parse_trun(body: &[u8], collect_samples: bool) -> Result<Trun, &'static str> 
     Ok(Trun {
         data_offset,
         first_flags,
+        later_sync,
         total_duration,
         total_size,
         sample_count,
@@ -1314,6 +1340,8 @@ mod tests {
                 assert_fragment_accepted(&bytes);
                 let info = parse_fragment(&bytes).unwrap();
                 assert_eq!(info.starts_with_sync, sync, "tfhd flags {optional:#x}");
+                // The default covers every sample of the table.
+                assert_eq!(info.all_sync, sync, "tfhd flags {optional:#x}");
                 assert_eq!(info.decode_time, 7_000);
                 assert_eq!(info.sequence, 9);
             }
@@ -1368,6 +1396,7 @@ mod tests {
                 assert_fragment_accepted(&bytes);
                 let info = parse_fragment(&bytes).unwrap();
                 assert_eq!(info.starts_with_sync, sync, "trun flags {extra:#x}");
+                assert!(!info.all_sync, "the third sample is not a sync sample");
                 assert_eq!(info.sample_durations, [3000, 2990, 3010]);
                 assert_eq!(info.sample_sizes, [6, 7, 5]);
                 assert_eq!(info.duration, 9000);
@@ -1381,6 +1410,38 @@ mod tests {
             ..ForeignLayout::default()
         });
         assert!(!parse_fragment(&bytes).unwrap().starts_with_sync);
+        // Flags in the table decide for the later samples, over the default;
+        // a lone sample is all of its fragment.
+        for (later, default_flags, all) in [
+            (SYNC_SAMPLE_FLAGS, NON_SYNC_SAMPLE_FLAGS, true),
+            (NON_SYNC_SAMPLE_FLAGS, SYNC_SAMPLE_FLAGS, false),
+        ] {
+            let bytes = foreign_fragment(ForeignLayout {
+                tfhd_flags: TFHD_DEFAULT_SAMPLE_FLAGS_PRESENT,
+                default_flags,
+                trun_flags: TIMED | TRUN_SAMPLE_FLAGS_PRESENT,
+                samples: &[(3000, 6, SYNC_SAMPLE_FLAGS), (2990, 7, later)],
+                ..ForeignLayout::default()
+            });
+            assert_eq!(parse_fragment(&bytes).unwrap().all_sync, all);
+        }
+        let lone = foreign_fragment(ForeignLayout {
+            tfhd_flags: TFHD_DEFAULT_SAMPLE_FLAGS_PRESENT,
+            default_flags: NON_SYNC_SAMPLE_FLAGS,
+            trun_flags: TIMED | TRUN_FIRST_SAMPLE_FLAGS_PRESENT,
+            first_flags: SYNC_SAMPLE_FLAGS,
+            samples: &[(3000, 6, 0)],
+        });
+        assert!(parse_fragment(&lone).unwrap().all_sync);
+        let pictures = foreign_fragment(ForeignLayout {
+            tfhd_flags: TFHD_DEFAULT_SAMPLE_FLAGS_PRESENT,
+            default_flags: NON_SYNC_SAMPLE_FLAGS,
+            trun_flags: TIMED | TRUN_FIRST_SAMPLE_FLAGS_PRESENT,
+            first_flags: SYNC_SAMPLE_FLAGS,
+            samples: &[(3000, 6, 0), (3000, 6, 0)],
+        });
+        let info = parse_fragment(&pictures).unwrap();
+        assert!(info.starts_with_sync && !info.all_sync);
     }
 
     #[test]

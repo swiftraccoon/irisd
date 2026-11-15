@@ -585,4 +585,55 @@ mod tests {
         assert_eq!(parsed.catalog, []);
         assert_eq!(parsed.other.lines.len(), 1);
     }
+
+    /// One row of each kind reaches its own part of the summary.
+    #[test]
+    fn every_series_is_rendered_from_its_rows() {
+        let output = rendered(&parse_text(concat!(
+            "2026-11-01T00:00:00Z INFO process threads=9 fds=40 cpu_pct=1.0 rss_mib=30.0\n",
+            "2026-11-01T00:01:00Z INFO process threads=9 fds=41 cpu_pct=3.0 rss_mib=32.0\n",
+            "2026-11-01T00:00:00Z INFO writer fragments=7 mib=1.5 write_max_ms=4.25 queue_peak=3\n",
+            "2026-11-01T00:00:00Z INFO catalog segments=4 gib=0.1 txn_max_ms=2.5\n",
+            "2026-11-01T00:00:00Z INFO root root=/srv/video free_gib=10.0 free_pct=69.6\n",
+            "2026-11-01T00:01:00Z INFO root root=/srv/video free_gib=9.0 free_pct=60.1\n",
+            "2026-11-01T00:00:00Z INFO stream stream=cam/main frames=0 fragments=0 connected=true\n",
+            "2026-11-01T00:00:10Z INFO stream stream=cam/main frames=300 fragments=5 connected=true\n",
+            "2026-11-01T00:00:20Z INFO stream stream=cam/main frames=500 fragments=9 connected=true\n",
+            "2026-11-01T00:00:30Z INFO gap stream=cam/main secs=1.0\n",
+            "2026-11-01T00:00:40Z WARN something else\n",
+        )));
+        for expected in [
+            "process samples=2 span=1.0 min",
+            "cpu_pct min=1.00 mean=2.00 max=3.00  rss_mib min=30.0 max=32.0",
+            "fds_max=41",
+            "final process: threads=9 fds=41 watchdog_withheld=-",
+            "writer write_p99_max_ms=- write_max_ms=4.2 sync_p99_max_ms=- sync_max_ms=- queue_peak=3",
+            "final writer: fragments=7 mib=1.5 syncs=-",
+            "catalog txn_p99_max_ms=- txn_max_ms=2.5",
+            "root /srv/video free_pct min=60.1 max=69.6 last_free_gib=9.0",
+            "cam/main           25.00   20.00   30.00      0     500         9",
+            "--- gaps, self-checks, retention passes, slow I/O (1) ---",
+            "   1x  2026-11-01T00:00:40Z WARN something else",
+        ] {
+            assert!(output.contains(expected), "{expected:?} not in:\n{output}");
+        }
+        assert!(!output.contains(" more"), "{output}");
+    }
+
+    #[test]
+    fn only_whole_timestamps_are_masked() {
+        assert_eq!(
+            dedup_key("t WARN a at=2026-11-01T00:00:00Z end"),
+            "WARN a at=<ts> end"
+        );
+        for kept in [
+            "1234 5678 abcdefghijklmnopqrst",
+            "abcdefg-hiTjk:lmnopqrstuvwxyz",
+            "abcdefghijTkl:mnopqrstuvwxyz",
+            "abcdefghijklm:nopqrstuvwxyzabc",
+            "2026-11-01 00:00:00.000000 no designator",
+        ] {
+            assert_eq!(dedup_key(&format!("t {kept}")), kept);
+        }
+    }
 }

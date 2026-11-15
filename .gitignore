@@ -27,3 +27,6 @@ AGENTS.override.md
 fuzz/corpus/
 fuzz/artifacts/
 fuzz/coverage/
+
+# Machine-specific settings that `just` loads (the justfile says which).
+.env

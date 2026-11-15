@@ -1,5 +1,11 @@
 //! Synthetic playback regression; the optional tools are not required for unit tests.
 
+#![expect(
+    clippy::missing_assert_message,
+    clippy::unwrap_used,
+    reason = "a helper of a test fails as the test does, by panicking"
+)]
+
 use std::collections::HashMap;
 use std::fs;
 use std::process::Command;
@@ -47,6 +53,10 @@ async fn respond(
     }
     if path == "/api/events" {
         return "[]".into_response();
+    }
+    if path.starts_with("/api/streams/fixture/audio/") {
+        // The fixture camera records no audio.
+        return StatusCode::NOT_FOUND.into_response();
     }
     if path.ends_with("vod.m3u8") {
         assert_eq!(

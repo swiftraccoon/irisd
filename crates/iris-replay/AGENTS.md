@@ -5,12 +5,18 @@ Scope: this crate only. Read the root `AGENTS.md` first.
 ## Invariants
 
 - Delivery must stay camera-like: one TCP segment per RTP packet by default, in-band parameter
-  sets before sync samples, RTCP sender reports every five seconds, decode-time pacing.
-  `docs/research/12-ingest-cost.md §2` records why; a change that alters delivery re-runs
-  the fidelity comparison there.
+  sets before sync samples, RTCP sender reports at `Options::report_interval` (five seconds by
+  default), decode-time pacing. `docs/research/12-ingest-cost.md §2` records why; a change that
+  alters delivery re-runs the fidelity comparison there.
 - RFC 7798 layout is pinned by the `rtp` tests (header bits, start and end flags, marker on
   the last packet of an access unit). MTU admission is `256..=65535`; packetization and
   interleaving are fallible and packetization stays streaming.
+- Optional synthetic audio is mono AAC-hbr over RFC 3640 on `trackID=1`, one frame every 1,024
+  samples. `Options` controls its sample rate, timestamp wander, lost or omitted frames, the
+  relative camera and sample-clock rates, the clock that stamps audio, and whether and how
+  audio sender reports are made. Every fault is a fixed function of a frame's or a report's
+  number, so ingest tests name the readings they expect; the video's SSRC and the instants
+  of the reports differ from run to run.
 - The server is a test instrument, not a product: no authentication, TCP only, bounded to
   what the recorder's client needs. The binary listens outside loopback only with
   `--allow-remote` (`Server::bind` binds what it is given), serves at most
@@ -32,10 +38,12 @@ Scope: this crate only. Read the root `AGENTS.md` first.
   fragment, complete nonempty access units, an initial sync sample, a representable
   nonoverlapping timeline, and a compatible version-1/four-byte-length `hvcC` carrying VPS,
   SPS, and PPS. `Media` keeps that state private, so every frame it lists has a sample.
-- The RTSP surface is one DESCRIBE/SETUP/PLAY lifecycle bound to one mount, negotiated TCP
-  channels, and the issued Session. `PAUSE` and replaying a started/finished session stay
-  unsupported; `TEARDOWN` must preserve preceding control responses, discard stale queued media,
-  and acknowledge its terminal response only after the socket write completes.
+- The RTSP surface is one DESCRIBE/PLAY lifecycle bound to one mount, the issued Session, and
+  negotiated TCP channels: video has one required `SETUP`; offered audio permits one further
+  `SETUP` after video and before `PLAY`, on the same mount and in the same Session. `PAUSE`
+  and replaying a started/finished session stay unsupported; `TEARDOWN` must preserve
+  preceding control responses, discard stale queued media, and acknowledge its terminal
+  response only after the socket write completes.
 
 ## Where things are
 
@@ -65,7 +73,8 @@ and `--pace` modes and compared with the live figures in `docs/research/12-inges
 ## Pitfalls
 
 - `--stall-after` resumes with a burst on purpose; do not "fix" it by shifting the clock.
-- Sender reports still sample their wall/RTP clock pair at one instant across that stall;
+- Sender reports still sample their wall/RTP clock pair at one instant across that stall
+  (`Clocks::late_reports` is the one fault that parts them);
   do not derive the SR RTP field from the delayed media frame.
 - Over loopback a whole frame written at once arrives as one segment; per-packet writes are
   what make the harness representative.

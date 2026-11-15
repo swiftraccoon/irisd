@@ -21,6 +21,10 @@ of correctness, efficiency, readability, and simplicity.
   `docs/research/10-phase2-results.md`.
 - Keeps the NVR clock as the authority for time: a constant-frame-rate regulariser turns
   camera RTP timestamps into exact frame durations and renders camera-dropped frames as holds.
+- Records a camera's AAC audio as received, when a camera's `record` list asks for it, as a
+  stream of its own on the video's timeline, and serves it with the picture: an HLS
+  rendition, the second track of an export, and a live feed
+  (`docs/research/13-audio.md`).
 - Catalogs files, runs, and camera events in SQLite; enforces retention by free space, a
   size quota, and per-camera age; recovers from a crash through validated sidecar tails with
   a bounded media scan as the fallback.

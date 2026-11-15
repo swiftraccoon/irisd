@@ -70,6 +70,16 @@ pub struct IngestOptions {
     pub user_agent: String,
     /// Where to publish frames for live viewers, if anyone watches.
     pub live: Option<LiveRing>,
+    /// Record the session's AAC audio, when the camera offers it at a
+    /// sampling rate whose frames are whole 90 kHz ticks, as fragments under
+    /// the camera's `audio` stream key. A camera that offers none, another
+    /// codec, or another rate records video alone.
+    pub audio: bool,
+    /// Where to publish the recorded audio's frames for live listeners. A
+    /// frame is published once its run is placed on the video's timeline,
+    /// with the decode time and wall time its recording gets
+    /// (`docs/research/13-audio.md` §10.3). Unused without `audio`.
+    pub audio_live: Option<LiveRing>,
     /// Read the camera socket on this cadence instead of on every packet: the
     /// socket is drained without arming a wake-up, then the task sleeps until
     /// the next tick of a clock shared by every stream, so one runtime wake-up
@@ -83,6 +93,16 @@ pub struct IngestOptions {
     /// bytes are queued (`SO_RCVLOWAT`, set after `PLAY`), so a steady RTP flow
     /// wakes the runtime once per that many bytes instead of once per packet.
     pub recv_low_water: Option<u32>,
+    /// The length of one window of the watches of parted clocks
+    /// (`docs/research/14-drift.md`): each reports once a window.
+    pub watch_window: Duration,
+    /// Make the steps the drift rule names on the recorded audio: frames
+    /// left out where the recording has the sound late against the picture,
+    /// frames recorded twice where it has it early
+    /// (`docs/research/13-audio.md` §5.3). Without it the rule logs and
+    /// counts each step and the recording is as the frames arrived. Unused
+    /// without `audio`.
+    pub audio_steps: bool,
 }
 
 impl Default for IngestOptions {
@@ -94,9 +114,13 @@ impl Default for IngestOptions {
             max_jump: Duration::from_secs(10),
             user_agent: "irisd/0.1".to_owned(),
             live: None,
+            audio: false,
+            audio_live: None,
             read_interval: None,
             ticker: None,
             recv_low_water: None,
+            watch_window: Duration::from_secs(600),
+            audio_steps: false,
         }
     }
 }

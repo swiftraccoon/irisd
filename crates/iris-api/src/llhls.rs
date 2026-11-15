@@ -31,7 +31,7 @@ use axum::extract::{Extension, Path, Query, State};
 use axum::http::header;
 use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
-use iris_core::id::{CameraId, StreamKey};
+use iris_core::id::{CameraId, StreamKey, StreamKind};
 use iris_core::time::{TIMESCALE, WallUs};
 use iris_ingest::{LiveError, LiveFrame, LiveRing};
 use iris_mp4::init::{SampleEntry, build_init_segment};
@@ -528,6 +528,12 @@ impl LiveHlsRegistry {
 
 fn lookup(state: &ApiState, camera: &str, kind: &str) -> Result<Arc<LiveHls>, ApiError> {
     let key = stream_key(camera, kind)?;
+    if key.kind == StreamKind::Audio {
+        // The segmenter starts a segment at every sync frame, and every
+        // audio frame is one: audio has no low-latency playlist
+        // (`docs/research/13-audio.md` §10.3).
+        return Err(ApiError::NotFound);
+    }
     let ring = state.live.get(&key).ok_or(ApiError::NotFound)?;
     Ok(state
         .live
@@ -903,7 +909,7 @@ mod tests {
         Arc::new(LiveFrame {
             key: StreamKey {
                 camera: "cam1".parse().unwrap(),
-                kind: iris_core::id::StreamKind::Main,
+                kind: StreamKind::Main,
             },
             sample_entry: Arc::new(SampleEntry::new(
                 Bytes::from_static(&[0u8; 8]),
@@ -1327,9 +1333,9 @@ mod tests {
         {
             let mut streams = registry.streams.lock().unwrap();
             for key in [
-                key("cam1", iris_core::id::StreamKind::Main),
-                key("cam1", iris_core::id::StreamKind::Sub),
-                key("cam2", iris_core::id::StreamKind::Main),
+                key("cam1", StreamKind::Main),
+                key("cam1", StreamKind::Sub),
+                key("cam2", StreamKind::Main),
             ] {
                 streams.insert(key, LiveHls::new());
             }
@@ -1337,7 +1343,7 @@ mod tests {
         registry.remove_camera(&"cam1".parse().unwrap());
         let streams = registry.streams.lock().unwrap();
         let left: Vec<_> = streams.keys().cloned().collect();
-        assert_eq!(left, [key("cam2", iris_core::id::StreamKind::Main)]);
+        assert_eq!(left, [key("cam2", StreamKind::Main)]);
     }
 
     #[test]

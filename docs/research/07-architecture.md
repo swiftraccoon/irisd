@@ -1,6 +1,6 @@
 # 07 — Daemon architecture (irisd)
 
-Integrates 03–06 into one design. Numbers refer to cam1 measurements (01).
+Integrates 03–06 into one design. Numbers refer to the measurements in 01.
 
 ## 1. Data flow
 
@@ -43,7 +43,7 @@ irisd/
     iris-events/             # Dahua CGI feed, ONVIF PullPoint, media lookups, discovery (oxvif)
     iris-api/                # axum: JSON, HLS/LL-HLS, WebSockets, export, auth
     irisd/                   # daemon with the retention policy; offline record, inspect,
-                             # recover, HLS, and serve commands
+                             # clocks, recover, HLS, and serve commands
     iris-tls/                # shared TLS client trust: platform roots plus an optional CA file
     iris-replay/             # bounded RTSP replay and synthetic-camera server
     iris-gui/                # GTK/GStreamer live, playback, thumbnails, and export client
@@ -125,8 +125,8 @@ struct Frame { data: Bytes /* length-prefixed NALs, no parameter sets */, raw_ts
                wall: WallUs, is_sync: bool, new_params: bool }
 struct Sample { data: Bytes, duration: u32, is_sync: bool }
 struct Fragment { samples: Vec<Sample>, decode_time: u64, wall: WallUs, raw_rtp: u32,
-                  new_run: bool, sample_entry: Arc<SampleEntry> }
-struct SampleEntry { bytes: Bytes /* complete hvc1 entry */, codecs: String,
+                  new_run: bool, steps: FrameSteps, sample_entry: Arc<SampleEntry> }
+struct SampleEntry { bytes: Bytes /* complete hvc1 or mp4a entry */, codecs: String,
                      width: u16, height: u16, hash: u32 /* CRC-32C */ }
 struct Event { camera: CameraId, source: EventSource, kind: EventKind, state: EventState,
                camera_time: Option<WallUs>, nvr_time: WallUs, data: Option<String> }
@@ -141,7 +141,7 @@ rows, and logical string bytes while preserving capacity-limited active retentio
 
 | Method | Path | Notes |
 |---|---|---|
-| GET | `/api/cameras`, `/api/cameras/{camera}` | the running cameras (`provisioned` marks those the API added) and per-stream health |
+| GET | `/api/cameras`, `/api/cameras/{camera}` | the running cameras (`provisioned` marks those the API added, `has_audio` those with recorded audio) and per-stream health |
 | POST | `/api/cameras` | adds a camera described like a `[[camera]]` table; needs `[provisioning] enabled` and the root token (201) |
 | DELETE | `/api/cameras/{camera}` | stops and forgets a camera the API added (204); a configured camera answers 409 |
 | GET | `/api/onvif/devices` | the cameras a bounded WS-Discovery probe finds, for the Add camera form; root token, `[provisioning] enabled` |
@@ -149,8 +149,10 @@ rows, and logical string bytes while preserving capacity-limited active retentio
 | GET | `/api/streams/{camera}/{kind}/segments?from=&to=` | catalog listing (wall ranges, runs, sample entries) |
 | GET | `/api/streams/{camera}/{kind}/hls/live.m3u8` (+ `_HLS_msn/_HLS_part`) | LL-HLS playlist and in-memory child resources |
 | GET | `/api/streams/{camera}/{kind}/hls/vod.m3u8?from=&to=` | byte-range playlist across segments |
+| GET | `/api/cameras/{camera}/hls/vod.m3u8?from=&to=` | multivariant playlist: the main stream, and recorded audio as a rendition |
 | GET | `/api/segments/{id}/file.mp4` (Range) | one bounded snapshot of the on-disk file |
 | GET | `/api/streams/{camera}/{kind}/export.mp4?from=&to=` | assembled MP4 |
+| GET | `/api/cameras/{camera}/export.mp4?from=&to=` | the main stream's export with recorded audio as a second track |
 | GET | `/api/streams/{camera}/{kind}/keyframe?t=` | init + one single-sample fragment |
 | GET | `/api/cameras/{camera}/snapshot.jpg` | proxied from the camera: the Dahua CGI endpoint, or the URL its ONVIF Media service names (`snapshot`, default by event source); one request per camera at a time |
 | WS | `/api/streams/{camera}/{kind}/live` | init + per-frame fragments, each message ≤ 16 MiB + 1 byte |
@@ -310,7 +312,7 @@ and a loopback listener, and the switch together with tokens is rejected.
 
 ## 7. Efficiency budgets and benchmark harness
 
-Targets for 6 cameras × (main 4K 8 Mbps + sub D1 1.3 Mbps) ≈ 56 Mbps, ≈ 5,000 packets/s:
+Targets for twelve streams at ≈ 56 Mbps together, ≈ 5,000 packets/s:
 
 | Metric | Budget | How measured |
 |---|---|---|
@@ -351,7 +353,7 @@ Harness (`iris-replay` and `iris-tools replay-bench`):
    `iris-tools replay-bench` drives the daemon against N replayed cameras.
 2. **Baselines on the same box**: `ffmpeg -c copy` to fMP4, Moonfire NVR 0.7.33, Frigate
    record-only; same inputs, same metrics.
-3. **Real cameras**: the six units, 24 h soak with metrics scraped every 10 s.
+3. **Real cameras**: a 24 h soak with metrics scraped every 10 s.
 4. **Chaos**: SIGKILL mid-fragment, disk full, slow disk (`dm-delay`), camera reboot, NVR
    clock step, parameter-set change via CGI, network partition; each with a pass criterion
    (no corrupt files, gap recorded, recovery time, catalog consistent).
@@ -366,13 +368,15 @@ Harness (`iris-replay` and `iris-tools replay-bench`):
 - Recovery tests over truncated and zero-filled tails (`crates/iris-store/tests/store.rs`
   and the `iris-mp4` reader's tests).
 - Integration tests that run ingest sessions against loopback replay servers and
-  fault-injecting RTSP peers (`crates/iris-ingest/tests/`), and the API's routes, limits, and
-  WebSocket lifetimes against a test catalog (`crates/iris-api/tests/`).
+  fault-injecting RTSP peers (`crates/iris-ingest/tests/`), one of them through a stream
+  whose 32-bit RTP timestamp wraps, which a camera's does every 13 hours, and the API's routes,
+  limits, and WebSocket lifetimes against a test catalog (`crates/iris-api/tests/`).
 - The daemon binary end to end (`crates/irisd/tests/`): start-up, readiness, and shutdown
   order, and one run that records a loopback camera served by the replay server, lists the
   open recording through the authenticated API, and on SIGTERM leaves a recording that
   scans clean, a sidecar bound to it, and a sealed catalog row with the same length and
-  fragment count.
+  fragment count; and one run in which the camera goes away and returns on the same address,
+  after which the daemon has reconnected by itself and recorded a second run.
 - Fuzz targets for every parser that faces the network (§2, `fuzz/README.md`).
 - Recordings checked with `ffprobe`, `irisd inspect`, and GStreamer playback.
 - The writer on a filesystem that fills up: a small tmpfs in a user namespace returns the real
@@ -390,8 +394,8 @@ Harness (`iris-replay` and `iris-tools replay-bench`):
   parsing code that every test still passes names logic no test pins down. The first runs
   (2026-11-10) led to the removal of a regulariser rule that no test needed and that
   measurements then showed to do harm (`11-multi-camera-results.md`).
-- The tests of the crates without C dependencies as 64-bit ARM code under user-mode
-  emulation (`just cross-test`, CI).
+- The tests of the crates without C dependencies as 64-bit ARM code, on a 64-bit ARM host
+  or under user-mode emulation (`just cross-test`, CI).
 - Not implemented: writer tests with injected read and write errors (`EIO`), captured-camera
   golden tests, and `mediastreamvalidator` and AVPlayer conformance (`08-roadmap.md`, phase-2
   exit criteria).
@@ -442,8 +446,10 @@ requires the root bearer token unless `[api] public_metrics` is set. Uptime uses
 instant. Metric scrapes share one cache-owned catalog-aggregate refresh at most once per second;
 concurrent scrapes coalesce and request cancellation cannot abandon the refresh. A failure serves
 the last snapshot or omits cold aggregates until the next cadence. The `systemd` watchdog ping is
-withheld whenever an ingest task made no progress in the interval. Figures the daemon cannot see
-from inside its sandbox (disk sectors written for write amplification, pressure stall information,
+withheld whenever an ingest task has not noted that it is alive in the interval, or has ended; a
+camera that is down or sends nothing does not withhold it (`iris_ingest::StreamStats::beats`).
+Figures the daemon cannot see from inside its sandbox (disk sectors written for write
+amplification, pressure stall information,
 NIC and TCP counters, NTP offset, the service's cgroup CPU and memory split) come from `iris-tools
 soak-sample`, which runs from a timer beside the service. Its bounded API check also captures the
 catalog failure, rejection, and reconciliation metrics so a healthy HTTP response cannot hide failed
@@ -451,8 +457,9 @@ persistence. Soak reports recognize the ordered startup prefix (the configuratio
 unauthenticated-API warnings, the descriptor limit, state-mode repairs, root availability, the
 sandbox decision, catalog open) before reconciliation as a run boundary, including after crashes
 without a `stopped` line; `iris-tools` matches those messages by their text, so a reworded message
-changes there in the same change. Reconciliation remains a fallback marker when the prefix is absent. Startup warnings belong to
-the restarted run and cannot extend the prior run's last observation. Without a clean stop or
+changes there in the same change. Reconciliation remains a fallback marker when the prefix is
+absent. Startup warnings belong to the restarted run and cannot extend the prior run's last
+observation. Without a clean stop or
 process identity in the exported log, the interval between runs remains unobserved / possible
 downtime; the report cannot infer the exact crash time. An API task whose result was consumed by the
 monitor is removed before shutdown; a bind failure therefore still drains the writer and catalog
@@ -491,12 +498,13 @@ connect_ports = [554, 80, 443]
 id = "cam1"
 name = "Example"
 rtsp_url = "rtsp://192.0.2.10:554/cam/realmonitor?channel=1&subtype=0&unicast=true&proto=Onvif"
-# subtype=2, the third stream, on a family whose sub stream stops beside a second session (01 §5b)
+# subtype=2, the third stream, on a camera whose sub stream stops beside a second session (01 §5b)
 sub_url  = "rtsp://192.0.2.10:554/cam/realmonitor?channel=1&subtype=1&unicast=true&proto=Onvif"
 username = "..."
 password = "..."
 vendor = "dahua"
 record = ["main", "sub"]
+audio_steps = false        # with "audio" recorded: hold it to the video by whole frames
 http_port = 80
 https = false
 tls_verify = true

@@ -73,6 +73,11 @@ impl Stage {
         }))
     }
 
+    /// The shared pipeline, whose clock every branch plays against.
+    pub fn pipeline(&self) -> &gst::Pipeline {
+        &self.pipeline
+    }
+
     /// Adds `bin` under `name` and brings it to the pipeline's state; `events`
     /// receives the branch's errors and readiness.
     pub fn add(

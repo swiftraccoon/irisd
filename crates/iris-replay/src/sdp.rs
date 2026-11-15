@@ -4,7 +4,7 @@ use std::fmt::Write as _;
 
 use iris_core::time::TIMESCALE;
 
-use crate::rtp::PAYLOAD_TYPE;
+use crate::rtp::{AUDIO_PAYLOAD_TYPE, PAYLOAD_TYPE};
 
 /// Builds the SDP for a mount whose parameter sets are `sets` (VPS, SPS, PPS in
 /// any order; each is announced under its type), announcing [`PAYLOAD_TYPE`] at
@@ -50,6 +50,30 @@ pub fn describe(sets: &[Vec<u8>], frame_rate: f64) -> String {
     )
 }
 
+/// The media section of a mono AAC-LC stream at `sample_rate` hertz, to
+/// append to [`describe`]'s output: RFC 3640 `AAC-hbr` under
+/// [`AUDIO_PAYLOAD_TYPE`] with the two-byte `AudioSpecificConfig` as `config`
+/// and `trackID=1` as its control. `None` for a rate MPEG-4 audio has no
+/// index for.
+#[must_use]
+pub fn describe_audio(sample_rate: u32) -> Option<String> {
+    const RATES: [u32; 13] = [
+        96_000, 88_200, 64_000, 48_000, 44_100, 32_000, 24_000, 22_050, 16_000, 12_000, 11_025,
+        8_000, 7_350,
+    ];
+    let index = u16::try_from(RATES.iter().position(|rate| *rate == sample_rate)?).ok()?;
+    // Object type 2 (AAC-LC) in 5 bits, the rate index in 4, one channel in
+    // 4, and three zero bits.
+    let config = (2 << 11) | (index << 7) | (1 << 3);
+    Some(format!(
+        "m=audio 0 RTP/AVP {AUDIO_PAYLOAD_TYPE}\r\n\
+         a=rtpmap:{AUDIO_PAYLOAD_TYPE} mpeg4-generic/{sample_rate}\r\n\
+         a=fmtp:{AUDIO_PAYLOAD_TYPE} streamtype=5;profile-level-id=1;mode=AAC-hbr;\
+         sizelength=13;indexlength=3;indexdeltalength=3;config={config:04x}\r\n\
+         a=control:trackID=1\r\n"
+    ))
+}
+
 /// Standard base64 with padding.
 fn base64(input: &[u8]) -> String {
     const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -80,6 +104,17 @@ fn base64(input: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_audio_section_announces_aac_with_its_config() {
+        let section = describe_audio(64_000).unwrap();
+        assert!(section.starts_with("m=audio 0 RTP/AVP 97\r\na=rtpmap:97 mpeg4-generic/64000\r\n"));
+        // AAC-LC, rate index 2 (64 kHz), one channel.
+        assert!(section.contains(";config=1108\r\n"), "{section}");
+        assert!(section.ends_with("a=control:trackID=1\r\n"));
+        assert!(describe_audio(48_000).unwrap().contains(";config=1188\r\n"));
+        assert_eq!(describe_audio(50_000), None);
+    }
 
     #[test]
     fn base64_matches_rfc_4648_vectors() {

@@ -3,6 +3,11 @@
 //! filter and sort written out here select, for generated ranges, cursors,
 //! and limits, with many rows sharing a timestamp.
 
+#![expect(
+    clippy::unwrap_used,
+    reason = "a helper of a test fails as the test does, by panicking"
+)]
+
 use std::path::PathBuf;
 use std::time::Duration;
 

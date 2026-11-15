@@ -12,7 +12,7 @@ from the workspace so that stable builds do not compile it.
 | `box_header` | ISO BMFF box headers and the big-endian field readers at arbitrary offsets |
 | `index` | the sidecar index codec: the header and record codecs, and `decode_index` over a whole file image (accepted records are contiguous and within the budget) |
 | `trailer` | the fragment trailer decoder |
-| `export_rebase` | the export rewrites: `parse_fragment`, `rebase_fragment` (a rewritten fragment parses with the new values), `trim_fragment_end` (a trimmed fragment parses and fits the limit), `with_edit_list` |
+| `export_rebase` | the export rewrites: `parse_fragment`, `rebase_fragment` (a rewritten fragment parses with the given values), `retrack_fragment`, `trim_fragment_end` (a trimmed fragment parses and fits the limit), `trim_fragment_start` (the remainder is all sync samples and starts later by what was left out), `with_edit_list` and `with_edit_lists`, and the sample entry and channel count read from an init segment; a fragment encoded from the input reaches the rewrites past the checksum |
 | `access_unit` | H.265 length-prefixed access-unit framing and parameter-set stripping |
 | `multipart` | the multipart event-feed reader and `boundary_from_content_type`, any boundary and any chunking: a fragmented feed yields the parts of the whole feed, and scan work stays linear |
 | `digest_challenge` | HTTP digest challenge parsing and the header built from it |
@@ -29,6 +29,7 @@ from the workspace so that stable builds do not compile it.
 | `depacketize_h265` | retina's H.265 depacketizer under arbitrary payloads, sequence numbers, timestamps, and marker bits: every frame stays within the 64 MiB access-unit bound |
 | `rtp_packet` | retina's RTP header validation over a contiguous slice and the two halves of a ring buffer, which must agree |
 | `vod_playlist` | the viewer's VOD playlist rules (`crates/iris-gui/src/vod.rs`, included by path): fragment timing, and the rewrite whose accepted output holds only the daemon's tags and absolute references on the API origin without userinfo, with the input's timing |
+| `live_fragment` | what the viewer reads from a live payload itself (`crates/iris-gui/src/fragment.rs`, included by path): a media time only for a payload that starts with a version-1 `prft` box, and then its ticks |
 
 Retina's RTCP compound validation and its `SETUP` and `PLAY` interpretation have no target
 here; the vendored crate's own tests (`just vendor-test`) and the `iris-ingest` integration

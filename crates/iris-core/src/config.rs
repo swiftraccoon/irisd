@@ -66,13 +66,20 @@ pub enum ConfigError {
         /// The repeated stream kind.
         kind: StreamKind,
     },
-    /// One camera requests a stream kind the recorder cannot ingest.
-    #[error("camera {camera} requests unsupported recorded stream kind {kind}")]
+    /// One camera requests a stream kind the recorder cannot ingest as
+    /// configured: `audio` without `main`, whose session carries it.
+    #[error("camera {camera} records {kind} without the main stream, whose session carries it")]
     UnsupportedRecordedKind {
         /// The camera with the unsupported kind.
         camera: CameraId,
         /// The unsupported stream kind.
         kind: StreamKind,
+    },
+    /// One camera sets `audio_steps` and does not record audio.
+    #[error("camera {camera} sets audio_steps and does not record audio")]
+    AudioStepsWithoutAudio {
+        /// The camera with the setting.
+        camera: CameraId,
     },
     /// One camera subscribes to the same event source more than once.
     #[error("camera {camera} subscribes to event source {event_source} more than once")]
@@ -438,7 +445,8 @@ impl IngestConfig {
 /// Top-level configuration: storage, API, ingest policy, and cameras.
 ///
 /// Unknown keys are errors rather than silent defaults, camera ids must be
-/// unique, recorded stream kinds must be distinct supported video kinds, event sources
+/// unique, recorded stream kinds must be distinct, audio needs the main stream and
+/// `audio_steps` needs audio, event sources
 /// must be unique per camera, and the storage knobs must lie in the ranges their
 /// fields document. The API needs at least one bearer token of
 /// [`MIN_API_TOKEN_LEN`] visible ASCII characters, or `api.allow_unauthenticated`
@@ -794,9 +802,17 @@ pub struct CameraConfig {
     /// Optional vendor label recorded in the catalog and returned by the API.
     #[serde(default)]
     pub vendor: Option<String>,
-    /// Which streams to record, with no repeated kinds.
+    /// Which streams to record, with no repeated kinds. `audio` records the
+    /// AAC audio that arrives in the main stream's session and needs `main`.
     #[serde(default = "default_record")]
     pub record: Vec<StreamKind>,
+    /// Hold the recorded audio to the video by whole frames: where the
+    /// recording has the sound late a frame is left out, where it has it
+    /// early a frame is recorded twice (`docs/research/13-audio.md` §5.3).
+    /// Off, the daemon logs each step it would make and records the audio
+    /// as it arrives. Needs `audio` among `record`.
+    #[serde(default)]
+    pub audio_steps: bool,
     /// Timestamp policy for this camera.
     #[serde(default)]
     pub timestamp_mode: TimestampMode,
@@ -834,6 +850,7 @@ impl fmt::Debug for CameraConfig {
             password: _,
             vendor,
             record,
+            audio_steps,
             timestamp_mode,
             http_port,
             https,
@@ -851,6 +868,7 @@ impl fmt::Debug for CameraConfig {
             .field("password", &"<redacted>")
             .field("vendor", vendor)
             .field("record", record)
+            .field("audio_steps", audio_steps)
             .field("timestamp_mode", timestamp_mode)
             .field("http_port", http_port)
             .field("https", https)
@@ -905,6 +923,7 @@ impl CameraConfig {
     /// [`ConfigError::InvalidRetentionDays`],
     /// [`ConfigError::UnsupportedRecordedKind`],
     /// [`ConfigError::DuplicateRecordedKind`],
+    /// [`ConfigError::AudioStepsWithoutAudio`],
     /// [`ConfigError::UnsupportedEventSource`], or
     /// [`ConfigError::DuplicateEventSource`], for the first rule that fails.
     pub fn validate(&self) -> Result<(), ConfigError> {
@@ -940,18 +959,23 @@ impl CameraConfig {
         }
         let mut kinds = HashSet::new();
         for &kind in &self.record {
-            if kind == StreamKind::Audio {
-                return Err(ConfigError::UnsupportedRecordedKind {
-                    camera: self.id.clone(),
-                    kind,
-                });
-            }
             if !kinds.insert(kind) {
                 return Err(ConfigError::DuplicateRecordedKind {
                     camera: self.id.clone(),
                     kind,
                 });
             }
+        }
+        if kinds.contains(&StreamKind::Audio) && !kinds.contains(&StreamKind::Main) {
+            return Err(ConfigError::UnsupportedRecordedKind {
+                camera: self.id.clone(),
+                kind: StreamKind::Audio,
+            });
+        }
+        if self.audio_steps && !kinds.contains(&StreamKind::Audio) {
+            return Err(ConfigError::AudioStepsWithoutAudio {
+                camera: self.id.clone(),
+            });
         }
         let mut event_sources = HashSet::new();
         for &event_source in &self.events {
@@ -1610,13 +1634,39 @@ mod tests {
                 Err(ConfigError::DuplicateRecordedKind { .. })
             ));
         }
-        for kinds in ["['audio']", "['audio','audio']"] {
+        assert!(matches!(
+            parse(&format!("{camera}record=['main','audio','audio']\n")),
+            Err(ConfigError::DuplicateRecordedKind { .. })
+        ));
+        // Audio arrives in the main stream's session.
+        for kinds in ["['audio']", "['sub','audio']"] {
+            let error = parse(&format!("{camera}record={kinds}\n")).unwrap_err();
+            assert!(
+                matches!(error, ConfigError::UnsupportedRecordedKind { .. }),
+                "{kinds}: {error}"
+            );
+            assert!(error.to_string().contains("audio without the main stream"));
+        }
+        // A step is of recorded audio.
+        for record in ["", "record=['main','sub']\n"] {
             assert!(matches!(
-                parse(&format!("{camera}record={kinds}\n")),
-                Err(ConfigError::UnsupportedRecordedKind { .. })
+                parse(&format!("{camera}{record}audio_steps=true\n")),
+                Err(ConfigError::AudioStepsWithoutAudio { .. })
             ));
         }
-        for kinds in ["['main','sub']", "[]"] {
+        let stepping = parse(&format!(
+            "{camera}record=['main','audio']\naudio_steps=true\n"
+        ))
+        .expect("audio with steps");
+        assert!(stepping.cameras[0].audio_steps);
+        let plain = parse(&format!("{camera}record=['main','audio']\n")).expect("audio");
+        assert!(!plain.cameras[0].audio_steps, "steps are off unless set");
+        for kinds in [
+            "['main','sub']",
+            "['main','audio']",
+            "['audio','main','sub']",
+            "[]",
+        ] {
             assert!(parse(&format!("{camera}record={kinds}\n")).is_ok());
         }
     }

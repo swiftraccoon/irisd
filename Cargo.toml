@@ -93,6 +93,10 @@ unused_qualifications = "warn"
 [workspace.lints.clippy]
 # The two groups carry priority -1, so the named lints override them wherever they sort.
 all = { level = "warn", priority = -1 }
+# A lint exception is an `expect` with its reason (STANDARDS.md §1), so one that no longer
+# applies fails the build.
+allow_attributes = "warn"
+allow_attributes_without_reason = "warn"
 # Media-time, box-field, and statistics arithmetic casts between integer widths; a value that
 # comes from input is bounds-checked before its cast (scanner sizes against their maxima,
 # frame rates against 1..=240).
@@ -101,10 +105,19 @@ cast_possible_wrap = "allow"
 # Rates and means convert counters to f64, and the counters stay far below 2^53.
 cast_precision_loss = "allow"
 cast_sign_loss = "allow"
+# What a finished change does not hold.
+dbg_macro = "warn"
+# Context strings on `assert!` outside tests (STANDARDS.md §6).
+missing_assert_message = "warn"
 # Types are imported unqualified (STANDARDS.md §4), so `config::StorageConfig` keeps its
 # module's word.
 module_name_repetitions = "allow"
 pedantic = { level = "warn", priority = -1 }
+todo = "warn"
+unimplemented = "warn"
+# `expect("<invariant>")` over `unwrap()` outside tests (STANDARDS.md §6; `clippy.toml` lets
+# tests unwrap).
+unwrap_used = "warn"
 
 [profile.release]
 codegen-units = 1

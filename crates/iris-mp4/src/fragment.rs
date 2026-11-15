@@ -71,6 +71,20 @@ pub struct FragmentHeader {
     pub wall: WallUs,
 }
 
+/// Whether a fragment holds a step of its stream: frames that the recorder
+/// left out or recorded twice to move the sound against the picture by whole
+/// frames (`docs/research/13-audio.md` §5.3). The store keeps both marks in
+/// the fragment's sidecar record.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FrameSteps {
+    /// Frames received just before one of the fragment's samples were not
+    /// recorded.
+    pub left_out: bool,
+    /// One or more of the fragment's samples are a frame recorded a second
+    /// time.
+    pub twice: bool,
+}
+
 /// A fragment assembled by ingest and handed to the store: one GOP (or a
 /// capped slice of one) with its decode time, wall time, the camera's raw RTP
 /// timestamp, and the sample entry in force. The store turns it into bytes with
@@ -88,6 +102,8 @@ pub struct Fragment {
     pub raw_rtp: u32,
     /// Whether a timing discontinuity precedes this fragment (a new run).
     pub new_run: bool,
+    /// Whether the fragment holds a step of its stream.
+    pub steps: FrameSteps,
     /// The codec configuration in force for these samples, shared by every
     /// fragment of a parameter-set epoch; the store compares entries with
     /// `Arc::ptr_eq` before comparing bytes.
@@ -164,10 +180,12 @@ impl EncodedFragment {
 }
 
 /// Encodes the boxes around `samples`: `prft`, `moof`, and the `mdat` header
-/// as the prefix, and the trailer over the prefix and the sample bytes. Only
-/// the first sample's sync flag is encoded (as `first_sample_flags`); every
-/// later sample carries the `tfhd` non-sync default, so a fragment holds at
-/// most one random access point, at its start.
+/// as the prefix, and the trailer over the prefix and the sample bytes. When
+/// every sample is a sync sample, as in an audio fragment, the `tfhd` default
+/// says so for all of them. Otherwise only the first sample's sync flag is
+/// encoded (as `first_sample_flags`) and every later sample carries the
+/// `tfhd` non-sync default, so such a fragment holds at most one random
+/// access point, at its start.
 ///
 /// # Errors
 ///
@@ -214,14 +232,19 @@ pub fn encode_fragment(
         TFHD_DEFAULT_BASE_IS_MOOF | TFHD_DEFAULT_SAMPLE_FLAGS_PRESENT,
     );
     w.u32(VIDEO_TRACK_ID);
-    w.u32(NON_SYNC_SAMPLE_FLAGS);
+    let all_sync = samples.iter().all(|s| s.is_sync);
+    w.u32(if all_sync {
+        SYNC_SAMPLE_FLAGS
+    } else {
+        NON_SYNC_SAMPLE_FLAGS
+    });
     w.end(tfhd);
 
     let tfdt = w.begin_full(b"tfdt", 1, 0);
     w.u64(header.decode_time);
     w.end(tfdt);
 
-    let first_is_sync = samples[0].is_sync;
+    let first_is_sync = samples[0].is_sync && !all_sync;
     let mut trun_flags =
         TRUN_DATA_OFFSET_PRESENT | TRUN_SAMPLE_DURATION_PRESENT | TRUN_SAMPLE_SIZE_PRESENT;
     if first_is_sync {
@@ -427,6 +450,7 @@ mod tests {
             wall: WallUs::new(0),
             raw_rtp: 0,
             new_run: true,
+            steps: FrameSteps::default(),
             sample_entry: entry,
         };
         assert_eq!(fragment.payload_len(), 14);
@@ -469,5 +493,49 @@ mod tests {
             reserved[20 + bit / 8] ^= 1 << (bit % 8);
             assert!(decode_trailer(&reserved).is_none(), "bit {bit}");
         }
+    }
+
+    /// The `tfhd` and `trun` fields of an encoded prefix that carry the
+    /// sample flags: the default, and the first sample's when present.
+    fn sample_flags(prefix: &[u8]) -> (u32, Option<u32>) {
+        let at = |kind: &[u8; 4]| prefix.windows(4).position(|w| w == kind).unwrap() + 4;
+        let word = |pos: usize| u32::from_be_bytes(prefix[pos..pos + 4].try_into().unwrap());
+        // tfhd: version and flags, the track id, then the default flags.
+        let default = word(at(b"tfhd") + 8);
+        // trun: version and flags, the count, the data offset, then the
+        // first sample's flags when its bit is set.
+        let trun = at(b"trun");
+        let first = (word(trun) & TRUN_FIRST_SAMPLE_FLAGS_PRESENT != 0).then(|| word(trun + 12));
+        (default, first)
+    }
+
+    /// A fragment whose samples are all sync samples says so in the default
+    /// flags; any other marks its first sample alone.
+    #[test]
+    fn the_default_flags_say_whether_every_sample_is_a_sync_sample() {
+        let encode = |sync: &[bool]| {
+            let samples: Vec<Sample> = sync
+                .iter()
+                .map(|&is_sync| Sample {
+                    data: Bytes::from_static(b"\0"),
+                    duration: 1440,
+                    is_sync,
+                })
+                .collect();
+            sample_flags(&encode_fragment(&header(), &samples).unwrap().prefix)
+        };
+        assert_eq!(encode(&[true, true, true]), (SYNC_SAMPLE_FLAGS, None));
+        assert_eq!(encode(&[true]), (SYNC_SAMPLE_FLAGS, None));
+        assert_eq!(
+            encode(&[true, false, false]),
+            (NON_SYNC_SAMPLE_FLAGS, Some(SYNC_SAMPLE_FLAGS))
+        );
+        // A sync sample in the middle is not encoded.
+        assert_eq!(
+            encode(&[true, false, true]),
+            (NON_SYNC_SAMPLE_FLAGS, Some(SYNC_SAMPLE_FLAGS))
+        );
+        assert_eq!(encode(&[false, true]), (NON_SYNC_SAMPLE_FLAGS, None));
+        assert_eq!(encode(&[false]), (NON_SYNC_SAMPLE_FLAGS, None));
     }
 }

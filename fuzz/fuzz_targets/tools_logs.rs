@@ -9,14 +9,14 @@
 use libfuzzer_sys::fuzz_target;
 
 #[path = "../../crates/iris-tools/src/logs.rs"]
-#[allow(
+#[expect(
     dead_code,
     reason = "the report tools use helpers this target does not"
 )]
 mod logs;
 
 #[path = "../../crates/iris-tools/src/time.rs"]
-#[allow(
+#[expect(
     dead_code,
     reason = "the report tools use helpers this target does not"
 )]

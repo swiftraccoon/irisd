@@ -1,10 +1,8 @@
 # 09 — Phase 1 results (measurement record, 2026-10-31)
 
 This file is a dated measurement record, so it names dates, commands, and the state of the code at
-the time. Host: the dev host described in the gitignored `AGENTS.override.md` (a 16-thread x86-64
-machine). Camera: cam1 as characterised in `01-camera-probe.md`. Build: `cargo build --release -p
-irisd` from the uncommitted working tree of 2026-10-31 (3.7 MB binary). Recording root: the
-configured root on an ext4 HDD.
+the time. One test camera with the behaviour recorded in `01-camera-probe.md`. Build: `cargo build
+--release -p irisd` from the uncommitted working tree of 2026-10-31 (3.7 MB binary).
 
 ## Procedure
 
@@ -17,13 +15,12 @@ configured root on an ext4 HDD.
 4. Playback: `irisd hls` in four variants (main/sub × trailers included with three fragments
    per segment / trailers excluded with one fragment per segment), then ffprobe, ffmpeg
    decode of the first 12 s through its HLS demuxer, and GStreamer `uridecodebin` over the
-   playlists. iPhone AVPlayer via `irisd serve` is left for the owner (the agent sandbox may
-   not bind a LAN-facing port).
+   playlists. AVPlayer through `irisd serve` is open.
 5. Baseline: `ffmpeg -rtsp_transport tcp -timeout 20000000 -i <main> -rtsp_transport tcp
    -timeout 20000000 -i <sub> -map 0:v -c copy -t 120 … -f mp4 main.mp4 -map 1:v -c copy
    -t 120 … -f mp4 sub.mp4` under `/usr/bin/time -v`.
 
-## CPU and memory (one camera, main 4K + sub D1, ten minutes)
+## CPU and memory (one camera, a main and a sub stream, ten minutes)
 
 | Sample (30 s) | user % | kernel % | total % of one core | RSS (MiB) |
 |---|---|---|---|---|
@@ -44,8 +41,8 @@ peak RSS.
 The phase-1 exit criterion (≤ 0.5 % for both streams) was a guess made before any
 measurement; the measured 1.74 % is dominated by kernel time (TCP receive of 9.3 Mbps in
 1,440-byte RTP packets, about 800 packets/s, plus page-cache writes). User time for
-depacketising, regularising, CRC-32C, and `pwritev` is 0.75 %. Projected for six cameras:
-about 10 % of one core, five times the `07-architecture.md` §7 budget of 2 % for six cameras
+depacketising, regularising, CRC-32C, and `pwritev` is 0.75 %. Projected for twelve
+streams: about 10 % of one core, five times the `07-architecture.md` §7 budget of 2 %
 (0.15 % per stream); `12-ingest-cost.md` records the changes that met it.
 
 Reconnects in this run were camera-side: the camera refused TCP connections for 7 s at
@@ -121,7 +118,7 @@ Exit criterion met.
 | ffmpeg decode, first 12 s | both variants, main and sub | 360 / 357 frames decoded |
 | GStreamer `uridecodebin` (hlsdemux + qtdemux + libde265) | included and excluded, sub | plays to end of stream, exit 0 |
 | ffprobe / ffmpeg on the raw `.mp4` | — | `hvc1`, decodes; a `duration` field reported by ffprobe is stale but pts are exact |
-| AVPlayer on iPhone | included / excluded | **to be measured by the owner**: `irisd serve --dir <hls test directory> --listen 0.0.0.0:8080`, then open `http://<host>:8080/index.html` |
+| AVPlayer | included / excluded | **open**: `irisd serve --dir <hls test directory> --listen <address>`, then open `http://<host>:8080/index.html` |
 
 ## Baseline comparison
 
@@ -158,7 +155,7 @@ wording, "constant 3000-tick durations", is superseded by the ±1 % lock describ
 ## Camera-side observation
 
 After this day's tests opened more than three sessions at once (two of them a hung ffmpeg),
-cam1's RTSP server refused connections for 7 s and then intermittently accepted sub-stream
-sessions without sending frames for the rest of the afternoon. Both are handled by the
+the camera's RTSP server refused connections for 7 s and then intermittently accepted
+sub-stream sessions without sending frames for some hours. Both are handled by the
 daemon (reconnect with backoff, new run file), and both argue for the inactivity timeout and
 for keeping every client behind irisd's single camera connection.

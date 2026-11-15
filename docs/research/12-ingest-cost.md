@@ -1,11 +1,11 @@
 # 12 — Ingest cost: where the CPU goes and the read policy
 
-Measured 2026-11-01 on the x86-64 development host (16 hardware threads), release build,
-the commit that added `iris-replay`. Numbers come from `iris-tools replay-bench` driving
-`irisd run` against `iris-replay` serving one 4K H.265 recording (15.5 Mbit/s, 30 fps, 2 s
+Measured 2026-11-01 on the test machine, release build, the commit that added `iris-replay`.
+Numbers come from `iris-tools replay-bench` driving
+`irisd run` against `iris-replay` serving one H.265 recording (15.5 Mbit/s, 30 fps, 2 s
 GOP) to N sessions over loopback, 90 s per run with the first 20 s discarded; the daemon's
 CPU and wake-ups (voluntary context switches of the runtime thread) are read from `/proc`.
-Live figures come from the seven-camera soak (14 streams, 100 Mbit/s) through
+Live figures come from a soak of the test cameras' streams at 100 Mbit/s through
 `iris-tools soak-sample`.
 
 The harness computes payload rate from differences between timestamped stream counters,
@@ -174,7 +174,7 @@ The two changes, in `iris-ingest` and the vendored retina:
   the next keepalive deadline instead of stalling the runtime thread (a blocking write would
   hold the thread for as long as the camera kept the connection open). A `TEARDOWN` on the
   connection first returns the socket to the reactor. The read path, and so the measurements
-  below, are the same either way: the session writes only its keepalive, every 30 s on cam1.
+  below, are the same either way: the session writes only its keepalive, every 30 s.
   Only the timer-driven mode detaches; packet-driven reads keep the reactor.
 - **One read per tick**: a detached read shorter than the space offered means the socket's
   queue is empty, so the connection answers the rest of that tick's polls with `Pending`
@@ -190,7 +190,7 @@ The two changes, in `iris-ingest` and the vendored retina:
 
 Against the 07 §7 budget of 0.036 % per Mbit/s, ingest sits at 0.022: under budget for
 the first time. The per-megabit figures here are lower than §5's 0.064 because this run
-replays a 4K main stream at 132 Mbit/s with the fuzz targets running niced in the
+replays a main stream at 132 Mbit/s with the fuzz targets running niced in the
 background; compare rows within a table, not across sections.
 
 With the detached socket the `readv` count first doubled, since a detached read ran until
@@ -267,9 +267,9 @@ The figures fit about 12 MiB plus 0.55 MiB per Mbit/s. glibc's `mallinfo2`, samp
 So the cost per stream follows its GOP size and the size its read ring reached. Six streams
 at 61.5 Mbit/s hold 46 to 47 MiB, inside the 07 §7 budget of 64 MB (61 MiB) at a tenth more
 than its 56 Mbit/s.
-The service's seven cameras write about 93 Mbit/s and sit at 79 MiB, where the fit gives
-63 MiB. The difference was not broken down; the service also runs fourteen sessions, seven
-event feeds, and the catalog with retention. Of its 81 MiB, 61 MiB is the main heap.
+A service recording the test cameras at about 93 Mbit/s sits at 79 MiB, where the fit
+gives 63 MiB. The difference is not broken down; the service also runs its event feeds and
+the catalog with retention. Of its 81 MiB, 61 MiB is the main heap.
 
 glibc's allocator settings trade memory for system time at fourteen streams. The defaults
 stay, and the first setting below is an operator's option (`packaging/README.md`):

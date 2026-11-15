@@ -9,8 +9,8 @@ use std::time::{Duration, Instant};
 use iris_core::id::StreamKey;
 use iris_mp4::fragment::Fragment;
 use iris_mp4::index::{
-    FLAG_DISCONTINUITY_BEFORE, FLAG_NEW_PARAMETERS, FLAG_STARTS_WITH_SYNC, IndexHeader,
-    IndexRecord, MAX_PERSISTED_INDEX_RECORDS,
+    FLAG_DISCONTINUITY_BEFORE, FLAG_FRAMES_LEFT_OUT, FLAG_FRAMES_TWICE, FLAG_NEW_PARAMETERS,
+    FLAG_STARTS_WITH_SYNC, IndexHeader, IndexRecord, MAX_PERSISTED_INDEX_RECORDS,
 };
 use iris_mp4::init::{SampleEntry, build_init_segment};
 use tracing::{info, warn};
@@ -178,6 +178,12 @@ impl StreamWriter {
         if parameters_changed {
             flags |= FLAG_NEW_PARAMETERS;
         }
+        if fragment.steps.left_out {
+            flags |= FLAG_FRAMES_LEFT_OUT;
+        }
+        if fragment.steps.twice {
+            flags |= FLAG_FRAMES_TWICE;
+        }
 
         if rotate {
             self.rotate(fragment)?;
@@ -319,7 +325,7 @@ mod tests {
     use bytes::Bytes;
     use iris_core::id::{CameraId, StreamKind};
     use iris_core::time::WallUs;
-    use iris_mp4::fragment::Sample;
+    use iris_mp4::fragment::{FrameSteps, Sample};
     use iris_mp4::index::{MAX_PERSISTED_INDEX_RECORDS, read_index_bounded};
     use iris_mp4::init::SampleEntry;
 
@@ -370,6 +376,7 @@ mod tests {
             wall: WallUs::new(1_700_000_000_000_000 + i64::try_from(index).unwrap()),
             raw_rtp: 0,
             new_run: run == Run::New,
+            steps: FrameSteps::default(),
             sample_entry: Arc::new(SampleEntry::new(
                 Bytes::from_static(b"\0\0\0\x10hvc1\0\0\0\0\0\0\0\0"),
                 "hvc1".into(),
@@ -410,6 +417,7 @@ mod tests {
             wall: WallUs::new(1_700_000_000_000_000 + i64::try_from(index).unwrap()),
             raw_rtp: 0,
             new_run: false,
+            steps: FrameSteps::default(),
             sample_entry: Arc::clone(entry),
         }
     }
@@ -632,6 +640,39 @@ mod tests {
         assert_ne!(changed.flags & FLAG_NEW_PARAMETERS, 0);
         assert_eq!(writer.files_opened(), 2);
         writer.close().unwrap();
+    }
+
+    /// A fragment that holds a step of its stream is marked in its sidecar
+    /// record, and neither mark starts a file or a run.
+    #[test]
+    fn the_steps_a_fragment_holds_are_marked_in_its_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut writer = writer(dir.path().to_path_buf(), Duration::ZERO);
+        let marks = FLAG_FRAMES_LEFT_OUT | FLAG_FRAMES_TWICE;
+        let steps = [(false, false), (true, false), (false, true), (true, true)];
+        let written: Vec<IndexRecord> = (0..)
+            .zip(steps)
+            .map(|(index, (left_out, twice))| {
+                let stepped = Fragment {
+                    steps: FrameSteps { left_out, twice },
+                    ..fragment(index, Run::Continues)
+                };
+                record(&writer.write(&stepped).unwrap())
+            })
+            .collect();
+        let flags: Vec<u8> = written.iter().map(|record| record.flags & marks).collect();
+        assert_eq!(flags, [0, FLAG_FRAMES_LEFT_OUT, FLAG_FRAMES_TWICE, marks]);
+        assert!(
+            written[1..]
+                .iter()
+                .all(|record| record.flags & FLAG_DISCONTINUITY_BEFORE == 0),
+            "{written:?}"
+        );
+        assert_eq!(writer.files_opened(), 1);
+        writer.close().unwrap();
+        let files = sidecars(dir.path());
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].1, written, "the sidecar on disk");
     }
 
     #[test]

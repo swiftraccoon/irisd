@@ -2,6 +2,10 @@
 
 set shell := ["bash", "-euo", "pipefail", "-c"]
 
+# A gitignored `.env` beside this file sets what differs from one machine to the next, such
+# as the C cross compiler and sysroot that `cross-check` names.
+set dotenv-load := true
+
 default:
     @just --list
 
@@ -9,8 +13,49 @@ default:
 fmt:
     cargo fmt --all
 
-# Verify formatting, lints (warnings are errors), docs, tests, and the vendored crates' tests.
-check: fmt-check clippy test doc vendor-test
+# Verify formatting, lints (warnings are errors), docs, tests, the vendored crates' tests, and
+# the mechanical rules of STANDARDS.md.
+check: fmt-check clippy test doc vendor-test standards
+
+# Everything the CI workflow runs (`.github/workflows/check.yml`), and the tests once more
+# with their temporary files on ext4, which is what a CI runner's are on. Run before a push.
+ci: check standards-commits msrv audit fuzz-clippy fuzz-build cross-check cross-test references-check ext4-test
+
+# Build and test on the minimum supported Rust version, in a target directory of its own.
+msrv:
+    CARGO_TARGET_DIR=target/msrv cargo +1.92.0 test --workspace --locked
+
+# Run the tests with their temporary directory on a scratch ext4 image, which reuses a freed
+# inode number at once and holds files a tmpfs does not. Needs `mkfs.ext4` and root to mount
+# the image (`sudo -n`); it fails where it cannot mount, and does not pass by skipping.
+ext4-test:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    image="$PWD/target/ext4-test.img"
+    mount="$PWD/target/ext4-test"
+    mkdir -p "$mount"
+    rm -f "$image"
+    truncate -s 8G "$image"
+    mkfs.ext4 -q -F "$image"
+    sudo -n mount -o loop "$image" "$mount"
+    trap 'sudo -n umount "$mount"; rm -f "$image"' EXIT
+    sudo -n chown "$(id -u):$(id -g)" "$mount"
+    TMPDIR="$mount" cargo test --workspace --locked
+
+# Check every file git tracks or would track against the mechanical rules of STANDARDS.md and
+# AGENTS.md. `standards.toml` holds the accepted exceptions.
+standards:
+    cargo run --quiet --locked -p iris-tools -- standards tree
+
+# Check the commits of a range the same way: the form of each message, and what each says of
+# its change.
+standards-commits range="origin/main..HEAD":
+    cargo run --quiet --locked -p iris-tools -- standards commits {{range}}
+
+# Make git run the checks in this clone: the tree before a commit, the message as it is made.
+# The hooks are written into the clone's git directory; the tree holds no executable file.
+hooks:
+    cargo run --quiet --locked -p iris-tools -- standards hooks
 
 # Lint the fuzz targets with the pinned nightly; `just fuzz-build` builds them.
 fuzz-clippy:
@@ -28,6 +73,14 @@ test:
 
 doc:
     RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --locked
+
+# The viewer's checks that need a display, which `just check` leaves out: on a virtual one
+# (`xvfb-run`), with ffmpeg's libx264 and the GStreamer HLS and H.264 plugins. Run after any
+# change to the viewer.
+display-test:
+    xvfb-run -a cargo test --locked -p iris-gui --bin iris-gui -- --ignored --test-threads=1
+    cargo test --locked -p iris-gui --test playback_origin -- --ignored
+    cargo test --locked -p iris-gui --test playback_snapshot -- --ignored
 
 # On a machine whose cargo cache lacks these dependencies, run
 # `cargo fetch --locked --manifest-path <manifest>` before this recipe.
@@ -66,11 +119,19 @@ mutants +files:
     cd "$copy"
     cargo mutants -j 2 -o "$out" $(printf -- '-f %s ' {{files}})
 
-# Run the tests of the crates without C dependencies as 64-bit ARM code under user-mode
-# emulation, in release mode because emulated debug code is too slow for the timing tests.
-# Needs `rustup target add aarch64-unknown-linux-musl` and qemu-aarch64-static.
+# Run the tests of the crates without C dependencies as 64-bit ARM code: natively on a
+# 64-bit ARM host, and elsewhere under user-mode emulation, in release mode because emulated
+# debug code is too slow for the timing tests. Needs `rustup target add
+# aarch64-unknown-linux-musl` and, off ARM, a qemu-aarch64-static that implements openat2,
+# which the store's tests call.
 cross-test:
-    CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=rust-lld CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_RUNNER=qemu-aarch64-static cargo test --release --locked --target aarch64-unknown-linux-musl -p iris-core -p iris-h265 -p iris-mp4 -p iris-store -p iris-ingest -p iris-replay
+    #!/usr/bin/env bash
+    set -euo pipefail
+    export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=rust-lld
+    if [ "$(uname -m)" != aarch64 ]; then
+        export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_RUNNER=qemu-aarch64-static
+    fi
+    cargo test --release --locked --target aarch64-unknown-linux-musl -p iris-core -p iris-h265 -p iris-mp4 -p iris-store -p iris-ingest -p iris-replay
 
 # Lint every crate but the GUI (which needs a GTK sysroot) for 64-bit ARM. Needs
 # `rustup target add aarch64-unknown-linux-gnu` and a C cross compiler named by

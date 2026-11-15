@@ -9,8 +9,9 @@ use hardware HEVC decode when available, and the Linux GUI falls back to softwar
 |---|---|---|---|
 | WebSocket live | binary: type byte plus an init segment (`ftyp+moov`), then one single-sample `prft+moof+mdat`+trailer fragment per video frame; a sample-entry change sends a fresh init segment in-band | ≈ 100–300 ms glass-to-glass on a LAN (camera encode + network dominate) | GUI grid, planned iOS live view, web MSE |
 | LL-HLS | in-memory fMP4 `hvc1` segments and 0.5 s parts from the live ring, blocking reload, preload hints | ≈ 1.5–3 s | planned iOS background/AirPlay, any HLS player |
-| HLS VOD / timeline | byte-range playlists over the on-disk files | seek < 1 s | playback in all clients |
-| MP4 export | assembled on the fly, `elst`-trimmed | — | downloads, sharing |
+| WebSocket live audio | the same protocol for a camera's recorded AAC: an `mp4a` init segment, then one fragment per audio frame, with the decode times the recording gives them (`13-audio.md` §10) | frames arrive in bursts, in steps up to 0.36 s; a player holds sound and picture about half a second | GUI focused view, planned iOS live view |
+| HLS VOD / timeline | byte-range playlists over the on-disk files; a camera's multivariant playlist names its recorded audio as a rendition whose segments follow the video's (`13-audio.md` §8) | seek < 1 s | playback in all clients |
+| MP4 export | assembled on the fly, `elst`-trimmed; a camera's export holds its recorded audio as a second track (`13-audio.md` §9) | — | downloads, sharing |
 | Keyframe resource | init + one single-sample fragment (sub stream by default) | — | client-rendered thumbnails and scrubbing |
 | Snapshot proxy | the camera's JPEG: the Dahua CGI endpoint, or the URL the camera's ONVIF Media service names (per `snapshot`) | — | zero-decode stills |
 | JSON API + WS events | cameras, streams, segments, events, health | — | everything else |
@@ -38,7 +39,13 @@ No iOS target is present in the repository. This section records the phase-4 cli
   publishes no concurrent-decoder limit (`VTDecompressionSession` ceiling is "high enough";
   `AVPlayer` observed ≈ 16 pipelines, paused players still hold decoders); budget ≈ 1.5× the
   decoded frame pool per tile (NV12 720p ≈ 1.4 MB/frame).
-- **Audio**: `AVSampleBufferAudioRenderer` sharing a timebase with the display layer.
+- **Audio**: `AVSampleBufferAudioRenderer` sharing a timebase with the display layer
+  (`AVSampleBufferRenderSynchronizer`), fed from the camera's audio WebSocket. What the
+  Linux viewer does holds for any player of the two feeds (`13-audio.md` §10):
+  audio frames arrive in bursts, so sound and picture are both held about half a second
+  against one clock; each feed is placed by the least of its arrival time less its media
+  time, which needs no shared timeline (the audio's is the main stream's, a sub stream has
+  its own); and `GET /api/cameras` says which cameras have audio (`has_audio`).
 
 Expected: decode on silicon, CPU spent only on demux; battery dominated by the display.
 
@@ -54,7 +61,7 @@ tile.**
 - Decoder selection by GStreamer rank: `vah265dec` (PRIMARY+1 since 1.24) on VA-API hosts,
   `nvh265dec` on NVIDIA, `avdec_h265` as the software fallback; `decodebin3` chooses, and the
   viewer does not log the choice.
-- A consumer NVIDIA GPU with a single NVDEC engine (the dev host's card): HEVC Main/Main10
+- A consumer NVIDIA GPU with a single NVDEC engine: HEVC Main/Main10
   4:2:0, NVIDIA rates one engine at roughly 800–1,600 fps of 1080p HEVC depending on the
   generation, no session cap on decode. Six D1 tiles plus one 4K view ≈ 25 % of an engine;
   CPU ≈ 5–15 % of one core for parsing and compositing. The viewer links `gst-plugin-gtk4`, so
@@ -65,7 +72,9 @@ tile.**
   the viewer selects itself; GTK's Vulkan renderer copies GL textures through the CPU). The daemon's
   live feed is a fragmented MP4 byte stream, so `qtdemux` demuxes it directly (no access-unit caps
   or `h265parse`), and `decodebin3` does the rank-based decoder choice. The sink runs
-  `sync=false` for a live view. The window is a stack of two views, the grid and one focused camera
+  `sync=false` for a live view; the focused view of a camera with audio also plays its audio
+  feed, and then holds both media half a second against the pipeline's clock
+  (`13-audio.md` §10.4). The window is a stack of two views, the grid and one focused camera
   on its main stream; only the visible view decodes, so a focused camera costs one main-stream
   decode and the grid costs one sub-stream decode per tile. Playback is a third view: the HLS VOD
   playlist of the window through `playbin3` (`hlsdemux2` fetches the byte ranges), with a timeline

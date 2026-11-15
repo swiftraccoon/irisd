@@ -88,7 +88,7 @@ mod tests {
     use iris_core::event::{EventKind, EventSource, EventState};
     use iris_core::id::{StreamKey, StreamKind};
     use iris_core::time::WallUs;
-    use iris_mp4::fragment::{Fragment, Sample};
+    use iris_mp4::fragment::{Fragment, FrameSteps, Sample};
     use iris_mp4::init::SampleEntry;
     use iris_store::{StoragePolicy, WriterHandle};
 
@@ -105,6 +105,7 @@ mod tests {
             wall: WallUs::new(1_700_000_000_000_000 + i64::try_from(index).unwrap() * 1_000_000),
             raw_rtp: 0,
             new_run: index == 0,
+            steps: FrameSteps::default(),
             sample_entry: Arc::clone(entry),
         }
     }

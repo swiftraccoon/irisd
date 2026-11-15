@@ -16,11 +16,13 @@ Scope: this crate only. Read the root `AGENTS.md` first.
 - Configuration keys and defaults are documented in `config/cameras.example.toml`; an
   added key or a changed default updates that file and the design document that fixes the value.
 - Configuration rejects duplicate camera ids, repeated recorded kinds or event sources per
-  camera, free-space percentages above 50, sync intervals outside 100..=60,000 ms, rotation
-  outside 60..=86,400 s or 64 MiB..=64 GiB, preallocation above the smaller of the rotation
-  size and 4 GiB, a zero quota, fragment durations outside 1..=60,000 ms, queues above 4,096
-  complete fragments per stream, read intervals above 1,000 ms, receive low-water marks above
-  1,024 KiB, camera URLs that embed credentials, and retention outside 1..=106,751,991 days.
+  camera, audio recorded without the main stream, `audio_steps` without recorded audio,
+  free-space percentages above 50, sync
+  intervals outside 100..=60,000 ms, rotation outside 60..=86,400 s or 64 MiB..=64 GiB,
+  preallocation above the smaller of the rotation size and 4 GiB, a zero quota, fragment
+  durations outside 1..=60,000 ms, queues above 4,096 complete fragments per stream, read
+  intervals above 1,000 ms, receive low-water marks above 1,024 KiB, camera URLs that embed
+  credentials, and retention outside 1..=106,751,991 days.
   The API needs a
   token of at least 32 visible ASCII characters that is not the example placeholder, or the
   `allow_unauthenticated` switch with no token on a loopback listener. Derived queue and

@@ -79,8 +79,9 @@
    ```
 
 `systemd-analyze security irisd` reports the hardening score. The daemon pings the
-watchdog only while every camera stream makes progress, so a wedged daemon is restarted
-within `WatchdogSec`. Logs go to the journal: `journalctl -u irisd -f`.
+watchdog only while every stream's task is alive, whatever its camera does, so a wedged
+daemon is restarted within `WatchdogSec` and a camera that is down restarts nothing. Logs go
+to the journal: `journalctl -u irisd -f`.
 `SyslogLevelPrefix=no` stores every line at the unit's `SyslogLevel=` (info by default), so
 camera-controlled text cannot raise a line's journal priority. irisd writes no priority
 prefixes: its level appears only as text in each line, so filter by that text

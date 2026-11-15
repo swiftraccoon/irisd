@@ -1030,6 +1030,7 @@ name = "iris-fuzz"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "bytes",
  "iris-core",
  "iris-events",
  "iris-h265",

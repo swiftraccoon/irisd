@@ -13,8 +13,18 @@ fault-tested without hardware: cost measurements, chaos runs, and the integratio
   to 30, a 60-second loop); `--listen` (default `127.0.0.1:8554`; an address outside
   loopback also needs `--allow-remote`), `--max-connections N` (default 256), `--mtu`,
   `--once`, `--burst` or `--pace` (not both), `--drop-every N` (N at least 1),
-  `--stall-after DURATION`, `--stall-for DURATION`. Recordings load before the runtime
-  starts; an unparsable `RUST_LOG` is reported and `info` applies.
+  `--stall-after DURATION`, `--stall-for DURATION`, `--base-rtp TICKS` (the RTP timestamp of
+  each session's first frame, to put the 32-bit wrap inside a stream). `Options` also offers
+  a synthetic AAC stream (`audio_sample_rate`): a second media section, `trackID=1`, set up
+  after the video in the same session, with one frame of known bytes
+  (`server::audio_frame`) every 1,024 samples, stamped early and backwards as cameras do
+  (`audio_timestamp_wander`), with one frame never sent (`audio_lose_frame`), or with sound
+  left out by the camera (`audio_leave_out`), and clock
+  faults for checks of what detects drift (`clocks`: a media clock fast against true time, an
+  audio sample clock fast against the media clock, audio stamped by the sample clock or by
+  the media clock, sender reports for the audio or none, sender reports stamped as a camera stamps
+  the two it makes together; `report_interval`). Recordings
+  load before the runtime starts; an unparsable `RUST_LOG` is reported and `info` applies.
 - `media` — `Media` loads a recording into memory, extracts VPS, SPS, and PPS from its
   `hvcC`, and indexes every frame with its decode time (relative to the file's first
   fragment, since stored decode times run on across the files of a run) and sync flag. Its
@@ -59,9 +69,10 @@ the two-mode recording test in `iris-ingest` do.
 
 - Packetization follows RFC 7798 §4.4.1 and §4.4.3 (single NAL unit packets and
   fragmentation units; no aggregation packets, no DONL), parameter sets are sent in-band
-  before every sync sample as cameras do, and a sender report goes out every five seconds
-  with the stream's own SSRC. RTP MTU is admitted only in `256..=65535`; packets are
-  produced one at a time and remain representable by RTSP interleaving. RTCP packet/octet
+  before every sync sample as cameras do, and a sender report goes out every
+  `Options::report_interval`, five seconds by default, with the stream's own SSRC. RTP MTU
+  is admitted only in `256..=65535`; packets are produced one at a time and remain
+  representable by RTSP interleaving. RTCP packet/octet
   fields use the low 32 bits of the continuing totals, rolling over instead of freezing.
 - Frames are paced by decode time. Each RTP packet is written with its own system call by
   default, and `--pace` spreads a frame's packets over the frame interval; this reproduces
@@ -71,7 +82,8 @@ the two-mode recording test in `iris-ingest` do.
   packet lost on the network does; a stall (`--stall-after`) pauses
   once and then sends the paused frames in a burst with their original timestamps, as a
   network stall would deliver them. Sender reports sample wall and RTP clocks at the same
-  instant; this does not change the intentional catch-up burst.
+  instant unless `Clocks::late_reports` sets them behind; this does not change the intentional
+  catch-up burst.
 - Only TCP interleaved transport is accepted (`SETUP` without it gets `461`); there is no
   authentication, so the binary refuses a `--listen` address outside loopback unless
   `--allow-remote` accepts serving every mount to whoever connects. At most
@@ -84,9 +96,10 @@ the two-mode recording test in `iris-ingest` do.
   session timeout). A reply that cannot be queued within the deadline in force, because the
   peer stopped reading and its queue filled, ends the connection instead of holding its slot.
   A request head is at most 64 KiB and a body at most 64 KiB; a `Content-Length` that is not
-  a decimal count, or repeats with another value, refuses the request. A connection must select one
-  mount, complete a valid `SETUP`, and return
-  the issued `Session` before `PLAY`; cross-mount and repeated/finished plays fail closed,
+  a decimal count, or repeats with another value, refuses the request. A connection must
+  select one mount, complete a valid `SETUP`, and return the issued `Session` before `PLAY`.
+  Offered audio takes one further `SETUP` on that mount and in that session, after the
+  video's and before `PLAY`. Cross-mount and repeated/finished plays fail closed,
   and `TEARDOWN` preserves prior control replies but bypasses stale queued media on a bounded,
   delivery-acknowledged terminal path.
 - Mount names are one URI segment and must be unique. Recordings must be CRC-clean irisd
@@ -108,7 +121,8 @@ remote-bind opt-in and the exclusive delivery flags; per-packet, burst, and pace
 and the drop interval, read from the player's queue; and, over loopback with shortened
 deadlines, the connection cap, partial and trickled requests and bare interleaved frames
 closed at the pre-`PLAY` deadline, a reply to a peer that stopped reading ending the
-connection, and a playing session kept by keepalives and closed once they stop.
+connection, and a playing session kept by keepalives and closed once they stop; the audio stream's
+SETUP rules, its frames left out, and sender reports set behind their clocks.
 `tests/loopback.rs` serves a synthetic recording and receives it through the recorder's own
 RTSP client, checking bytes, sync flags, and timestamps. The fidelity of the replay against
 live cameras and the measurements it enabled are in `docs/research/12-ingest-cost.md`.

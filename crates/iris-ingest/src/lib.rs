@@ -61,12 +61,16 @@
 //! ```
 
 pub mod assembler;
+mod audio;
+mod cadence;
 pub mod live;
 pub mod regularize;
 mod session;
 mod sink;
 mod source;
 mod stats;
+mod steer;
+mod sync;
 
 pub use live::{LiveError, LiveFrame, LiveRing, LiveSubscription};
 /// The most background `TEARDOWN` tasks retina runs at once in a process; a
@@ -82,6 +86,6 @@ pub use retina::client::background_teardowns;
 pub use session::{ReadTicker, deliver_fragment, run_stream};
 pub use sink::{FragmentSink, SinkError};
 pub use source::{IngestOptions, StreamSource};
-pub use stats::StreamStats;
+pub use stats::{SoundSteps, StreamStats};
 /// The URL type accepted by [`StreamSource`], re-exported so callers need not depend on `url`.
 pub use url::Url;
