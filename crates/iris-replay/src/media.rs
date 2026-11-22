@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use iris_h265::{FramingError, inspect_access_unit};
-use iris_mp4::boxes::BoxHeader;
+use iris_mp4::decoder_config::{self, HvccError};
 use iris_mp4::reader::{self, ScanOptions, ScanReport, ScanStop};
 
 /// A count of the recording's 90 kHz clock. Unsigned, as the recording's decode
@@ -156,48 +156,6 @@ pub enum MediaError {
     ParameterSets(#[source] HvccError),
 }
 
-/// Why an init segment's `hvcC` yields no usable parameter sets.
-#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
-#[non_exhaustive]
-pub enum HvccError {
-    /// A box on the path to the sample entry's `hvcC`, or the fields before it,
-    /// is missing or does not fit its parent.
-    #[error("{0} is missing or malformed")]
-    Missing(&'static str),
-    /// The sample entry is not HEVC.
-    #[error("the sample entry {0:?} is not HEVC")]
-    NotHevc(String),
-    /// The configuration version is not 1.
-    #[error("unsupported hvcC configuration version")]
-    Version,
-    /// NAL units carry length prefixes other than four bytes.
-    #[error("hvcC does not use four-byte NAL length prefixes")]
-    LengthSize,
-    /// An array or NAL unit runs past the end of the configuration.
-    #[error("hvcC is truncated")]
-    Truncated,
-    /// An array header has its reserved bit set.
-    #[error("hvcC array reserved bit is set")]
-    Reserved,
-    /// A NAL unit is shorter than its two-byte header.
-    #[error("hvcC NAL unit is shorter than its two-byte header")]
-    ShortNal,
-    /// A NAL unit's type differs from its array's.
-    #[error("hvcC array type {array} contains NAL unit type {nal}")]
-    TypeMismatch {
-        /// The array's type.
-        array: u8,
-        /// The NAL unit's type.
-        nal: u8,
-    },
-    /// Bytes follow the last array.
-    #[error("hvcC has trailing bytes")]
-    Trailing,
-    /// A VPS, SPS, or PPS is missing.
-    #[error("hvcC is missing parameter-set type {0}")]
-    MissingParameterSet(u8),
-}
-
 /// A recording ready to replay.
 ///
 /// [`Media::from_bytes`] admits a file only when it is CRC-clean through exact
@@ -257,8 +215,11 @@ impl Media {
     /// regresses, overlaps, or exceeds [`MAX_REPLAY_TICKS`], a zero sample
     /// duration, a sample outside the file, an empty or malformed access unit, a
     /// sync flag that disagrees with its access unit, a first sample that is not
-    /// a sync sample, or an `hvcC` without version 1, four-byte lengths, and a
-    /// VPS, SPS, and PPS.
+    /// a sync sample, or an init segment that
+    /// [`decoder_config::parse_parameter_sets`] refuses. Among others, that
+    /// reader refuses an `hvcC` without version 1, four-byte lengths, and a
+    /// VPS, SPS, and PPS, and one that holds more than 16 VPSs, 16 SPSs, or
+    /// 64 PPSs ([`HvccError::TooManyParameterSets`]).
     pub fn from_bytes(data: Bytes) -> Result<Self, MediaError> {
         let report = reader::scan(
             Cursor::new(&data[..]),
@@ -286,12 +247,18 @@ impl Media {
         let Some(first) = report.fragments.first() else {
             return Err(MediaError::NoFragments);
         };
-        let init_len = usize::try_from(report.init_len).map_err(|_| MediaError::Unscanned {
-            accepted: report.valid_len,
-            len: data.len() as u64,
-        })?;
+        // The scan read all of `data`, so the init segment it reports lies
+        // inside it. A length past the end, which no scan reports, is refused
+        // as bytes the scan did not accept.
+        let init = usize::try_from(report.init_len)
+            .ok()
+            .and_then(|init_len| data.get(..init_len))
+            .ok_or(MediaError::Unscanned {
+                accepted: report.valid_len,
+                len: data.len() as u64,
+            })?;
         let parameter_sets =
-            parameter_sets(&data[..init_len]).map_err(MediaError::ParameterSets)?;
+            decoder_config::parse_parameter_sets(init).map_err(MediaError::ParameterSets)?;
         // Stored decode times are continuous within a recording run, so a file
         // that is not the first of its run starts far from zero; playback times
         // are relative to the file's first fragment.
@@ -414,131 +381,6 @@ impl Media {
     }
 }
 
-/// Extracts the VPS, SPS, and PPS NAL units from an init segment's `hvcC`.
-///
-/// # Errors
-///
-/// [`HvccError::Missing`] when a box on the path `moov`/`trak`/`mdia`/`minf`/
-/// `stbl`/`stsd` to the sample entry's `hvcC` is absent or malformed,
-/// [`HvccError::NotHevc`] for a sample entry other than `hvc1` or `hev1`, and
-/// every error of [`parse_hvcc`].
-pub fn parameter_sets(init: &[u8]) -> Result<Vec<Vec<u8>>, HvccError> {
-    let moov = child(init, *b"moov").ok_or(HvccError::Missing("moov"))?;
-    let trak = child(moov, *b"trak").ok_or(HvccError::Missing("trak"))?;
-    let mdia = child(trak, *b"mdia").ok_or(HvccError::Missing("mdia"))?;
-    let minf = child(mdia, *b"minf").ok_or(HvccError::Missing("minf"))?;
-    let stbl = child(minf, *b"stbl").ok_or(HvccError::Missing("stbl"))?;
-    let stsd = child(stbl, *b"stsd").ok_or(HvccError::Missing("stsd"))?;
-    // stsd is a full box: version/flags then entry_count, then the entries.
-    let entries = stsd.get(8..).ok_or(HvccError::Missing("stsd entries"))?;
-    let entry = first_box(entries).ok_or(HvccError::Missing("sample entry"))?;
-    if &entry.kind != b"hvc1" && &entry.kind != b"hev1" {
-        return Err(HvccError::NotHevc(
-            String::from_utf8_lossy(&entry.kind).into_owned(),
-        ));
-    }
-    // A visual sample entry has 78 bytes of fixed fields after the box header.
-    let children = entry
-        .body
-        .get(78..)
-        .ok_or(HvccError::Missing("sample entry fields"))?;
-    let hvcc = child(children, *b"hvcC").ok_or(HvccError::Missing("hvcC"))?;
-    parse_hvcc(hvcc)
-}
-
-/// Reads the NAL unit arrays of an `hvcC` body (ISO/IEC 14496-15 §8.3.3.1) and
-/// returns its VPS, SPS, and PPS NAL units in order.
-///
-/// # Errors
-///
-/// An [`HvccError`] for a configuration version other than 1, length prefixes
-/// other than four bytes, a truncated array or NAL unit, a set reserved bit, a
-/// NAL unit shorter than its header or of another type than its array, trailing
-/// bytes, or a missing VPS, SPS, or PPS.
-pub fn parse_hvcc(body: &[u8]) -> Result<Vec<Vec<u8>>, HvccError> {
-    if body.first() != Some(&1) {
-        return Err(HvccError::Version);
-    }
-    if body.get(21).ok_or(HvccError::Truncated)? & 0x03 != 3 {
-        return Err(HvccError::LengthSize);
-    }
-    let count = usize::from(*body.get(22).ok_or(HvccError::Truncated)?);
-    let byte = |pos: usize| body.get(pos).copied().ok_or(HvccError::Truncated);
-    let mut pos = 23;
-    let mut sets = Vec::new();
-    for _ in 0..count {
-        let array_header = byte(pos)?;
-        if array_header & 0x40 != 0 {
-            return Err(HvccError::Reserved);
-        }
-        let array_type = array_header & 0x3f;
-        let nalus = usize::from(u16::from_be_bytes([byte(pos + 1)?, byte(pos + 2)?]));
-        pos += 3;
-        for _ in 0..nalus {
-            let len = usize::from(u16::from_be_bytes([byte(pos)?, byte(pos + 1)?]));
-            pos += 2;
-            let end = pos.checked_add(len).ok_or(HvccError::Truncated)?;
-            let nal = body.get(pos..end).ok_or(HvccError::Truncated)?;
-            if nal.len() < 2 {
-                return Err(HvccError::ShortNal);
-            }
-            let actual_type = (nal[0] >> 1) & 0x3f;
-            if actual_type != array_type {
-                return Err(HvccError::TypeMismatch {
-                    array: array_type,
-                    nal: actual_type,
-                });
-            }
-            if matches!(array_type, 32..=34) {
-                sets.push(nal.to_vec());
-            }
-            pos = end;
-        }
-    }
-    if pos != body.len() {
-        return Err(HvccError::Trailing);
-    }
-    for required in 32..=34 {
-        if !sets.iter().any(|nal| ((nal[0] >> 1) & 0x3f) == required) {
-            return Err(HvccError::MissingParameterSet(required));
-        }
-    }
-    Ok(sets)
-}
-
-/// A box found inside a buffer.
-struct FoundBox<'a> {
-    kind: [u8; 4],
-    body: &'a [u8],
-}
-
-fn first_box(buf: &[u8]) -> Option<FoundBox<'_>> {
-    let header = BoxHeader::parse(buf)?;
-    let size = usize::try_from(header.size.unwrap_or(buf.len() as u64)).ok()?;
-    let body = buf.get(usize::from(header.header_len)..size)?;
-    Some(FoundBox {
-        kind: header.kind,
-        body,
-    })
-}
-
-/// The body of the first child box of type `kind`.
-fn child(buf: &[u8], kind: [u8; 4]) -> Option<&[u8]> {
-    let mut rest = buf;
-    while !rest.is_empty() {
-        let header = BoxHeader::parse(rest)?;
-        let size = usize::try_from(header.size.unwrap_or(rest.len() as u64)).ok()?;
-        if size < usize::from(header.header_len) || size > rest.len() {
-            return None;
-        }
-        if header.kind == kind {
-            return Some(&rest[usize::from(header.header_len)..size]);
-        }
-        rest = &rest[size..];
-    }
-    None
-}
-
 #[cfg(test)]
 mod tests {
     use iris_core::time::WallUs;
@@ -608,76 +450,6 @@ mod tests {
         .unwrap()
     }
 
-    fn hvcc(arrays: &[(u8, Vec<Vec<u8>>)]) -> Vec<u8> {
-        let mut body = vec![
-            1, 0x01, 0x60, 0, 0, 0, 0x90, 0, 0, 0, 0, 0, 0x5a, 0xf0, 0x00, 0xfc, 0xfd, 0xf8, 0xf8,
-            0, 0, 0x0f,
-        ];
-        body.push(u8::try_from(arrays.len()).unwrap());
-        for (kind, nals) in arrays {
-            body.push(0x80 | kind);
-            body.extend_from_slice(&u16::try_from(nals.len()).unwrap().to_be_bytes());
-            for nal in nals {
-                body.extend_from_slice(&u16::try_from(nal.len()).unwrap().to_be_bytes());
-                body.extend_from_slice(nal);
-            }
-        }
-        body
-    }
-
-    fn required_hvcc_arrays() -> Vec<(u8, Vec<Vec<u8>>)> {
-        vec![
-            (32, vec![TEST_VPS.to_vec()]),
-            (33, vec![TEST_SPS.to_vec()]),
-            (34, vec![TEST_PPS.to_vec()]),
-        ]
-    }
-
-    #[test]
-    fn parameter_sets_come_from_hvcc() {
-        let entry = synth::sample_entry(&[TEST_VPS.to_vec(), TEST_SPS.to_vec(), TEST_PPS.to_vec()])
-            .unwrap();
-        let init = build_init_segment(&entry);
-        let sets = parameter_sets(&init).unwrap();
-        assert_eq!(
-            sets,
-            vec![TEST_VPS.to_vec(), TEST_SPS.to_vec(), TEST_PPS.to_vec()]
-        );
-    }
-
-    /// Either HEVC sample entry is read; another codec's is refused by name.
-    #[test]
-    fn only_hevc_sample_entries_are_read() {
-        let sets = vec![TEST_VPS.to_vec(), TEST_SPS.to_vec(), TEST_PPS.to_vec()];
-        let init = build_init_segment(&synth::sample_entry(&sets).unwrap());
-        let stsd = init.windows(4).position(|w| w == b"stsd").unwrap();
-        let kind = stsd + init[stsd..].windows(4).position(|w| w == b"hvc1").unwrap();
-        let mut hev1 = init.to_vec();
-        hev1[kind..kind + 4].copy_from_slice(b"hev1");
-        assert_eq!(parameter_sets(&hev1).unwrap(), sets);
-        let mut avc1 = init.to_vec();
-        avc1[kind..kind + 4].copy_from_slice(b"avc1");
-        assert_eq!(
-            parameter_sets(&avc1),
-            Err(HvccError::NotHevc("avc1".to_owned()))
-        );
-    }
-
-    /// An empty box is stepped over; a box that claims more bytes than are
-    /// left ends the search.
-    #[test]
-    fn boxes_are_walked_by_their_declared_sizes() {
-        let sets = vec![TEST_VPS.to_vec(), TEST_SPS.to_vec(), TEST_PPS.to_vec()];
-        let init = build_init_segment(&synth::sample_entry(&sets).unwrap());
-        let mut led = b"\0\0\0\x08free".to_vec();
-        led.extend_from_slice(&init);
-        assert_eq!(parameter_sets(&led).unwrap(), sets);
-        assert_eq!(
-            parameter_sets(&init[..init.len() - 1]),
-            Err(HvccError::Missing("moov"))
-        );
-    }
-
     #[test]
     fn decode_times_are_relative_to_the_first_fragment() {
         let bytes = synth::recording(Plan {
@@ -702,7 +474,32 @@ mod tests {
             media.sample(&media.frames()[0]).map(<[u8]>::len),
             Some(media.frames()[0].len)
         );
-        assert_eq!(media.parameter_sets().len(), 3);
+    }
+
+    /// `Media::from_bytes` gives the parameter sets that `synth::recording`
+    /// wrote, in their order.
+    #[test]
+    fn media_holds_the_parameter_sets_the_recording_carries() {
+        let media = Media::from_bytes(synth::recording(small_plan()).unwrap()).unwrap();
+        assert_eq!(media.parameter_sets(), [TEST_VPS, TEST_SPS, TEST_PPS]);
+    }
+
+    /// The configuration version is the first byte of the `hvcC` body. The
+    /// fragment checksums leave the init segment out, so the scan accepts
+    /// the file.
+    #[test]
+    fn a_recording_whose_hvcc_is_of_version_0_is_rejected() {
+        let mut bytes = synth::recording(small_plan()).unwrap().to_vec();
+        let hvcc = bytes
+            .windows(4)
+            .position(|window| window == b"hvcC")
+            .unwrap();
+        assert_eq!(bytes[hvcc + 4], 1, "configurationVersion");
+        bytes[hvcc + 4] = 0;
+        assert!(matches!(
+            Media::from_bytes(Bytes::from(bytes)),
+            Err(MediaError::ParameterSets(HvccError::Version))
+        ));
     }
 
     #[test]
@@ -894,82 +691,5 @@ mod tests {
             Media::from_bytes(recording_with_fragments(&[(0, vec![mislabeled])])),
             Err(MediaError::SyncMismatch)
         ));
-    }
-
-    #[test]
-    fn a_valid_hvcc_yields_its_three_parameter_sets() {
-        assert_eq!(parse_hvcc(&hvcc(&required_hvcc_arrays())).unwrap().len(), 3);
-    }
-
-    #[test]
-    fn hvcc_requires_version_one() {
-        let mut wrong_version = hvcc(&required_hvcc_arrays());
-        wrong_version[0] = 0;
-        assert_eq!(parse_hvcc(&wrong_version), Err(HvccError::Version));
-    }
-
-    #[test]
-    fn hvcc_requires_four_byte_lengths() {
-        for length_size_minus_one in 0..3 {
-            let mut wrong_length = hvcc(&required_hvcc_arrays());
-            wrong_length[21] = (wrong_length[21] & !3) | length_size_minus_one;
-            assert_eq!(
-                parse_hvcc(&wrong_length),
-                Err(HvccError::LengthSize),
-                "{length_size_minus_one}"
-            );
-        }
-    }
-
-    #[test]
-    fn hvcc_requires_each_parameter_set_type() {
-        for missing in 32..=34 {
-            let arrays = required_hvcc_arrays()
-                .into_iter()
-                .filter(|(kind, _)| *kind != missing)
-                .collect::<Vec<_>>();
-            assert_eq!(
-                parse_hvcc(&hvcc(&arrays)),
-                Err(HvccError::MissingParameterSet(missing))
-            );
-        }
-    }
-
-    #[test]
-    fn hvcc_keeps_repeated_sets_and_ignores_unrelated_arrays() {
-        let mut arrays = required_hvcc_arrays();
-        arrays.insert(1, (39, vec![vec![39 << 1, 1, 0xaa]]));
-        arrays.push((33, vec![TEST_SPS.to_vec()]));
-        let sets = parse_hvcc(&hvcc(&arrays)).unwrap();
-        assert_eq!(sets.len(), 4);
-        assert_eq!(
-            sets.iter().filter(|nal| nal[0] >> 1 & 0x3f == 33).count(),
-            2
-        );
-    }
-
-    #[test]
-    fn malformed_hvcc_arrays_are_rejected() {
-        let mut mismatch = required_hvcc_arrays();
-        mismatch[0] = (32, vec![TEST_SPS.to_vec()]);
-        assert_eq!(
-            parse_hvcc(&hvcc(&mismatch)),
-            Err(HvccError::TypeMismatch { array: 32, nal: 33 })
-        );
-
-        let mut short = required_hvcc_arrays();
-        short[0] = (32, vec![vec![32 << 1]]);
-        assert_eq!(parse_hvcc(&hvcc(&short)), Err(HvccError::ShortNal));
-        // A NAL unit that is its two-byte header alone is whole.
-        short[0] = (32, vec![vec![32 << 1, 1]]);
-        assert_eq!(parse_hvcc(&hvcc(&short)).unwrap()[0], [32 << 1, 1]);
-
-        let mut reserved = hvcc(&required_hvcc_arrays());
-        reserved[23] |= 0x40;
-        assert_eq!(parse_hvcc(&reserved), Err(HvccError::Reserved));
-
-        let mut trailing = hvcc(&required_hvcc_arrays());
-        trailing.push(0);
-        assert_eq!(parse_hvcc(&trailing), Err(HvccError::Trailing));
     }
 }

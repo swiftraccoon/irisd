@@ -147,16 +147,18 @@ repeat per fragment (one GOP, ≤ 1.25 × max_fragment_ms of frames):
   (Frigate's `force_record_hvc1` exists for the same reason). the test camera's parameter sets are
   byte-identical across GOPs; the writer compares each fragment's sample entry with the open
   file's and seals the file when the bytes change.
-- The `CODECS` string comes from retina's `rfc6381_codec()`, which derives it from the SPS
-  `profile_tier_level` per ISO/IEC 14496-15 Annex E; it is stored with each sample entry and in
-  the catalog's `codecs` column, and the test camera's main stream reports `hvc1.1.6.L150.00` (the
-  `stream` line's `codec` field).
+- The `CODECS` string comes from retina's `rfc6381_codec()`, which builds it from the
+  `profile_tier_level` of the SPS (`third_party/retina/src/codec/h265/nal.rs`). The comments of that
+  function quote the rule they follow and give its source as section E.3 of ISO/IEC 14496-15 or of a
+  working draft of it. ISO/IEC 14496-15 was not read, so the form of the string is **unverified**
+  against it. The string is stored with each sample entry and in the catalog's `codecs` column, and
+  the test camera's main stream reports `hvc1.1.6.L150.00` (the `stream` line's `codec` field).
 - Version-1 (64-bit) `mvhd`/`tkhd`/`mdhd`/`tfdt` avoid the 13.26 h overflow of 32-bit
   90 kHz fields. `trun` per-sample durations are 32-bit, which is fine.
-- `prft` (version 1, flags 0x18, the value ffmpeg writes for `-write_prft wallclock`) makes
-  each fragment self-describing in wall time. The flag semantics in ISO/IEC 14496-12:2022
-  §8.16.5 are unverified against the paywalled text (§12); matching ffmpeg keeps the files
-  readable by the tools that parse `prft`.
+- `prft` (version 1, flags 0x18, the value ffmpeg writes for `-write_prft wallclock`) makes each
+  fragment self-describing in wall time. ISO/IEC 14496-12 was not read, so what its text says the
+  flags mean is **unverified** (§12); matching ffmpeg keeps the files readable by the tools that
+  parse `prft`.
 - The trailer is a standard, universally ignored 24-byte `free` box: size, `free`, the magic
   `IRX1`, a CRC-32C over `prft` through the end of `mdat`, `fragment_len` (from the start of
   `prft` to the end of the trailer), and four reserved bytes that are zero. They lie outside

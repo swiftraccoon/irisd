@@ -12,19 +12,22 @@ use futures::StreamExt as _;
 use gst::prelude::*;
 use gtk::prelude::*;
 use gtk::{gdk, glib};
+use iris_client::api::{ApiError, EventRecord, Retention, Segment, Window};
+use iris_client::playback::{PlaybackSelection, ThumbnailTime, export_name, thumbnail_times};
+use iris_client::timeline_model::{PlaylistOffset, TimelineModel};
+use iris_client::vod::PlaybackFragment;
 use iris_core::id::{CameraId, StreamKind};
 use iris_core::time::WallUs;
+use iris_transport::Client;
 use tokio::runtime::Runtime;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
 use tokio::task::AbortHandle;
 use tokio_util::task::AbortOnDropHandle;
 use tracing::{info, warn};
 
-use crate::api::{Client, EventRecord, Segment};
 use crate::snapshot::Snapshot;
 use crate::thumbs;
-use crate::timeline::{self, MICROS_PER_SECOND, Model, Timeline};
-use crate::vod::PlaybackFragment;
+use crate::timeline::{self, MICROS_PER_SECOND, Timeline};
 
 /// The video sink handed to `playbin3`; see [`Playback::start`].
 const VIDEO_SINK: &str = "glupload ! glcolorconvert ! gtk4paintablesink name=sink sync=true";
@@ -165,7 +168,7 @@ pub struct Playback {
     exporting: RefCell<Option<AbortHandle>>,
     export_generation: Cell<u64>,
     generation: Cell<u64>,
-    client: RefCell<Option<Arc<Client>>>,
+    client: RefCell<Option<Client>>,
     runtime: RefCell<Option<Arc<Runtime>>>,
 }
 
@@ -353,16 +356,21 @@ impl Playback {
         let (Some(client), Some(runtime)) = (client, runtime) else {
             return;
         };
-        let until = match event.retain_until {
-            Some(_) => None,
-            None => Some(WallUs::new(glib::real_time()).offset(KEEP_EVENT_DAYS * MICROS_PER_DAY)),
+        let retention = match event.retain_until {
+            Some(_) => Retention::Release,
+            None => Retention::Until(
+                WallUs::new(glib::real_time()).offset(KEEP_EVENT_DAYS * MICROS_PER_DAY),
+            ),
         };
-        let task = runtime.spawn(async move { client.retain_event(event.id, until).await });
+        let task = runtime.spawn(async move {
+            let updated = client.retain_event(event.id, retention).await;
+            updated.map_err(anyhow::Error::from)
+        });
         match task.await {
             Ok(Ok(updated)) => {
                 self.status.set_label(&format!(
                     "{} at {}: {}",
-                    updated.kind.label(),
+                    updated.kind,
                     timeline::clock_label(updated.nvr_time),
                     if updated.retain_until.is_some() {
                         format!("kept for {KEEP_EVENT_DAYS} days")
@@ -377,28 +385,38 @@ impl Playback {
         }
     }
 
-    /// The export range when both marks are set and ordered.
-    fn export_range(&self) -> Option<(WallUs, WallUs)> {
+    /// The export range of the timeline's marks, as [`export_window`] gives
+    /// it.
+    #[must_use]
+    fn export_range(&self) -> Option<Result<Window, ApiError>> {
         self.timeline
-            .with_model(|model| match (model.mark_in, model.mark_out) {
-                (Some(i), Some(o)) if o > i => Some((i, o)),
-                _ => None,
-            })
+            .with_model(|model| export_window(model.mark_in, model.mark_out))
     }
 
-    /// Asks where to save, then exports the marked range there.
+    /// Asks where to save, then exports the marked range there. A range longer
+    /// than seven days is refused in the status line before any dialog opens.
+    /// The refusal starts no export and cancels none: a running export goes
+    /// on, and its progress replaces the refusal in the status line.
     async fn export_dialog(self: Rc<Self>, window: Option<&gtk::Window>) {
-        let Some((from, to)) = self.export_range() else {
-            self.status.set_label("set the in and out marks first");
-            return;
+        let range = match self.export_range() {
+            Some(Ok(range)) => range,
+            Some(Err(refused)) => {
+                warn!(camera = %self.camera, error = %refused, "export failed");
+                self.status.set_label(&format!("export failed: {refused}"));
+                return;
+            }
+            None => {
+                self.status.set_label("set the in and out marks first");
+                return;
+            }
         };
         let dialog = gtk::FileDialog::builder()
             .title("Export recording")
-            .initial_name(export_name(&self.camera, self.kind, from))
+            .initial_name(export_name(&self.camera, self.kind, range.from()))
             .build();
         match dialog.save_future(window).await {
             Ok(file) => match file.path() {
-                Some(path) => self.export_to(path, from, to).await,
+                Some(path) => self.export_to(path, range).await,
                 None => self
                     .status
                     .set_label("export needs a local file; the chosen location has no path"),
@@ -412,8 +430,8 @@ impl Playback {
         }
     }
 
-    /// Exports `[from, to)` to `path`, reporting progress in the status line.
-    pub async fn export_to(self: Rc<Self>, path: PathBuf, from: WallUs, to: WallUs) {
+    /// Exports `range` to `path`, reporting progress in the status line.
+    pub async fn export_to(self: Rc<Self>, path: PathBuf, range: Window) {
         let (client, runtime) = (self.client.borrow().clone(), self.runtime.borrow().clone());
         let (Some(client), Some(runtime)) = (client, runtime) else {
             self.status.set_label("nothing is open");
@@ -429,10 +447,11 @@ impl Playback {
         let target = path.clone();
         let task = AbortOnDropHandle::new(runtime.spawn(async move {
             client
-                .export(&camera, kind, from, to, &target, |written| {
+                .export(&camera, kind, range, &target, |written| {
                     tx.send_replace(written);
                 })
                 .await
+                .map_err(anyhow::Error::from)
         }));
         *self.exporting.borrow_mut() = Some(task.abort_handle());
         let status = self.status.clone();
@@ -482,40 +501,33 @@ impl Playback {
         &self.widget
     }
 
-    /// Loads the window `[from, to)`: the timeline from the segment and event
-    /// lists, and the player from the VOD playlist. Runs on the main loop;
-    /// the HTTP requests run on `runtime`.
-    pub async fn open(
-        self: &Rc<Self>,
-        client: Arc<Client>,
-        runtime: Arc<Runtime>,
-        from: WallUs,
-        to: WallUs,
-    ) {
+    /// Loads `window`: the timeline from the segment and event lists, and the
+    /// player from the VOD playlist. Runs on the main loop; the HTTP requests
+    /// run on `runtime`.
+    pub async fn open(self: &Rc<Self>, client: Client, runtime: Arc<Runtime>, window: Window) {
         self.close();
         let generation = self.generation.get();
         // The previous window's playhead and marks go at once, so an export
         // started while this window loads cannot reuse them.
-        self.timeline.set_model(Model {
-            from,
-            to,
-            ..Model::default()
+        self.timeline.set_model(TimelineModel {
+            from: window.from(),
+            to: window.to(),
+            ..TimelineModel::default()
         });
-        *self.client.borrow_mut() = Some(Arc::clone(&client));
+        *self.client.borrow_mut() = Some(client.clone());
         *self.runtime.borrow_mut() = Some(Arc::clone(&runtime));
         self.title.set_label(&format!(
             "{} {} stream, {} to {}",
             self.camera,
             self.kind,
-            timeline::clock_label(from),
-            timeline::clock_label(to)
+            timeline::clock_label(window.from()),
+            timeline::clock_label(window.to())
         ));
         let lists = AbortOnDropHandle::new(runtime.spawn(fetch_window(
-            Arc::clone(&client),
+            client.clone(),
             self.camera.clone(),
             self.kind,
-            from,
-            to,
+            window,
         )));
         *self.opening.borrow_mut() = Some(lists.abort_handle());
         let loaded = lists.await;
@@ -530,10 +542,10 @@ impl Playback {
                 return;
             }
         };
-        let Some((segments, snapshot)) = self.show_window(lists, from, to) else {
+        let Some((segments, snapshot)) = self.show_window(lists, window) else {
             return;
         };
-        self.load_thumbnails(&client, &runtime, from, to, &segments);
+        self.load_thumbnails(&client, &runtime, window, &segments);
         let Some(snapshot) = snapshot else {
             return;
         };
@@ -548,8 +560,7 @@ impl Playback {
     fn show_window(
         &self,
         lists: WindowLists,
-        from: WallUs,
-        to: WallUs,
+        window: Window,
     ) -> Option<(Vec<Segment>, Option<Snapshot>)> {
         let mut segments = match lists.segments {
             Ok(segments) => segments,
@@ -589,9 +600,9 @@ impl Playback {
         let (fragments, snapshot) = playback.map_or((Vec::new(), None), |(fragments, snapshot)| {
             (fragments, Some(snapshot))
         });
-        self.timeline.set_model(Model {
-            from,
-            to,
+        self.timeline.set_model(TimelineModel {
+            from: window.from(),
+            to: window.to(),
             segments: segments.clone(),
             playback: fragments,
             events,
@@ -611,10 +622,9 @@ impl Playback {
     /// recorded, on the runtime, and shows each as it arrives.
     fn load_thumbnails(
         self: &Rc<Self>,
-        client: &Arc<Client>,
+        client: &Client,
         runtime: &Runtime,
-        from: WallUs,
-        to: WallUs,
+        window: Window,
         segments: &[Segment],
     ) {
         self.stop_thumbnails();
@@ -623,26 +633,15 @@ impl Playback {
         }
         let generation = self.generation.get();
         let (tx, rx) = async_channel::bounded::<(usize, thumbs::Image)>(THUMBNAIL_CONCURRENCY);
-        let span = i128::from(to.get()) - i128::from(from.get());
-        let mut jobs = Vec::with_capacity(THUMBNAILS);
-        for slot in 0..THUMBNAILS {
-            let numerator = i128::try_from(2 * slot + 1).expect("thumbnail slot fits i128");
-            let denominator = i128::try_from(2 * THUMBNAILS).expect("thumbnail count fits i128");
-            let t = i64::try_from(i128::from(from.get()) + span * numerator / denominator)
-                .map_or(to, WallUs::new);
-            if !segments.iter().any(|s| s.start <= t && t < s.end) {
-                continue;
-            }
-            jobs.push((slot, t));
-        }
+        let jobs = thumbnail_times(window, segments, THUMBNAILS);
         let (camera, kind) = (self.camera.clone(), self.thumb_kind);
         let thumbnail_decoders = Arc::clone(&self.thumbnail_decoders);
         let task = runtime.spawn({
-            let client = Arc::clone(client);
+            let client = client.clone();
             async move {
                 futures::stream::iter(jobs)
-                    .for_each_concurrent(THUMBNAIL_CONCURRENCY, |(slot, t)| {
-                        let client = Arc::clone(&client);
+                    .for_each_concurrent(THUMBNAIL_CONCURRENCY, |ThumbnailTime { slot, time }| {
+                        let client = client.clone();
                         let thumbnail_decoders = Arc::clone(&thumbnail_decoders);
                         let tx = tx.clone();
                         let camera = camera.clone();
@@ -653,7 +652,8 @@ impl Playback {
                             let Ok(permit) = thumbnail_decoders.acquire_owned().await else {
                                 return;
                             };
-                            let bytes = match client.keyframe(&camera, kind, t).await {
+                            let keyframe = client.keyframe(&camera, kind, time).await;
+                            let bytes = match keyframe.map_err(anyhow::Error::from) {
                                 Ok(Some(bytes)) => bytes,
                                 Ok(None) => return,
                                 Err(error) => {
@@ -813,7 +813,10 @@ impl Playback {
                     .as_ref()
                     .and_then(|r| r.playbin.query_position::<gst::ClockTime>());
                 if let Some(position) = position {
-                    let time = view.timeline.with_model(|model| model.wall_time(position));
+                    // The player's nanoseconds, which the model reads in whole
+                    // microseconds rounded down.
+                    let offset = PlaylistOffset::new(Duration::from(position));
+                    let time = view.timeline.with_model(|model| model.wall_time(offset));
                     view.timeline.set_playhead(Some(time));
                 }
                 glib::ControlFlow::Continue
@@ -830,14 +833,20 @@ impl Playback {
 
     /// Seeks to a wall-clock time inside the window.
     fn seek(&self, time: WallUs) {
-        let (target, near, from, to) = self.timeline.with_model(|model| {
+        let (offset, near, from, to) = self.timeline.with_model(|model| {
             (
                 model.playlist_offset(time),
-                model.nearest_event_label(time, EVENT_NEAR),
+                timeline::nearest_event_label(model, time, EVENT_NEAR),
                 model.from,
                 model.to,
             )
         });
+        // The player's clock counts nanoseconds and holds the offset's whole
+        // microseconds exactly. A playlist of at most
+        // `iris_client::vod::MAX_PLAYBACK_FRAGMENTS` fragments of 32-bit ticks
+        // ends inside the clock's range; past it, the target is the clock's
+        // end.
+        let target = gst::ClockTime::try_from(offset.get()).unwrap_or(gst::ClockTime::MAX);
         if let Some(running) = self.pipeline.borrow().as_ref() {
             if let Err(error) = running
                 .playbin
@@ -911,43 +920,49 @@ impl Playback {
 struct WindowLists {
     segments: anyhow::Result<Vec<Segment>>,
     events: anyhow::Result<Vec<EventRecord>>,
-    /// The playlist's fragment timing and the snapshot serving its body; `None`
-    /// when nothing is recorded in the window.
+    /// The selection's fragment timing and the snapshot serving its bodies;
+    /// `None` when nothing is recorded in the window.
     playback: anyhow::Result<Option<(Vec<PlaybackFragment>, Snapshot)>>,
 }
 
-/// Lists `[from, to)` of `camera`'s `kind` stream and, when something is
-/// recorded there, fetches its VOD playlist and starts the snapshot serving it.
+/// Lists the segments of the `kind` stream of `camera` in `window` and the
+/// camera's events in it. Unless the listing shows nothing recorded, it also
+/// fetches the window's VOD playlist, with the audio playlist for a main
+/// stream, as one selection, and starts the snapshot that serves its bodies.
 async fn fetch_window(
-    client: Arc<Client>,
+    client: Client,
     camera: CameraId,
     kind: StreamKind,
-    from: WallUs,
-    to: WallUs,
+    window: Window,
 ) -> WindowLists {
-    let segments = client.segments(&camera, kind, from, to).await;
-    let events = client.events(&camera, from, to, EVENT_LIMIT).await;
+    let segments = client
+        .segments(&camera, kind, window)
+        .await
+        .map_err(anyhow::Error::from);
+    let events = client
+        .events(&camera, window, EVENT_LIMIT)
+        .await
+        .map_err(anyhow::Error::from);
     let playback = if segments.as_ref().is_ok_and(Vec::is_empty) {
         Ok(None)
     } else {
         async {
-            let playlist = client.vod_playlist(&camera, kind, from, to).await?;
+            let playlist = client.vod_playlist(&camera, kind, window).await?;
             // The camera's audio lies on the main stream's timeline, so it
             // plays with that stream alone. A window without recorded audio
             // answers 404, and no fault of the audio keeps the picture away.
             let audio = if kind == StreamKind::Main {
                 client
-                    .vod_playlist(&camera, StreamKind::Audio, from, to)
+                    .vod_playlist(&camera, StreamKind::Audio, window)
                     .await
                     .ok()
             } else {
                 None
             };
-            let snapshot = match audio {
-                Some(audio) => Snapshot::with_audio(playlist.body, audio.body).await?,
-                None => Snapshot::new(playlist.body).await?,
-            };
-            Ok(Some((playlist.fragments, snapshot)))
+            let selection = PlaybackSelection::new(playlist, audio);
+            let (fragments, bodies) = selection.into_parts();
+            let snapshot = Snapshot::serve(bodies).await?;
+            Ok(Some((fragments, snapshot)))
         }
         .await
     };
@@ -955,6 +970,25 @@ async fn fetch_window(
         segments,
         events,
         playback,
+    }
+}
+
+/// The export range of the marks `mark_in` and `mark_out`. It is `None`
+/// unless both are set and the out mark is after the in mark. Otherwise it is
+/// the window between the marks, or the refusal of a range longer than
+/// [`iris_client::api::MAX_RANGE_US`], seven days. A mark is set at the
+/// playhead, or at the window's edge when nothing has played. The playhead
+/// can lie outside the playback window, in a boundary fragment.
+#[must_use]
+fn export_window(
+    mark_in: Option<WallUs>,
+    mark_out: Option<WallUs>,
+) -> Option<Result<Window, ApiError>> {
+    match (mark_in, mark_out) {
+        (Some(mark_in), Some(mark_out)) if mark_out > mark_in => {
+            Some(Window::try_new(mark_in, mark_out))
+        }
+        _ => None,
     }
 }
 
@@ -977,15 +1011,6 @@ fn marks_status(mark_in: Option<WallUs>, mark_out: Option<WallUs>) -> String {
     }
 }
 
-/// A file name for an export: camera, kind, and the start time in UTC.
-fn export_name(camera: &CameraId, kind: StreamKind, from: WallUs) -> String {
-    let c = from.to_civil();
-    format!(
-        "{camera}-{kind}-{:04}{:02}{:02}T{:02}{:02}{:02}Z.mp4",
-        c.year, c.month, c.day, c.hour, c.minute, c.second
-    )
-}
-
 impl Drop for Playback {
     fn drop(&mut self) {
         self.close();
@@ -993,8 +1018,8 @@ impl Drop for Playback {
 }
 
 /// Playback checks that need a display; `crate::tests::gtk_lifecycle_checks`
-/// runs them on GTK's one initializer thread, and `export_names_*` and
-/// `export_progress_*` run as ordinary tests.
+/// runs them on GTK's one initializer thread, and the `#[test]`s here run as
+/// ordinary tests.
 #[cfg(test)]
 pub(crate) mod tests {
     use std::convert::Infallible;
@@ -1004,6 +1029,9 @@ pub(crate) mod tests {
     use std::task::{Context, Poll};
 
     use axum::routing;
+    use futures::future::Either;
+    use iris_client::api::{MAX_RANGE_US, Rule};
+    use iris_client::origin::{ApiOrigin, PlainHttp};
     use url::Url;
 
     use super::*;
@@ -1016,16 +1044,22 @@ pub(crate) mod tests {
         WallUs::new(micros)
     }
 
+    /// The window `[from, to)`, in microseconds.
+    fn window_of(from: i64, to: i64) -> Window {
+        Window::try_new(at(from), at(to)).unwrap()
+    }
+
     /// A playback view of `id`'s main stream with sub-stream thumbnails.
     fn view_of(id: &str, pool: Arc<Semaphore>) -> Rc<Playback> {
         Playback::new(&camera(id), StreamKind::Main, StreamKind::Sub, &[], pool)
     }
 
-    fn client_for(address: SocketAddr) -> Arc<Client> {
-        Arc::new(Client::for_tests(
-            Url::parse(&format!("http://{address}")).unwrap(),
+    fn client_for(address: SocketAddr) -> Client {
+        Client::new(
+            ApiOrigin::parse(&format!("http://{address}"), PlainHttp::LoopbackOnly).unwrap(),
             None,
-        ))
+            Arc::unwrap_or_clone(iris_tls::client_config(None).unwrap()),
+        )
     }
 
     fn bind(runtime: &Runtime) -> tokio::net::TcpListener {
@@ -1095,9 +1129,9 @@ pub(crate) mod tests {
         }
     }
 
-    /// Waits on the main loop until `condition` holds, failing with `failure`
-    /// after `limit`.
-    async fn wait_until(condition: impl Fn() -> bool, limit: Duration, failure: &str) {
+    /// Waits on the main loop until `condition` holds or `limit` passes, and
+    /// tells whether it held.
+    async fn holds_within(condition: impl Fn() -> bool, limit: Duration) -> bool {
         let reached = async {
             while !condition() {
                 glib::timeout_future(Duration::from_millis(5)).await;
@@ -1105,13 +1139,16 @@ pub(crate) mod tests {
         };
         let timeout = glib::timeout_future(limit);
         futures::pin_mut!(reached, timeout);
-        assert!(
-            matches!(
-                futures::future::select(reached, timeout).await,
-                futures::future::Either::Left(_)
-            ),
-            "{failure}"
-        );
+        matches!(
+            futures::future::select(reached, timeout).await,
+            Either::Left(_)
+        )
+    }
+
+    /// Waits on the main loop until `condition` holds, failing with `failure`
+    /// after `limit`.
+    async fn wait_until(condition: impl Fn() -> bool, limit: Duration, failure: &str) {
+        assert!(holds_within(condition, limit).await, "{failure}");
     }
 
     pub(crate) fn dropping_playback_releases_the_view_and_button_callbacks() {
@@ -1179,7 +1216,7 @@ pub(crate) mod tests {
             let opening = glib::spawn_future_local({
                 let view = Rc::clone(&view);
                 let runtime = Arc::clone(&runtime);
-                async move { view.open(client, runtime, at(0), at(1_000_000)).await }
+                async move { view.open(client, runtime, window_of(0, 1_000_000)).await }
             });
             rx.recv().await.unwrap();
             view.close();
@@ -1188,7 +1225,7 @@ pub(crate) mod tests {
             assert!(
                 matches!(
                     futures::future::select(opening, timeout).await,
-                    futures::future::Either::Left(_)
+                    Either::Left(_)
                 ),
                 "closing playback must cancel its pending playlist request"
             );
@@ -1242,7 +1279,7 @@ pub(crate) mod tests {
             end: at(12_000_000),
             sealed: true,
         }];
-        view.load_thumbnails(&client, &runtime, at(0), at(12_000_000), &segments);
+        view.load_thumbnails(&client, &runtime, window_of(0, 12_000_000), &segments);
         glib::MainContext::default().block_on(async {
             let started = async {
                 for _ in 0..THUMBNAIL_CONCURRENCY {
@@ -1254,7 +1291,7 @@ pub(crate) mod tests {
             assert!(
                 matches!(
                     futures::future::select(started, timeout).await,
-                    futures::future::Either::Left(_)
+                    Either::Left(_)
                 ),
                 "the bounded thumbnail requests must start"
             );
@@ -1269,7 +1306,7 @@ pub(crate) mod tests {
             assert!(
                 matches!(
                     futures::future::select(dropped, timeout).await,
-                    futures::future::Either::Left(_)
+                    Either::Left(_)
                 ),
                 "closing playback must drop all active keyframe responses"
             );
@@ -1283,7 +1320,35 @@ pub(crate) mod tests {
         server.abort();
     }
 
-    pub(crate) fn replacement_views_share_uninterruptible_decoder_permits() {
+    /// Readings of three playback views that share one decoder pool. Each
+    /// view opens in turn and closes while its thumbnails wait for a permit.
+    /// The first view's two decoders wait at a gate until all three close.
+    struct Replacements {
+        /// Keyframes fetched while the first view's decoders run.
+        first_fetches: usize,
+        /// Permits left while the first view's decoders run.
+        first_permits: usize,
+        /// Decoders running once the three views are closed.
+        closed_decoders: usize,
+        /// Permits left once the three views are closed.
+        closed_permits: usize,
+        /// Keyframes fetched once the three views are closed.
+        closed_fetches: usize,
+        /// Most decoders that ran at once up to the opening of the gate.
+        closed_peak: usize,
+        /// Whether the closed first view shows a thumbnail of its generation.
+        stale_shown: bool,
+        /// Whether every permit returned within two seconds of the decoders
+        /// ending.
+        permits_returned: bool,
+        /// Most decoders that ran at once over the whole run, read once the
+        /// permits returned.
+        released_peak: usize,
+        /// Keyframes fetched 100 ms after the permits returned.
+        released_fetches: usize,
+    }
+
+    fn open_replacements() -> Replacements {
         gtk::init().unwrap();
         gst::init().unwrap();
         gstgtk4::plugin_register_static().unwrap();
@@ -1306,41 +1371,26 @@ pub(crate) mod tests {
         let first = view_of("fixture-one", Arc::clone(&pool));
         let second = view_of("fixture-two", Arc::clone(&pool));
         let third = view_of("fixture-three", Arc::clone(&pool));
-        let window = (at(0), at(12_000_000));
+        let window = window_of(0, 12_000_000);
+        let fetches = || keyframe_fetches.load(Ordering::SeqCst);
 
-        glib::MainContext::default().block_on(async {
+        let seen = glib::MainContext::default().block_on(async {
             first
-                .open(
-                    Arc::clone(&client),
-                    Arc::clone(&runtime),
-                    window.0,
-                    window.1,
-                )
+                .open(client.clone(), Arc::clone(&runtime), window)
                 .await;
             wait_for_atomic_at_least(&DECODER_ADMISSION_ATTEMPTS, 2, Duration::from_secs(2)).await;
             wait_for_decoder_count(2, Duration::from_secs(2)).await;
-            assert_eq!(keyframe_fetches.load(Ordering::SeqCst), 2);
-            assert_eq!(pool.available_permits(), 0);
+            let (first_fetches, first_permits) = (fetches(), pool.available_permits());
 
             let stale_generation = first.generation.get();
             first.close();
             second
-                .open(
-                    Arc::clone(&client),
-                    Arc::clone(&runtime),
-                    window.0,
-                    window.1,
-                )
+                .open(client.clone(), Arc::clone(&runtime), window)
                 .await;
             wait_for_atomic_at_least(&DECODER_ADMISSION_ATTEMPTS, 4, Duration::from_secs(2)).await;
             second.close();
             third
-                .open(
-                    Arc::clone(&client),
-                    Arc::clone(&runtime),
-                    window.0,
-                    window.1,
-                )
+                .open(client.clone(), Arc::clone(&runtime), window)
                 .await;
             wait_for_atomic_at_least(&DECODER_ADMISSION_ATTEMPTS, 6, Duration::from_secs(2)).await;
             third.close();
@@ -1353,36 +1403,98 @@ pub(crate) mod tests {
                 })
                 .await
                 .unwrap();
-            assert_eq!(ACTIVE_DECODERS.load(Ordering::SeqCst), 2);
-            assert_eq!(PEAK_DECODERS.load(Ordering::SeqCst), 2);
-            assert_eq!(pool.available_permits(), 0);
-            assert_eq!(
-                keyframe_fetches.load(Ordering::SeqCst),
-                2,
-                "cancelled permit waiters must not fetch keyframe bodies"
-            );
-            assert!(!first.show_thumbnail(stale_generation, 0, thumbs::Image::black(1, 1)));
+            let closed_decoders = ACTIVE_DECODERS.load(Ordering::SeqCst);
+            let closed_peak = PEAK_DECODERS.load(Ordering::SeqCst);
+            let closed_permits = pool.available_permits();
+            let closed_fetches = fetches();
+            let stale_shown = first.show_thumbnail(stale_generation, 0, thumbs::Image::black(1, 1));
 
             decode_gate.release();
             wait_for_decoder_count(0, Duration::from_secs(2)).await;
-            wait_until(
+            let permits_returned = holds_within(
                 || pool.available_permits() == THUMBNAIL_CONCURRENCY,
                 Duration::from_secs(2),
-                "released decoders must return their permits",
             )
             .await;
-            assert_eq!(PEAK_DECODERS.load(Ordering::SeqCst), 2);
+            let released_peak = PEAK_DECODERS.load(Ordering::SeqCst);
             // A cancelled waiter that still held a turn would fetch soon after
             // the permits return; nothing fetches within this window.
             glib::timeout_future(Duration::from_millis(100)).await;
-            assert_eq!(
-                keyframe_fetches.load(Ordering::SeqCst),
-                2,
-                "cancelled permit waiters must not fetch after permits are released"
-            );
+            Replacements {
+                first_fetches,
+                first_permits,
+                closed_decoders,
+                closed_permits,
+                closed_fetches,
+                closed_peak,
+                stale_shown,
+                permits_returned,
+                released_peak,
+                released_fetches: fetches(),
+            }
         });
         drop(decode_gate);
         server.abort();
+        seen
+    }
+
+    /// Under a display: each of the first view's two decoders fetches its
+    /// keyframe.
+    pub(crate) fn the_first_views_decoders_fetch_two_keyframes() {
+        assert_eq!(open_replacements().first_fetches, 2);
+    }
+
+    /// Under a display: the first view's two decoders hold every permit of
+    /// the pool.
+    pub(crate) fn the_first_views_decoders_hold_every_permit() {
+        assert_eq!(open_replacements().first_permits, 0);
+    }
+
+    /// Under a display: closing a view leaves its running decoders running.
+    pub(crate) fn closing_a_view_leaves_its_decoders_running() {
+        assert_eq!(open_replacements().closed_decoders, 2);
+    }
+
+    /// Under a display: the decoders of a closed view keep their permits
+    /// until they end.
+    pub(crate) fn a_closed_views_decoders_keep_their_permits() {
+        assert_eq!(open_replacements().closed_permits, 0);
+    }
+
+    /// Under a display: the views that replace one another never run more
+    /// decoders at once than the pool admits, before or after the first
+    /// view's decoders end.
+    pub(crate) fn replacement_views_run_no_more_decoders_than_the_pool_admits() {
+        let seen = open_replacements();
+        assert_eq!((seen.closed_peak, seen.released_peak), (2, 2));
+    }
+
+    /// Under a display: a thumbnail job cancelled while it waits for a
+    /// permit fetches no keyframe, before or after the permits return.
+    pub(crate) fn a_cancelled_permit_waiter_fetches_no_keyframe() {
+        let seen = open_replacements();
+        assert_eq!(
+            seen.closed_fetches, 2,
+            "cancelled permit waiters must not fetch keyframe bodies"
+        );
+        assert_eq!(
+            seen.released_fetches, 2,
+            "cancelled permit waiters must not fetch after permits are released"
+        );
+    }
+
+    /// Under a display: a closed view shows no thumbnail of the generation
+    /// it had when it closed.
+    pub(crate) fn a_closed_view_shows_no_thumbnail_of_its_generation() {
+        assert!(!open_replacements().stale_shown);
+    }
+
+    /// Under a display: decoders that end return their permits to the pool.
+    pub(crate) fn ended_decoders_return_their_permits() {
+        assert!(
+            open_replacements().permits_returned,
+            "released decoders must return their permits"
+        );
     }
 
     fn replacement_fixture(keyframe_fetches: Arc<AtomicUsize>) -> axum::Router {
@@ -1453,7 +1565,7 @@ pub(crate) mod tests {
         assert!(
             matches!(
                 futures::future::select(reached, timeout).await,
-                futures::future::Either::Left(_)
+                Either::Left(_)
             ),
             "counter did not reach {expected}; current={}",
             value.load(Ordering::SeqCst)
@@ -1471,7 +1583,7 @@ pub(crate) mod tests {
         assert!(
             matches!(
                 futures::future::select(reached, timeout).await,
-                futures::future::Either::Left(_)
+                Either::Left(_)
             ),
             "decoder count did not reach {expected}; active={} peak={}",
             ACTIVE_DECODERS.load(Ordering::SeqCst),
@@ -1508,7 +1620,9 @@ pub(crate) mod tests {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("export.mp4");
         glib::MainContext::default().block_on(async {
-            Rc::clone(&view).export_to(path.clone(), at(1), at(2)).await;
+            Rc::clone(&view)
+                .export_to(path.clone(), window_of(1, 2))
+                .await;
             glib::timeout_future(Duration::from_millis(25)).await;
         });
         assert_eq!(std::fs::metadata(&path).unwrap().len(), CHUNKS as u64);
@@ -1522,7 +1636,95 @@ pub(crate) mod tests {
         server.abort();
     }
 
-    pub(crate) fn playback_error_releases_its_snapshot_listener() {
+    /// Presses "Export" on `view` with marks a microsecond more than seven
+    /// days apart, and runs the main loop until the press is handled. The
+    /// refusal comes before the save dialog; if a dialog opens instead, the
+    /// check fails after a second rather than wait on it.
+    async fn export_a_range_over_seven_days(view: &Rc<Playback>) {
+        let week = i64::try_from(MAX_RANGE_US).unwrap();
+        view.timeline.set_marks(Some(at(0)), Some(at(week + 1)));
+        let pressed = Rc::clone(view).export_dialog(None);
+        let timeout = glib::timeout_future(Duration::from_secs(1));
+        futures::pin_mut!(pressed, timeout);
+        assert!(
+            matches!(
+                futures::future::select(pressed, timeout).await,
+                Either::Left(_)
+            ),
+            "the refusal must come before the save dialog"
+        );
+    }
+
+    /// Under a display: "Export" with marks a microsecond more than seven
+    /// days apart shows the refusal of the range in the status line.
+    pub(crate) fn export_shows_the_refusal_of_a_range_over_seven_days() {
+        gtk::init().unwrap();
+        let view = view_of("fixture", thumbnail_decoder_pool());
+        glib::MainContext::default().block_on(export_a_range_over_seven_days(&view));
+        assert_eq!(
+            view.status.text(),
+            "export failed: time range exceeds seven days"
+        );
+        view.close();
+    }
+
+    /// Under a display: "Export" with marks more than seven days apart,
+    /// pressed while an export runs, leaves that export running.
+    pub(crate) fn a_refused_range_leaves_a_running_export_running() {
+        gtk::init().unwrap();
+        let runtime = Arc::new(Runtime::new().unwrap());
+        let listener = bind(&runtime);
+        let address = listener.local_addr().unwrap();
+        // The export's answer never comes, so the export runs until it is
+        // cancelled.
+        let server = runtime.spawn(async move {
+            let app = axum::Router::new().route(
+                "/api/cameras/fixture/export.mp4",
+                routing::get(futures::future::pending::<String>),
+            );
+            axum::serve(listener, app).await.unwrap();
+        });
+        let view = view_of("fixture", thumbnail_decoder_pool());
+        *view.client.borrow_mut() = Some(client_for(address));
+        *view.runtime.borrow_mut() = Some(Arc::clone(&runtime));
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("export.mp4");
+        let export = glib::spawn_future_local(Rc::clone(&view).export_to(path, window_of(1, 2)));
+        glib::MainContext::default().block_on(async {
+            wait_until(
+                || view.exporting.borrow().is_some(),
+                Duration::from_secs(1),
+                "the export must start",
+            )
+            .await;
+            export_a_range_over_seven_days(&view).await;
+            // An export that the refusal cancelled would end in this time.
+            glib::timeout_future(Duration::from_millis(25)).await;
+        });
+        assert!(
+            view.exporting
+                .borrow()
+                .as_ref()
+                .is_some_and(|running| !running.is_finished()),
+            "the refused range must leave the running export running"
+        );
+        view.close();
+        export.abort();
+        server.abort();
+    }
+
+    /// Readings of a view whose media are missing, taken once its player
+    /// fails.
+    struct FailedPlayback {
+        /// Whether the snapshot's listener refused requests within a second
+        /// of the failure.
+        listener_closed: bool,
+        /// Whether the view released its pipeline.
+        stopped: bool,
+    }
+
+    /// Plays a snapshot whose media are missing until the player fails.
+    fn fail_playback() -> FailedPlayback {
         gtk::init().unwrap();
         gst::init().unwrap();
         gstgtk4::plugin_register_static().unwrap();
@@ -1532,12 +1734,17 @@ pub(crate) mod tests {
         let server = runtime.spawn(async move {
             axum::serve(listener, axum::Router::new()).await.unwrap();
         });
+        let origin = ApiOrigin::parse(&format!("http://{address}"), PlainHttp::LoopbackOnly);
         let snapshot = runtime
-            .block_on(Snapshot::new(format!(
-                "#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-TARGETDURATION:2\n\
-                 #EXT-X-PLAYLIST-TYPE:VOD\n#EXT-X-MAP:URI=\"http://{address}/missing.mp4\"\n\
-                 #EXTINF:2.00000,\nhttp://{address}/missing.m4s\n#EXT-X-ENDLIST\n"
-            )))
+            .block_on(Snapshot::serve_video(
+                &origin.unwrap(),
+                &format!(
+                    "#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-TARGETDURATION:2\n\
+                     #EXT-X-PLAYLIST-TYPE:VOD\n#EXT-X-MAP:URI=\"http://{address}/missing.mp4\"\n\
+                     #IRIS-FRAGMENT:WALL-US=0,DURATION-TICKS=180000\n\
+                     #EXTINF:2.00000,\nhttp://{address}/missing.m4s\n#EXT-X-ENDLIST\n"
+                ),
+            ))
             .unwrap();
         let url = snapshot.url().clone();
         let view = view_of("fixture", thumbnail_decoder_pool());
@@ -1566,11 +1773,27 @@ pub(crate) mod tests {
         let stopped = view.pipeline.borrow().is_none();
         view.close();
         server.abort();
-        assert!(
+        FailedPlayback {
             listener_closed,
+            stopped,
+        }
+    }
+
+    /// Under a display: a playback error closes the listener of the view's
+    /// snapshot.
+    pub(crate) fn playback_error_releases_its_snapshot_listener() {
+        assert!(
+            fail_playback().listener_closed,
             "playback failure must close its snapshot listener"
         );
-        assert!(stopped, "playback failure must release its pipeline");
+    }
+
+    /// Under a display: a playback error releases the view's pipeline.
+    pub(crate) fn playback_error_releases_its_pipeline() {
+        assert!(
+            fail_playback().stopped,
+            "playback failure must release its pipeline"
+        );
     }
 
     pub(crate) fn a_window_holding_only_a_stale_open_segment_shows_nothing_recorded() {
@@ -1606,13 +1829,13 @@ pub(crate) mod tests {
         let client = client_for(address);
         let view = view_of("fixture", thumbnail_decoder_pool());
         glib::MainContext::default().block_on(async {
-            let opening = view.open(client, Arc::clone(&runtime), at(0), at(3_600_000_000));
+            let opening = view.open(client, Arc::clone(&runtime), window_of(0, 3_600_000_000));
             let timeout = glib::timeout_future(Duration::from_secs(5));
             futures::pin_mut!(opening, timeout);
             assert!(
                 matches!(
                     futures::future::select(opening, timeout).await,
-                    futures::future::Either::Left(_)
+                    Either::Left(_)
                 ),
                 "the window must load before the deadline"
             );
@@ -1624,14 +1847,6 @@ pub(crate) mod tests {
         assert_eq!(vod_requests.load(Ordering::SeqCst), 0);
         view.close();
         server.abort();
-    }
-
-    #[test]
-    fn export_names_carry_camera_kind_and_utc_start() {
-        assert_eq!(
-            export_name(&camera("cam1"), StreamKind::Main, at(1_793_571_648_056_937)),
-            "cam1-main-20261101T222048Z.mp4"
-        );
     }
 
     #[test]
@@ -1652,6 +1867,52 @@ pub(crate) mod tests {
         assert!(marks_status(Some(i), None).ends_with("set the out mark"));
         assert!(marks_status(None, Some(o)).ends_with("set the in mark"));
         assert_eq!(marks_status(None, None), "");
+    }
+
+    #[test]
+    fn no_marks_give_no_export_range() {
+        assert!(export_window(None, None).is_none());
+    }
+
+    #[test]
+    fn one_mark_alone_gives_no_export_range() {
+        assert!(export_window(Some(at(0)), None).is_none());
+        assert!(export_window(None, Some(at(1))).is_none());
+    }
+
+    #[test]
+    fn an_out_mark_not_after_the_in_mark_gives_no_export_range() {
+        for (mark_in, mark_out) in [(5, 5), (5, 4)] {
+            assert!(
+                export_window(Some(at(mark_in)), Some(at(mark_out))).is_none(),
+                "[{mark_in}, {mark_out})"
+            );
+        }
+    }
+
+    #[test]
+    fn marks_a_window_admits_give_that_window() {
+        let range = export_window(Some(at(1)), Some(at(2)));
+        assert!(
+            matches!(range, Some(Ok(window)) if window == window_of(1, 2)),
+            "{range:?}"
+        );
+    }
+
+    /// Marks a microsecond more than seven days apart give the refusal whose
+    /// text the status shows after "export failed: ".
+    #[test]
+    fn marks_more_than_seven_days_apart_give_the_ranges_refusal() {
+        let week = i64::try_from(MAX_RANGE_US).unwrap();
+        let range = export_window(Some(at(0)), Some(at(week + 1)));
+        let Some(Err(refused)) = range else {
+            panic!("{range:?}");
+        };
+        assert!(
+            matches!(refused, ApiError::Invalid(Rule::TimeRangeTooLong)),
+            "{refused:?}"
+        );
+        assert_eq!(refused.to_string(), "time range exceeds seven days");
     }
 
     /// A VOD body of one fragment of `segment`, as the daemon writes it.
@@ -1724,8 +1985,7 @@ pub(crate) mod tests {
             client_for(address),
             camera("fixture"),
             StreamKind::Main,
-            at(0),
-            at(1_000_000),
+            window_of(0, 1_000_000),
         )
         .await;
         let (fragments, snapshot) = lists.playback.unwrap().unwrap();
@@ -1752,8 +2012,7 @@ pub(crate) mod tests {
             client_for(address),
             camera("fixture"),
             StreamKind::Sub,
-            at(0),
-            at(1_000_000),
+            window_of(0, 1_000_000),
         )
         .await;
         let (_, snapshot) = lists.playback.unwrap().unwrap();
@@ -1774,8 +2033,7 @@ pub(crate) mod tests {
             client_for(address),
             camera("fixture"),
             StreamKind::Main,
-            at(0),
-            at(1_000_000),
+            window_of(0, 1_000_000),
         )
         .await;
         let (_, snapshot) = lists.playback.unwrap().unwrap();

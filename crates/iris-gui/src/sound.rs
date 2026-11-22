@@ -1,42 +1,24 @@
-//! Sound in the focused live view: the timing that plays a camera's audio
-//! feed and its picture against one clock (`docs/research/13-audio.md`
-//! §10.4).
+//! Sound in the focused live view: the pads that play a camera's audio feed
+//! and its picture against one clock (`docs/research/13-audio.md` §10.4).
 //!
-//! Audio frames reach the viewer in bursts, so sound played as it arrives
-//! stutters, and a picture shown the instant it is decoded would lead its
-//! sound by the delay that smooths it. Both feeds are therefore held the
-//! same [`DELAY`]: each keeps the least of arrival time less media time over
-//! a window, and a frame plays at its media time plus that least plus the
-//! delay. The mapping is a running-time offset on the pad after each feed's
-//! demuxer. While a feed's first frames are still held it follows the
-//! estimate, which one frame cannot give; after that it moves only when an
-//! estimate has left what is applied by [`REANCHOR`], and then for both
-//! feeds together.
+//! The rule that places the two is [`SoundClock`], from `iris-client`: each
+//! feed is held [`iris_client::sound_clock::DELAY`] after its least-delay
+//! arrival, and the mapping moves past a threshold, for both feeds together.
+//! Here it meets the pipeline. A [`Pacer`] tells its [`Pairing`] of each
+//! payload its feed pushes. The pairing hands the clock the fragment's media
+//! time with the pipeline's running time. It sets each offset the clock
+//! returns on the pad after the feed's demuxer, which starts its segment at
+//! the feed's first fragment.
 
-use std::collections::VecDeque;
 use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use gst::prelude::*;
+use iris_client::live;
+use iris_client::sound_clock::{Engagement, Medium, SoundClock};
 use tracing::debug;
-
-use crate::fragment;
-
-/// How long after its least-delay arrival a frame plays: more than the
-/// longest step between audio frames seen from a camera.
-pub const DELAY: Duration = Duration::from_millis(500);
-
-/// How far an estimate moves from the applied mapping before the mapping
-/// follows it.
-const REANCHOR: Duration = Duration::from_millis(80);
-
-/// The seconds of arrivals an estimate looks back over.
-const WINDOW_SECONDS: i64 = 10;
-
-/// Nanoseconds in a second.
-const SECOND: i64 = 1_000_000_000;
 
 /// Whether a camera's audio is discarded instead of played on the default
 /// output: set by `--mute`, and always in tests.
@@ -52,113 +34,11 @@ pub fn silent() -> bool {
     SILENT.load(Ordering::Relaxed)
 }
 
-/// One of the two feeds of a camera that play together.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Medium {
-    /// The video feed.
-    Picture = 0,
-    /// The audio feed.
-    Sound = 1,
-}
-
-/// The least of arrival time less media time over the last
-/// [`WINDOW_SECONDS`], kept as one least for each second of arrivals.
-#[derive(Debug, Default)]
-struct LeastDelay {
-    /// The second of running time and the least delay seen in it.
-    seconds: VecDeque<(i64, i64)>,
-}
-
-impl LeastDelay {
-    /// Notes an arrival at `running` nanoseconds with `delay` nanoseconds
-    /// and returns the least delay of the window that ends there.
-    fn note(&mut self, running: i64, delay: i64) -> i64 {
-        let second = running.div_euclid(SECOND);
-        match self.seconds.back_mut() {
-            Some((at, least)) if *at == second => *least = (*least).min(delay),
-            _ => self.seconds.push_back((second, delay)),
-        }
-        while self
-            .seconds
-            .front()
-            .is_some_and(|(old, _)| *old <= second - WINDOW_SECONDS)
-        {
-            self.seconds.pop_front();
-        }
-        self.seconds
-            .iter()
-            .map(|(_, least)| *least)
-            .min()
-            .unwrap_or(delay)
-    }
-}
-
-/// One feed's place on the clock.
-#[derive(Debug, Default)]
-struct Track {
-    /// Media time of the byte stream's first fragment, where the demuxer
-    /// starts its segment, and the running time at which it arrived.
-    first: Option<(i64, i64)>,
-    delays: LeastDelay,
-    /// The offset the estimate asks for.
-    wanted: Option<i64>,
-    /// The offset in force.
-    applied: Option<i64>,
-}
-
-/// The mapping of both feeds, without the pipeline: what [`Pairing`] decides.
-#[derive(Debug, Default)]
-struct Anchors {
-    tracks: [Track; 2],
-}
-
-impl Anchors {
-    /// A feed starts a byte stream over: its demuxer starts a segment at
-    /// the next fragment, and its estimate starts with it.
-    fn restart(&mut self, feed: Medium) {
-        self.tracks[feed as usize] = Track::default();
-    }
-
-    /// Notes a fragment of `feed` with the media time `media` arriving at
-    /// the running time `running`, both in nanoseconds. Returns the offset
-    /// of each feed to put in force when the mapping moves: with every
-    /// change of the estimate while the feed's first frames are held (the
-    /// first [`DELAY`] of it, when one frame's delay is all there is and
-    /// nothing has played), and after that when the feed's estimate has
-    /// left what is applied by [`REANCHOR`].
-    fn note(&mut self, feed: Medium, media: i64, running: i64) -> Option<[Option<i64>; 2]> {
-        let track = &mut self.tracks[feed as usize];
-        let (first, started) = *track.first.get_or_insert((media, running));
-        let least = track.delays.note(running, running.saturating_sub(media));
-        let settling = running.saturating_sub(started) < nanos(DELAY);
-        let tolerance = if settling { 0 } else { nanos(REANCHOR) };
-        // A frame's running time after the demuxer is its media time less
-        // the first frame's; it is to play at media time plus the least
-        // delay plus the delay.
-        let wanted = first.saturating_add(least).saturating_add(nanos(DELAY));
-        track.wanted = Some(wanted);
-        let moved = track
-            .applied
-            .is_none_or(|applied| wanted.abs_diff(applied) > tolerance.unsigned_abs());
-        if !moved {
-            return None;
-        }
-        for track in &mut self.tracks {
-            track.applied = track.wanted;
-        }
-        Some([self.tracks[0].applied, self.tracks[1].applied])
-    }
-}
-
-fn nanos(duration: Duration) -> i64 {
-    i64::try_from(duration.as_nanos()).unwrap_or(i64::MAX)
-}
-
 /// The picture and the sound of one camera, played against the clock of
 /// the pipeline their branches are in.
 pub struct Pairing {
     /// What tells the running time: the pipeline.
-    clock: gst::Element,
+    pipeline: gst::Element,
     state: Mutex<State>,
 }
 
@@ -170,11 +50,13 @@ impl fmt::Debug for Pairing {
 
 #[derive(Default)]
 struct State {
-    anchors: Anchors,
-    /// The pad after each feed's demuxer, where its offset is set.
-    pads: [Option<gst::Pad>; 2],
-    /// Whether the mapping is in force: from the sound's first fragment.
-    engaged: bool,
+    /// The place of both feeds on the clock, and whether it is in force.
+    clock: SoundClock,
+    /// The pad after the picture's demuxer, where the picture's offset is
+    /// set.
+    video_pad: Option<gst::Pad>,
+    /// The pad after the sound's demuxer, where the sound's offset is set.
+    audio_pad: Option<gst::Pad>,
     /// Called once, when the mapping comes into force.
     on_engage: Option<Box<dyn FnOnce() + Send>>,
 }
@@ -185,7 +67,7 @@ impl Pairing {
     /// held, and a camera without sound never holds it.
     pub fn new(pipeline: &gst::Pipeline, on_engage: impl FnOnce() + Send + 'static) -> Arc<Self> {
         Arc::new(Self {
-            clock: pipeline.clone().upcast(),
+            pipeline: pipeline.clone().upcast(),
             state: Mutex::new(State {
                 on_engage: Some(Box::new(on_engage)),
                 ..State::default()
@@ -195,7 +77,12 @@ impl Pairing {
 
     /// The pacer of one feed, whose frames pass `pad` after its demuxer.
     pub fn pacer(self: &Arc<Self>, feed: Medium, pad: gst::Pad) -> Pacer {
-        self.state.lock().expect("pairing lock").pads[feed as usize] = Some(pad);
+        let mut state = self.state.lock().expect("pairing lock");
+        match feed {
+            Medium::Video => state.video_pad = Some(pad),
+            Medium::Audio => state.audio_pad = Some(pad),
+        }
+        drop(state);
         Pacer {
             pairing: Arc::clone(self),
             feed,
@@ -203,54 +90,41 @@ impl Pairing {
     }
 
     fn restart(&self, feed: Medium) {
-        self.state
-            .lock()
-            .expect("pairing lock")
-            .anchors
-            .restart(feed);
+        self.state.lock().expect("pairing lock").clock.restart(feed);
     }
 
     fn fragment(&self, feed: Medium, payload: &[u8]) {
-        let Some(media) = fragment::media_time(payload) else {
+        let Some(media) = live::media_time(payload) else {
             return;
         };
-        let Some(running) = self
-            .clock
-            .current_running_time()
-            .and_then(|time| i64::try_from(time.nseconds()).ok())
-        else {
+        let Some(running) = self.pipeline.current_running_time() else {
             return;
         };
         let mut state = self.state.lock().expect("pairing lock");
-        let moved = state.anchors.note(feed, media, running);
-        let engaging = feed == Medium::Sound && !state.engaged;
-        state.engaged |= engaging;
-        if !state.engaged {
-            return;
-        }
-        // Engaging puts the picture's mapping in force with the sound's.
-        let offsets = if engaging {
-            [
-                state.anchors.tracks[0].applied,
-                state.anchors.tracks[1].applied,
-            ]
-        } else if let Some(offsets) = moved {
-            offsets
-        } else {
+        // The clock answers with the offsets to set: both feeds' on the
+        // sound's first fragment, and after it both feeds' when the mapping
+        // moves.
+        let Some(placement) = state.clock.fragment(feed, media, Duration::from(running)) else {
             return;
         };
-        for (pad, offset) in state.pads.iter().zip(offsets) {
+        let placed = [
+            (&state.video_pad, placement.video_offset_ns),
+            (&state.audio_pad, placement.audio_offset_ns),
+        ];
+        for (pad, offset) in placed {
             if let (Some(pad), Some(offset)) = (pad, offset) {
                 pad.set_offset(offset);
             }
         }
         // The picture is held from here on, with its mapping in place.
-        if let Some(on_engage) = state.on_engage.take() {
+        if placement.engaged == Engagement::Engaged
+            && let Some(on_engage) = state.on_engage.take()
+        {
             on_engage();
         }
         debug!(
-            picture_ms = offsets[0].map(|offset| offset / 1_000_000),
-            sound_ms = offsets[1].map(|offset| offset / 1_000_000),
+            picture_ms = placement.video_offset_ns.map(|offset| offset / 1_000_000),
+            sound_ms = placement.audio_offset_ns.map(|offset| offset / 1_000_000),
             "sound and picture placed on the clock"
         );
     }
@@ -279,9 +153,19 @@ impl Pacer {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::AtomicUsize;
+
+    use iris_client::sound_clock::DELAY;
+
     use super::*;
 
-    const MS: i64 = 1_000_000;
+    const NANOS_PER_MS: i64 = 1_000_000;
+
+    const NANOS_PER_SECOND: i64 = 1_000_000_000;
+
+    fn nanos(duration: Duration) -> i64 {
+        i64::try_from(duration.as_nanos()).unwrap_or(i64::MAX)
+    }
 
     /// No test plays a camera's audio on the machine it runs on.
     #[test]
@@ -291,19 +175,9 @@ mod tests {
         assert!(silent());
     }
 
-    #[test]
-    fn the_least_delay_is_the_least_of_the_last_ten_seconds() {
-        let mut least = LeastDelay::default();
-        assert_eq!(least.note(0, 50), 50);
-        assert_eq!(least.note(SECOND / 2, 70), 50);
-        assert_eq!(least.note(SECOND, 30), 30);
-        assert_eq!(least.note(4 * SECOND, 90), 30);
-        // Ten seconds after the second that held 30, it has left the window.
-        assert_eq!(least.note(10 * SECOND + SECOND / 2, 80), 30);
-        assert_eq!(least.note(11 * SECOND, 85), 80);
-        assert_eq!(least.note(30 * SECOND, 5), 5);
-        assert_eq!(least.seconds.len(), 1);
-    }
+    /// The start of an init segment of the sound: a payload that is no
+    /// fragment, since it starts with no `prft` box.
+    const SOUND_INIT: &[u8] = b"\0\0\0\x1cftypiso6\0\0\0\0iso6cmfcmp41";
 
     /// The `prft` box a live fragment starts with, for the media time
     /// `ticks`.
@@ -318,227 +192,240 @@ mod tests {
         fragment
     }
 
-    /// A pairing sets nothing until the sound's first fragment arrives:
-    /// then it sets both pads' offsets and says so, once. An init segment
-    /// changes nothing, and a feed that starts over is placed by its next
-    /// fragment. The offsets put a first fragment half a second after its
-    /// arrival, whatever its media time.
-    #[test]
-    fn a_pairing_sets_the_pads_from_the_sounds_first_fragment_on() {
-        gst::init().unwrap();
-        let pipeline = gst::Pipeline::new();
-        pipeline.set_state(gst::State::Playing).unwrap();
-        let (_, state, _) = pipeline.state(gst::ClockTime::from_seconds(5));
-        assert_eq!(state, gst::State::Playing);
-        let engagements = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let pairing = Pairing::new(&pipeline, {
-            let engagements = Arc::clone(&engagements);
-            move || {
-                engagements.fetch_add(1, Ordering::AcqRel);
+    /// A pairing on a playing pipeline, with a pad and a pacer for each feed
+    /// and a count of the times the pairing engaged.
+    struct Paired {
+        pipeline: gst::Pipeline,
+        engagements: Arc<AtomicUsize>,
+        picture_pad: gst::Pad,
+        sound_pad: gst::Pad,
+        picture: Pacer,
+        sound: Pacer,
+    }
+
+    impl Paired {
+        fn new() -> Self {
+            gst::init().unwrap();
+            let pipeline = gst::Pipeline::new();
+            pipeline.set_state(gst::State::Playing).unwrap();
+            let (_, state, _) = pipeline.state(gst::ClockTime::from_seconds(5));
+            assert_eq!(state, gst::State::Playing);
+            let engagements = Arc::new(AtomicUsize::new(0));
+            let pairing = Pairing::new(&pipeline, {
+                let engagements = Arc::clone(&engagements);
+                move || {
+                    engagements.fetch_add(1, Ordering::AcqRel);
+                }
+            });
+            let pad = || gst::Pad::builder(gst::PadDirection::Src).build();
+            let (picture_pad, sound_pad) = (pad(), pad());
+            let picture = pairing.pacer(Medium::Video, picture_pad.clone());
+            let sound = pairing.pacer(Medium::Audio, sound_pad.clone());
+            Self {
+                pipeline,
+                engagements,
+                picture_pad,
+                sound_pad,
+                picture,
+                sound,
             }
-        });
-        let pad = || gst::Pad::builder(gst::PadDirection::Src).build();
-        let (picture_pad, sound_pad) = (pad(), pad());
-        let picture = pairing.pacer(Medium::Picture, picture_pad.clone());
-        let sound = pairing.pacer(Medium::Sound, sound_pad.clone());
-        let running =
-            || i64::try_from(pipeline.current_running_time().unwrap().nseconds()).unwrap();
-        // The demuxer counts a feed's running time from its first fragment,
-        // so the offset of a feed whose first fragment just arrived is the
-        // running time of the arrival plus the delay.
-        let placed_now = |pad: &gst::Pad, before: i64| {
+        }
+
+        fn running_ns(&self) -> i64 {
+            i64::try_from(self.pipeline.current_running_time().unwrap().nseconds()).unwrap()
+        }
+
+        fn engagements(&self) -> usize {
+            self.engagements.load(Ordering::Acquire)
+        }
+
+        /// The picture's first two fragments, 33 ms of media apart, which
+        /// arrive at once.
+        fn picture_alone(&self) {
+            self.picture.payload(&prft(90_000_000));
+            self.picture.payload(&prft(90_003_000));
+        }
+
+        /// The picture's first fragments, then the sound's init segment and
+        /// first fragment, on another timeline than the picture's; returns
+        /// the running time before that fragment arrived.
+        fn sounds_first_fragment(&self) -> i64 {
+            self.picture_alone();
+            self.sound.payload(SOUND_INIT);
+            let before_ns = self.running_ns();
+            self.sound.payload(&prft(450_000_000));
+            before_ns
+        }
+
+        /// The sound's second fragment, 16 ms after its first.
+        fn sounds_later_fragment(&self) {
+            std::thread::sleep(Duration::from_millis(16));
+            self.sound.payload(&prft(450_001_440));
+        }
+
+        /// The sound starts over on another run 30 ms on, and its next
+        /// fragment arrives; returns the running time before it arrived.
+        fn sound_starts_over(&self) -> i64 {
+            std::thread::sleep(Duration::from_millis(30));
+            self.sound.restart();
+            let before_ns = self.running_ns();
+            self.sound.payload(&prft(9_000));
+            before_ns
+        }
+
+        /// The picture starts over 30 ms on, and its next fragment arrives;
+        /// returns the running time before it arrived.
+        fn picture_starts_over(&self) -> i64 {
+            std::thread::sleep(Duration::from_millis(30));
+            self.picture.restart();
+            let before_ns = self.running_ns();
+            self.picture.payload(&prft(18_000));
+            before_ns
+        }
+
+        /// Checks that the offset of `pad` is that of a first fragment that
+        /// arrived after `before_ns`: the running time of its arrival plus
+        /// the delay. The demuxer counts a feed's running time from its
+        /// first fragment, so the offset plays that fragment half a second
+        /// after it arrived.
+        fn assert_placed_now(&self, pad: &gst::Pad, before_ns: i64) {
             let offset = pad.offset();
-            let after = running();
+            let after_ns = self.running_ns();
             assert!(
-                (before + nanos(DELAY)..=after + nanos(DELAY)).contains(&offset),
-                "offset {offset} outside {before}..={after} plus the delay"
+                ((before_ns + nanos(DELAY))..=(after_ns + nanos(DELAY))).contains(&offset),
+                "offset {offset} outside {before_ns}..={after_ns} plus the delay"
             );
-        };
+        }
+    }
 
-        // The picture alone: tracked, with nothing set.
-        picture.payload(&prft(90_000_000));
-        picture.payload(&prft(90_003_000));
-        assert_eq!((picture_pad.offset(), sound_pad.offset()), (0, 0));
-        assert_eq!(engagements.load(Ordering::Acquire), 0);
-        // An init segment of the sound is not a fragment.
-        sound.payload(b"\0\0\0\x1cftypiso6\0\0\0\0iso6cmfcmp41");
-        assert_eq!(engagements.load(Ordering::Acquire), 0);
-        assert_eq!(sound_pad.offset(), 0);
+    impl Drop for Paired {
+        fn drop(&mut self) {
+            let _ = self.pipeline.set_state(gst::State::Null);
+        }
+    }
 
-        // The sound's first fragment, on a timeline of its own.
-        let before = running();
-        sound.payload(&prft(450_000_000));
-        assert_eq!(engagements.load(Ordering::Acquire), 1);
-        placed_now(&sound_pad, before);
-        // The picture's offset is in force too: its first fragment arrived
-        // a moment earlier, and the second 33 ms of media after it.
-        let picture_offset = picture_pad.offset();
-        assert!(picture_offset > 0 && picture_offset <= sound_pad.offset());
-        assert!(sound_pad.offset() - picture_offset < 200 * MS);
+    /// The picture's fragments before the sound's first set no offset on
+    /// either pad.
+    #[test]
+    fn the_picture_alone_sets_no_offset() {
+        let paired = Paired::new();
+        paired.picture_alone();
+        assert_eq!(
+            (paired.picture_pad.offset(), paired.sound_pad.offset()),
+            (0, 0)
+        );
+    }
 
-        // More fragments move nothing and say nothing.
-        let settled = sound_pad.offset();
-        std::thread::sleep(Duration::from_millis(16));
-        sound.payload(&prft(450_001_440));
+    /// The picture's fragments before the sound's first do not engage the
+    /// pairing.
+    #[test]
+    fn the_picture_alone_does_not_engage_the_pairing() {
+        let paired = Paired::new();
+        paired.picture_alone();
+        assert_eq!(paired.engagements(), 0);
+    }
+
+    /// An init segment of the sound is not a fragment: it does not engage
+    /// the pairing.
+    #[test]
+    fn an_init_segment_of_the_sound_does_not_engage_the_pairing() {
+        let paired = Paired::new();
+        paired.picture_alone();
+        paired.sound.payload(SOUND_INIT);
+        assert_eq!(paired.engagements(), 0);
+    }
+
+    /// An init segment of the sound is not a fragment: it sets no offset on
+    /// the sound's pad.
+    #[test]
+    fn an_init_segment_of_the_sound_sets_no_offset() {
+        let paired = Paired::new();
+        paired.picture_alone();
+        paired.sound.payload(SOUND_INIT);
+        assert_eq!(paired.sound_pad.offset(), 0);
+    }
+
+    #[test]
+    fn the_sounds_first_fragment_engages_the_pairing() {
+        let paired = Paired::new();
+        paired.sounds_first_fragment();
+        assert_eq!(paired.engagements(), 1);
+    }
+
+    /// The offset of the sound's first fragment, at 5,000 s of media time,
+    /// plays it half a second after its arrival.
+    #[test]
+    fn the_sounds_first_fragment_plays_half_a_second_after_its_arrival() {
+        let paired = Paired::new();
+        let before_ns = paired.sounds_first_fragment();
+        paired.assert_placed_now(&paired.sound_pad, before_ns);
+    }
+
+    /// The sound's first fragment puts the picture's offset in force too:
+    /// the picture's first fragment arrived a moment earlier, and its second
+    /// 33 ms of media after it.
+    #[test]
+    fn the_sounds_first_fragment_puts_the_pictures_offset_in_force() {
+        let paired = Paired::new();
+        paired.sounds_first_fragment();
+        let (picture, sound) = (paired.picture_pad.offset(), paired.sound_pad.offset());
         assert!(
-            (sound_pad.offset() - settled).abs() <= MS,
+            picture > 0 && picture <= sound,
+            "picture {picture}, sound {sound}"
+        );
+        assert!(
+            sound - picture < 200 * NANOS_PER_MS,
+            "picture {picture}, sound {sound}"
+        );
+    }
+
+    #[test]
+    fn a_later_fragment_of_the_sound_leaves_its_offset() {
+        let paired = Paired::new();
+        paired.sounds_first_fragment();
+        let settled = paired.sound_pad.offset();
+        paired.sounds_later_fragment();
+        assert!(
+            (paired.sound_pad.offset() - settled).abs() <= NANOS_PER_MS,
             "the estimate held"
         );
-        assert_eq!(engagements.load(Ordering::Acquire), 1);
-
-        // The sound starts over on another run: placed by its next fragment.
-        std::thread::sleep(Duration::from_millis(30));
-        sound.restart();
-        let before = running();
-        sound.payload(&prft(9_000));
-        placed_now(&sound_pad, before);
-        assert!(sound_pad.offset() > settled + 25 * MS);
-        assert_eq!(engagements.load(Ordering::Acquire), 1);
-        // The picture starts over too.
-        std::thread::sleep(Duration::from_millis(30));
-        picture.restart();
-        let before = running();
-        picture.payload(&prft(18_000));
-        placed_now(&picture_pad, before);
-        pipeline.set_state(gst::State::Null).unwrap();
     }
 
-    /// A feed's frames play at media time plus the least delay plus the
-    /// delay: the offset is the first media time plus those two, since the
-    /// demuxer counts running time from the first frame.
+    /// The pairing engages on the sound's first fragment alone: not on its
+    /// later fragments, nor when it starts over.
     #[test]
-    fn a_feed_is_placed_by_its_least_delay() {
-        let mut anchors = Anchors::default();
-        // Media time 100 s arrives at running time 7 s, 40 ms late.
-        let media = 100 * SECOND;
-        let moved = anchors.note(Medium::Picture, media, 7 * SECOND + 40 * MS);
-        let first = media + (7 * SECOND + 40 * MS - media) + 500 * MS;
-        assert_eq!(moved, Some([Some(first), None]));
-        // The next frame arrives on time. The first frames are still held,
-        // so the mapping follows the estimate, 40 ms earlier.
-        assert_eq!(
-            anchors.note(Medium::Picture, media + 33 * MS, 7 * SECOND + 33 * MS),
-            Some([Some(first - 40 * MS), None])
-        );
-        // Half a second after the feed's first frame, to the nanosecond,
-        // nothing is held any more: a frame 30 ms earlier still is inside
-        // the threshold and moves nothing.
-        assert_eq!(
-            anchors.note(Medium::Picture, media + 570 * MS, 7 * SECOND + 540 * MS),
-            None
-        );
-        // The sound's first fragment places the sound; the picture takes
-        // the estimate it had reached.
-        let sound_media = 250 * SECOND;
-        let moved = anchors.note(Medium::Sound, sound_media, 8 * SECOND + 60 * MS);
-        assert_eq!(
-            moved,
-            Some([
-                Some(first - 70 * MS),
-                Some(sound_media + (8 * SECOND + 60 * MS - sound_media) + 500 * MS),
-            ])
-        );
-        // The frames of the sound's first group came together; the last of
-        // them is the least delayed, and the sound follows it at once.
-        let moved = anchors.note(Medium::Sound, sound_media + 64 * MS, 8 * SECOND + 60 * MS);
-        assert_eq!(
-            moved.map(|offsets| offsets[1]),
-            Some(Some(
-                sound_media + (8 * SECOND - 4 * MS - sound_media) + 500 * MS
-            ))
-        );
+    fn the_pairing_engages_once() {
+        let paired = Paired::new();
+        paired.sounds_first_fragment();
+        paired.sounds_later_fragment();
+        assert_eq!(paired.engagements(), 1);
+        paired.sound_starts_over();
+        assert_eq!(paired.engagements(), 1);
     }
 
-    /// A burst of earlier frames at the start puts the first estimate late; the
-    /// first live frame moves it, once. Late frames after that change
-    /// nothing, and a slow drift moves the mapping when it has grown past
-    /// the threshold.
+    /// A sound that starts over is placed by its next fragment, half a
+    /// second after that fragment's arrival.
     #[test]
-    fn the_mapping_moves_only_past_the_threshold() {
-        let mut anchors = Anchors::default();
-        let media = 50 * SECOND;
-        // The connection's burst: a frame captured two seconds before.
-        assert!(anchors.note(Medium::Picture, media, 2 * SECOND).is_some());
-        // The first live frame is two seconds of media later, at once.
-        let live = anchors
-            .note(Medium::Picture, media + 2 * SECOND, 2 * SECOND + 5 * MS)
-            .expect("the estimate fell by two seconds");
-        // It plays half a second after it arrived: 2.505 s, which is two
-        // seconds of media after the first frame, plus the offset.
-        assert_eq!(live[0], Some(505 * MS));
-        // Frames up to 270 ms late do not move it.
-        for step in 1..200 {
-            let at = 2 * SECOND + 5 * MS + step * 33 * MS;
-            let late = (step % 10) * 30 * MS;
-            assert_eq!(
-                anchors.note(
-                    Medium::Picture,
-                    media + 2 * SECOND + step * 33 * MS,
-                    at + late
-                ),
-                None,
-                "step {step}"
-            );
-        }
-        // The camera's clock runs slow by a thousandth: every frame is a
-        // little later, and after the window has passed the estimate
-        // follows; the mapping moves when it has gone 80 ms.
-        let mut moves = 0;
-        for step in 200..6_000 {
-            let media_at = media + 2 * SECOND + step * 33 * MS;
-            let at = 2 * SECOND + 5 * MS + step * 33 * MS + (step - 200) * 33 * MS / 1_000;
-            if anchors.note(Medium::Picture, media_at, at).is_some() {
-                moves += 1;
-            }
-        }
-        // 191 s at a thousandth is 191 ms of drift: two moves of 80 ms.
-        assert_eq!(moves, 2);
+    fn a_sound_that_starts_over_is_placed_by_its_next_fragment() {
+        let paired = Paired::new();
+        paired.sounds_first_fragment();
+        let settled = paired.sound_pad.offset();
+        paired.sounds_later_fragment();
+        let before_ns = paired.sound_starts_over();
+        paired.assert_placed_now(&paired.sound_pad, before_ns);
+        assert!(paired.sound_pad.offset() > settled + 25 * NANOS_PER_MS);
     }
 
-    /// A feed's first media time and later fragments may span the whole
-    /// nonnegative input range. Comparing two resulting offsets stays exact
-    /// even when their distance exceeds a signed integer.
+    /// A picture that starts over is placed by its next fragment, half a
+    /// second after that fragment's arrival.
     #[test]
-    fn extreme_media_times_do_not_overflow_the_mapping_distance() {
-        let mut anchors = Anchors::default();
-        let first = i64::MAX / 2;
-        assert_eq!(
-            anchors.note(Medium::Picture, first, 0),
-            Some([Some(nanos(DELAY)), None])
-        );
-
-        // Each later arrival begins a fresh least-delay window. The first
-        // moves the applied offset below zero; the second moves it above zero
-        // by more than i64::MAX.
-        let below = first + (11 * SECOND - i64::MAX) + nanos(DELAY);
-        assert_eq!(
-            anchors.note(Medium::Picture, i64::MAX, 11 * SECOND),
-            Some([Some(below), None])
-        );
-        let above = first + 22 * SECOND + nanos(DELAY);
-        assert!(above.abs_diff(below) > i64::MAX.unsigned_abs());
-        assert_eq!(
-            anchors.note(Medium::Picture, 0, 22 * SECOND),
-            Some([Some(above), None])
-        );
-    }
-
-    /// A feed that starts over is placed anew by its next fragment.
-    #[test]
-    fn a_restarted_feed_is_placed_anew() {
-        let mut anchors = Anchors::default();
-        assert!(anchors.note(Medium::Sound, 10 * SECOND, SECOND).is_some());
-        assert_eq!(
-            anchors.note(Medium::Sound, 10 * SECOND + 16 * MS, SECOND + 16 * MS),
-            None
-        );
-        anchors.restart(Medium::Sound);
-        // Another run: media time starts elsewhere.
-        let moved = anchors.note(Medium::Sound, 3 * SECOND, 20 * SECOND);
-        assert_eq!(
-            moved,
-            Some([None, Some(3 * SECOND + 17 * SECOND + 500 * MS)])
-        );
+    fn a_picture_that_starts_over_is_placed_by_its_next_fragment() {
+        let paired = Paired::new();
+        paired.sounds_first_fragment();
+        paired.sounds_later_fragment();
+        paired.sound_starts_over();
+        let before_ns = paired.picture_starts_over();
+        paired.assert_placed_now(&paired.picture_pad, before_ns);
     }
 
     /// An `mp4a` sample entry with its `esds`: AAC-LC, one channel, 64 kHz.
@@ -580,16 +467,34 @@ mod tests {
         fragment
     }
 
+    /// A frame a sink rendered: its media time and the running time of the
+    /// rendering.
+    #[derive(Clone, Copy, Debug)]
+    struct Rendered {
+        media_ns: i64,
+        /// The running time of the rendering, in nanoseconds.
+        running_ns: i64,
+    }
+
+    /// How long after their capture a feed's frames were rendered, and how
+    /// many frames its sink rendered in all.
+    #[derive(Clone, Copy, Debug)]
+    struct Delays {
+        least_ns: i64,
+        most_ns: i64,
+        /// The frames the sink rendered.
+        rendered: usize,
+    }
+
     /// One feed of the test below: its input, its pacer, and what its sink
-    /// rendered, as media time and the running time of the rendering.
+    /// rendered.
     struct TestFeed {
         src: gst_app::AppSrc,
         pacer: Pacer,
-        rendered: Arc<Mutex<Vec<(i64, i64)>>>,
-        /// Media time of the frame captured at the test's start, in ticks.
-        media_start: u64,
-        /// A frame's length in ticks.
-        frame: u32,
+        rendered: Arc<Mutex<Vec<Rendered>>>,
+        /// Media time of the frame captured at the test's start.
+        media_start_ticks: u64,
+        frame_ticks: u32,
         sent: u32,
     }
 
@@ -612,10 +517,13 @@ mod tests {
                 let clock = pipeline.clone();
                 move |values| {
                     let buffer = values[1].get::<gst::Buffer>().unwrap();
-                    let media = i64::try_from(buffer.pts().unwrap().nseconds()).unwrap();
-                    let running =
+                    let media_ns = i64::try_from(buffer.pts().unwrap().nseconds()).unwrap();
+                    let running_ns =
                         i64::try_from(clock.current_running_time().unwrap().nseconds()).unwrap();
-                    rendered.lock().unwrap().push((media, running));
+                    rendered.lock().unwrap().push(Rendered {
+                        media_ns,
+                        running_ns,
+                    });
                     None
                 }
             });
@@ -629,26 +537,26 @@ mod tests {
                 iris_mp4::init::build_init_segment(&sound_entry()).to_vec(),
             ))
             .unwrap();
-            let (media_start, frame) = match medium {
+            let (media_start_ticks, frame_ticks) = match medium {
                 // Thirty pictures a second, 1,000 s into their run.
-                Medium::Picture => (90_000_000, 3_000),
+                Medium::Video => (90_000_000, 3_000),
                 // Audio frames of 16 ms, 5,000 s into another run.
-                Medium::Sound => (450_000_000, 1_440),
+                Medium::Audio => (450_000_000, 1_440),
             };
             Self {
                 src,
                 pacer,
                 rendered,
-                media_start,
-                frame,
+                media_start_ticks,
+                frame_ticks,
                 sent: 0,
             }
         }
 
         /// Sends the next frame, as the tile's source does.
         fn send(&mut self) {
-            let ticks = self.media_start + u64::from(self.sent) * u64::from(self.frame);
-            let fragment = live_fragment(self.sent + 1, ticks, self.frame);
+            let ticks = self.media_start_ticks + u64::from(self.sent) * u64::from(self.frame_ticks);
+            let fragment = live_fragment(self.sent + 1, ticks, self.frame_ticks);
             self.pacer.payload(&fragment);
             self.src
                 .push_buffer(gst::Buffer::from_slice(fragment))
@@ -658,35 +566,36 @@ mod tests {
 
         /// When the frame after the last sent one was captured, in
         /// nanoseconds since the test's start.
-        fn next_capture(&self) -> i64 {
-            i64::from(self.sent) * i64::from(self.frame) * 100_000 / 9
+        fn next_capture_ns(&self) -> i64 {
+            i64::from(self.sent) * i64::from(self.frame_ticks) * 100_000 / 9
         }
 
         /// How long after its capture each frame from `from` on was
-        /// rendered: the least and the most, in nanoseconds, with `start`
-        /// the running time of the test's start.
-        fn delays(&self, start: i64, from: usize) -> (i64, i64, usize) {
-            let media_zero = i64::try_from(u128::from(self.media_start) * 100_000 / 9).unwrap();
+        /// rendered, the least and the most, with `start_ns` the running
+        /// time of the test's start in nanoseconds.
+        fn delays(&self, start_ns: i64, from: usize) -> Delays {
+            let media_zero_ns =
+                i64::try_from(u128::from(self.media_start_ticks) * 100_000 / 9).unwrap();
             let rendered = self.rendered.lock().unwrap();
-            let delays: Vec<i64> = rendered
+            let delays_ns: Vec<i64> = rendered
                 .iter()
                 .skip(from)
-                .map(|(media, running)| (running - start) - (media - media_zero))
+                .map(|frame| (frame.running_ns - start_ns) - (frame.media_ns - media_zero_ns))
                 .collect();
-            (
-                *delays.iter().min().unwrap(),
-                *delays.iter().max().unwrap(),
-                rendered.len(),
-            )
+            Delays {
+                least_ns: *delays_ns.iter().min().unwrap(),
+                most_ns: *delays_ns.iter().max().unwrap(),
+                rendered: rendered.len(),
+            }
         }
     }
 
-    /// Two feeds of frames captured together, each on a timeline of its own:
-    /// the picture's arrive 20 ms after their capture, the sound's in groups
-    /// of five whose last is 20 ms old and whose first is 84 ms old. Every
-    /// frame of both reaches its sink half a second after the least-delay
-    /// arrival of its instant, so sound and picture of one instant are
-    /// rendered together, and the mapping is set once.
+    /// Two feeds of frames captured together, on different timelines. The
+    /// picture's frames arrive 20 ms after their capture. The sound's arrive in
+    /// groups of five, whose last is 20 ms old and whose first is 84 ms old.
+    /// With the mapping in force, every frame of both reaches its sink half a
+    /// second after the least-delay arrival of its instant. Sound and picture
+    /// of one instant are then rendered together.
     #[test]
     #[ignore = "requires the GStreamer MP4 demuxer (gst-plugins-good); `just display-test` runs it"]
     fn feeds_captured_together_reach_their_sinks_together() {
@@ -698,19 +607,19 @@ mod tests {
             let engaged = Arc::clone(&engaged);
             move || engaged.store(true, Ordering::Release)
         });
-        let mut picture = TestFeed::new(&pipeline, &pairing, Medium::Picture);
-        let mut sound = TestFeed::new(&pipeline, &pairing, Medium::Sound);
-        let transit = 20 * MS;
-        let running =
+        let mut picture = TestFeed::new(&pipeline, &pairing, Medium::Video);
+        let mut sound = TestFeed::new(&pipeline, &pairing, Medium::Audio);
+        let transit_ns = 20 * NANOS_PER_MS;
+        let running_ns =
             || i64::try_from(pipeline.current_running_time().unwrap().nseconds()).unwrap();
-        let start = running();
-        while running() - start < 3 * SECOND {
-            let now = running() - start;
-            while picture.next_capture() + transit <= now {
+        let start_ns = running_ns();
+        while running_ns() - start_ns < 3 * NANOS_PER_SECOND {
+            let now_ns = running_ns() - start_ns;
+            while picture.next_capture_ns() + transit_ns <= now_ns {
                 picture.send();
             }
             // A group goes out when its fifth frame is 20 ms old.
-            while sound.next_capture() + 4 * 16 * MS + transit <= now {
+            while sound.next_capture_ns() + 4 * 16 * NANOS_PER_MS + transit_ns <= now_ns {
                 for _ in 0..5 {
                     sound.send();
                 }
@@ -720,26 +629,28 @@ mod tests {
         // What was sent in the last half second is still held.
         std::thread::sleep(Duration::from_millis(700));
         assert!(engaged.load(Ordering::Acquire));
-        let (picture_least, picture_most, pictures) = picture.delays(start, 15);
-        let (sound_least, sound_most, sounds) = sound.delays(start, 30);
+        let pictures = picture.delays(start_ns, 15);
+        let sounds = sound.delays(start_ns, 30);
         pipeline.set_state(gst::State::Null).unwrap();
         assert!(
-            pictures > 80 && sounds > 170,
-            "{pictures} pictures, {sounds} frames"
+            pictures.rendered > 80 && sounds.rendered > 170,
+            "{} pictures, {} frames",
+            pictures.rendered,
+            sounds.rendered
         );
         // Half a second after the least-delay arrival: 520 ms after capture.
-        let wanted = transit + nanos(DELAY);
-        for (what, delay) in [
-            ("picture least", picture_least),
-            ("picture most", picture_most),
-            ("sound least", sound_least),
-            ("sound most", sound_most),
+        let wanted_ns = transit_ns + nanos(DELAY);
+        for (what, delay_ns) in [
+            ("picture least", pictures.least_ns),
+            ("picture most", pictures.most_ns),
+            ("sound least", sounds.least_ns),
+            ("sound most", sounds.most_ns),
         ] {
             assert!(
-                (delay - wanted).abs() < 25 * MS,
+                (delay_ns - wanted_ns).abs() < 25 * NANOS_PER_MS,
                 "{what}: rendered {} ms after capture, not near {} ms",
-                delay / MS,
-                wanted / MS
+                delay_ns / NANOS_PER_MS,
+                wanted_ns / NANOS_PER_MS
             );
         }
     }

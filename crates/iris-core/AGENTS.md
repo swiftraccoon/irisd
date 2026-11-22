@@ -80,4 +80,5 @@ Most crates depend on this one, so finish with `just check` before handing a cha
 - `docs/research/04-storage-format.md` §7, `07-architecture.md` §4 and §9,
   `12-ingest-cost.md`
 - Dependents: `iris-mp4`, `iris-ingest`, `iris-store`, `iris-catalog`, `iris-events`,
-  `iris-api`, `iris-replay`, `irisd`.
+  `iris-api`, `iris-replay`, `irisd`, `iris-client`, `iris-transport`, `iris-gui`, `iris-tools`,
+  and the fuzz targets (`fuzz/Cargo.toml`).

@@ -69,6 +69,8 @@
 
 mod auth;
 mod cameras;
+#[cfg(test)]
+mod client_bounds;
 mod error;
 mod events;
 mod export;

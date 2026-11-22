@@ -7,6 +7,7 @@ use std::path::PathBuf;
 use std::process::Command;
 
 use super::finding::{Finding, Rule};
+use super::names::Names;
 
 /// The repository a check reads.
 #[derive(Debug, Default)]
@@ -15,6 +16,10 @@ pub struct Repo {
     pub root: PathBuf,
     /// The names of the `justfile`'s recipes.
     pub recipes: BTreeSet<String>,
+    /// The names of the tree's code, which the names in its prose are
+    /// checked against; nothing when the code was not read, and then the
+    /// rule `unknown-name` checks nothing.
+    pub names: Option<Names>,
 }
 
 impl Repo {
@@ -24,6 +29,7 @@ impl Repo {
         Self {
             recipes: recipes(&justfile),
             root,
+            names: None,
         }
     }
 

@@ -6,7 +6,7 @@ license.workspace = true
 publish.workspace = true
 repository.workspace = true
 rust-version.workspace = true
-description = "Fragmented MP4 writer, reader, and index for irisd recordings"
+description = "Fragmented MP4 writer, reader, index, and decoder configuration for irisd recordings"
 
 [dependencies]
 bytes = { workspace = true }

@@ -44,7 +44,7 @@ pub(crate) const MAX_SEGMENT_ROWS: usize = 4_096;
 /// Maximum selected records retained across a response.
 pub(crate) const MAX_SELECTED_RECORDS: usize = 100_000;
 /// Maximum rendered VOD playlist size.
-const MAX_PLAYLIST_BYTES: usize = 16 * 1024 * 1024;
+pub(crate) const MAX_PLAYLIST_BYTES: usize = 16 * 1024 * 1024;
 /// Maximum initialization section read by serving paths.
 pub(crate) const MAX_INIT_BYTES: u64 = 4 * 1024 * 1024;
 /// Maximum complete stored fragment read by serving paths: the 64 MiB

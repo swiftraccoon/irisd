@@ -20,7 +20,8 @@ Rust workspace. Read this file first, then `STANDARDS.md`, then `docs/research/R
 ```
 crates/iris-core     ids, time units (WallUs, MediaTicks), TOML config
 crates/iris-h265     NAL classification, length-prefixed access-unit helpers
-crates/iris-mp4      fMP4 init segment, fragment encoder, scanner, sidecar index, HLS playlists
+crates/iris-mp4      fMP4 init segment, fragment encoder, scanner, sidecar index, HLS playlists,
+                     decoder configuration
 crates/iris-ingest   retina RTSP sessions, timestamp regulariser, fragment assembly
 crates/iris-store    segment files, preallocation, sync policy, writer thread, recovery
 crates/iris-catalog  SQLite catalog, bounded admission, retention queries, migrations
@@ -30,9 +31,17 @@ crates/irisd         the binary: run (the daemon), record, inspect, clocks, reco
 crates/iris-replay   RTSP replay server: recordings as synthetic cameras, for benchmarks and
                      fault injection
 crates/iris-tls      shared TLS client trust: the platform's roots plus an optional CA file
+crates/iris-client   the rules a viewer applies to the daemon's API and to what the daemon serves:
+                     the API origin, requests and answer checks, answer types and validators,
+                     VOD playlist rules, the timeline model, the playback selection, a live
+                     fragment's media time, the sound placement rule, the live protocol with its
+                     reconnect policy and byte budget, the live decoder
+crates/iris-transport
+                     the Linux viewer's transport: the requests of iris-client over reqwest and
+                     tungstenite, the export download, and the live feed loop
 crates/iris-gui      Linux viewer: GTK 4 live grid, focus, playback, timeline, export
 crates/iris-tools    the tools binary: log summaries, soak sampler and report, benchmark driver,
-                     camera probes, gh-commit
+                     camera probes, gh-commit, the standards checks, doc
 fuzz/                cargo-fuzz targets for the parsers (rule 8), with their own workspace,
                      lockfile, and pinned nightly
 config/              cameras.example.toml (committed); *.local.toml copies (gitignored secrets)
@@ -42,7 +51,8 @@ docs/research/       research and design, including every dated measurement
 docs/design/         the cross-crate interfaces of the phase-2 crates
 .rust-reference/     the Rust project reference pack (policies, vendored guides, its own Rust CLI)
 docs/standards/ietf/ the RTSP, RTP, RTP audio and video profile, MPEG-4 and HEVC payload,
-                     HLS, and codecs documents, as published
+                     HLS, codecs, WebSocket, and private and shared IPv4 address range
+                     documents, as published
 third_party/         vendored dependencies with local patches (retina, oxvif); see its README
 .github/             workflows/check.yml (format, clippy, tests, rustdoc, vendored tests, MSRV,
                      audit, fuzz build, aarch64 clippy and tests, references), workflows/docs.yml

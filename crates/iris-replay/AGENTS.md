@@ -25,19 +25,23 @@ Scope: this crate only. Read the root `AGENTS.md` first.
   frames do not extend it) or that stays silent for `idle_timeout` after it, and one whose
   reply cannot be queued within the deadline in force. Keep `idle_timeout` well above the
   recorder's 30-s keepalive, or long benchmarks lose their sessions.
-- The library's errors are `thiserror` types (`MediaError`, `HvccError`, `RtpError`,
-  `SynthError`, `ServerError`); `anyhow` belongs to `main.rs` alone. Units and ids are
-  newtypes: `Ticks`, `RtpTimestamp`, `Ssrc`, `MountName`.
+- The library's errors are `thiserror` types (`MediaError`, `RtpError`, `SynthError`,
+  `ServerError`, `InvalidMountName`); `anyhow` belongs to `main.rs` alone.
+  `MediaError::ParameterSets` carries the `HvccError` of the `hvcC` parser of `iris-mp4`
+  (`iris_mp4::decoder_config`). Units and ids are newtypes: `Ticks`, `RtpTimestamp`, `Ssrc`,
+  `MountName`.
 - Client-controlled header parsing lives in `rtsp.rs` (`parse`, `mount_name`,
   `interleaved_transport`, `session_id`), where the `rtsp_request` fuzz target reaches it;
   keep it there rather than in `server.rs`.
 - Synthetic recordings are real irisd files (scanner and CRC clean); `synth` must track the
   format in `iris-mp4`. Its public builders are fallible and enforce their documented GOP,
   frame, payload, NAL, duration, and clock bounds before allocating the recording.
-- Normal mounts fail closed unless CRC-clean through exact EOF with samples in every
-  fragment, complete nonempty access units, an initial sync sample, a representable
-  nonoverlapping timeline, and a compatible version-1/four-byte-length `hvcC` carrying VPS,
-  SPS, and PPS. `Media` keeps that state private, so every frame it lists has a sample.
+- Normal mounts fail closed unless the recording is CRC-clean through exact EOF, with samples in
+  every fragment, complete nonempty access units, an initial sync sample, and a representable
+  nonoverlapping timeline. The recording's `hvcC` must be version 1 with four-byte lengths and carry
+  a VPS, an SPS, and a PPS. An `hvcC` with more than 16 VPSs, 16 SPSs, or 64 PPSs is refused
+  (`HvccError::TooManyParameterSets`). `Media` keeps that state private, so every frame it lists has
+  a sample.
 - The RTSP surface is one DESCRIBE/PLAY lifecycle bound to one mount, the issued Session, and
   negotiated TCP channels: video has one required `SETUP`; offered audio permits one further
   `SETUP` after video and before `PLAY`, on the same mount and in the same Session. `PAUSE`
@@ -48,7 +52,8 @@ Scope: this crate only. Read the root `AGENTS.md` first.
 ## Where things are
 
 - `main.rs` — the command line.
-- `media.rs` — recording loader, `hvcC` parsing, frame table.
+- `media.rs` — recording loader and frame table; it reads the parameter sets with
+  `iris_mp4::decoder_config::parse_parameter_sets` (`crates/iris-mp4/src/decoder_config.rs`).
 - `rtp.rs` — packetizer, sender reports, interleaving.
 - `rtsp.rs` — request parsing, responses, mount names.
 - `sdp.rs` — session description and base64.

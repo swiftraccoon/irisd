@@ -70,11 +70,30 @@ over them.
   warnings cannot establish a restart, and `catalog open` is not a catalog statistics row.
 - `standards` is how `STANDARDS.md` and the root `AGENTS.md` are held to: a rule one of them
   states and a program can decide has its check, and a change to such a rule changes the check
-  and `STANDARDS.md` §1 in the same commit. A rule that reads a fact (a width, an address, a
-  path that must exist) takes no waiver; only the rules that read meaning from words or shapes
-  do, and a waiver is a line in `standards.toml` with its reason, never a pattern loosened to
-  let one text pass. Every rule has a test with a text that breaks it and texts that must
-  pass. The checks add no dependency: they scan text with `text.rs`.
+  and `STANDARDS.md` §1 in the same commit. A rule that reads a fact (an address, a path that
+  must exist, the width of Markdown prose) takes no waiver. The rules that read meaning from
+  words or shapes do, the widths of Rust lines among them, and a waiver is a line in
+  `standards.toml` with its reason. It is never a pattern loosened to let one text pass. A
+  waiver also covers the breaches of a rule in text written before it, and its count only
+  falls. Every rule has a test with a text that breaks it and texts that must pass. The checks
+  add no dependency: they scan text with `text.rs`. `tree` reads each file once. From what it
+  read it builds, once a run, the names of the tree's code that `unknown-name` checks prose
+  against, and the module tree of each crate that `missing-example` and
+  `unasserted-error-text` read.
+- `doc` removes nothing but the output directory, `doc` in the target directory that
+  `cargo metadata` names, and it reads the target directory, the build directory, and the
+  libraries from that one `cargo metadata` document. It empties the output directory after the
+  check passes and before it documents: a page from before the run can hold unresolved links,
+  and Cargo keeps such a page until it documents the crate again. Every pass of `cargo doc` runs
+  with `--jobs 1`, after one `cargo check --workspace --locked`: with jobs in parallel the links
+  between the crates do not resolve, and neither rustdoc nor Cargo reports it. After the last
+  pass, when that pass succeeded, `doc` fails unless each library directory it made holds
+  `index.html`. Cargo writes the documentation to another directory when `build.target` is in a
+  configuration file, and `doc` cannot see that key. It makes no directory for a library with
+  `doc = false`, and so does not check one. The step after its first pass is the pure function
+  `after_first_pass`, and `check_and_document` takes the cargo runs as closures, so the unit
+  tests cover both without running cargo. The module documentation of `doc.rs` says why each
+  step is there.
 
 ## Where things are
 
@@ -87,11 +106,17 @@ over them.
 - `probe_parser.rs` — the bounded parsers of the camera tools.
 - `stats.rs`, `report.rs`, `sample.rs`, `bench.rs`, `rtsp_probe.rs`, `onvif_call.rs`,
   `gh_commit.rs` — one subcommand each, with `Args` and `run`.
+- `doc.rs` — the `doc` subcommand, which takes no arguments: `run`, the reading of
+  `cargo metadata`, the order of the steps, the step after the first pass of `cargo doc`, and
+  the check of the index pages.
+  `tests/doc.rs` runs the subcommand as a process, with a script in place of cargo.
 - `secret.rs` — `Password` and the `--password-env` value parser the camera tools share.
 - `standards.rs` and `standards/` — the checks of `STANDARDS.md` §1: `command.rs` (the three
   modes and their git calls), `finding.rs` (the rules' names), `config.rs` (`standards.toml`),
-  `installation.rs`, `prose.rs`, `markdown.rs`, `rust.rs`, `layout.rs`, and `commits.rs` (one
-  family of rules each), and `text.rs` (scanning without a pattern library).
+  `installation.rs`, `prose.rs`, `markdown.rs`, `rust.rs`, `layout.rs`, `names.rs`,
+  `examples.rs`, `error_texts.rs`, and `commits.rs` (one family of rules each), `modules.rs`
+  (the items and the module tree of a crate, which the rules that read a whole crate share),
+  and `text.rs` (scanning without a pattern library).
 
 ## Testing
 

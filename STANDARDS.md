@@ -1,10 +1,11 @@
 # Engineering standards
 
 irisd follows six published standards. Verbatim copies live in the reference pack under
-`.rust-reference/references/` (provenance, hashes, and licenses in
-`.rust-reference/references/README.md` and `manifest.json`; the pack's own policies in
-`.rust-reference/docs/`), and the IETF documents the protocols come from under
-`docs/standards/ietf/`. This file is the digest of what we adopt and how it is enforced.
+`.rust-reference/references/`. Their provenance, hashes, and licenses are in
+`.rust-reference/references/README.md` and `manifest.json`, and the pack's policies are in
+`.rust-reference/docs/`. The IETF documents that define the protocols and the private and shared
+address ranges are under `docs/standards/ietf/`. This file is the digest of what we adopt and how it
+is enforced.
 Where the sources conflict, the order of precedence is:
 
 1. The Rust Style Guide (`.rust-reference/references/rust-style-guide/src/doc/style-guide/src/`)
@@ -34,12 +35,12 @@ Where the sources conflict, the order of precedence is:
 | Mechanical rules | `just standards` (`iris-tools standards tree`): the rules of this file and of `AGENTS.md` that a program can decide, listed below | required |
 | Commits | `iris-tools standards commits RANGE` for a range; `iris-tools standards message FILE` as the `commit-msg` hook (`just hooks`); `iris-tools gh-commit` on the message it is given, before it publishes | CI for a message's form; the hook and `gh-commit` for its form and for what it says of its change |
 | Unsafe code | `#![forbid(unsafe_code)]` workspace-wide (`unsafe_code = "forbid"`) | required |
-| Public docs | `missing_docs`, and clippy's `missing_errors_doc` and `missing_panics_doc` (pedantic); `cargo doc` with `RUSTDOCFLAGS=-D warnings` | required |
+| Public docs | `missing_docs`, and clippy's `missing_errors_doc` and `missing_panics_doc` (pedantic); `just doc`, `cargo doc` with `RUSTDOCFLAGS=-D warnings`, run by `iris-tools doc` so that links between the workspace's crates resolve | required |
 | Tests | `cargo test --workspace` and the vendored crates' suites (`just vendor-test`) | required |
 | Supply chain | `cargo audit` on every lockfile; `cargo deny check` (`deny.toml`) for the root and `fuzz/` graphs (`just audit`) | required before a release |
 | Fuzz build | `just fuzz-build` (the nightly pinned in `fuzz/rust-toolchain.toml`) | CI |
 | 64-bit ARM portability | `just cross-check` (clippy with warnings as errors on every crate but the GUI for `aarch64-unknown-linux-gnu`) | CI |
-| 64-bit ARM tests | `just cross-test` (the six crates without C dependencies, as `aarch64-unknown-linux-musl` code, on a 64-bit ARM host or under `qemu-aarch64-static`) | CI |
+| 64-bit ARM tests | `just cross-test` (the seven crates without C dependencies, as `aarch64-unknown-linux-musl` code, on a 64-bit ARM host or under `qemu-aarch64-static`) | CI |
 | MSRV | `cargo +1.92.0 test --workspace --locked` (`rust-version` in `Cargo.toml`) | CI |
 | Reference pack | `just references-check` (the snapshots match `manifest.json`; the maintenance tool's tests) | CI |
 | Viewer display tests | `just display-test` (the `#[ignore]`d tests of `iris-gui` that need a display, an H.264 encoder, or GStreamer's plugins, on a virtual display) | after any change to `iris-gui` |
@@ -70,8 +71,22 @@ site's cameras, capture groups a scripted edit left unfilled, and that every `ju
 repository path a document names exists. In Rust: a path inside `use` braces, uppercase hex,
 `allow` attributes, `TODO` without an owner, `get_` getters, timeless words and the same
 phrases in rustdoc, and in public functions `bool` parameters and tuples of bare numbers. In
+Rust it also checks the width of each line: 100 columns, and 80 after the indentation for a
+line that holds only a comment. It refuses a `# Examples` heading, a type or a trait written
+through two modules or more, a derive written by its path, and two `use` declarations of one
+module path in one scope. It refuses a test whose name joins two behaviours with `_and_`. In
+Markdown, rustdoc, and comments it checks that a sentence holds at most 35 words. It refuses
+there the phrases that `crates/iris-tools/src/standards/prose.rs` bars, which a reader must
+read twice, `the core` for `iris-client`, and a possessive on a code span. It refuses a code
+span there that has the shape of a path, a call, or a type name and names what no code of the
+tree holds outside its comments and literals. Research and design documents name the types of
+other systems throughout, and there it checks only paths and calls. In
 the tree: each crate's `README.md`, `AGENTS.md`, crate documentation, and line in the layout
-of `AGENTS.md`; each fuzz target's `[[bin]]` and `fuzz/README.md` row. In a commit: the
+of `AGENTS.md`; each fuzz target's `[[bin]]` and `fuzz/README.md` row. In each library crate
+it refuses a public module or item that a user can name and whose rustdoc holds neither an
+example nor a sentence that says *example* and links one (C-EXAMPLE). A constant or a static
+needs none. In every crate it refuses an error text, in an `#[error(...)]` attribute, whose longest
+part between its placeholders stands in no string of the crate's tests. In a commit: the
 subject's form, type, scope, length, and mood, a body free of those phrases, no attribution
 lines; and, against its change, that its scope's crate is the one changed and the body names
 any other, that a `feat` changes a document or names one under `docs/`, and that a package
@@ -80,21 +95,32 @@ added to a lockfile comes with the word *license*.
 The rules that read meaning from words or shapes (timeless words, those phrases, camera
 counts, `get_`, `bool` parameters, bare tuples) can be wrong, and `standards.toml` holds their
 accepted exceptions: a file, a rule, a count, and a reason. A file with more breaches than its
-waiver fails, and so does one with fewer. The other rules have no exceptions beyond the
-published texts `standards.toml` lists as allowed. A reviewer still decides what no program
-can: whether the research behind a change was adequate, whether a document is true, whether a
-parser that faces the network has its fuzz target, whether a commit is one change, and whether
-a text that uses none of those phrases still tells a story in place of a fact.
+waiver fails, and so does one with fewer. The rules of the widths of Rust lines, headings,
+paths, `use` declarations, and test names take waivers too, since each meets shapes it cannot
+tell apart. So do the rules of sentence length, phrases, `the core`, and possessives, which
+read meaning from words. So does the rule of names in code spans, which cannot tell a name of
+another system from a name the tree has lost. The rule of examples takes them too: it tells
+from declarations alone what a user can name. So does the rule of error texts, which reads the
+strings of a crate's tests and not what each test asserts. Their waivers also cover the text
+written before each rule, and a count falls as a file is brought to its rule. The other rules
+have no exceptions beyond the published texts `standards.toml` lists as allowed. A reviewer
+still decides what no program can: whether the research behind a change was adequate, whether
+a document is true, whether a parser that faces the network has its fuzz target, whether a
+commit is one change, and whether a text that uses none of those phrases still tells a story
+in place of a fact.
 
 ## 2. Formatting (Rust Style Guide)
 
 - rustfmt with `style_edition = "2024"`, `max_width = 100`, `use_field_init_shorthand`,
   `use_try_shorthand`, Unix newlines. Never `#[rustfmt::skip]` for taste; only for
-  deliberate alignment such as matrices or box layouts.
+  deliberate alignment such as matrices or box layouts. rustfmt leaves a long string or macro
+  call past the width and wraps no comment, so `iris-tools standards` checks each line: 100
+  columns, or 80 after the indentation for a comment line.
 - Options the Google guide recommends but that stable rustfmt does not support
   (`imports_granularity = "Module"`, `hex_literal_case = "Lower"`,
   `format_macro_matchers`) are followed by hand: one `use` per module (no `::` inside braces)
-  and lowercase hex literals, both of which `iris-tools standards` checks.
+  and lowercase hex literals, both of which `iris-tools standards` checks. It also refuses two
+  `use` declarations of one module path in one scope, which one `use` with braces holds.
 - `Cargo.toml` follows
   `.rust-reference/references/rust-style-guide/src/doc/style-guide/src/cargo.md`: `[package]`
   first, with `name` and `version` leading and `description` last; keys version-sorted within
@@ -196,12 +222,13 @@ a text that uses none of those phrases still tells a story in place of a fact.
 
 ## 8. Testing
 
-- Unit tests live in `mod tests` with `use super::*`; golden tests use captured camera media
-  kept outside git (the one committed capture,
-  `crates/iris-ingest/tests/data/cam1-main-10min.idx`, is a timing-only sidecar: header and
-  records, no payload or text); seeded property tests cover the timestamp regulariser and the
-  fragment codec with its scanner and sidecar record; chaos tests (SIGKILL, truncation,
-  zero-filled tails, a filesystem that fills up) cover the store; fuzz targets cover parsers.
+- Unit tests live in `mod tests` with `use super::*`. Golden tests use captured camera media kept
+  outside git. The one committed capture, `crates/iris-ingest/tests/data/cam1-main-10min.idx`, is a
+  timing-only sidecar: header and records, no payload or text. The two init segments in
+  `crates/iris-mp4/tests/ffmpeg_hev1.rs` and `crates/iris-mp4/tests/ffmpeg_mp4a.rs` are ffmpeg's
+  output from synthetic input, not captures. Seeded property tests cover the timestamp regulariser
+  and the fragment codec with its scanner and sidecar record. Chaos tests (SIGKILL, truncation,
+  zero-filled tails, a filesystem that fills up) cover the store. Fuzz targets cover parsers.
 - A test asserts one behaviour and names it: `rejects_truncated_trun`, not `test1`.
 
 ## 9. Commits, versions, and changes
@@ -215,9 +242,9 @@ a text that uses none of those phrases still tells a story in place of a fact.
   `BREAKING CHANGE:` footer describe incompatibility with a published compatibility promise;
   differences only from unpublished alpha history do not use them. Types: `feat`, `fix`,
   `docs`, `refactor`, `perf`, `test`, `build`, `ci`, `style`, `chore`, `revert`. Scopes are
-  crate names without the `iris-` prefix (`ingest`, `store`, `api`, `gui`, `replay`, `mp4`,
-  `catalog`, `events`, `core`, `h265`, `tls`, `tools`), `irisd` for the binary crate, or an
-  area (`docs`, `ci`, `soak`).
+  crate names without the `iris-` prefix (`ingest`, `store`, `api`, `gui`, `client`,
+  `transport`, `replay`, `mp4`, `catalog`, `events`, `core`, `h265`, `tls`, `tools`), `irisd`
+  for the binary crate, or an area (`docs`, `ci`, `soak`).
 - Keep each commit coherent; split independent changes. Commits are created through the
   GitHub API (`gh api graphql`, `createCommitOnBranch`) so GitHub signs them.
   `iris-tools gh-commit -m HEADLINE --body TEXT` does this for the difference between

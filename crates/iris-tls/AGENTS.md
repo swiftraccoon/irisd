@@ -43,4 +43,4 @@ The doctest and `the_platform_store_alone_builds_a_configuration` need the host'
 ## Related documents
 
 - `docs/research/06-clients.md` §3, `07-architecture.md` §5 and §6.
-- Dependents: `iris-gui`, `iris-tools`.
+- Dependents: `iris-transport`, `iris-gui`, and `iris-tools`.

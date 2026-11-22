@@ -53,11 +53,42 @@ pub enum Rule {
     Research,
     /// A dependency arrives with its reason and license (`AGENTS.md`, definition of done).
     Dependency,
+    /// A line that holds only a comment fits in 80 characters after its
+    /// indentation.
+    CommentWidth,
+    /// Any other line of Rust fits in 100 characters (`STANDARDS.md` §2),
+    /// which rustfmt leaves to the writer for a long string or macro.
+    CodeWidth,
+    /// Rustdoc examples go under `# Example`.
+    ExampleHeading,
+    /// Types are imported and used unqualified (`STANDARDS.md` §4).
+    FullPathType,
+    /// A derive is imported and written bare (`STANDARDS.md` §4).
+    DerivePath,
+    /// One `use` per module (`STANDARDS.md` §2).
+    UsePerPath,
+    /// A test asserts one behaviour and names it (`STANDARDS.md` §8).
+    TestNameAnd,
+    /// A sentence holds at most 35 words.
+    SentenceLength,
+    /// Phrases a reader must read twice, in place of plain words.
+    BarredPhrase,
+    /// The documents name the crate `iris-client`.
+    TheCore,
+    /// No possessive on a code span.
+    PossessiveCodeSpan,
+    /// A document names only code that the tree holds.
+    UnknownName,
+    /// Every public item has an example or a sentence that links one
+    /// (`STANDARDS.md` §7).
+    MissingExample,
+    /// A test of its crate asserts each error text (`STANDARDS.md` §8).
+    UnassertedErrorText,
 }
 
 impl Rule {
     /// Every rule, in the order a report lists them.
-    pub const ALL: [Self; 23] = [
+    pub const ALL: [Self; 37] = [
         Self::ProseWidth,
         Self::Timeless,
         Self::Narration,
@@ -81,6 +112,20 @@ impl Rule {
         Self::Scope,
         Self::Research,
         Self::Dependency,
+        Self::CommentWidth,
+        Self::CodeWidth,
+        Self::ExampleHeading,
+        Self::FullPathType,
+        Self::DerivePath,
+        Self::UsePerPath,
+        Self::TestNameAnd,
+        Self::SentenceLength,
+        Self::BarredPhrase,
+        Self::TheCore,
+        Self::PossessiveCodeSpan,
+        Self::UnknownName,
+        Self::MissingExample,
+        Self::UnassertedErrorText,
     ];
 
     /// The rule's name in reports and in `standards.toml`.
@@ -109,6 +154,20 @@ impl Rule {
             Self::Scope => "scope",
             Self::Research => "research",
             Self::Dependency => "dependency",
+            Self::CommentWidth => "comment-width",
+            Self::CodeWidth => "code-width",
+            Self::ExampleHeading => "example-heading",
+            Self::FullPathType => "full-path-type",
+            Self::DerivePath => "derive-path",
+            Self::UsePerPath => "use-per-path",
+            Self::TestNameAnd => "test-name-and",
+            Self::SentenceLength => "sentence-length",
+            Self::BarredPhrase => "barred-phrase",
+            Self::TheCore => "the-core",
+            Self::PossessiveCodeSpan => "possessive-code-span",
+            Self::UnknownName => "unknown-name",
+            Self::MissingExample => "missing-example",
+            Self::UnassertedErrorText => "unasserted-error-text",
         }
     }
 

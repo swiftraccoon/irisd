@@ -50,12 +50,27 @@ Scope: this crate only. Read the root `AGENTS.md` first.
   is what a rebuild keeps.
 - `scan` accepts at most the same 131,072 fragments; `ScanStop::FragmentLimit` reports a complete
   fragment beyond the limit and must never be treated as a truncation point.
+- `decoder_config` faces the network (root `AGENTS.md` rule 8): `DecoderConfig::parse`,
+  `parse_parameter_sets`, and `parse_hvcc` never panic (fuzz target `decoder_config`). An
+  accepted `hvcC` has four-byte NAL length prefixes, since that is what the samples carry, and
+  an accepted AudioSpecificConfig is 2 to 64 bytes with a nonzero sampling rate.
+  `HevcConfig::parameter_sets()` are NAL units without length prefixes, in the record's order:
+  at most 16 VPSs, 16 SPSs, and 64 PPSs, one for each identifier that ITU-T H.265 defines for
+  the type (`PARAMETER_SET_BOUNDS`). The set past a type's bound is refused before it is
+  copied. So a record of any length allocates at most 96 sets of at most 65,535 bytes. Keep
+  every copy behind a declared maximum (`STANDARDS.md` §6). The `decoder_config` readers and
+  `init::sample_entry_bytes` walk boxes with the one walker `boxes::child`, which refuses a box
+  of size 0 at any depth, so they refuse the same boxes on the path to the sample entry.
 
 ## Where things are
 
 - `boxes.rs` — `BoxWriter` (nested boxes with patched sizes), `BoxHeader`, `be_u32`,
-  `be_u64`.
+  `be_u64`, and `child`, the walker that `init::sample_entry_bytes` and the `decoder_config`
+  readers share.
 - `init.rs` — `SampleEntry`, `build_init_segment`, `VIDEO_TRACK_ID`.
+- `decoder_config.rs` — `DecoderConfig` with its reader `DecoderConfig::parse`, `HevcConfig`,
+  and `AacConfig`; the `hvcC` parser (`parse_parameter_sets`, `parse_hvcc`); the `esds` reader;
+  and their errors `DecoderConfigError`, `HvccError`, and `EsdsError`.
 - `fragment.rs` — `Sample`, `Fragment`, `FragmentHeader`, `encode_fragment`,
   `EncodedFragment`, the trailer codec, and the format constants (box flag bits included).
 - `reader.rs` — `scan`, `scan_with_limit`, `parse_fragment`, their report types, and the
@@ -78,7 +93,8 @@ RUSTDOCFLAGS="-D warnings" cargo doc -p iris-mp4 --no-deps
 just fuzz-build                                                   # every target still builds
 cd fuzz && cargo fuzz run scan -- -max_total_time=60              # pinned nightly; after a parser
                                                                   # change: scan, box_header, index,
-                                                                  # trailer, or export_rebase
+                                                                  # trailer, export_rebase, or
+                                                                  # decoder_config
 cargo run -p irisd -- inspect <file.mp4>                          # against a real recording
 ```
 
@@ -110,6 +126,8 @@ cargo run -p irisd -- inspect <file.mp4>                          # against a re
 
 ## Related documents
 
-- `docs/research/04-storage-format.md`, `07-architecture.md` §2 and §8, `12-ingest-cost.md` §5
-- Dependents: `iris-ingest`, `iris-store`, `iris-catalog`, `iris-api`, `iris-replay`,
-  `irisd`.
+- `docs/research/04-storage-format.md`, `07-architecture.md` §2 and §8, `12-ingest-cost.md` §5,
+  `15-apple-clients.md` §4 and §5 (decoder configuration)
+- Dependents: `iris-ingest`, `iris-store`, `iris-catalog`, `iris-api`, `iris-replay`, `irisd`,
+  `iris-client`, whose live decoder reads a viewer's messages with `DecoderConfig::parse` and
+  `reader::parse_fragment`, `iris-gui` (its tests), and the fuzz targets (`fuzz/Cargo.toml`).

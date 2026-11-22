@@ -23,8 +23,8 @@ pub use crate::text::MAX_TEXT_CHARS;
 /// Most cameras one probe lists; once that many distinct hosts and ports are
 /// known, further answers are ignored.
 pub const MAX_DISCOVERED: usize = 64;
-/// Longest endpoint reference kept.
-const MAX_ENDPOINT_CHARS: usize = 256;
+/// Longest endpoint reference kept, in characters.
+pub const MAX_ENDPOINT_CHARS: usize = 256;
 /// Scopes and service URLs looked at per device.
 pub const MAX_LIST_ENTRIES: usize = 16;
 const SCOPE_PREFIX: &str = "onvif://www.onvif.org/";
@@ -61,7 +61,8 @@ impl DiscoveredCamera {
     /// and the device service URLs. Accepts anything a network peer could
     /// send; only the first [`MAX_LIST_ENTRIES`] scopes and the first
     /// [`MAX_LIST_ENTRIES`] service URLs are examined, and every text is cut
-    /// to [`MAX_TEXT_CHARS`] characters (the endpoint reference to 256).
+    /// to [`MAX_TEXT_CHARS`] characters (the endpoint reference to
+    /// [`MAX_ENDPOINT_CHARS`]).
     ///
     /// ```
     /// use iris_events::DiscoveredCamera;

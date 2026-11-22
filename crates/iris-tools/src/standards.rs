@@ -14,10 +14,14 @@
 mod command;
 mod commits;
 mod config;
+mod error_texts;
+mod examples;
 mod finding;
 mod installation;
 mod layout;
 mod markdown;
+mod modules;
+mod names;
 mod prose;
 mod rust;
 mod text;

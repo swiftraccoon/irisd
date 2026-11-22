@@ -9,12 +9,15 @@
 //!   GitHub API, which signs the commit.
 //! - `standards` checks the tree, a range of commits, or a commit message
 //!   against the mechanical rules of `STANDARDS.md` and `AGENTS.md`.
+//! - `doc` documents the workspace with warnings as errors, so that the
+//!   links between its crates resolve.
 //!
 //! No tool changes the recording service or a camera's configuration:
 //! `onvif-call` sends only `Get` operations and the PullPoint subscription
 //! operations, whose subscriptions expire.
 
 mod bench;
+mod doc;
 mod gh_commit;
 mod logs;
 mod onvif_call;
@@ -56,6 +59,9 @@ enum Command {
     GhCommit(gh_commit::Args),
     /// Check the tree or commits against the mechanical rules of `STANDARDS.md`.
     Standards(standards::Args),
+    /// Document the workspace with warnings as errors, so that the links
+    /// between its crates resolve.
+    Doc,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -68,5 +74,6 @@ fn main() -> anyhow::Result<()> {
         Command::OnvifCall(args) => onvif_call::run(&args),
         Command::GhCommit(args) => gh_commit::run(&args),
         Command::Standards(args) => standards::run(&args),
+        Command::Doc => doc::run(),
     }
 }

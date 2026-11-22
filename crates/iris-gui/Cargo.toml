@@ -24,14 +24,11 @@ gst_app = { package = "gstreamer-app", version = "0.25" }
 gst_video = { package = "gstreamer-video", version = "0.25" }
 gstgtk4 = { package = "gst-plugin-gtk4", version = "0.15", features = ["wayland", "x11egl", "x11glx", "dmabuf", "gtk_v4_14"] }
 gtk = { package = "gtk4", version = "0.11" }
+iris-client = { workspace = true }
 iris-core = { workspace = true }
 iris-tls = { workspace = true }
-reqwest = { workspace = true }
-rustix = { workspace = true }
-serde = { workspace = true }
-serde_json = { workspace = true }
+iris-transport = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread"] }
-tokio-tungstenite = { workspace = true, features = ["rustls-tls-native-roots"] }
 tokio-util = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
@@ -40,9 +37,10 @@ url = { workspace = true }
 [dev-dependencies]
 bytes = { workspace = true }
 iris-mp4 = { workspace = true }
-rcgen = { workspace = true }
+reqwest = { workspace = true }
+serde_json = { workspace = true }
 tempfile = { workspace = true }
-tokio-rustls = { workspace = true }
+tokio-tungstenite = { workspace = true }
 
 [lints]
 workspace = true

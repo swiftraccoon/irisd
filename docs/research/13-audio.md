@@ -15,12 +15,13 @@ Local text is under `docs/standards/ietf/`; clause numbers are theirs.
 | Audio with its picture | RFC 3550 §5.1, §6.4.1 | Timestamps of different media are related only through the NTP and RTP timestamp pair of each stream's RTCP sender reports | Sender reports are the standard basis for lip sync; receipt time is not |
 | HLS renditions | draft-pantos-hls-rfc8216bis-22 §6.2.4 | "Matching content in Variant Streams and Renditions MUST have matching timestamps" and "matching Discontinuity Sequence Numbers"; every Media Playlist "MUST have the same Target Duration" | An audio rendition shares the video's timeline and its discontinuities |
 | Apple devices | HLS Authoring Specification for Apple Devices 2.1, 2.3, 9.5, 8.2, 8.3, 8.15, 8.22, 7.3 | Audio in fMP4 or elementary; stereo AAC "MUST be provided"; "You SHOULD deliver video and audio as separate streams"; audio and video playlists "MUST" share target duration and content duration; "MUST have discontinuities at the same points in time"; segment boundaries "SHOULD" coincide (MUST on tvOS); `tfdt` consistent with the previous segment | Separate audio files fit; audio segments are cut where the video's are |
-| Encoder delay | ISO/IEC 14496-12 (`roll` sample group, edit lists); Apple QuickTime File Format, appendix G | A decoder needs the preceding AAC frame for a correct first frame (`roll_distance` −1); encoder priming is trimmed by an edit list | A recording that joins a running encoder has no priming to trim; the first frame of a run decodes imperfectly unless a `roll` group says so |
-| Track timescale | ISO/IEC 14496-12 `mdhd`; ISO/IEC 23000-19 (CMAF) §7.5.5 | 14496-12 leaves the media timescale free. The CMAF text was not read (not freely available) | Whether CMAF constrains an audio track's timescale to the sampling rate is **unverified** |
+| Encoder delay | Apple QuickTime File Format, appendix G. It says that its mechanisms "are specified in ISO MPEG-4 standards (ISO/IEC 14496-12, 2008)"; that text was not read | AAC "encoders add at least 1024 samples of silence" before the sound, the priming. A track "uses an edit list to indicate the placement of the source signal in the time represented by the encoded AAC packets". A `roll` sample group states what a decoder needs first: "the typical value is `-1`, meaning one preceding AAC packet" | A recording that joins a running encoder has no priming to trim; the first frame of a run decodes imperfectly unless a `roll` group says so |
+| Track timescale | ISO/IEC 14496-12 (`mdhd`) and ISO/IEC 23000-19 (CMAF) | Neither text was read (`docs/standards/README.md`) | Whether either text constrains an audio track's timescale to the sampling rate is **unverified**. FFmpeg and GStreamer decode an audio track with a 90 kHz timescale (§3) |
 
 The Apple specification states no sampling-rate limit; Apple's guide to preparing audio says
-rates "are normally 44.1 kHz or 48 kHz". Whether Apple's decoders accept 64 kHz AAC-LC is
-**unverified**.
+rates "are normally 44.1 kHz or 48 kHz". On macOS 27, `AVAudioConverter` decoded 400 frames of the
+test daemon's 64 kHz AAC-LC with no error (`15-apple-clients.md` §3.1, one session on 2026-11-15, a
+dated observation). Whether the decoders of iOS accept it is **unverified**.
 
 ## 2. How others do it
 
@@ -72,7 +73,7 @@ are **unverified**.
 | Time within a run is the count of frames | RFC 3640 §2.6; measured rate within 0.02 % of nominal; timestamps unusable per frame | §3 |
 | A run continues while a timestamp is within half a second of the count | Measured steps of −24 to +76 ms; packet loss or a larger step is a real break | §3; the bound itself is a choice, **unverified** against a camera that drops audio |
 | The timestamp policy of the RTSP library covers video only | A backward audio step ended the whole session six times in 103 s (§7) | regression test fails on the library as published |
-| 90 kHz media timescale for audio | One time model for the sidecar, catalog, playlists, and export; exact for 8, 16, 32, 48, 64, 96 kHz, refused for the 44.1 kHz family | FFmpeg and GStreamer decode; CMAF text and Apple players **unverified** |
+| 90 kHz media timescale for audio | One time model for the sidecar, catalog, playlists, and export; exact for 8, 16, 32, 48, 64, 96 kHz, refused for the 44.1 kHz family | FFmpeg and GStreamer decode. On macOS 27, AVPlayer played a multivariant playlist with its audio track enabled, and AVFoundation opened an export with its audio at the 90 kHz timescale (`15-apple-clients.md` §3.2, dated observations of 2026-11-15). The CMAF text and iOS are **unverified** |
 
 ## 5. Audio against its picture
 
@@ -488,9 +489,9 @@ draft (`docs/standards/ietf/`) and Apple's authoring specification:
 |---|---|---|
 | A separate audio rendition is declared with `EXT-X-MEDIA` `TYPE=AUDIO`, a `GROUP-ID`, a `NAME`, and the `URI` of its media playlist; the variant names the group in `AUDIO=` | draft §4.4.6.1, §4.4.6.2.1; Apple 8.9 | a multivariant playlist per camera and range: one variant (the video media playlist) and one audio rendition |
 | `LANGUAGE` "MUST be included in every `EXT-X-MEDIA` tag that doesn't have `TYPE=VIDEO`" | Apple 8.10 | `LANGUAGE="und"` (RFC 5646), since a camera's sound has no declared language |
-| The variant's `CODECS` "lists every sample format present in any Rendition in the Group" | draft §4.4.6.1.1 | `CODECS="hvc1…,mp4a.40.2"` |
-| `BANDWIDTH` covers every playable combination | draft §4.4.6.2.1 | video peak plus audio peak |
-| `CHANNELS` and `SAMPLE-RATE` are optional and only for audio | draft §4.4.6.1 | `CHANNELS` from the sample entry's channel count; `SAMPLE-RATE` not declared |
+| The variant's `CODECS` "lists every sample format present in any Rendition in the Group" | draft §4.4.6.1.1 | `CODECS="hvc1…,mp4a.40.2"` in the daemon's playlist (`crates/iris-mp4/src/hls.rs`). The Linux viewer's local multivariant playlist (`iris_client::vod::multivariant_playlist`) declares no `CODECS` |
+| `BANDWIDTH` covers every playable combination | draft §4.4.6.2.1 | video peak plus audio peak in the daemon's playlist, which also declares the sum of the two averages as `AVERAGE-BANDWIDTH`. The viewer's local playlist declares the sum of the two average rates as `BANDWIDTH`, against the MUST of RFC 8216 §4.3.4.2. The viewer plays it (§6); any other player is **unverified** |
+| `CHANNELS` and `SAMPLE-RATE` are optional and only for audio | draft §4.4.6.1 | `CHANNELS` from the sample entry's channel count in the daemon's playlist; `SAMPLE-RATE` not declared. The viewer's local playlist declares no `CHANNELS` |
 | A rendition meets the constraints of a variant: matching timestamps and discontinuity sequence numbers, the same target duration, the same `EXT-X-PLAYLIST-TYPE` | draft §6.2.4 | the audio playlist is built from the video playlist's segment boundaries and discontinuities, not from the audio files alone |
 | The init segment has `ftyp` compatible with `iso6`, a `trak` for every `traf` with matching `track_ID`, zero durations in `mvhd` and `tkhd`, and `mvex`; every `traf` has a `tfdt` | draft §3.1.2 | met by the audio files as written (§6) |
 | Segment boundaries of renditions coincide (SHOULD; MUST on tvOS) | Apple 8.22 | audio fragments are cut with the video's (§5.2), so the same grouping of fragments into segments gives boundaries within one audio frame |
@@ -561,7 +562,7 @@ player is one file with two tracks. What that takes, and what checks it:
 
 | Part | Design | Check |
 |---|---|---|
-| Initialization | `ftyp` and one `moov` with the video `trak` as track 1 and the audio `trak` as track 2, one `trex` for each in `mvex`, built from the two sample entries; "the Movie Box MUST contain a Track Box for every Track Fragment Box ... with matching track_ID" (HLS draft §3.1.2, which restates ISO/IEC 14496-12) | `ffprobe` lists an `hevc` and an `aac` stream |
+| Initialization | `ftyp` and one `moov` with the video `trak` as track 1 and the audio `trak` as track 2, one `trex` for each in `mvex`, built from the two sample entries. HLS draft §3.1.2: "The Movie Box MUST contain a Track Box ('trak') for every Track Fragment Box ('traf') in the fMP4 Segment, with matching track_ID." | `ffprobe` lists an `hevc` and an `aac` stream |
 | Fragments | Each stored fragment stays one `moof` with one `traf`; an audio fragment's `tfhd` track id becomes 2. Sequence numbers count over both tracks | `irisd inspect --verify` reports each track, no sequence gap, every checksum; `ffmpeg` decodes both to the end without an error |
 | Order | A video fragment, then the audio fragments that start inside its span | players read without seeking back |
 | Timeline | A video fragment keeps the export's continuous time. An audio fragment is as far into the export as into the video: the difference of the stored decode times, which share the video run's timeline (§5.2), or of the wall times when the two disagree by more than a millisecond | no decode-time gap in either track in `irisd inspect` |
@@ -605,15 +606,18 @@ fragment completes, with its sound starting 1.4 s into the range.
 Both exports decode to the end in FFmpeg and in GStreamer without an error, and
 `irisd inspect --verify` finds eleven fragments in each track, no gap, and every checksum.
 
-The viewer exports a main stream through this route (`crates/iris-gui/src/api.rs`); a
-minute exported by the viewer from the running service holds both tracks. An export that
-ends at the present ends its sound up to one fragment before its picture, because an audio
-fragment is written when the video fragment after it closes (§5.2).
+The viewer exports a main stream through this route (`crates/iris-transport/src/export.rs`). A
+minute that the viewer exported from the running service held both tracks. No date or command is
+recorded for that export, so it is **unverified**. An export that ends at the present ends its sound
+up to one fragment before its picture, because an audio fragment is written when the video fragment
+after it closes (§5.2).
 
-**Unverified**: ISO/IEC 14496-12 itself was not read, so the two-track layout rests on the
-restatement above and on what FFmpeg and GStreamer accept. FFmpeg shifts the video's hidden
-frames into view when it remuxes or plays with its own tools, as it does for an export
-without sound. QuickTime, AVPlayer, and browsers are **unverified**.
+**Unverified**: ISO/IEC 14496-12 was not read, so the two-track layout rests on §3.1.2 of the HLS
+draft, quoted in the table above, and on what FFmpeg and GStreamer accept. FFmpeg shifts the video's
+hidden frames into view when it remuxes or plays with its tools, as it does for an export without
+sound. On macOS 27, AVFoundation opened an export with two tracks and took 2112 samples (33 ms) off
+the start of its sound (`15-apple-clients.md` §3.2, one file on 2026-11-15, a dated observation).
+QuickTime Player, AVPlayer, iOS, and browsers are **unverified**.
 
 ## 10. Sound in the live view
 
@@ -698,14 +702,16 @@ audio against video (§5.1):
 | The focused live view plays the camera's sound when it has any, as playback does; `--mute` discards it. The grid plays none | one camera is listened to at a time | — |
 | Each feed keeps the least of arrival time less media time over the last ten seconds, and a frame plays at its media time plus that least plus half a second, on the pipeline's clock | audio arrives in steps of up to 0.36 s (§10.1), so half a second holds it; the least receipt delay is the estimate that places recorded audio against video within 15 ms of the sender reports (§5.1), and both feeds reach the viewer over one path, so the same estimate there gives the same relation, on any pair of timelines | two feeds whose frames were captured together, one arriving in bursts, reach their sinks within 20 ms of each other and half a second after the least-delay arrival |
 | The picture is held only once the audio feed delivers: until then, and for a camera without audio, it shows as it is decoded | no delay where nothing needs it | a camera without audio answers 404 and its picture is never held |
-| The mapping is a running-time offset on the pad after the demuxer, and it moves only when a feed's estimate has moved 80 ms from what is applied, both feeds then together | between moves each medium plays at its own rate; a camera's clock drifts from the viewer's by parts per million, which takes tens of minutes to reach 80 ms | the offsets move once at the start and not again in a steady test |
+| The mapping is a running-time offset on the pad after the demuxer, and it moves only when a feed's estimate has moved more than 80 ms from what is applied, both feeds then together | between moves each medium plays at its own rate; a camera's clock drifts from the viewer's by parts per million, which takes tens of minutes to reach 80 ms | the offsets move once at the start and not again in a steady test |
 
-Built (`crates/iris-gui/src/sound.rs`, `tile.rs`). Two things go beyond the table.
-A feed's first estimate is one frame's delay, and an error under the
-threshold then stays (sound 64 ms late in a test run), so while a feed's first half
-second is held the mapping follows the estimate, and the threshold applies after that. And
-a picture sink that drops late frames shows nothing for the seconds a decoder needs to work
-through the frames a feed starts with, so a late picture is shown at once, not dropped.
+Built: the rule is `iris_client::sound_clock` (`crates/iris-client/src/sound_clock.rs`,
+`15-apple-clients.md` §5). The Linux viewer applies it to the pads after its demuxers
+(`crates/iris-gui/src/sound.rs`, `tile.rs`). Two things go beyond the table. A feed's first estimate
+is one frame's delay, and an error under the threshold then stays (sound 64 ms late in a test run).
+So while a feed's first half second is held the mapping follows the estimate, and the threshold
+applies after that. A picture sink that drops late frames shows nothing for the seconds a decoder
+needs to work through the frames a feed starts with. So a late picture is shown at once, not
+dropped.
 
 Checked on 2026-11-11. In a pipeline of the real elements with two feeds of frames captured
 together, on timelines 4,000 s apart, the sound sent in groups of five frames 64 ms apart
@@ -760,7 +766,7 @@ No client of the project needs it: the viewer plays live from the WebSocket
   <https://developer.apple.com/documentation/http-live-streaming/hls-authoring-specification-for-apple-devices>
 - Preparing audio for HTTP Live Streaming:
   <https://developer.apple.com/documentation/http-live-streaming/preparing-audio-for-http-live-streaming>
-- QuickTime File Format, appendix G (audio priming):
+- QuickTime File Format, appendix G (audio priming) and the pages under it, read on 2026-11-18:
   <https://developer.apple.com/documentation/quicktime-file-format/appendix_g_audio_priming_handling_encoder_delay_in_aac>
 - Moonfire NVR, issue 34 (audio support): <https://github.com/scottlamb/moonfire-nvr/issues/34>
 - Moonfire NVR, API reference (live stream):

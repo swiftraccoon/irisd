@@ -1,0 +1,37 @@
+[package]
+name = "iris-transport"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "The Linux viewer's transport: iris-client's requests, exports, and live feeds"
+
+[dependencies]
+async-channel = { workspace = true }
+futures = { workspace = true }
+getrandom = { workspace = true }
+iris-client = { workspace = true }
+iris-core = { workspace = true }
+iris-tls = { workspace = true }
+reqwest = { workspace = true }
+rustix = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tokio-tungstenite = { workspace = true, features = ["rustls-tls-native-roots"] }
+tokio-util = { workspace = true }
+tracing = { workspace = true }
+url = { workspace = true }
+
+[dev-dependencies]
+axum = { workspace = true }
+rcgen = { workspace = true }
+serde_json = { workspace = true }
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }
+tokio-rustls = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[lints]
+workspace = true

@@ -71,8 +71,17 @@ clippy:
 test:
     cargo test --workspace --locked
 
+# rustdoc resolves a link to another crate of the workspace only when that
+# crate's directory is in the output directory as rendering starts. Cargo
+# removes a crate's directory while it documents that crate, documents the
+# crates in no fixed order, and empties the output directory when another
+# rustc made it. `iris-tools doc` checks the workspace, empties the output
+# directory, makes each library's directory, documents one crate at a time,
+# and documents again after Cargo empties the directory; its module
+# documentation gives the whole account.
+# Document every crate of the workspace, warnings as errors.
 doc:
-    RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --locked
+    cargo run --quiet --locked -p iris-tools -- doc
 
 # The viewer's checks that need a display, which `just check` leaves out: on a virtual one
 # (`xvfb-run`), with ffmpeg's libx264 and the GStreamer HLS and H.264 plugins. Run after any
@@ -119,11 +128,12 @@ mutants +files:
     cd "$copy"
     cargo mutants -j 2 -o "$out" $(printf -- '-f %s ' {{files}})
 
-# Run the tests of the crates without C dependencies as 64-bit ARM code: natively on a
-# 64-bit ARM host, and elsewhere under user-mode emulation, in release mode because emulated
-# debug code is too slow for the timing tests. Needs `rustup target add
-# aarch64-unknown-linux-musl` and, off ARM, a qemu-aarch64-static that implements openat2,
-# which the store's tests call.
+# Run the tests of the crates without C dependencies as 64-bit ARM code. They run natively
+# on a 64-bit ARM host, and elsewhere under user-mode emulation. The build is in release mode
+# because emulated debug code is too slow for the timing tests. Needs
+# `rustup target add aarch64-unknown-linux-musl` and, off ARM, a qemu-aarch64-static that
+# implements openat2, which the store's tests call.
+# Test the crates without C dependencies as 64-bit ARM code.
 cross-test:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -131,7 +141,7 @@ cross-test:
     if [ "$(uname -m)" != aarch64 ]; then
         export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_RUNNER=qemu-aarch64-static
     fi
-    cargo test --release --locked --target aarch64-unknown-linux-musl -p iris-core -p iris-h265 -p iris-mp4 -p iris-store -p iris-ingest -p iris-replay
+    cargo test --release --locked --target aarch64-unknown-linux-musl -p iris-core -p iris-h265 -p iris-mp4 -p iris-store -p iris-ingest -p iris-replay -p iris-client
 
 # Lint every crate but the GUI (which needs a GTK sysroot) for 64-bit ARM. Needs
 # `rustup target add aarch64-unknown-linux-gnu` and a C cross compiler named by

@@ -27,8 +27,13 @@ jobs:
       - name: Install the pinned toolchain
         run: rustup show active-toolchain || rustup toolchain install
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - uses: taiki-e/install-action@c509219cf42fba86913069efd0ade2458c59337b # v2.90.1
+        with:
+          tool: just@1.43.0
+      # The recipe runs `iris-tools doc`, so that the links between the
+      # workspace's crates resolve.
       - name: Build rustdoc (warnings are errors)
-        run: RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --locked
+        run: just doc
       - name: Add a landing page that opens the daemon's documentation
         run: printf '<!doctype html><meta http-equiv="refresh" content="0; url=irisd/index.html"><a href="irisd/index.html">irisd documentation</a>\n' > target/doc/index.html
       - uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0

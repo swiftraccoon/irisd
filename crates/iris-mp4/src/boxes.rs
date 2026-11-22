@@ -179,6 +179,25 @@ pub fn be_u64(buf: &[u8], offset: usize) -> Option<u64> {
     Some(u64::from_be_bytes(*buf.get(offset..)?.first_chunk::<8>()?))
 }
 
+/// The body of the first child box of type `kind` in `buf`. `None` when
+/// there is none, or when that box or a box before it has a header that
+/// [`BoxHeader::parse`] refuses, is open-ended (a size of 0), or claims more
+/// than `buf` holds. `init::sample_entry_bytes` and the `decoder_config`
+/// readers walk the boxes with it, so they refuse the same boxes.
+pub(crate) fn child(buf: &[u8], kind: [u8; 4]) -> Option<&[u8]> {
+    let mut rest = buf;
+    while !rest.is_empty() {
+        let header = BoxHeader::parse(rest)?;
+        let size = usize::try_from(header.size?).ok()?;
+        let (whole, after) = rest.split_at_checked(size)?;
+        if header.kind == kind {
+            return whole.get(usize::from(header.header_len)..);
+        }
+        rest = after;
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

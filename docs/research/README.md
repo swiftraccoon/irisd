@@ -1,7 +1,7 @@
 # irisd design decisions and research
 
 The phase-0 research (2026-10-31) and the decisions taken since, for a Linux H.265 NVR daemon
-whose record path never decodes, with a Linux GUI and a planned iOS app (08, phase 4).
+whose record path never decodes, with a Linux GUI and a planned iOS and macOS app (08, phase 4).
 Inputs: a hands-on probe of the first camera (01), five source-level research threads
 (appendices A–E), and the measurements in 01. Everything below is either measured, read
 from primary sources (specs, source code, crates.io), or marked as an open question.
@@ -25,7 +25,7 @@ from primary sources (specs, source code, crates.io), or marked as an open quest
 | Discovery | WS-Discovery and ONVIF stream lookup run in the daemon for the Add camera form, root token only, bounded and sanitised, every camera-advertised URL moved onto the operator's host | 05 §5 |
 | HTTP | HTTP/1.1 only for the API; HTTP/2 and HTTP/3 stay out (a LAN API with few clients gains nothing that offsets the attack surface) | 07 §5 |
 | Camera policy | Operators supply H.265 video with smart codec off, GOP ≤ 2× fps, CBR, and NTP; the third stream serves as the secondary stream on a camera whose sub stream stops beside a second session (01 §5b, 11) | 05 §4 |
-| Planned iOS client | `AVSampleBufferDisplayLayer` over WebSocket for live; `AVPlayer` + HLS for playback/AirPlay | 06 §2 |
+| Planned Apple clients | one SwiftUI app for iOS and macOS over the Rust library crate `iris-client`, which the Linux viewer uses. Live: a sample-buffer renderer over WebSocket. Playback: `AVPlayer` + HLS, with the playlists handed over by a resource loader | 15 §4, 06 §2 |
 | Linux GUI | gtk4-rs + gstreamer-rs (`gst-plugin-gtk4` as a crate), `vah265dec`/`nvh265dec` | 06 §3 |
 | Soak timing | a soak window runs while the change rate is low; a ready build with features awaiting hardware checks closes an open window early, as the third window (25.2 h) was | 11 (Soak, third window) |
 
@@ -57,7 +57,7 @@ from primary sources (specs, source code, crates.io), or marked as an open quest
 3. `03-language-runtime.md` — why Rust/tokio, crate list, hardening.
 4. `04-storage-format.md` — the format, index, I/O, and time model (the core).
 5. `05-ingest-events.md` — RTSP session policy, pipeline, events, provisioning.
-6. `06-clients.md` — iOS, GUI, web.
+6. `06-clients.md` — iOS and macOS, GUI, web.
 7. `07-architecture.md` — crates, threads, API, budgets, benchmark and test plan.
 8. `08-roadmap.md` — phases with exit criteria.
 9. `09-phase1-results.md`, `10-phase2-results.md`, `11-multi-camera-results.md`,
@@ -66,14 +66,18 @@ from primary sources (specs, source code, crates.io), or marked as an open quest
     serving it with the picture: playlists, export, and the live view.
 11. `14-drift.md` — the clocks a recording rests on, every pair that can part, the measure
     that shows each parting, and the checks against a clock fault of known size.
-12. `../design/phase2-interfaces.md` — the crate contracts the daemon is built on.
-13. `appendix/` — research notes with citations as written on 2026-10-31 (A prior art, B storage,
+12. `15-apple-clients.md` — the planned iOS and macOS viewer: what Apple's decoders and players did
+    with the daemon's output on macOS 27, the library crate `iris-client` that the Linux viewer
+    uses, and what stays unverified.
+13. `../design/phase2-interfaces.md` — the crate contracts the daemon is built on.
+14. `appendix/` — research notes with citations as written on 2026-10-31 (A prior art, B storage,
     C clients, D camera integration, E language/runtime); each notes a later edit under its title.
 
 ## Top open questions (each has a planned test)
 
-1. AVFoundation playback of byte-range segments spanning several on-disk fragments (an iPhone
-   or `mediastreamvalidator` run).
+1. AVFoundation playback of byte-range segments spanning several on-disk fragments: they played on
+   macOS 27 on 2026-11-15 (`15-apple-clients.md` §3.2, a dated observation); an iPhone or
+   `mediastreamvalidator` run remains.
 2. `prft` flag semantics and tool acceptance (the same run).
 3. Camera backpressure tolerance and metadata-track feasibility (phase 5).
 4. ext4 vs XFS under 12 writers over weeks (a seven-day soak).

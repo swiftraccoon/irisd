@@ -49,11 +49,13 @@ full-res view, timeline with event markers and keyframe thumbnails, export dialo
 provisioning UI. Exit: six tiles plus one main view at ≤ 15 % of one core; works with
 VA-API and DMA-BUF zero-copy.
 
-## Phase 4 — iOS app (4–6 weeks)
+## Phase 4 — iOS and macOS app
 
-Swift app: WebSocket live via `AVSampleBufferDisplayLayer`, HLS timeline via `AVPlayer`,
-PiP, event list and push, export sharing. Exit: 150–300 ms live latency on the LAN, grid of
-six tiles, background/foreground decoder recovery.
+One SwiftUI app over the Rust library crate `iris-client`, which the Linux viewer uses
+(`15-apple-clients.md`): WebSocket live through a sample-buffer renderer, HLS timeline via
+`AVPlayer`. A live grid, a focused camera with sound, and playback come first; export sharing,
+thumbnails, PiP, provisioning, and an event list follow. Exit: 150–300 ms live latency on the LAN
+for a view without sound, grid of six tiles on an iPhone, background/foreground decoder recovery.
 
 ## Phase 5 — Breadth
 

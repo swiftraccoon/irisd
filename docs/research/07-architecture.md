@@ -36,7 +36,8 @@ irisd/
   crates/
     iris-core/               # ids, config (TOML), time types (WallUs, MediaTicks), errors
     iris-h265/               # NAL classification, length-prefixed access units, parameter sets
-    iris-mp4/                # fMP4 writer (ftyp/moov/prft/moof/mdat/trailer), reader/scanner, fragment rewrite export, mini-fragments
+    iris-mp4/                # fMP4 writer (ftyp/moov/prft/moof/mdat/trailer), reader/scanner,
+                             # fragment rewrite export, mini-fragments, decoder configuration
     iris-ingest/             # retina session supervisor, regulariser, fragment builder, live ring
     iris-store/              # writers, preallocation, sync, sidecar appends, recovery, removal
     iris-catalog/            # SQLite schema, migrations, queries (single owning thread)
@@ -46,6 +47,13 @@ irisd/
                              # clocks, recover, HLS, and serve commands
     iris-tls/                # shared TLS client trust: platform roots plus an optional CA file
     iris-replay/             # bounded RTSP replay and synthetic-camera server
+    iris-client/             # a viewer's rules, used by the Linux viewer and shaped for the
+                             # planned Apple viewer: API origin, requests and answer checks,
+                             # answer types and validators, VOD playlist rules, timeline model,
+                             # playback selection, live media time, sound placement, live
+                             # protocol, reconnect policy, byte budget, and live decoder
+    iris-transport/          # the Linux viewer's transport: the requests of iris-client over
+                             # reqwest and tungstenite, export download, and live feed loop
     iris-gui/                # GTK/GStreamer live, playback, thumbnails, and export client
     iris-tools/              # soak, replay-benchmark, probe, report, and commit tooling
   fuzz/                      # cargo-fuzz targets for the parsers (excluded from the workspace)
@@ -54,18 +62,18 @@ irisd/
 
 The `hvcC` sample entry and the `CODECS` string come from retina (`mp4_sample_entry`,
 `rfc6381_codec`). `iris-h265`, `iris-mp4`, and the event parsers in `iris-events` are pure,
-allocation-light
-libraries with bounded regression fixtures. `cargo-fuzz` targets (`fuzz/README.md`) cover their
-parsers, the ONVIF notification normaliser, and the WS-Discovery answer mapping, the `iris-api`
-timestamp, `Range`, and pre-authentication token parsers, the `iris-replay` RTSP request parser,
-the `iris-tools` probe and log parsers, the viewer's VOD playlist rules, the vendored oxvif
-SOAP/XML parser, and the vendored retina RTSP message parser, RTP
-header validation, H.265 depacketization, and `DESCRIBE` interpretation with its SDP parsing.
-`iris-store` has no fuzz target of its own; its recovery parses recordings and sidecars through
-the fuzzed `iris-mp4` scanner and index codec. Retina's RTCP compound validation and its
-`SETUP` and `PLAY` interpretation have no fuzz target; retina's own test suite
-(`just vendor-test`) and the `iris-ingest` integration tests, which run sessions against
-loopback replay servers and fault-injecting peers, exercise them.
+allocation-light libraries with bounded regression fixtures. `cargo-fuzz` targets (`fuzz/README.md`)
+cover their parsers, the ONVIF notification normaliser, and the WS-Discovery answer mapping. They
+cover the timestamp, `Range`, and pre-authentication token parsers of `iris-api`, the RTSP request
+parser of `iris-replay`, and the probe and log parsers of `iris-tools`. In `iris-client` they cover
+the VOD playlist rules, the media time of a live fragment, the live message framing, the live
+decoder, and the answer checks. They cover the vendored oxvif SOAP/XML parser. In the vendored
+retina they cover the RTSP message parser, RTP header validation, H.265 depacketization, and
+`DESCRIBE` interpretation with its SDP parsing. `iris-store` has no fuzz target; its recovery parses
+recordings and sidecars through the fuzzed `iris-mp4` scanner and index codec. Retina's RTCP
+compound validation and its `SETUP` and `PLAY` interpretation have no fuzz target. Retina's test
+suite (`just vendor-test`) and the `iris-ingest` integration tests exercise them. Those tests run
+sessions against loopback replay servers and fault-injecting peers.
 
 ## 3. Threads and tasks
 
@@ -394,8 +402,8 @@ Harness (`iris-replay` and `iris-tools replay-bench`):
   parsing code that every test still passes names logic no test pins down. The first runs
   (2026-11-10) led to the removal of a regulariser rule that no test needed and that
   measurements then showed to do harm (`11-multi-camera-results.md`).
-- The tests of the crates without C dependencies as 64-bit ARM code, on a 64-bit ARM host
-  or under user-mode emulation (`just cross-test`, CI).
+- The tests of the crates without C dependencies as 64-bit ARM code, on a 64-bit ARM host or under
+  user-mode emulation (`just cross-test`, CI; `03-language-runtime.md` names the crates).
 - Not implemented: writer tests with injected read and write errors (`EIO`), captured-camera
   golden tests, and `mediastreamvalidator` and AVPlayer conformance (`08-roadmap.md`, phase-2
   exit criteria).

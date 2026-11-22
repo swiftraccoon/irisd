@@ -24,7 +24,7 @@ use crate::state::ApiState;
 /// How long a probe collects answers when the request names no `wait_ms`.
 const DEFAULT_DISCOVERY_WAIT: Duration = Duration::from_secs(3);
 /// The `wait_ms` values accepted.
-const DISCOVERY_WAIT_MS: RangeInclusive<u64> = 500..=10_000;
+pub(crate) const DISCOVERY_WAIT_MS: RangeInclusive<u64> = 500..=10_000;
 
 /// `GET /api/onvif/devices` query.
 #[derive(Debug, Deserialize)]

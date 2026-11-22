@@ -42,4 +42,4 @@ cd fuzz && cargo fuzz run access_unit -- -max_total_time=60   # pinned nightly; 
 ## Related documents
 
 - `docs/research/01-camera-probe.md` §3, `04-storage-format.md` §4, `05-ingest-events.md` §2
-- Dependents: `iris-ingest`, `iris-replay`.
+- Dependents: `iris-ingest`, `iris-replay`, `iris-tools`, and the fuzz targets (`fuzz/Cargo.toml`).

@@ -24,7 +24,7 @@ use crate::websocket::{self, Inbound};
 
 /// Default and maximum number of events returned by a listing.
 const DEFAULT_LIMIT: usize = 200;
-const MAX_LIMIT: usize = 10_000;
+pub(crate) const MAX_LIMIT: usize = 10_000;
 /// A stalled peer cannot postpone shutdown past the daemon's outer grace.
 const SEND_DEADLINE: Duration = Duration::from_secs(2);
 /// Largest outbound event message: more than twice the 64 KiB event data

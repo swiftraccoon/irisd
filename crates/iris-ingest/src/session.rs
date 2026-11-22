@@ -467,7 +467,7 @@ impl ReadTicker {
     ///
     /// # Panics
     ///
-    /// Panics when called outside a Tokio runtime (it calls [`tokio::spawn`]).
+    /// Panics when called outside a Tokio runtime (it calls `tokio::spawn`).
     #[must_use]
     pub fn spawn(interval: Duration) -> Self {
         let notify = Arc::new(Notify::new());

@@ -1,18 +1,18 @@
-//! Fuzzes the viewer's VOD playlist rules (`crates/iris-gui/src/vod.rs`): any
+//! Fuzzes the VOD playlist rules a viewer applies (`iris_client::vod`): any
 //! body gives fragment timing or a refusal, never a panic, and an accepted
+//! rewrite and its input are each at most `vod::MAX_VOD_PLAYLIST_BYTES`. The
 //! rewrite holds only `#EXT` tags the daemon emits and absolute references on
-//! the API origin without userinfo, with the same fragment timing as its input;
-//! and the multivariant playlist built over an accepted body is five fixed lines.
+//! the API origin without userinfo, with the same fragment timing as its input.
+//! The multivariant playlist built over an accepted body has five lines, which
+//! name the two media playlists and a positive bit rate.
 #![no_main]
 
+use iris_client::vod;
 use libfuzzer_sys::fuzz_target;
 use url::{Origin, Url};
 
-#[path = "../../crates/iris-gui/src/vod.rs"]
-mod vod;
-
-/// The tags `vod::absolute_playlist` lets through, as `crates/iris-api/src/hls.rs`
-/// writes them.
+/// The tags `vod::absolute_playlist` lets through, as
+/// `crates/iris-api/src/hls.rs` writes them.
 const DAEMON_TAGS: [&str; 11] = [
     "#EXTM3U",
     "#EXT-X-VERSION",
@@ -47,7 +47,11 @@ fuzz_target!(|data: &[u8]| {
     let origin = base.origin();
     let timing = vod::playlist_fragments(text);
     if let Ok(fragments) = &timing {
-        assert!(!fragments.is_empty() && fragments.len() <= vod::MAX_PLAYBACK_FRAGMENTS);
+        assert!(
+            !fragments.is_empty() && fragments.len() <= vod::MAX_PLAYBACK_FRAGMENTS,
+            "{} fragments",
+            fragments.len()
+        );
         for fragment in fragments {
             assert!(fragment.duration.get() > 0, "{fragment:?}");
             assert!(
@@ -63,19 +67,31 @@ fuzz_target!(|data: &[u8]| {
     let Ok(body) = vod::absolute_playlist(text, &base, &origin) else {
         return;
     };
-    assert!(body.len() <= vod::MAX_VOD_PLAYLIST_BYTES);
+    assert!(
+        text.len() <= vod::MAX_VOD_PLAYLIST_BYTES,
+        "a rewrite of a body of {} bytes",
+        text.len()
+    );
+    assert!(
+        body.len() <= vod::MAX_VOD_PLAYLIST_BYTES,
+        "a rewrite of {} bytes",
+        body.len()
+    );
     // The multivariant playlist over an accepted body carries nothing of it:
-    // five fixed lines that name the two local playlists and a positive rate.
+    // five lines that name the two local playlists and a positive rate.
     let multivariant = vod::multivariant_playlist(&body, &body);
     let lines: Vec<&str> = multivariant.lines().collect();
     assert_eq!(lines.len(), 5, "{multivariant}");
-    assert!(lines[2].ends_with(&format!("URI=\"{}\"", vod::AUDIO_PLAYLIST)));
+    assert!(
+        lines[2].ends_with(&format!("URI=\"{}\"", vod::AUDIO_PLAYLIST)),
+        "{multivariant}"
+    );
     let rate = lines[3]
         .strip_prefix("#EXT-X-STREAM-INF:BANDWIDTH=")
         .and_then(|rest| rest.strip_suffix(",AUDIO=\"audio\""))
         .and_then(|rate| rate.parse::<u64>().ok());
     assert!(rate.is_some_and(|rate| rate > 0), "{multivariant}");
-    assert_eq!(lines[4], vod::VIDEO_PLAYLIST);
+    assert_eq!(lines[4], vod::VIDEO_PLAYLIST, "{multivariant}");
     for line in body.lines() {
         if let Some(attributes) = line.strip_prefix("#EXT-X-MAP:URI=\"") {
             let (uri, _) = attributes

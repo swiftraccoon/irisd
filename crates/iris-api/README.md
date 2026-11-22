@@ -265,7 +265,9 @@ symlinked recording and sidecar on every media route, a path swapped after valid
 under a response, and rows outside every approved root. `tests/websocket_limits.rs` covers the 1008
 policy close for inbound data and oversized messages, the live and event socket caps, the oversized
 live frame skip and 1009 close, a message exactly at the limit, and a forged CRC-32C collision
-between sample entries. Live integration against real cameras, playback through ffprobe, ffmpeg, and
+between sample entries. `src/client_bounds.rs` holds each bound that `iris-client` documents as
+the daemon's to the constant the daemon applies, so a limit changed on one side alone fails a
+test. Live integration against real cameras, playback through ffprobe, ffmpeg, and
 GStreamer, and the hourly playlist-continuity check of the soak are recorded in
 `docs/research/10-phase2-results.md` and `11-multi-camera-results.md`.
 

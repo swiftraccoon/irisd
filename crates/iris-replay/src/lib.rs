@@ -13,7 +13,10 @@
 //!
 //! # Modules
 //!
-//! - [`media`] — [`Media`](media::Media) loads a recording and indexes its frames.
+//! - [`media`] — [`Media`](media::Media) loads a recording, takes its parameter
+//!   sets from `hvcC` with
+//!   [`iris_mp4::decoder_config::parse_parameter_sets`], and indexes its
+//!   frames.
 //! - [`rtp`] — fallible streaming [`Packetizer`](rtp::Packetizer), sender
 //!   reports, and interleaving.
 //! - [`rtsp`] — request parsing and responses.

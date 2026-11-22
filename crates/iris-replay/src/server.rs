@@ -252,7 +252,7 @@ pub enum ServerError {
     /// The MTU is outside the supported range.
     #[error(transparent)]
     Mtu(#[from] RtpError),
-    /// The connection cap is zero or above [`Semaphore::MAX_PERMITS`].
+    /// The connection cap is zero or above `tokio::sync::Semaphore::MAX_PERMITS`.
     #[error("the replay connection cap {0} is outside 1..={max}", max = Semaphore::MAX_PERMITS)]
     ConnectionCap(usize),
     /// A deadline is zero or longer than a day.
@@ -307,10 +307,10 @@ impl Server {
     ///
     /// [`ServerError::Mtu`] for an MTU outside `256..=65535`,
     /// [`ServerError::ConnectionCap`] for a cap of zero or above
-    /// [`Semaphore::MAX_PERMITS`], [`ServerError::Deadline`] for a request or
-    /// idle deadline outside a millisecond to a day, [`ServerError::NoMounts`]
-    /// for an empty mount set, and [`ServerError::Bind`] when the address cannot
-    /// be bound.
+    /// `tokio::sync::Semaphore::MAX_PERMITS`, [`ServerError::Deadline`] for a
+    /// request or idle deadline outside a millisecond to a day,
+    /// [`ServerError::NoMounts`] for an empty mount set, and [`ServerError::Bind`]
+    /// when the address cannot be bound.
     pub async fn bind(
         addr: SocketAddr,
         mounts: Mounts,

@@ -16,7 +16,8 @@ use super::config::Config;
 use super::finding::{Finding, Rule};
 use super::installation::{Own, Site};
 use super::layout::{self, Repo};
-use super::{markdown, rust};
+use super::names::Names;
+use super::{error_texts, examples, markdown, modules, rust};
 
 /// Arguments of `standards`.
 #[derive(Debug, Parser)]
@@ -194,14 +195,14 @@ fn file_findings(path: &str, text: &str, repo: &Repo, site: &Site) -> Vec<Findin
     if Path::new(path).extension().is_some_and(|ext| ext == "md") {
         findings.extend(markdown::check(path, text, repo));
     } else if Path::new(path).extension().is_some_and(|ext| ext == "rs") {
-        findings.extend(rust::check(path, text));
+        findings.extend(rust::check(path, text, repo.names.as_ref()));
     }
     findings
 }
 
 /// The findings in the tree at `root`.
 fn tree(root: &Path) -> anyhow::Result<Vec<Finding>> {
-    let repo = Repo::open(root.to_owned());
+    let mut repo = Repo::open(root.to_owned());
     let config = match repo.read("standards.toml") {
         Some(text) => Config::parse(&text)?,
         None => Config::default(),
@@ -217,12 +218,17 @@ fn tree(root: &Path) -> anyhow::Result<Vec<Finding>> {
             "--exclude-standard",
         ],
     )?;
+    // A file that is not text, or that is deleted and not yet staged, has no lines.
+    let files: Vec<(&str, String)> = listed
+        .split('\0')
+        .filter(|path| !path.is_empty())
+        .filter_map(|path| Some((path, fs::read_to_string(root.join(path)).ok()?)))
+        .collect();
+    let texts = || files.iter().map(|(path, text)| (*path, text.as_str()));
+    repo.names = Some(Names::of(texts(), &VENDORED));
     let mut findings = Vec::new();
-    for path in listed.split('\0').filter(|path| !path.is_empty()) {
-        // A file that is not text, or that is deleted and not yet staged, has no lines.
-        if let Ok(text) = fs::read_to_string(root.join(path)) {
-            findings.extend(file_findings(path, &text, &repo, &site));
-        }
+    for (path, text) in texts() {
+        findings.extend(file_findings(path, text, &repo, &site));
     }
     for entry in git(root, &["ls-files", "-s", "-z"])?.split('\0') {
         let Some((mode, path)) = entry
@@ -239,6 +245,12 @@ fn tree(root: &Path) -> anyhow::Result<Vec<Finding>> {
     }
     findings.extend(layout::crate_docs(&repo));
     findings.extend(layout::fuzz_targets(&repo));
+    let sources: Vec<(&str, &str)> = texts().collect();
+    for (dir, files) in modules::workspace(&sources) {
+        let modules = modules::crate_modules(&dir, &files);
+        findings.extend(examples::findings(&modules));
+        findings.extend(error_texts::findings(&dir, &modules, &files));
+    }
     Ok(config.settle(&findings))
 }
 
@@ -484,7 +496,8 @@ mod tests {
         git_in(root, &["init", "-q", "-b", "main"]);
         fs::create_dir_all(root.join("crates/iris-a/src")).unwrap();
         fs::write(root.join("crates/iris-a/Cargo.toml"), "").unwrap();
-        fs::write(root.join("crates/iris-a/src/lib.rs"), "//! A.\n").unwrap();
+        let lib = "//! A.\n//!\n//! ```\n//! ```\n";
+        fs::write(root.join("crates/iris-a/src/lib.rs"), lib).unwrap();
         fs::write(root.join("crates/iris-a/README.md"), "# a\n").unwrap();
         fs::write(root.join("crates/iris-a/AGENTS.md"), "# a\n").unwrap();
         fs::write(root.join("AGENTS.md"), "`crates/iris-a`\n").unwrap();
@@ -518,6 +531,56 @@ mod tests {
                 ("notes.md".to_owned(), Rule::Installation),
             ]
         );
+    }
+
+    #[test]
+    fn a_document_is_checked_against_the_names_of_the_code_of_the_tree() {
+        let dir = repository();
+        let root = dir.path();
+        fs::write(root.join("crates/iris-a/src/b.rs"), "pub struct Held;\n").unwrap();
+        fs::write(
+            root.join("crates/iris-a/README.md"),
+            "# a\n\n`Held`, `Gone`\n",
+        )
+        .unwrap();
+        let found: Vec<(String, usize, Rule)> = tree(root)
+            .unwrap()
+            .into_iter()
+            .map(|finding| (finding.path, finding.line, finding.rule))
+            .collect();
+        let readme = "crates/iris-a/README.md".to_owned();
+        assert_eq!(found, [(readme, 3, Rule::UnknownName)]);
+    }
+
+    #[test]
+    fn the_public_items_of_a_library_of_the_tree_are_checked_for_examples() {
+        let dir = repository();
+        let root = dir.path();
+        let lib = "//! A.\n//!\n//! ```\n//! ```\n\n/// Acts.\npub fn act() {}\n";
+        fs::write(root.join("crates/iris-a/src/lib.rs"), lib).unwrap();
+        let found: Vec<(String, usize, Rule)> = tree(root)
+            .unwrap()
+            .into_iter()
+            .map(|finding| (finding.path, finding.line, finding.rule))
+            .collect();
+        let lib = "crates/iris-a/src/lib.rs".to_owned();
+        assert_eq!(found, [(lib, 7, Rule::MissingExample)]);
+    }
+
+    #[test]
+    fn the_error_texts_of_a_crate_of_the_tree_are_checked_against_its_tests() {
+        let dir = repository();
+        let root = dir.path();
+        let lib = "//! A.\n//!\n//! ```\n//! ```\n\n\
+                   enum E {\n    #[error(\"the list is empty\")]\n    A,\n}\n";
+        fs::write(root.join("crates/iris-a/src/lib.rs"), lib).unwrap();
+        let found: Vec<(String, usize, Rule)> = tree(root)
+            .unwrap()
+            .into_iter()
+            .map(|finding| (finding.path, finding.line, finding.rule))
+            .collect();
+        let lib = "crates/iris-a/src/lib.rs".to_owned();
+        assert_eq!(found, [(lib, 7, Rule::UnassertedErrorText)]);
     }
 
     #[test]

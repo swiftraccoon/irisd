@@ -182,15 +182,37 @@ into its private root.
 - `iris-tools standards tree | commits RANGE [--lenient] | message FILE | hooks` — the rules of
   `STANDARDS.md` and the root `AGENTS.md` that a program can decide (`STANDARDS.md` §1 lists
   them). `tree` reads every file git tracks or would track, so a breach is found before it is
-  staged; `commits` reads each commit of a range, its message and the paths and lockfile
-  packages it changes; `message` reads the message of the commit being made against what is
-  staged, for the `commit-msg` hook; `hooks` writes that hook and a `pre-commit` hook that
-  runs `tree` into the clone's git directory, and leaves a hook of another content alone. Each
-  check prints one line a finding, as a compiler does
+  staged. It checks the names its documents give against the code of those files. It checks
+  the rustdoc of each public item of a library for an example, and each error text of a crate
+  for a test that asserts it. `commits` reads each commit of a range, its message and the paths
+  and lockfile packages it changes; `message` reads the message of the commit being made against
+  what is staged, for the `commit-msg` hook; `hooks` writes that hook and a `pre-commit` hook
+  that runs `tree` into the clone's git directory, and leaves a hook of another content alone.
+  Each check prints one line a finding, as a compiler does
   (`path:line: [rule] what is wrong`), and exits non-zero when one stands. `--lenient` prints
   what a message fails to say of its change as notes and fails only on a message's form.
   `standards.toml` at the repository's root holds the accepted exceptions; the gitignored
   `docs/local/denylist.txt` holds, one a line, the names no committed file may hold.
+- `iris-tools doc` — documents the workspace of the working directory with warnings as errors,
+  so that the links between its crates resolve. It runs `cargo check --workspace --locked` and
+  then `cargo doc --workspace --no-deps --locked --jobs 1`: with jobs in parallel, rustdoc
+  leaves links between the crates unresolved and reports nothing. After the check passes it
+  empties the output directory, because a page from before the run can hold unresolved links.
+  The output directory is `doc` in the target directory that `cargo metadata` names, `target/doc`
+  by default. Emptying it has three costs: every run documents every crate, the pages of
+  dependencies built there are removed, and a documentation pass that fails leaves only the pages
+  it wrote. It makes the directory of each library in the output directory before it documents,
+  and it documents again when Cargo empties the output directory for another rustc. The module
+  documentation of `src/doc.rs` gives the whole account and the command's limits. It reads the
+  target directory, the build directory, and the libraries from `cargo metadata` and reports a
+  failure of that command with cargo's standard error. A library with `doc = false` in its
+  manifest gets no directory. It refuses to run while `CARGO_BUILD_TARGET` or
+  `CARGO_ENCODED_RUSTDOCFLAGS` is set. After the last documentation pass, when that pass
+  succeeded, it fails with exit status 1 unless each library directory it made holds
+  `index.html`. That is how it fails with `build.target` in a configuration file: Cargo then
+  writes the documentation to another directory, where the command made no directory. It exits
+  with cargo's status when the check or the documentation fails, and with 128 plus the signal's
+  number when a signal stopped cargo. `just doc` runs it.
 
 ## How it is used
 
@@ -201,7 +223,8 @@ target/release/iris-tools soak-sample --out SOAK_DIR --unit irisd --disk DISK --
   --subnet 192.0.2.0/24 --api http://127.0.0.1:8554 --token-env IRISD_API_TOKEN --api-check-every 60
 target/release/iris-tools soak-report SOAK_DIR --since 2026-01-01T00:00:00Z
 target/release/iris-tools replay-bench --file RECORDING.mp4 --cameras 14 --seconds 90 \
-  --root SCRATCH --irisd target/release/irisd --replay target/release/iris-replay --replay-arg=--pace
+  --root SCRATCH --irisd target/release/irisd --replay target/release/iris-replay \
+  --replay-arg=--pace
 read -rs CAMERA_PASSWORD && export CAMERA_PASSWORD   # reads it without echo or shell history
 mkdir -m 700 -p probe
 target/release/iris-tools rtsp-probe --password-env CAMERA_PASSWORD HOST_IP user 90 0 probe/meta.xml
@@ -245,18 +268,22 @@ delivers them. Pass replay flags through the driver as `--replay-arg=--pace`.
 ## Tests and measurements
 
 Unit tests cover terminal-safe log parsing and statistics classification, strict RFC 3339
-and camera UTC parsing, playlist and RTSP/RTP/RTCP/H.265 payload bounds, output-path
-confinement, report completeness and window semantics (the baseline kept out of gauges, the
-restart horizon, the writer's fractional `mib` total, container overhead across daemon
-versions, write amplification over matched intervals), benchmark root/config/clock safety and
-the perf command line, sampler directory modes and the authenticated metrics scrape,
-passwords read from the environment and redacted from `Debug`, metadata output refusing links
-and FIFOs, the `onvif-call` operation check and WS-Security digest, GitHub target/mode
-parsing, the gh-commit plan, signature, parent, and message checks, every rule of `standards`
-with a text that breaks it and texts that must pass, its tree, range, and message modes
-against a git repository made for the test, and the probe's receive
-path end to end against `iris-replay` on loopback, a clean end at the deadline and a stall
-included. Two libFuzzer targets include the parser files by path: `tools_protocol` (the
+and camera UTC parsing, playlist and RTSP/RTP/RTCP/H.265 payload bounds, and output-path
+confinement. They cover report completeness and window semantics: the baseline kept out of
+gauges, the restart horizon, the writer's fractional `mib` total, container overhead across
+daemon versions, and write amplification over matched intervals. They cover benchmark
+root/config/clock safety and the perf command line, sampler directory modes, and the
+authenticated metrics scrape. They cover passwords read from the environment and redacted from
+`Debug`, metadata output refusing links and FIFOs, and the `onvif-call` operation check and
+WS-Security digest. They cover GitHub target/mode parsing and the gh-commit plan, signature,
+parent, and message checks. They cover every rule of `standards` with a text that breaks it and
+texts that must pass, and its tree, range, and message modes against a git repository made for
+the test. Of `doc` they cover the step after its first pass, its reading of `cargo metadata`,
+the order of its steps, and its check of the index pages. They also run the probe's receive path
+end to end against `iris-replay` on loopback, a clean end at the deadline and a stall included.
+An integration test, `tests/doc.rs`, runs `doc` against a script in place of cargo: the commands
+it runs, the status it exits with, the lines it prints, and the environment it refuses. Two
+libFuzzer targets include the parser files by path: `tools_protocol` (the
 probes' camera-facing parsers) and `tools_logs` (the log parsers). Measured results are in
 `docs/research/11-multi-camera-results.md` (soak, and the reports' memory, which follows the
 window rather than the soak) and `12-ingest-cost.md` (bench).

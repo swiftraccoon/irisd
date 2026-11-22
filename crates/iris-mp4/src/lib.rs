@@ -1,5 +1,6 @@
 //! Fragmented MP4 for irisd recordings: the on-disk format, its scanner, the
-//! sidecar index, and byte-range HLS playlists.
+//! sidecar index, byte-range HLS playlists, and the readers of the decoder
+//! configuration of an init segment.
 //!
 //! A recording file is `ftyp` + `moov` (the initialization segment) followed
 //! by self-describing fragments: an optional `prft` wall-clock box, `moof`,
@@ -14,6 +15,12 @@
 //!
 //! - [`init`]: [`init::SampleEntry`] and [`init::build_init_segment`], the
 //!   `hvc1` sample entry and the `ftyp` + `moov` bytes.
+//! - [`decoder_config`]: [`decoder_config::DecoderConfig::parse`] reads what
+//!   a decoder needs from the sample entry of an init segment. That is the
+//!   parameter sets and picture size of HEVC ([`decoder_config::HevcConfig`]),
+//!   or the `AudioSpecificConfig`, sampling rate, and channel count of AAC
+//!   ([`decoder_config::AacConfig`]). [`decoder_config::parse_parameter_sets`]
+//!   and [`decoder_config::parse_hvcc`] read `hvcC` alone.
 //! - [`fragment`]: [`fragment::Sample`], [`fragment::Fragment`], and
 //!   [`fragment::encode_fragment`], which produces the [`fragment::EncodedFragment`]
 //!   a writer lays around the samples with one vectored write; the trailer codec
@@ -44,7 +51,7 @@
 //! `raw_rtp`, `run_id`, and the discontinuity and new-parameter flags survive
 //! only in a sidecar whose records match. Every parser accepts arbitrary bytes
 //! without panicking (fuzz targets `scan`, `box_header`, `index`, `trailer`,
-//! and `export_rebase`).
+//! `export_rebase`, and `decoder_config`).
 //!
 //! ```
 //! use bytes::Bytes;
@@ -68,6 +75,7 @@
 
 pub mod boxes;
 pub mod crc;
+pub mod decoder_config;
 pub mod export;
 pub mod fragment;
 pub mod hls;

@@ -45,3 +45,3625 @@ rule = "bare-tuple"
 path = "crates/iris-tools/src/summary.rs"
 count = 1
 reason = "a rate and a count that the function's name states in order"
+
+# Breaches of the rules of Rust line widths, example headings, paths, `use` declarations, test
+# names, sentence length, phrases, `the core`, and possessives in text written before each rule.
+# A count falls as its file is brought to the rule, and no count rises.
+
+[[waiver]]
+rule = "barred-phrase"
+path = "README.md"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "barred-phrase"
+path = "STANDARDS.md"
+count = 2
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "barred-phrase"
+path = "crates/iris-api/README.md"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "barred-phrase"
+path = "crates/iris-api/src/llhls.rs"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "barred-phrase"
+path = "crates/iris-api/tests/api.rs"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "barred-phrase"
+path = "crates/iris-core/README.md"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "barred-phrase"
+path = "crates/iris-core/src/id.rs"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "barred-phrase"
+path = "crates/iris-events/src/onvif.rs"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "barred-phrase"
+path = "crates/iris-gui/README.md"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "barred-phrase"
+path = "crates/iris-ingest/AGENTS.md"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "barred-phrase"
+path = "crates/iris-ingest/README.md"
+count = 2
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "barred-phrase"
+path = "crates/iris-ingest/src/cadence.rs"
+count = 2
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "barred-phrase"
+path = "crates/iris-ingest/src/steer.rs"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "barred-phrase"
+path = "crates/iris-ingest/src/sync.rs"
+count = 3
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "barred-phrase"
+path = "crates/iris-ingest/tests/log_bounds.rs"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "barred-phrase"
+path = "crates/iris-ingest/tests/teardown_bound.rs"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "barred-phrase"
+path = "crates/iris-mp4/src/hls.rs"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "barred-phrase"
+path = "crates/iris-mp4/src/index.rs"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "barred-phrase"
+path = "crates/iris-mp4/src/reader.rs"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "barred-phrase"
+path = "crates/iris-replay/src/server.rs"
+count = 2
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "barred-phrase"
+path = "crates/iris-store/tests/full_disk.rs"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "barred-phrase"
+path = "crates/iris-tls/AGENTS.md"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "barred-phrase"
+path = "crates/iris-tools/README.md"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "barred-phrase"
+path = "crates/iris-tools/src/bench.rs"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "barred-phrase"
+path = "crates/iris-tools/src/standards/command.rs"
+count = 2
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "barred-phrase"
+path = "crates/irisd/src/inspect.rs"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "barred-phrase"
+path = "crates/irisd/src/run.rs"
+count = 3
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "barred-phrase"
+path = "crates/irisd/src/sandbox.rs"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "barred-phrase"
+path = "crates/irisd/src/selfcheck.rs"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "barred-phrase"
+path = "crates/irisd/tests/recording.rs"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "barred-phrase"
+path = "docs/research/01-camera-probe.md"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "barred-phrase"
+path = "docs/research/04-storage-format.md"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "barred-phrase"
+path = "docs/research/05-ingest-events.md"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "barred-phrase"
+path = "docs/research/06-clients.md"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "barred-phrase"
+path = "docs/research/07-architecture.md"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "barred-phrase"
+path = "docs/research/13-audio.md"
+count = 5
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "barred-phrase"
+path = "docs/research/14-drift.md"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "barred-phrase"
+path = "docs/research/appendix/A-prior-art.md"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "barred-phrase"
+path = "docs/research/appendix/B-storage.md"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "barred-phrase"
+path = "packaging/README.md"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "code-width"
+path = "crates/iris-api/src/export.rs"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "code-width"
+path = "crates/iris-api/src/hls.rs"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "code-width"
+path = "crates/iris-api/src/live.rs"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "code-width"
+path = "crates/iris-api/src/llhls.rs"
+count = 2
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "code-width"
+path = "crates/iris-api/src/metrics.rs"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "code-width"
+path = "crates/iris-api/src/snapshot.rs"
+count = 11
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "code-width"
+path = "crates/iris-api/src/state.rs"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "code-width"
+path = "crates/iris-api/tests/api.rs"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "code-width"
+path = "crates/iris-api/tests/media_cancellation.rs"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "code-width"
+path = "crates/iris-api/tests/websocket_limits.rs"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "code-width"
+path = "crates/iris-catalog/src/db.rs"
+count = 2
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "code-width"
+path = "crates/iris-catalog/src/handle.rs"
+count = 2
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "code-width"
+path = "crates/iris-core/src/config.rs"
+count = 13
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "code-width"
+path = "crates/iris-events/src/dahua.rs"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "code-width"
+path = "crates/iris-events/src/digest.rs"
+count = 6
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "code-width"
+path = "crates/iris-events/src/feed.rs"
+count = 4
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "code-width"
+path = "crates/iris-events/src/loopback.rs"
+count = 10
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "code-width"
+path = "crates/iris-events/src/media.rs"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "code-width"
+path = "crates/iris-events/src/multipart.rs"
+count = 2
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "code-width"
+path = "crates/iris-events/src/onvif.rs"
+count = 20
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "code-width"
+path = "crates/iris-events/src/transport.rs"
+count = 4
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "code-width"
+path = "crates/iris-gui/src/playback.rs"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "code-width"
+path = "crates/iris-ingest/src/regularize.rs"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "code-width"
+path = "crates/iris-ingest/src/session.rs"
+count = 2
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "code-width"
+path = "crates/iris-mp4/src/hls.rs"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "code-width"
+path = "crates/iris-store/src/fs.rs"
+count = 3
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "code-width"
+path = "crates/iris-store/src/segment.rs"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "code-width"
+path = "crates/iris-tls/src/lib.rs"
+count = 2
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "code-width"
+path = "crates/iris-tools/src/standards/command.rs"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "code-width"
+path = "crates/iris-tools/src/standards/commits.rs"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "code-width"
+path = "crates/iris-tools/src/standards/config.rs"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "code-width"
+path = "crates/iris-tools/src/stats.rs"
+count = 4
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "code-width"
+path = "fuzz/fuzz_targets/depacketize_h265.rs"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "comment-width"
+path = "crates/iris-api/src/error.rs"
+count = 5
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "comment-width"
+path = "crates/iris-api/src/events.rs"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "comment-width"
+path = "crates/iris-api/src/export.rs"
+count = 4
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "comment-width"
+path = "crates/iris-api/src/hls.rs"
+count = 6
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "comment-width"
+path = "crates/iris-api/src/keyframe.rs"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "comment-width"
+path = "crates/iris-api/src/lib.rs"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "comment-width"
+path = "crates/iris-api/src/live.rs"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "comment-width"
+path = "crates/iris-api/src/media_admission.rs"
+count = 2
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "comment-width"
+path = "crates/iris-api/src/provision.rs"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "comment-width"
+path = "crates/iris-api/src/query/range.rs"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "comment-width"
+path = "crates/iris-api/src/query/time.rs"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "comment-width"
+path = "crates/iris-api/src/server.rs"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "comment-width"
+path = "crates/iris-api/src/state.rs"
+count = 13
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "comment-width"
+path = "crates/iris-api/tests/api.rs"
+count = 2
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "comment-width"
+path = "crates/iris-api/tests/keyframe_bounds.rs"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "comment-width"
+path = "crates/iris-api/tests/media_cancellation.rs"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "comment-width"
+path = "crates/iris-api/tests/websocket_limits.rs"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "comment-width"
+path = "crates/iris-catalog/src/db.rs"
+count = 5
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "comment-width"
+path = "crates/iris-catalog/src/types.rs"
+count = 3
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "comment-width"
+path = "crates/iris-catalog/tests/catalog.rs"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "comment-width"
+path = "crates/iris-core/src/config.rs"
+count = 35
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "comment-width"
+path = "crates/iris-core/src/event.rs"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "comment-width"
+path = "crates/iris-core/src/lib.rs"
+count = 4
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "comment-width"
+path = "crates/iris-core/src/metrics.rs"
+count = 9
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "comment-width"
+path = "crates/iris-events/src/digest.rs"
+count = 2
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "comment-width"
+path = "crates/iris-events/src/lib.rs"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "comment-width"
+path = "crates/iris-events/src/onvif.rs"
+count = 9
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "comment-width"
+path = "crates/iris-gui/src/main.rs"
+count = 2
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "comment-width"
+path = "crates/iris-gui/src/playback.rs"
+count = 2
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "comment-width"
+path = "crates/iris-gui/src/tile.rs"
+count = 3
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "comment-width"
+path = "crates/iris-gui/tests/playback_snapshot.rs"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "comment-width"
+path = "crates/iris-h265/src/lib.rs"
+count = 3
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "comment-width"
+path = "crates/iris-ingest/src/assembler.rs"
+count = 4
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "comment-width"
+path = "crates/iris-ingest/src/audio.rs"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "comment-width"
+path = "crates/iris-ingest/src/lib.rs"
+count = 2
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "comment-width"
+path = "crates/iris-ingest/src/session.rs"
+count = 5
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "comment-width"
+path = "crates/iris-ingest/src/stats.rs"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "comment-width"
+path = "crates/iris-ingest/tests/replay.rs"
+count = 4
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "comment-width"
+path = "crates/iris-ingest/tests/replay_server.rs"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "comment-width"
+path = "crates/iris-mp4/src/export.rs"
+count = 3
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "comment-width"
+path = "crates/iris-mp4/src/fragment.rs"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "comment-width"
+path = "crates/iris-mp4/src/hls.rs"
+count = 3
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "comment-width"
+path = "crates/iris-mp4/src/index.rs"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "comment-width"
+path = "crates/iris-mp4/src/init.rs"
+count = 3
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "comment-width"
+path = "crates/iris-mp4/src/lib.rs"
+count = 5
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "comment-width"
+path = "crates/iris-mp4/src/reader.rs"
+count = 2
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "comment-width"
+path = "crates/iris-replay/src/lib.rs"
+count = 5
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "comment-width"
+path = "crates/iris-replay/src/rtsp.rs"
+count = 2
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "comment-width"
+path = "crates/iris-replay/src/server.rs"
+count = 2
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "comment-width"
+path = "crates/iris-replay/src/synth.rs"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "comment-width"
+path = "crates/iris-store/src/fs.rs"
+count = 2
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "comment-width"
+path = "crates/iris-store/src/layout.rs"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "comment-width"
+path = "crates/iris-store/src/lib.rs"
+count = 2
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "comment-width"
+path = "crates/iris-store/src/writer.rs"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "comment-width"
+path = "crates/iris-store/tests/store.rs"
+count = 2
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "comment-width"
+path = "crates/iris-tls/src/lib.rs"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "comment-width"
+path = "crates/iris-tools/src/bench.rs"
+count = 2
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "comment-width"
+path = "crates/iris-tools/src/logs.rs"
+count = 5
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "comment-width"
+path = "crates/iris-tools/src/main.rs"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "comment-width"
+path = "crates/iris-tools/src/onvif_call.rs"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "comment-width"
+path = "crates/iris-tools/src/probe_parser.rs"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "comment-width"
+path = "crates/iris-tools/src/report.rs"
+count = 3
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "comment-width"
+path = "crates/iris-tools/src/rtsp_probe.rs"
+count = 4
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "comment-width"
+path = "crates/iris-tools/src/sample.rs"
+count = 2
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "comment-width"
+path = "crates/iris-tools/src/standards/finding.rs"
+count = 2
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "comment-width"
+path = "crates/iris-tools/src/time.rs"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "comment-width"
+path = "crates/irisd/src/adopt.rs"
+count = 2
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "comment-width"
+path = "crates/irisd/src/main.rs"
+count = 4
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "comment-width"
+path = "crates/irisd/src/record.rs"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "comment-width"
+path = "crates/irisd/src/retention.rs"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "comment-width"
+path = "crates/irisd/src/run.rs"
+count = 13
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "comment-width"
+path = "fuzz/fuzz_targets/api_range.rs"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "comment-width"
+path = "fuzz/fuzz_targets/api_time.rs"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "comment-width"
+path = "fuzz/fuzz_targets/digest_challenge.rs"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "comment-width"
+path = "fuzz/fuzz_targets/multipart.rs"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "comment-width"
+path = "fuzz/fuzz_targets/rtsp_message.rs"
+count = 4
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "derive-path"
+path = "crates/iris-mp4/src/export.rs"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "derive-path"
+path = "crates/iris-replay/src/media.rs"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "derive-path"
+path = "crates/iris-replay/src/rtp.rs"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "derive-path"
+path = "crates/iris-replay/src/rtsp.rs"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "derive-path"
+path = "crates/iris-replay/src/server.rs"
+count = 2
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "derive-path"
+path = "crates/iris-replay/src/synth.rs"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "full-path-type"
+path = "crates/iris-api/src/auth.rs"
+count = 4
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "full-path-type"
+path = "crates/iris-api/src/error.rs"
+count = 2
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "full-path-type"
+path = "crates/iris-api/src/export.rs"
+count = 7
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "full-path-type"
+path = "crates/iris-api/src/hls.rs"
+count = 6
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "full-path-type"
+path = "crates/iris-api/src/live.rs"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "full-path-type"
+path = "crates/iris-api/src/llhls.rs"
+count = 5
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "full-path-type"
+path = "crates/iris-api/src/onvif.rs"
+count = 3
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "full-path-type"
+path = "crates/iris-api/src/provision.rs"
+count = 4
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "full-path-type"
+path = "crates/iris-api/src/segments.rs"
+count = 3
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "full-path-type"
+path = "crates/iris-api/src/server.rs"
+count = 2
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "full-path-type"
+path = "crates/iris-api/src/snapshot.rs"
+count = 6
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "full-path-type"
+path = "crates/iris-api/src/state.rs"
+count = 5
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "full-path-type"
+path = "crates/iris-api/src/websocket.rs"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "full-path-type"
+path = "crates/iris-api/tests/api.rs"
+count = 37
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "full-path-type"
+path = "crates/iris-api/tests/keyframe_bounds.rs"
+count = 2
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "full-path-type"
+path = "crates/iris-api/tests/listener.rs"
+count = 4
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "full-path-type"
+path = "crates/iris-api/tests/media_binding.rs"
+count = 5
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "full-path-type"
+path = "crates/iris-api/tests/media_cancellation.rs"
+count = 2
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "full-path-type"
+path = "crates/iris-api/tests/metrics_cancellation.rs"
+count = 3
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "full-path-type"
+path = "crates/iris-api/tests/provisioning.rs"
+count = 3
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "full-path-type"
+path = "crates/iris-api/tests/websocket_lifetime.rs"
+count = 6
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "full-path-type"
+path = "crates/iris-api/tests/websocket_limits.rs"
+count = 5
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "full-path-type"
+path = "crates/iris-catalog/src/db.rs"
+count = 3
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "full-path-type"
+path = "crates/iris-catalog/src/types.rs"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "full-path-type"
+path = "crates/iris-core/src/config.rs"
+count = 2
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "full-path-type"
+path = "crates/iris-core/src/id.rs"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "full-path-type"
+path = "crates/iris-events/src/backoff.rs"
+count = 2
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "full-path-type"
+path = "crates/iris-events/src/feed.rs"
+count = 15
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "full-path-type"
+path = "crates/iris-events/src/media.rs"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "full-path-type"
+path = "crates/iris-events/src/onvif.rs"
+count = 3
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "full-path-type"
+path = "crates/iris-events/src/transport.rs"
+count = 3
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "full-path-type"
+path = "crates/iris-gui/src/main.rs"
+count = 9
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "full-path-type"
+path = "crates/iris-gui/src/playback.rs"
+count = 35
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "full-path-type"
+path = "crates/iris-gui/src/sound.rs"
+count = 3
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "full-path-type"
+path = "crates/iris-gui/src/stage.rs"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "full-path-type"
+path = "crates/iris-gui/src/tile.rs"
+count = 2
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "full-path-type"
+path = "crates/iris-gui/tests/playback_origin.rs"
+count = 3
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "full-path-type"
+path = "crates/iris-gui/tests/playback_snapshot.rs"
+count = 3
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "full-path-type"
+path = "crates/iris-ingest/src/cadence.rs"
+count = 10
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "full-path-type"
+path = "crates/iris-ingest/src/session.rs"
+count = 6
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "full-path-type"
+path = "crates/iris-ingest/src/source.rs"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "full-path-type"
+path = "crates/iris-ingest/tests/adversarial_rtsp.rs"
+count = 9
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "full-path-type"
+path = "crates/iris-ingest/tests/log_bounds.rs"
+count = 2
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "full-path-type"
+path = "crates/iris-ingest/tests/replay_server.rs"
+count = 14
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "full-path-type"
+path = "crates/iris-mp4/src/crc.rs"
+count = 3
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "full-path-type"
+path = "crates/iris-mp4/src/export.rs"
+count = 3
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "full-path-type"
+path = "crates/iris-replay/src/main.rs"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "full-path-type"
+path = "crates/iris-replay/src/server.rs"
+count = 4
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "full-path-type"
+path = "crates/iris-replay/tests/loopback.rs"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "full-path-type"
+path = "crates/iris-store/src/recover.rs"
+count = 3
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "full-path-type"
+path = "crates/iris-store/src/root_worker.rs"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "full-path-type"
+path = "crates/iris-store/src/segment.rs"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "full-path-type"
+path = "crates/iris-store/src/stream.rs"
+count = 5
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "full-path-type"
+path = "crates/iris-store/src/writer.rs"
+count = 2
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "full-path-type"
+path = "crates/iris-store/tests/store.rs"
+count = 5
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "full-path-type"
+path = "crates/iris-tls/src/lib.rs"
+count = 5
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "full-path-type"
+path = "crates/iris-tools/src/bench.rs"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "full-path-type"
+path = "crates/iris-tools/src/gh_commit.rs"
+count = 3
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "full-path-type"
+path = "crates/iris-tools/src/onvif_call.rs"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "full-path-type"
+path = "crates/iris-tools/src/rtsp_probe.rs"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "full-path-type"
+path = "crates/iris-tools/src/sample.rs"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "full-path-type"
+path = "crates/irisd/src/adopt.rs"
+count = 9
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "full-path-type"
+path = "crates/irisd/src/capability.rs"
+count = 5
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "full-path-type"
+path = "crates/irisd/src/catalog_observer.rs"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "full-path-type"
+path = "crates/irisd/src/hls.rs"
+count = 24
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "full-path-type"
+path = "crates/irisd/src/inspect.rs"
+count = 2
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "full-path-type"
+path = "crates/irisd/src/permissions.rs"
+count = 3
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "full-path-type"
+path = "crates/irisd/src/provision.rs"
+count = 2
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "full-path-type"
+path = "crates/irisd/src/record.rs"
+count = 9
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "full-path-type"
+path = "crates/irisd/src/retention.rs"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "full-path-type"
+path = "crates/irisd/src/run.rs"
+count = 49
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "full-path-type"
+path = "crates/irisd/src/sandbox.rs"
+count = 2
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "full-path-type"
+path = "crates/irisd/src/selfcheck.rs"
+count = 13
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "full-path-type"
+path = "crates/irisd/src/serve.rs"
+count = 14
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "full-path-type"
+path = "crates/irisd/tests/recording.rs"
+count = 11
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "full-path-type"
+path = "crates/irisd/tests/startup.rs"
+count = 7
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "full-path-type"
+path = "fuzz/fuzz_targets/api_time.rs"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "possessive-code-span"
+path = "STANDARDS.md"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "possessive-code-span"
+path = "crates/iris-api/src/llhls.rs"
+count = 2
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "possessive-code-span"
+path = "crates/iris-api/src/snapshot.rs"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "possessive-code-span"
+path = "crates/iris-catalog/AGENTS.md"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "possessive-code-span"
+path = "crates/iris-core/AGENTS.md"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "possessive-code-span"
+path = "crates/iris-core/README.md"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "possessive-code-span"
+path = "crates/iris-core/src/metrics.rs"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "possessive-code-span"
+path = "crates/iris-events/src/media.rs"
+count = 2
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "possessive-code-span"
+path = "crates/iris-gui/src/main.rs"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "possessive-code-span"
+path = "crates/iris-gui/src/playback.rs"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "possessive-code-span"
+path = "crates/iris-ingest/AGENTS.md"
+count = 2
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "possessive-code-span"
+path = "crates/iris-ingest/README.md"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "possessive-code-span"
+path = "crates/iris-ingest/src/audio.rs"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "possessive-code-span"
+path = "crates/iris-mp4/src/crc.rs"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "possessive-code-span"
+path = "crates/iris-replay/src/sdp.rs"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "possessive-code-span"
+path = "crates/iris-store/AGENTS.md"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "possessive-code-span"
+path = "crates/iris-tools/src/sample.rs"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "possessive-code-span"
+path = "crates/iris-tools/src/standards/layout.rs"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "possessive-code-span"
+path = "crates/irisd/src/retention.rs"
+count = 2
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "possessive-code-span"
+path = "docs/design/phase2-interfaces.md"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "possessive-code-span"
+path = "docs/research/04-storage-format.md"
+count = 2
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "possessive-code-span"
+path = "docs/research/07-architecture.md"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "possessive-code-span"
+path = "docs/research/12-ingest-cost.md"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "sentence-length"
+path = "AGENTS.md"
+count = 8
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "sentence-length"
+path = "README.md"
+count = 2
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "sentence-length"
+path = "STANDARDS.md"
+count = 12
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "sentence-length"
+path = "crates/iris-api/AGENTS.md"
+count = 10
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "sentence-length"
+path = "crates/iris-api/README.md"
+count = 28
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "sentence-length"
+path = "crates/iris-api/src/export.rs"
+count = 6
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "sentence-length"
+path = "crates/iris-api/src/hls.rs"
+count = 4
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "sentence-length"
+path = "crates/iris-api/src/lib.rs"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "sentence-length"
+path = "crates/iris-api/src/llhls.rs"
+count = 7
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "sentence-length"
+path = "crates/iris-api/src/server.rs"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "sentence-length"
+path = "crates/iris-api/src/state.rs"
+count = 2
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "sentence-length"
+path = "crates/iris-api/tests/api.rs"
+count = 8
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "sentence-length"
+path = "crates/iris-api/tests/websocket_limits.rs"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "sentence-length"
+path = "crates/iris-catalog/AGENTS.md"
+count = 2
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "sentence-length"
+path = "crates/iris-catalog/README.md"
+count = 15
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "sentence-length"
+path = "crates/iris-catalog/src/db.rs"
+count = 4
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "sentence-length"
+path = "crates/iris-catalog/src/handle.rs"
+count = 10
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "sentence-length"
+path = "crates/iris-catalog/src/lib.rs"
+count = 3
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "sentence-length"
+path = "crates/iris-catalog/src/types.rs"
+count = 2
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "sentence-length"
+path = "crates/iris-catalog/tests/event_lifecycle_model.rs"
+count = 2
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "sentence-length"
+path = "crates/iris-catalog/tests/query_model.rs"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "sentence-length"
+path = "crates/iris-catalog/tests/retention_model.rs"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "sentence-length"
+path = "crates/iris-core/AGENTS.md"
+count = 3
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "sentence-length"
+path = "crates/iris-core/README.md"
+count = 9
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "sentence-length"
+path = "crates/iris-core/src/config.rs"
+count = 6
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "sentence-length"
+path = "crates/iris-events/AGENTS.md"
+count = 3
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "sentence-length"
+path = "crates/iris-events/README.md"
+count = 15
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "sentence-length"
+path = "crates/iris-events/src/digest.rs"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "sentence-length"
+path = "crates/iris-events/src/discovery.rs"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "sentence-length"
+path = "crates/iris-events/src/endpoint.rs"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "sentence-length"
+path = "crates/iris-events/src/feed.rs"
+count = 2
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "sentence-length"
+path = "crates/iris-events/src/lib.rs"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "sentence-length"
+path = "crates/iris-events/src/media.rs"
+count = 3
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "sentence-length"
+path = "crates/iris-events/src/onvif.rs"
+count = 3
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "sentence-length"
+path = "crates/iris-events/src/transport.rs"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "sentence-length"
+path = "crates/iris-gui/AGENTS.md"
+count = 3
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "sentence-length"
+path = "crates/iris-gui/README.md"
+count = 16
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "sentence-length"
+path = "crates/iris-gui/src/main.rs"
+count = 2
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "sentence-length"
+path = "crates/iris-gui/src/playback.rs"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "sentence-length"
+path = "crates/iris-gui/src/tile.rs"
+count = 2
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "sentence-length"
+path = "crates/iris-ingest/AGENTS.md"
+count = 10
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "sentence-length"
+path = "crates/iris-ingest/README.md"
+count = 27
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "sentence-length"
+path = "crates/iris-ingest/src/assembler.rs"
+count = 4
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "sentence-length"
+path = "crates/iris-ingest/src/audio.rs"
+count = 14
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "sentence-length"
+path = "crates/iris-ingest/src/cadence.rs"
+count = 3
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "sentence-length"
+path = "crates/iris-ingest/src/lib.rs"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "sentence-length"
+path = "crates/iris-ingest/src/live.rs"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "sentence-length"
+path = "crates/iris-ingest/src/regularize.rs"
+count = 19
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "sentence-length"
+path = "crates/iris-ingest/src/session.rs"
+count = 3
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "sentence-length"
+path = "crates/iris-ingest/src/source.rs"
+count = 2
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "sentence-length"
+path = "crates/iris-ingest/src/stats.rs"
+count = 5
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "sentence-length"
+path = "crates/iris-ingest/src/steer.rs"
+count = 5
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "sentence-length"
+path = "crates/iris-ingest/src/sync.rs"
+count = 7
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "sentence-length"
+path = "crates/iris-ingest/tests/adversarial_rtsp.rs"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "sentence-length"
+path = "crates/iris-ingest/tests/log_bounds.rs"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "sentence-length"
+path = "crates/iris-ingest/tests/replay.rs"
+count = 2
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "sentence-length"
+path = "crates/iris-ingest/tests/replay_server.rs"
+count = 13
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "sentence-length"
+path = "crates/iris-ingest/tests/teardown_bound.rs"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "sentence-length"
+path = "crates/iris-mp4/AGENTS.md"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "sentence-length"
+path = "crates/iris-mp4/README.md"
+count = 7
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "sentence-length"
+path = "crates/iris-mp4/src/export.rs"
+count = 6
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "sentence-length"
+path = "crates/iris-mp4/src/hls.rs"
+count = 3
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "sentence-length"
+path = "crates/iris-mp4/src/index.rs"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "sentence-length"
+path = "crates/iris-mp4/src/init.rs"
+count = 4
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "sentence-length"
+path = "crates/iris-mp4/src/lib.rs"
+count = 3
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "sentence-length"
+path = "crates/iris-mp4/src/reader.rs"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "sentence-length"
+path = "crates/iris-replay/AGENTS.md"
+count = 2
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "sentence-length"
+path = "crates/iris-replay/README.md"
+count = 7
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "sentence-length"
+path = "crates/iris-replay/src/lib.rs"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "sentence-length"
+path = "crates/iris-replay/src/media.rs"
+count = 2
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "sentence-length"
+path = "crates/iris-replay/src/rtp.rs"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "sentence-length"
+path = "crates/iris-replay/src/server.rs"
+count = 6
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "sentence-length"
+path = "crates/iris-store/README.md"
+count = 19
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "sentence-length"
+path = "crates/iris-store/src/fs.rs"
+count = 4
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "sentence-length"
+path = "crates/iris-store/src/lib.rs"
+count = 3
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "sentence-length"
+path = "crates/iris-store/src/recover.rs"
+count = 4
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "sentence-length"
+path = "crates/iris-store/src/segment.rs"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "sentence-length"
+path = "crates/iris-store/src/stream.rs"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "sentence-length"
+path = "crates/iris-store/src/writer.rs"
+count = 2
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "sentence-length"
+path = "crates/iris-store/tests/full_disk.rs"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "sentence-length"
+path = "crates/iris-store/tests/recover_properties.rs"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "sentence-length"
+path = "crates/iris-store/tests/writer_properties.rs"
+count = 2
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "sentence-length"
+path = "crates/iris-tls/README.md"
+count = 3
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "sentence-length"
+path = "crates/iris-tools/AGENTS.md"
+count = 8
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "sentence-length"
+path = "crates/iris-tools/README.md"
+count = 27
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "sentence-length"
+path = "crates/iris-tools/src/bench.rs"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "sentence-length"
+path = "crates/iris-tools/src/probe_parser.rs"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "sentence-length"
+path = "crates/iris-tools/src/rtsp_probe.rs"
+count = 2
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "sentence-length"
+path = "crates/iris-tools/src/standards/command.rs"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "sentence-length"
+path = "crates/iris-tools/src/standards/prose.rs"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "sentence-length"
+path = "crates/irisd/AGENTS.md"
+count = 10
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "sentence-length"
+path = "crates/irisd/README.md"
+count = 21
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "sentence-length"
+path = "crates/irisd/src/adopt.rs"
+count = 5
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "sentence-length"
+path = "crates/irisd/src/capability.rs"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "sentence-length"
+path = "crates/irisd/src/clocks.rs"
+count = 4
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "sentence-length"
+path = "crates/irisd/src/main.rs"
+count = 3
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "sentence-length"
+path = "crates/irisd/src/permissions.rs"
+count = 4
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "sentence-length"
+path = "crates/irisd/src/provision.rs"
+count = 2
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "sentence-length"
+path = "crates/irisd/src/run.rs"
+count = 9
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "sentence-length"
+path = "crates/irisd/src/sandbox.rs"
+count = 2
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "sentence-length"
+path = "crates/irisd/src/selfcheck.rs"
+count = 2
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "sentence-length"
+path = "crates/irisd/tests/recording.rs"
+count = 4
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "sentence-length"
+path = "docs/design/phase2-interfaces.md"
+count = 27
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "sentence-length"
+path = "docs/research/01-camera-probe.md"
+count = 6
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "sentence-length"
+path = "docs/research/03-language-runtime.md"
+count = 8
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "sentence-length"
+path = "docs/research/04-storage-format.md"
+count = 54
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "sentence-length"
+path = "docs/research/05-ingest-events.md"
+count = 32
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "sentence-length"
+path = "docs/research/06-clients.md"
+count = 7
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "sentence-length"
+path = "docs/research/07-architecture.md"
+count = 36
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "sentence-length"
+path = "docs/research/08-roadmap.md"
+count = 2
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "sentence-length"
+path = "docs/research/09-phase1-results.md"
+count = 10
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "sentence-length"
+path = "docs/research/10-phase2-results.md"
+count = 19
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "sentence-length"
+path = "docs/research/11-multi-camera-results.md"
+count = 49
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "sentence-length"
+path = "docs/research/12-ingest-cost.md"
+count = 17
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "sentence-length"
+path = "docs/research/13-audio.md"
+count = 78
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "sentence-length"
+path = "docs/research/14-drift.md"
+count = 33
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "sentence-length"
+path = "docs/research/README.md"
+count = 5
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "sentence-length"
+path = "docs/research/appendix/A-prior-art.md"
+count = 17
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "sentence-length"
+path = "docs/research/appendix/B-storage.md"
+count = 18
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "sentence-length"
+path = "docs/research/appendix/C-clients.md"
+count = 8
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "sentence-length"
+path = "docs/research/appendix/D-camera-integration.md"
+count = 14
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "sentence-length"
+path = "docs/research/appendix/E-language-runtime.md"
+count = 5
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "sentence-length"
+path = "fuzz/README.md"
+count = 2
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "sentence-length"
+path = "fuzz/fuzz_targets/api_range.rs"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "sentence-length"
+path = "fuzz/fuzz_targets/describe_diagnostics.rs"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "sentence-length"
+path = "fuzz/fuzz_targets/export_rebase.rs"
+count = 2
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "sentence-length"
+path = "fuzz/fuzz_targets/rtsp_message.rs"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "sentence-length"
+path = "fuzz/fuzz_targets/tools_logs.rs"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "sentence-length"
+path = "fuzz/fuzz_targets/tools_protocol.rs"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "sentence-length"
+path = "packaging/README.md"
+count = 6
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "test-name-and"
+path = "crates/iris-api/src/auth.rs"
+count = 7
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "test-name-and"
+path = "crates/iris-api/src/events.rs"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "test-name-and"
+path = "crates/iris-api/src/export.rs"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "test-name-and"
+path = "crates/iris-api/src/hls.rs"
+count = 8
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "test-name-and"
+path = "crates/iris-api/src/llhls.rs"
+count = 7
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "test-name-and"
+path = "crates/iris-api/src/onvif.rs"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "test-name-and"
+path = "crates/iris-api/src/provision.rs"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "test-name-and"
+path = "crates/iris-api/src/query.rs"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "test-name-and"
+path = "crates/iris-api/src/query/time.rs"
+count = 3
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "test-name-and"
+path = "crates/iris-api/src/segments.rs"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "test-name-and"
+path = "crates/iris-api/src/snapshot.rs"
+count = 3
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "test-name-and"
+path = "crates/iris-api/src/state.rs"
+count = 2
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "test-name-and"
+path = "crates/iris-api/src/websocket.rs"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "test-name-and"
+path = "crates/iris-api/tests/api.rs"
+count = 15
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "test-name-and"
+path = "crates/iris-api/tests/listener.rs"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "test-name-and"
+path = "crates/iris-api/tests/media_binding.rs"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "test-name-and"
+path = "crates/iris-api/tests/provisioning.rs"
+count = 5
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "test-name-and"
+path = "crates/iris-api/tests/websocket_lifetime.rs"
+count = 2
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "test-name-and"
+path = "crates/iris-api/tests/websocket_limits.rs"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "test-name-and"
+path = "crates/iris-catalog/src/db.rs"
+count = 13
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "test-name-and"
+path = "crates/iris-catalog/src/handle.rs"
+count = 3
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "test-name-and"
+path = "crates/iris-catalog/tests/catalog.rs"
+count = 11
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "test-name-and"
+path = "crates/iris-core/src/config.rs"
+count = 18
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "test-name-and"
+path = "crates/iris-core/src/event.rs"
+count = 5
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "test-name-and"
+path = "crates/iris-core/src/id.rs"
+count = 3
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "test-name-and"
+path = "crates/iris-core/src/metrics.rs"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "test-name-and"
+path = "crates/iris-core/src/nonce.rs"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "test-name-and"
+path = "crates/iris-core/src/text.rs"
+count = 2
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "test-name-and"
+path = "crates/iris-core/src/time.rs"
+count = 2
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "test-name-and"
+path = "crates/iris-events/src/dahua.rs"
+count = 2
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "test-name-and"
+path = "crates/iris-events/src/digest.rs"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "test-name-and"
+path = "crates/iris-events/src/discovery.rs"
+count = 3
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "test-name-and"
+path = "crates/iris-events/src/endpoint.rs"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "test-name-and"
+path = "crates/iris-events/src/feed.rs"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "test-name-and"
+path = "crates/iris-events/src/media.rs"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "test-name-and"
+path = "crates/iris-events/src/onvif.rs"
+count = 11
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "test-name-and"
+path = "crates/iris-events/src/stats.rs"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "test-name-and"
+path = "crates/iris-events/src/text.rs"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "test-name-and"
+path = "crates/iris-events/src/transport.rs"
+count = 2
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "test-name-and"
+path = "crates/iris-gui/src/main.rs"
+count = 5
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "test-name-and"
+path = "crates/iris-gui/src/playback.rs"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "test-name-and"
+path = "crates/iris-gui/src/tile.rs"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "test-name-and"
+path = "crates/iris-h265/src/lib.rs"
+count = 2
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "test-name-and"
+path = "crates/iris-ingest/src/assembler.rs"
+count = 7
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "test-name-and"
+path = "crates/iris-ingest/src/audio.rs"
+count = 3
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "test-name-and"
+path = "crates/iris-ingest/src/cadence.rs"
+count = 2
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "test-name-and"
+path = "crates/iris-ingest/src/live.rs"
+count = 2
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "test-name-and"
+path = "crates/iris-ingest/src/regularize.rs"
+count = 7
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "test-name-and"
+path = "crates/iris-ingest/src/session.rs"
+count = 6
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "test-name-and"
+path = "crates/iris-ingest/src/stats.rs"
+count = 2
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "test-name-and"
+path = "crates/iris-ingest/src/steer.rs"
+count = 2
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "test-name-and"
+path = "crates/iris-ingest/src/sync.rs"
+count = 3
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "test-name-and"
+path = "crates/iris-ingest/tests/adversarial_rtsp.rs"
+count = 4
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "test-name-and"
+path = "crates/iris-ingest/tests/replay_server.rs"
+count = 4
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "test-name-and"
+path = "crates/iris-mp4/src/boxes.rs"
+count = 3
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "test-name-and"
+path = "crates/iris-mp4/src/export.rs"
+count = 4
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "test-name-and"
+path = "crates/iris-mp4/src/fragment.rs"
+count = 2
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "test-name-and"
+path = "crates/iris-mp4/src/hls.rs"
+count = 2
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "test-name-and"
+path = "crates/iris-mp4/src/index.rs"
+count = 6
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "test-name-and"
+path = "crates/iris-mp4/src/reader.rs"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "test-name-and"
+path = "crates/iris-mp4/tests/properties.rs"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "test-name-and"
+path = "crates/iris-replay/src/main.rs"
+count = 3
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "test-name-and"
+path = "crates/iris-replay/src/media.rs"
+count = 2
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "test-name-and"
+path = "crates/iris-replay/src/rtp.rs"
+count = 2
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "test-name-and"
+path = "crates/iris-replay/src/rtsp.rs"
+count = 3
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "test-name-and"
+path = "crates/iris-replay/src/server.rs"
+count = 10
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "test-name-and"
+path = "crates/iris-replay/src/synth.rs"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "test-name-and"
+path = "crates/iris-store/src/fs.rs"
+count = 5
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "test-name-and"
+path = "crates/iris-store/src/recover.rs"
+count = 4
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "test-name-and"
+path = "crates/iris-store/src/root_worker.rs"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "test-name-and"
+path = "crates/iris-store/src/segment.rs"
+count = 2
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "test-name-and"
+path = "crates/iris-store/src/stream.rs"
+count = 2
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "test-name-and"
+path = "crates/iris-store/src/writer.rs"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "test-name-and"
+path = "crates/iris-store/tests/full_disk.rs"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "test-name-and"
+path = "crates/iris-store/tests/store.rs"
+count = 7
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "test-name-and"
+path = "crates/iris-store/tests/writer_properties.rs"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "test-name-and"
+path = "crates/iris-tools/src/bench.rs"
+count = 3
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "test-name-and"
+path = "crates/iris-tools/src/gh_commit.rs"
+count = 6
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "test-name-and"
+path = "crates/iris-tools/src/logs.rs"
+count = 3
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "test-name-and"
+path = "crates/iris-tools/src/onvif_call.rs"
+count = 5
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "test-name-and"
+path = "crates/iris-tools/src/probe_parser.rs"
+count = 11
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "test-name-and"
+path = "crates/iris-tools/src/report.rs"
+count = 10
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "test-name-and"
+path = "crates/iris-tools/src/rtsp_probe.rs"
+count = 4
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "test-name-and"
+path = "crates/iris-tools/src/sample.rs"
+count = 3
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "test-name-and"
+path = "crates/iris-tools/src/standards/command.rs"
+count = 3
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "test-name-and"
+path = "crates/iris-tools/src/standards/commits.rs"
+count = 4
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "test-name-and"
+path = "crates/iris-tools/src/standards/config.rs"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "test-name-and"
+path = "crates/iris-tools/src/standards/installation.rs"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "test-name-and"
+path = "crates/iris-tools/src/standards/markdown.rs"
+count = 3
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "test-name-and"
+path = "crates/iris-tools/src/standards/prose.rs"
+count = 2
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "test-name-and"
+path = "crates/iris-tools/src/standards/rust.rs"
+count = 2
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "test-name-and"
+path = "crates/iris-tools/src/stats.rs"
+count = 2
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "test-name-and"
+path = "crates/iris-tools/src/summary.rs"
+count = 2
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "test-name-and"
+path = "crates/iris-tools/src/time.rs"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "test-name-and"
+path = "crates/irisd/src/adopt.rs"
+count = 7
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "test-name-and"
+path = "crates/irisd/src/capability.rs"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "test-name-and"
+path = "crates/irisd/src/catalog_observer.rs"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "test-name-and"
+path = "crates/irisd/src/clocks.rs"
+count = 5
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "test-name-and"
+path = "crates/irisd/src/hls.rs"
+count = 4
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "test-name-and"
+path = "crates/irisd/src/inspect.rs"
+count = 3
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "test-name-and"
+path = "crates/irisd/src/permissions.rs"
+count = 3
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "test-name-and"
+path = "crates/irisd/src/provision.rs"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "test-name-and"
+path = "crates/irisd/src/retention.rs"
+count = 8
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "test-name-and"
+path = "crates/irisd/src/run.rs"
+count = 13
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "test-name-and"
+path = "crates/irisd/src/sandbox.rs"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "test-name-and"
+path = "crates/irisd/tests/recording.rs"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "test-name-and"
+path = "crates/irisd/tests/startup.rs"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "use-per-path"
+path = "crates/iris-api/src/hls.rs"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "use-per-path"
+path = "crates/iris-api/src/lib.rs"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "use-per-path"
+path = "crates/iris-api/src/snapshot.rs"
+count = 2
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "use-per-path"
+path = "crates/iris-api/src/state.rs"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "use-per-path"
+path = "crates/iris-catalog/src/handle.rs"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "use-per-path"
+path = "crates/iris-catalog/tests/catalog.rs"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "use-per-path"
+path = "crates/iris-gui/src/snapshot.rs"
+count = 2
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "use-per-path"
+path = "crates/iris-gui/src/thumbs.rs"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "use-per-path"
+path = "crates/iris-gui/tests/playback_origin.rs"
+count = 2
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "use-per-path"
+path = "crates/iris-gui/tests/playback_snapshot.rs"
+count = 2
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "use-per-path"
+path = "crates/iris-ingest/src/session.rs"
+count = 2
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "use-per-path"
+path = "crates/iris-replay/src/server.rs"
+count = 2
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "use-per-path"
+path = "crates/iris-store/src/recover.rs"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "use-per-path"
+path = "crates/iris-store/src/stream.rs"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "use-per-path"
+path = "crates/iris-store/src/writer.rs"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "use-per-path"
+path = "crates/iris-store/tests/store.rs"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "use-per-path"
+path = "crates/iris-tools/src/gh_commit.rs"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "use-per-path"
+path = "crates/iris-tools/src/onvif_call.rs"
+count = 2
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "use-per-path"
+path = "crates/iris-tools/src/report.rs"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "use-per-path"
+path = "crates/iris-tools/src/rtsp_probe.rs"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "use-per-path"
+path = "crates/iris-tools/src/sample.rs"
+count = 2
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "use-per-path"
+path = "crates/irisd/src/hls.rs"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "use-per-path"
+path = "crates/irisd/src/inspect.rs"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "use-per-path"
+path = "crates/irisd/src/proc.rs"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "use-per-path"
+path = "crates/irisd/src/raw_calls.rs"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "use-per-path"
+path = "crates/irisd/tests/startup.rs"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+# Breaches of the rules of examples and of error texts in text written before each rule. A count
+# falls as its file is brought to the rule, and no count rises.
+
+[[waiver]]
+rule = "missing-example"
+path = "crates/iris-api/src/auth.rs"
+count = 2
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "missing-example"
+path = "crates/iris-api/src/lib.rs"
+count = 3
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "missing-example"
+path = "crates/iris-api/src/provision.rs"
+count = 3
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "missing-example"
+path = "crates/iris-api/src/server.rs"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "missing-example"
+path = "crates/iris-api/src/state.rs"
+count = 24
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "missing-example"
+path = "crates/iris-catalog/src/db.rs"
+count = 4
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "missing-example"
+path = "crates/iris-catalog/src/handle.rs"
+count = 32
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "missing-example"
+path = "crates/iris-catalog/src/metrics.rs"
+count = 20
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "missing-example"
+path = "crates/iris-catalog/src/types.rs"
+count = 16
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "missing-example"
+path = "crates/iris-core/src/config.rs"
+count = 26
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "missing-example"
+path = "crates/iris-core/src/event.rs"
+count = 12
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "missing-example"
+path = "crates/iris-core/src/id.rs"
+count = 13
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "missing-example"
+path = "crates/iris-core/src/metrics.rs"
+count = 17
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "missing-example"
+path = "crates/iris-core/src/nonce.rs"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "missing-example"
+path = "crates/iris-core/src/text.rs"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "missing-example"
+path = "crates/iris-core/src/time.rs"
+count = 22
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "missing-example"
+path = "crates/iris-events/src/dahua.rs"
+count = 6
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "missing-example"
+path = "crates/iris-events/src/digest.rs"
+count = 7
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "missing-example"
+path = "crates/iris-events/src/discovery.rs"
+count = 4
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "missing-example"
+path = "crates/iris-events/src/endpoint.rs"
+count = 2
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "missing-example"
+path = "crates/iris-events/src/feed.rs"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "missing-example"
+path = "crates/iris-events/src/media.rs"
+count = 6
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "missing-example"
+path = "crates/iris-events/src/multipart.rs"
+count = 6
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "missing-example"
+path = "crates/iris-events/src/onvif.rs"
+count = 4
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "missing-example"
+path = "crates/iris-events/src/sink.rs"
+count = 2
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "missing-example"
+path = "crates/iris-events/src/stats.rs"
+count = 11
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "missing-example"
+path = "crates/iris-h265/src/lib.rs"
+count = 12
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "missing-example"
+path = "crates/iris-ingest/src/assembler.rs"
+count = 16
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "missing-example"
+path = "crates/iris-ingest/src/live.rs"
+count = 13
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "missing-example"
+path = "crates/iris-ingest/src/regularize.rs"
+count = 7
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "missing-example"
+path = "crates/iris-ingest/src/session.rs"
+count = 5
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "missing-example"
+path = "crates/iris-ingest/src/sink.rs"
+count = 3
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "missing-example"
+path = "crates/iris-ingest/src/source.rs"
+count = 2
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "missing-example"
+path = "crates/iris-ingest/src/stats.rs"
+count = 30
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "missing-example"
+path = "crates/iris-mp4/src/boxes.rs"
+count = 23
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "missing-example"
+path = "crates/iris-mp4/src/crc.rs"
+count = 6
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "missing-example"
+path = "crates/iris-mp4/src/export.rs"
+count = 10
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "missing-example"
+path = "crates/iris-mp4/src/fragment.rs"
+count = 16
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "missing-example"
+path = "crates/iris-mp4/src/hls.rs"
+count = 8
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "missing-example"
+path = "crates/iris-mp4/src/index.rs"
+count = 19
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "missing-example"
+path = "crates/iris-mp4/src/init.rs"
+count = 7
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "missing-example"
+path = "crates/iris-mp4/src/reader.rs"
+count = 8
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "missing-example"
+path = "crates/iris-replay/src/media.rs"
+count = 15
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "missing-example"
+path = "crates/iris-replay/src/rtp.rs"
+count = 22
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "missing-example"
+path = "crates/iris-replay/src/rtsp.rs"
+count = 14
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "missing-example"
+path = "crates/iris-replay/src/sdp.rs"
+count = 3
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "missing-example"
+path = "crates/iris-replay/src/server.rs"
+count = 13
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "missing-example"
+path = "crates/iris-replay/src/synth.rs"
+count = 7
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "missing-example"
+path = "crates/iris-store/src/fs.rs"
+count = 17
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "missing-example"
+path = "crates/iris-store/src/layout.rs"
+count = 4
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "missing-example"
+path = "crates/iris-store/src/observer.rs"
+count = 8
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "missing-example"
+path = "crates/iris-store/src/policy.rs"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "missing-example"
+path = "crates/iris-store/src/recover.rs"
+count = 8
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "missing-example"
+path = "crates/iris-store/src/writer.rs"
+count = 23
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "missing-example"
+path = "crates/iris-tls/src/lib.rs"
+count = 2
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "unasserted-error-text"
+path = "crates/iris-api/src/error.rs"
+count = 3
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "unasserted-error-text"
+path = "crates/iris-api/src/provision.rs"
+count = 10
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "unasserted-error-text"
+path = "crates/iris-catalog/src/types.rs"
+count = 14
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "unasserted-error-text"
+path = "crates/iris-core/src/config.rs"
+count = 32
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "unasserted-error-text"
+path = "crates/iris-core/src/event.rs"
+count = 3
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "unasserted-error-text"
+path = "crates/iris-core/src/id.rs"
+count = 3
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "unasserted-error-text"
+path = "crates/iris-events/src/feed.rs"
+count = 7
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "unasserted-error-text"
+path = "crates/iris-events/src/media.rs"
+count = 3
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "unasserted-error-text"
+path = "crates/iris-events/src/multipart.rs"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "unasserted-error-text"
+path = "crates/iris-events/src/onvif.rs"
+count = 6
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "unasserted-error-text"
+path = "crates/iris-h265/src/lib.rs"
+count = 3
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "unasserted-error-text"
+path = "crates/iris-ingest/src/live.rs"
+count = 2
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "unasserted-error-text"
+path = "crates/iris-ingest/src/session.rs"
+count = 5
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "unasserted-error-text"
+path = "crates/iris-ingest/src/sink.rs"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "unasserted-error-text"
+path = "crates/iris-mp4/src/export.rs"
+count = 4
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "unasserted-error-text"
+path = "crates/iris-mp4/src/fragment.rs"
+count = 3
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "unasserted-error-text"
+path = "crates/iris-mp4/src/hls.rs"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "unasserted-error-text"
+path = "crates/iris-mp4/src/index.rs"
+count = 7
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "unasserted-error-text"
+path = "crates/iris-replay/src/media.rs"
+count = 15
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "unasserted-error-text"
+path = "crates/iris-replay/src/rtp.rs"
+count = 5
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "unasserted-error-text"
+path = "crates/iris-replay/src/rtsp.rs"
+count = 1
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "unasserted-error-text"
+path = "crates/iris-replay/src/server.rs"
+count = 8
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "unasserted-error-text"
+path = "crates/iris-replay/src/synth.rs"
+count = 7
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "unasserted-error-text"
+path = "crates/iris-store/src/recover.rs"
+count = 3
+reason = "written before the rule; brought to it when the file next changes"
+
+[[waiver]]
+rule = "unasserted-error-text"
+path = "crates/iris-tls/src/lib.rs"
+count = 6
+reason = "written before the rule; brought to it when the file next changes"
+
+# Names in code spans that the rule of names cannot tell from a name the tree has lost. Each is
+# a name of another system or an example of a form, and stays as written.
+
+[[waiver]]
+rule = "unknown-name"
+path = "STANDARDS.md"
+count = 6
+reason = "three example names that show a casing, the suffix `Ext`, and two traits of the standard library"
+
+[[waiver]]
+rule = "unknown-name"
+path = "crates/iris-events/README.md"
+count = 1
+reason = "`ClockSkew` is a fault marker of the ONVIF specification"
+
+[[waiver]]
+rule = "unknown-name"
+path = "crates/iris-replay/src/server.rs"
+count = 1
+reason = "`SplitMix64` is the published name of a generator"
+
+[[waiver]]
+rule = "unknown-name"
+path = "crates/iris-transport/AGENTS.md"
+count = 1
+reason = "`IncompleteMessage` is an error kind of the hyper crate, which no code of the tree names"

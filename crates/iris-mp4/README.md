@@ -5,8 +5,9 @@ initialization segment (`ftyp` + `moov`) followed by self-describing fragments, 
 `prft` + `moof` + `mdat` + a 24-byte trailer carrying a CRC-32C and the fragment length,
 with a sidecar index of fixed-size records. This crate encodes those bytes for the writer,
 scans and validates them for recovery and self-checks, rewrites them for export, and builds
-byte-range HLS playlists for offline serving. It sits at the centre of the record path (RTSP
-in → fMP4 on disk → byte-range serving).
+byte-range HLS playlists for offline serving. It also reads the decoder configuration of an
+init segment, for a client and the replay server. It sits at the centre of the record path
+(RTSP in → fMP4 on disk → byte-range serving).
 
 ## What it provides
 
@@ -17,6 +18,13 @@ in → fMP4 on disk → byte-range serving).
   whose frames are not whole ticks. `init::build_av_init_segment` gives the init segment of
   a file with a video track and an audio track (track 2, `init::AV_AUDIO_TRACK_ID`), and
   `init::sample_entry_bytes` reads the sample entry back from an init segment.
+- `decoder_config::DecoderConfig::parse` — what a decoder needs from the sample entry of an init
+  segment, a `decoder_config::DecoderConfig`. For `hvc1` or `hev1` it is a
+  `decoder_config::HevcConfig`: the parameter sets of `hvcC` and the picture size. For `mp4a` it is
+  a `decoder_config::AacConfig`: the AudioSpecificConfig of `esds`, its sampling rate, and the
+  channel count. `TryFrom<&[u8]>` does the same. `decoder_config::parse_parameter_sets` and
+  `decoder_config::parse_hvcc` read `hvcC` alone. Refusals are `DecoderConfigError`, `HvccError`,
+  and `EsdsError` variants.
 - `fragment::Sample`, `fragment::Fragment`, `fragment::FragmentHeader`, and
   `fragment::encode_fragment` — one access unit, one assembled GOP, and the `prft`,
   `moof`, `mdat` header, and trailer around its samples (`EncodedFragment`).
@@ -87,7 +95,10 @@ The writer calls `encode_fragment` and writes `EncodedFragment::io_slices` with 
 `pwritev`. Recovery (`reader::scan_with_limit`) and the daily self-check (`reader::scan`)
 verify every CRC. The offline `irisd hls` command builds playlists with `hls::media_playlist`;
 `iris-api` renders its own VOD playlists from sidecar records, and its export rewrites
-fragments with `export::rebase_fragment` and `export::trim_fragment_end`.
+fragments with `export::rebase_fragment` and `export::trim_fragment_end`. `iris-replay` takes a
+recording's parameter sets with `decoder_config::parse_parameter_sets`, and
+`DecoderConfig::parse` gives a client the configuration of the decoder for a stream's init
+segment (`docs/research/15-apple-clients.md` §4 and §5).
 
 ## Invariants and limits
 
@@ -129,8 +140,23 @@ fragments with `export::rebase_fragment` and `export::trim_fragment_end`.
 - Media timescale 90 kHz; `tfdt` is 64-bit and continuous within a run: `04 §7`.
 - Samples hold length-prefixed NAL units without parameter sets; the sample entry is `hvc1`
   with parameter sets in `hvcC`: `04 §4`.
-- Bounds: a `moof` is at most `MAX_MOOF_LEN` (1 MiB), a payload at most `MAX_PAYLOAD_LEN`
-  (1 GiB), a fragment at most 65 535 samples.
+- Decoder configuration: an `hvcC` is version 1 with four-byte NAL length prefixes and holds a VPS,
+  an SPS, and a PPS, and at most 16 VPSs, 16 SPSs, and 64 PPSs. That is one set for each
+  identifier that ITU-T H.265 defines for the type. `vps_video_parameter_set_id` is u(4)
+  (§7.3.2.1), `sps_seq_parameter_set_id` is 0 to 15 (§7.4.3.2.1), and `pps_pic_parameter_set_id`
+  is 0 to 63 (§7.4.3.3.1). A set is referred to by its identifier (§7.4.2.4.2).
+  `docs/research/15-apple-clients.md` §1 names the edition these clauses come from. The set past
+  the bound of its type is refused (`HvccError::TooManyParameterSets`) before it is copied, so a
+  record of any length yields at most 96 sets of at most 65,535 bytes. An `esds` holds an
+  ES_Descriptor, whose flags announce fields that are skipped. Inside it is a
+  DecoderConfigDescriptor of MPEG-4 audio (object type `0x40`), and inside that the
+  DecoderSpecificInfo. Each has a length of one to four bytes, high bits first. The
+  AudioSpecificConfig is 2 to 64 bytes, and its audio object type is not the escape value 31. Its
+  sampling rate comes from frequency index 0 to 12, or from index 15 and a nonzero 24-bit rate.
+  The channel count is the entry's `channelcount`, never zero. A box of size 0 anywhere on the
+  path to the configuration, which would run to the end of its parent, is refused.
+- Bounds: a `moof` is at most `MAX_MOOF_LEN` (1 MiB), a payload at most `MAX_PAYLOAD_LEN` (1 GiB),
+  and a fragment at most 65 535 samples.
 - The CRC is CRC-32C (iSCSI polynomial); the implementation may change, the value may not.
 - Export rebasing verifies the original trailer checksum before changing bytes; payload
   corruption is rejected rather than given a fresh checksum.
@@ -141,26 +167,59 @@ fragments with `export::rebase_fragment` and `export::trim_fragment_end`.
 
 ## Tests and measurements
 
-Unit tests per module: box nesting and size patching, large and open-ended headers,
-bounds-checked field reads, fragment layout, encoder rejections (empty, too many samples, payload
-over the maximum), trailer round trips and rejections, scanner behaviour on clean files,
-initialization-only files, truncation, zero fill, corruption, the fragment limit, and an
-initialization segment over 4 GiB, index header rejections and record round trips with a partial
-tail, playlist grouping, continuation trailer exclusion, and refused playlist text,
-malformed-cache fallback, completed-init recovery guards, fragment order, addressing,
-optional-field, missing-flag, empty-`trun`, container-padding, and bound rejections, edit-parent
-and media-time restrictions, and a CRC cross-check against the reference crate at every start
-offset and after every chunk. `tests/properties.rs` holds seeded property tests over generated
-recordings: the scanner, the memory parser, and the sidecar record read back what the encoder
-wrote, a file cut inside a fragment is valid up to it, and a flipped bit anywhere in a fragment
-ends the valid prefix before it. The doctest in `lib.rs` runs in the suite. Fuzz targets under
-`fuzz/fuzz_targets/` (`scan`, `box_header`, `index`, `trailer`, and `export_rebase` for the export
-rewrites) cover the parsers. Container overhead and the checksum's cost are measured in
-`docs/research/04-storage-format.md §4` and `12-ingest-cost.md §5`.
+The unit tests are in the `mod tests` of each module:
+
+- `boxes`: box nesting and size patching, large and open-ended headers, bounds-checked field
+  reads, and the payload length of open-ended and undersized headers.
+- `init`: every field of the init segment, box by box, and its `ftyp` before its `moov`. Also the
+  audio init segment against the video one, the two-track init segment against its single
+  tracks, audio frame durations in ticks, the channel count of an `mp4a` entry, and the sample
+  entry read back.
+- `fragment`: the fragment layout and the encoder's rejections (empty, too many samples, a payload
+  over the maximum). Also the payload duration and sync start a fragment reports, the default
+  flags that say whether every sample is a sync sample, and trailer round trips and rejections.
+- `reader`: the scanner on clean files, initialization-only files, an incomplete initialization
+  segment, a partial fragment header, truncation, zero fill, corruption, and a trailer of the wrong
+  length. Also boxes whose size runs past the file, the fragment limit, an initialization segment
+  over 4 GiB, and the texts of three stops. Also the memory parser reading an encoded fragment back,
+  and the rejections of both readers: fragment order, addressing, optional fields, missing flags,
+  an empty `trun`, container padding, and the bounds.
+- `index`: header rejections, header and record round trips, a record from a scanned fragment, the
+  saturating end of a record built by hand, and a file read back with a partial tail. Also the
+  rejections of a malformed cache, the bounded readers at their limit and one byte past it, and
+  the refusal of a sidecar that does not match its media.
+- `hls`: playlist grouping at sync samples, trailer exclusion and inclusion with continuations and
+  the independence each declares, the master playlist and its audio rendition, and refused
+  playlist text. Also the peak bit rate over the segment windows that qualify, and the average
+  where none does.
+- `export`: rebasing, with its refusals of payload corruption and of a fragment cut short. Tail
+  trimming keeps the sample bytes and the sync samples, shortens the crossing duration, and
+  refuses payload corruption and a duration that is not positive. Also head trimming, retracking,
+  and edit lists for one track and for two, with the edit-parent and media-time restrictions.
+- `crc`: a cross-check against the reference crate at every start offset and after every chunk,
+  and the published check value.
+- `decoder_config`: the tests read init segments built with the crate's writers. They check the
+  configuration read from an HEVC and from an AAC entry, and through boxes with a 64-bit size.
+  They check each refusal of the `hvcC` and `esds` readers in a separate test, with its text. They
+  check each bound at its limit and one past it, and the input cut at every length.
+
+`tests/properties.rs` holds seeded property tests over generated recordings. The scanner, the
+memory parser, and the sidecar record read back what the encoder wrote. A file cut inside a
+fragment is valid up to it, and a flipped bit anywhere in a fragment ends the valid prefix before
+it. `tests/ffmpeg_hev1.rs` reads an `hev1` init segment that ffmpeg wrote from a synthetic frame.
+It records how the file was made, and checks its picture size and the parameter sets that
+ffmpeg's Annex B rewrite gives. `tests/ffmpeg_mp4a.rs` reads an `mp4a` init segment that ffmpeg
+wrote from a synthetic tone, whose `esds` gives every descriptor length in four bytes. It
+records how the file was made, and checks the AudioSpecificConfig, sampling rate, and channel
+count that ffprobe reports. The doctest in `lib.rs` runs in the suite. Fuzz targets under
+`fuzz/fuzz_targets/` (`scan`, `box_header`, `index`, `trailer`, `export_rebase` for the export
+rewrites, and `decoder_config`) cover the parsers. Container overhead and the checksum's cost
+are measured in `docs/research/04-storage-format.md §4` and `12-ingest-cost.md §5`.
 
 ## Further reading
 
 - `docs/research/04-storage-format.md` §3 to §5, §9, §10
 - `docs/research/07-architecture.md` §2 and §8
 - `docs/research/12-ingest-cost.md` §5
+- `docs/research/15-apple-clients.md` §4 and §5
 - `STANDARDS.md`

@@ -1,10 +1,13 @@
 //! The rules for Markdown: width, timeless wording, what scripted edits
-//! leave, counts of cameras, and the recipes and paths a document names.
+//! leave, counts of cameras, and the recipes and paths a document names. It
+//! runs the rules of sentences and phrases in `prose.rs` and the rule of
+//! names in `names.rs`.
 
 use std::path::Path;
 
 use super::finding::{Finding, Rule};
 use super::layout::Repo;
+use super::names::{self, Shapes};
 use super::{prose, text};
 
 /// The widest line of prose (`STANDARDS.md` §7).
@@ -214,6 +217,23 @@ fn references(file: &str, number: usize, line: &str, kind: Kind, repo: &Repo) ->
     findings
 }
 
+/// Which code spans of `file` the rule `unknown-name` checks. The documents
+/// of a crate and of the root name the tree's code, and their type names are
+/// checked. The other documents, research and design among them, name the
+/// APIs of other systems throughout, so only their paths and calls are.
+fn shapes(file: &str) -> Shapes {
+    let crate_document = file.strip_prefix("crates/").is_some_and(|rest| {
+        rest.split_once('/')
+            .is_some_and(|(_, name)| name == "README.md" || name == "AGENTS.md")
+    });
+    let root = ["AGENTS.md", "README.md", "STANDARDS.md", "fuzz/README.md"].contains(&file);
+    if crate_document || root {
+        Shapes::All
+    } else {
+        Shapes::PathsAndCalls
+    }
+}
+
 /// The findings in the Markdown file `file`, whose contents are `text`.
 pub fn check(file: &str, text: &str, repo: &Repo) -> Vec<Finding> {
     let mut findings = Vec::new();
@@ -248,6 +268,10 @@ pub fn check(file: &str, text: &str, repo: &Repo) -> Vec<Finding> {
         for number in prose::camera_counts(&block) {
             let message = "a count of cameras describes a site";
             findings.push(Finding::new(Rule::DeviceCount, file, number, message));
+        }
+        findings.extend(prose::findings(file, &block));
+        if let Some(names) = &repo.names {
+            findings.extend(names::findings(file, &block, names, shapes(file)));
         }
     }
     findings.sort();
@@ -376,6 +400,79 @@ mod tests {
         assert_eq!(
             found("crates/a/README.md", "`src/gone.rs`"),
             ["`crates/a/src/gone.rs` does not exist"]
+        );
+    }
+
+    #[test]
+    fn a_paragraph_ends_a_sentence() {
+        let words = "word ".repeat(15);
+        assert_eq!(rules(&format!("{words}\n{words}\n\n{words}\n{words}")), []);
+    }
+
+    #[test]
+    fn a_code_block_holds_no_sentence() {
+        assert_eq!(rules(&format!("```\n{}\n```", "word ".repeat(40))), []);
+    }
+
+    #[test]
+    fn the_rules_of_words_read_markdown() {
+        let words = "word ".repeat(18);
+        let text = format!(
+            "{words}\n{words}.\n\nIt reads as one.\n\nThe core checks it.\n\nThe `Feed`'s token."
+        );
+        assert_eq!(
+            rules(&text),
+            [
+                (1, Rule::SentenceLength),
+                (4, Rule::BarredPhrase),
+                (6, Rule::TheCore),
+                (8, Rule::PossessiveCodeSpan)
+            ]
+        );
+    }
+
+    /// The rules found in `text` as the file `file`, against the names of the
+    /// Rust code `code`.
+    fn named_rules(file: &str, text: &str, code: &str) -> Vec<(usize, Rule)> {
+        let repo = Repo {
+            names: Some(names::Names::of([("src/a.rs", code)], &[])),
+            ..Repo::default()
+        };
+        check(file, text, &repo)
+            .into_iter()
+            .map(|finding| (finding.line, finding.rule))
+            .collect()
+    }
+
+    #[test]
+    fn a_document_of_a_crate_names_only_types_the_code_holds() {
+        let found = named_rules("crates/a/README.md", "The `Gone` type.", "struct Held;");
+        assert_eq!(found, [(1, Rule::UnknownName)]);
+    }
+
+    #[test]
+    fn a_document_of_the_root_names_only_types_the_code_holds() {
+        let found = named_rules("STANDARDS.md", "The `Gone` type.", "struct Held;");
+        assert_eq!(found, [(1, Rule::UnknownName)]);
+    }
+
+    #[test]
+    fn a_research_document_may_name_a_type_of_another_system() {
+        let found = named_rules("docs/research/a.md", "The `Gone` type.", "struct Held;");
+        assert_eq!(found, []);
+    }
+
+    #[test]
+    fn a_research_document_names_only_paths_the_code_holds() {
+        let found = named_rules("docs/research/a.md", "Call `Held::gone()`.", "struct Held;");
+        assert_eq!(found, [(1, Rule::UnknownName)]);
+    }
+
+    #[test]
+    fn a_name_in_a_code_block_is_not_checked() {
+        assert_eq!(
+            named_rules("README.md", "```\n`Gone`\n```", "struct Held;"),
+            []
         );
     }
 }

@@ -98,16 +98,20 @@ Do not use: `tokio-uring`, `glommio`, `monoio` (stale or incompatible), `mp4` 0.
 - Profile: `panic = "abort"`, `lto = "fat"`, `codegen-units = 1`, `strip = true`; expect a
   4–8 MB static-ish binary with rustls + bundled SQLite.
 - ARM64 SBCs: CI lints every crate but the GUI for `aarch64-unknown-linux-gnu` with the GNU cross
-  toolchain (`just cross-check`) and runs the tests of the six crates without C dependencies (core,
-  H.265, MP4, store, ingest, replay) as `aarch64-unknown-linux-musl` code (`just cross-test`: on
-  CI's 64-bit ARM runner, and elsewhere under user-mode emulation), so a portability break surfaces
-  on the change that makes it. An emulator without `openat2` fails the store's tests. On 2026-11-10
-  those 459 tests passed under `qemu-aarch64-static`, among them the CRC-32C cross-check on the ARM
-  implementation and the MP4 and recovery properties; in debug builds three of ingest's timing tests
-  exceed their bounds under emulation, which is why the recipe builds for release. Release binaries
-  for a board come from `cargo zigbuild --target aarch64-unknown-linux-gnu.2.28` (or musl for a
-  static binary), cross-rs as fallback. The GUI needs a GTK sysroot for the target and is built on
-  the board.
+  toolchain (`just cross-check`). It runs the tests of the seven crates without C dependencies as
+  `aarch64-unknown-linux-musl` code (`just cross-test`): core, H.265, MP4, store, ingest, replay,
+  and the client library `iris-client`. The tests run on CI's 64-bit ARM runner, and elsewhere under
+  user-mode emulation, so a portability break surfaces on the change that makes it. `iris-client` is
+  tested this way because the planned iOS and macOS viewer runs it as 64-bit ARM code
+  (`15-apple-clients.md` §3.5 and §4). An emulator without `openat2` fails the store's tests. On
+  2026-11-10 the 459 tests of core, H.265, MP4, store, ingest, and replay passed under
+  `qemu-aarch64-static`. Among them were the CRC-32C cross-check on the ARM implementation and the
+  MP4 and recovery properties. On 2026-11-17 `just cross-test` passed 945 tests under
+  `qemu-aarch64-static`, 282 of them the tests of `iris-client` (`15-apple-clients.md` §11 records
+  that run). In debug builds three of ingest's timing tests exceed their bounds under emulation,
+  which is why the recipe builds for release. Release binaries for a board come from
+  `cargo zigbuild --target aarch64-unknown-linux-gnu.2.28` (or musl for a static binary), with
+  cross-rs as the fallback. The GUI needs a GTK sysroot for the target and is built on the board.
 - systemd unit: `Type=notify`, `WatchdogSec=60` (ping only when every ingest task reported
   progress, so a wedged runtime is killed), `Restart=always`, static `User=irisd` via
   `sysusers.d`, `StateDirectory=irisd` for the catalog, `ReadWritePaths=` for the video root,

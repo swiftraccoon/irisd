@@ -77,11 +77,11 @@ packet-driven reads without the low-water mark.
 
 ## Documentation
 
-- **rustdoc** — published to GitHub Pages (the rustdoc badge above links there; the daemon's
-  crate opens first, with the other crates in the sidebar). The `docs` workflow builds
-  `cargo doc --workspace --no-deps` on every push to `main` and deploys it to GitHub Pages,
-  whose source must be set to GitHub Actions. Locally, `just doc` writes it to
-  `target/doc/irisd/index.html`.
+- **rustdoc** — published to GitHub Pages (the rustdoc badge above links there; the daemon's crate
+  opens first, with the other crates in the sidebar). The `docs` workflow builds it with `just doc`,
+  which runs `iris-tools doc` so that the links between the workspace's crates resolve. The
+  workflow runs on every push to `main` and deploys the documentation to GitHub Pages, whose source
+  must be set to GitHub Actions. Locally, `just doc` writes it to `target/doc/irisd/index.html`.
 - **Design** — `docs/research/README.md` holds the decision table and the reading order;
   `04-storage-format.md` fixes the on-disk format and time model, `07-architecture.md` the
   crates, threads, budgets, and observability, `12-ingest-cost.md` the measured cost.

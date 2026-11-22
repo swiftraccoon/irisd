@@ -46,7 +46,8 @@ The crate's tests build a private authority with `rcgen`, serve HTTPS on loopbac
 `tokio-rustls`, and check that `reqwest` with the configuration connects only when the CA file
 names that authority, and that a missing, empty, non-PEM, unusable-certificate, or oversized
 file is reported. Building the platform-only configuration needs the host's CA bundle.
-`crates/iris-gui/src/live.rs` runs the same check for `wss`.
+The live feed of `iris-transport`, the Linux viewer's transport
+(`crates/iris-transport/src/feed.rs`), runs the same check for `wss`.
 
 ## Further reading
 

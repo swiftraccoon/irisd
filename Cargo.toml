@@ -12,6 +12,8 @@ members = [
     "crates/irisd",
     "crates/iris-replay",
     "crates/iris-tls",
+    "crates/iris-client",
+    "crates/iris-transport",
     "crates/iris-gui",
     "crates/iris-tools",
 ]
@@ -39,12 +41,14 @@ futures = "0.3"
 futures-util = "0.3"
 getrandom = "0.4"
 hex = "0.4"
+http = "1"
 humantime = "2"
 humantime-serde = "1"
 hyper = { version = "1", features = ["http1", "server"] }
 hyper-util = { version = "0.1", features = ["tokio", "service"] }
 iris-api = { path = "crates/iris-api" }
 iris-catalog = { path = "crates/iris-catalog" }
+iris-client = { path = "crates/iris-client" }
 iris-core = { path = "crates/iris-core" }
 iris-events = { path = "crates/iris-events" }
 iris-h265 = { path = "crates/iris-h265" }
@@ -53,6 +57,7 @@ iris-mp4 = { path = "crates/iris-mp4" }
 iris-replay = { path = "crates/iris-replay" }
 iris-store = { path = "crates/iris-store" }
 iris-tls = { path = "crates/iris-tls" }
+iris-transport = { path = "crates/iris-transport" }
 landlock = "0.4"
 md-5 = "0.11"
 oxvif = "0.17"

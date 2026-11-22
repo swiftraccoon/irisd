@@ -1969,6 +1969,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "iris-catalog",
+ "iris-client",
  "iris-core",
  "iris-events",
  "iris-ingest",
@@ -2005,6 +2006,19 @@ dependencies = [
  "thiserror",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "iris-client"
+version = "0.1.0"
+dependencies = [
+ "http",
+ "iris-core",
+ "iris-mp4",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "url",
 ]
 
 [[package]]
@@ -2057,17 +2071,15 @@ dependencies = [
  "gstreamer-app",
  "gstreamer-video",
  "gtk4",
+ "iris-client",
  "iris-core",
  "iris-mp4",
  "iris-tls",
- "rcgen",
+ "iris-transport",
  "reqwest",
- "rustix",
- "serde",
  "serde_json",
  "tempfile",
  "tokio",
- "tokio-rustls",
  "tokio-tungstenite 0.30.0",
  "tokio-util",
  "tracing",
@@ -2183,6 +2195,32 @@ dependencies = [
  "tempfile",
  "tokio",
  "toml",
+]
+
+[[package]]
+name = "iris-transport"
+version = "0.1.0"
+dependencies = [
+ "async-channel",
+ "axum",
+ "futures",
+ "getrandom 0.4.3",
+ "iris-client",
+ "iris-core",
+ "iris-tls",
+ "rcgen",
+ "reqwest",
+ "rustix",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tokio-rustls",
+ "tokio-tungstenite 0.30.0",
+ "tokio-util",
+ "tracing",
+ "tracing-subscriber",
+ "url",
 ]
 
 [[package]]

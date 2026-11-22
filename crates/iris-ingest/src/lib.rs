@@ -87,5 +87,11 @@ pub use session::{ReadTicker, deliver_fragment, run_stream};
 pub use sink::{FragmentSink, SinkError};
 pub use source::{IngestOptions, StreamSource};
 pub use stats::{SoundSteps, StreamStats};
-/// The URL type accepted by [`StreamSource`], re-exported so callers need not depend on `url`.
+// The link is in the second paragraph. Rustdoc's search index shows the first
+// paragraph as the item's summary, and there it shows an intra-doc link on a
+// re-export of another crate's item as bracketed text.
+/// The URL type of an RTSP address, re-exported so callers need not depend on
+/// `url`.
+///
+/// [`StreamSource::url`] holds the address of a stream in this type.
 pub use url::Url;

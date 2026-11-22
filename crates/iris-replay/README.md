@@ -26,11 +26,13 @@ fault-tested without hardware: cost measurements, chaos runs, and the integratio
   the two it makes together; `report_interval`). Recordings
   load before the runtime starts; an unparsable `RUST_LOG` is reported and `info` applies.
 - `media` — `Media` loads a recording into memory, extracts VPS, SPS, and PPS from its
-  `hvcC`, and indexes every frame with its decode time (relative to the file's first
-  fragment, since stored decode times run on across the files of a run) and sync flag. Its
-  validated state is private behind `frames`, `parameter_sets`, and `total_ticks`, and
-  `sample` returns `None` for a frame that does not lie inside the recording. Times are
-  `Ticks` of the 90 kHz clock; refusals are `MediaError` and `HvccError` variants.
+  `hvcC` with `iris_mp4::decoder_config::parse_parameter_sets`, and indexes every frame with its
+  decode time (relative to the file's first fragment, since stored decode times run on across
+  the files of a run) and sync flag. Its validated state is private behind `frames`,
+  `parameter_sets`, and `total_ticks`, and `sample` returns `None` for a frame that does not lie
+  inside the recording. Times are `Ticks` of the 90 kHz clock; refusals are `MediaError`
+  variants, and `MediaError::ParameterSets` carries the parser's
+  `iris_mp4::decoder_config::HvccError`.
 - `rtp` — `Packetizer` returns a fallible streaming iterator of RFC 7798 packets (single
   NAL units and fragmentation units, marker bit on the last) and builds RTCP sender
   reports from a `WallUs`; fallible `interleave` frames one packet for a TCP channel. SSRCs
@@ -102,27 +104,37 @@ the two-mode recording test in `iris-ingest` do.
   video's and before `PLAY`. Cross-mount and repeated/finished plays fail closed,
   and `TEARDOWN` preserves prior control replies but bypasses stale queued media on a bounded,
   delivery-acknowledged terminal path.
-- Mount names are one URI segment and must be unique. Recordings must be CRC-clean irisd
-  files through exact EOF, start with a truthful sync sample, carry samples in every
-  fragment, contain completely framed access units, have a nonoverlapping representable
-  timeline, and carry a version-1 four-byte-length `hvcC` with VPS, SPS, and PPS. Valid
-  forward timeline gaps are retained.
+- Mount names are one URI segment and must be unique. Recordings must be CRC-clean irisd files
+  through exact EOF that start with a truthful sync sample and carry samples in every fragment.
+  Their access units must be completely framed, and their timeline nonoverlapping and representable.
+  Their `hvcC` must be version 1 with four-byte lengths and hold a VPS, an SPS, and a PPS. An
+  `hvcC` with more than 16 VPSs, 16 SPSs, or 64 PPSs is refused (`HvccError::TooManyParameterSets`).
+  Valid forward timeline gaps are retained.
 - Synthetic plans are checked before generation: at most 100,000 GOPs, 65,535 frames per
   GOP, 1,000,000 frames and 1 GiB of sample payload in total; durations and NAL units must
   be nonzero/representable. The constructors return diagnostics instead of panicking.
 
 ## Tests and measurements
 
-Unit tests cover strict `hvcC`, CRC/EOF/AU and timeline admission, a fragment without
-samples included; RTP MTU, streaming fragmentation, rollover, 32-bit clock wrap, and
-interleaving boundaries; RTSP head and `Content-Length` limits, mount/session/channel/state,
-and TEARDOWN behavior; grouped SDP parameter sets; every synthetic plan ceiling; the
-remote-bind opt-in and the exclusive delivery flags; per-packet, burst, and paced delivery
-and the drop interval, read from the player's queue; and, over loopback with shortened
-deadlines, the connection cap, partial and trickled requests and bare interleaved frames
-closed at the pre-`PLAY` deadline, a reply to a peer that stopped reading ending the
-connection, and a playing session kept by keepalives and closed once they stop; the audio stream's
-SETUP rules, its frames left out, and sender reports set behind their clocks.
+The unit tests are in the `mod tests` of each module:
+
+- `media`: admission by CRC, exact EOF, access-unit framing, and timeline, a fragment without
+  samples included.
+- `rtp`: the MTU range, streaming fragmentation, rollover, the 32-bit clock wrap, and interleaving
+  boundaries.
+- `rtsp` and `server`: the RTSP head and `Content-Length` limits, the mount, session, channel, and
+  state rules, and TEARDOWN behavior.
+- `sdp`: grouped parameter sets.
+- `synth`: every plan ceiling.
+- `main`: the remote-bind opt-in and the exclusive delivery flags.
+- `server`: per-packet, burst, and paced delivery and the drop interval, read from the player's
+  queue. Also the audio stream's SETUP rules, its frames left out, and sender reports set behind
+  their clocks.
+- `server`, over loopback with shortened deadlines: the connection cap, and partial and trickled
+  requests and bare interleaved frames closed at the pre-`PLAY` deadline. Also a reply to a peer
+  that stopped reading ending the connection, and a playing session kept by keepalives and closed
+  once they stop.
+
 `tests/loopback.rs` serves a synthetic recording and receives it through the recorder's own
 RTSP client, checking bytes, sync flags, and timestamps. The fidelity of the replay against
 live cameras and the measurements it enabled are in `docs/research/12-ingest-cost.md`.

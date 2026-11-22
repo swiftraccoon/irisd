@@ -112,5 +112,6 @@ Tests use temporary directories only. A change to what the writer writes must ke
 
 - `docs/research/04-storage-format.md`, `11-multi-camera-results.md`, `12-ingest-cost.md §5`,
   `docs/design/phase2-interfaces.md`.
-- Depends on `iris-core` and `iris-mp4`. Depended on by `irisd` (writer, retention,
-  recovery at start-up).
+- Depends on `iris-core` and `iris-mp4`. Depended on by `irisd` (writer, retention, recovery at
+  start-up) and `iris-api` (the approved recording roots it is handed, and opening the files it
+  serves beneath them).

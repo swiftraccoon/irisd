@@ -1,13 +1,25 @@
-//! The rules for Rust source that neither rustfmt nor clippy checks: import
-//! form, hex case, lint exceptions, `TODO` owners, getter names, `bool`
-//! parameters, bare integer tuples, and timeless rustdoc.
+//! The rules for Rust source that neither rustfmt nor clippy checks. In
+//! code: import form, hex case, lint exceptions, getter names, `bool`
+//! parameters, bare integer tuples, types and derives by their paths, one
+//! `use` per module path, and test names that join two behaviours. In
+//! comments: `TODO` owners, timeless rustdoc, the heading of examples, and
+//! the rules of `prose.rs` and `names.rs`. In every line: its width.
+
+use std::collections::BTreeSet;
 
 use super::finding::{Finding, Rule};
+use super::names::{self, Names, Shapes};
 use super::{prose, text};
+
+/// The widest line of code (`STANDARDS.md` §2).
+const CODE_WIDTH: usize = 100;
+
+/// The widest line that holds only a comment, after its indentation.
+const COMMENT_WIDTH: usize = 80;
 
 /// What a byte of a source file belongs to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Class {
+pub enum Class {
     /// Code.
     Code,
     /// A comment that is not documentation.
@@ -94,11 +106,16 @@ fn char_end(source: &str, at: usize) -> Option<usize> {
 }
 
 /// What each byte of `source` belongs to.
-fn classify(source: &str) -> Vec<Class> {
+pub fn classify(source: &str) -> Vec<Class> {
     let bytes = source.as_bytes();
     let mut classes = vec![Class::Code; bytes.len()];
     let mut at = 0;
     while at < bytes.len() {
+        // Only these bytes start a comment or a literal: most bytes pass here.
+        if !b"/\"'bcr".contains(&bytes[at]) {
+            at += 1;
+            continue;
+        }
         let rest = &bytes[at..];
         let word_before =
             at > 0 && (bytes[at - 1].is_ascii_alphanumeric() || bytes[at - 1] == b'_');
@@ -138,7 +155,7 @@ fn classify(source: &str) -> Vec<Class> {
 
 /// `source` with every byte that is not of `class` blanked, line breaks kept,
 /// so that line numbers and columns hold.
-fn only(source: &str, classes: &[Class], class: Class) -> String {
+pub fn only(source: &str, classes: &[Class], class: Class) -> String {
     let kept: Vec<u8> = source
         .bytes()
         .zip(classes)
@@ -325,8 +342,10 @@ fn signatures(code: &str) -> Vec<(usize, Rule, String)> {
     found
 }
 
-/// The timeless words and the narration in rustdoc, outside its code.
-fn wording(docs: &str) -> Vec<(usize, Rule, String)> {
+/// The blocks of prose of rustdoc: runs of documentation lines without their
+/// markers, parted at a blank line and at a code fence, without what a fence
+/// holds.
+fn doc_blocks(docs: &str) -> Vec<Vec<(usize, &str)>> {
     let mut blocks: Vec<Vec<(usize, &str)>> = vec![Vec::new()];
     let mut fenced = false;
     for (index, line) in docs.lines().enumerate() {
@@ -344,8 +363,423 @@ fn wording(docs: &str) -> Vec<(usize, Rule, String)> {
                 .push((index + 1, prose));
         }
     }
+    blocks.retain(|block| !block.is_empty());
+    blocks
+}
+
+/// The blocks of prose of the comments that are not documentation. A block
+/// is a run of lines that hold only such a comment, without its markers. A
+/// blank comment line and a code fence part blocks, and what a fence holds is
+/// left out. A comment that follows code on its line is a block by itself.
+fn comment_blocks<'a>(source: &'a str, classes: &[Class]) -> Vec<Vec<(usize, &'a str)>> {
+    let mut blocks: Vec<Vec<(usize, &str)>> = vec![Vec::new()];
+    let mut fenced = false;
+    let mut offset = 0;
+    for (index, line) in source.split('\n').enumerate() {
+        let start = offset;
+        offset += line.len() + 1;
+        let end = start + line.len();
+        let Some(first) = (start..end).find(|at| classes[*at] == Class::Comment) else {
+            fenced = false;
+            blocks.push(Vec::new());
+            continue;
+        };
+        let last = (first..end)
+            .find(|at| classes[*at] != Class::Comment)
+            .unwrap_or(end);
+        let prose = source[first..last]
+            .trim_start()
+            .trim_start_matches(['/', '!', '*'])
+            .trim_end()
+            .trim_end_matches("*/")
+            .trim();
+        let fence = prose.starts_with("```");
+        if !source[start..first].trim().is_empty() {
+            blocks.push(Vec::new());
+            if !prose.is_empty() {
+                blocks.push(vec![(index + 1, prose)]);
+            }
+            blocks.push(Vec::new());
+        } else if fence || fenced || prose.is_empty() {
+            fenced ^= fence;
+            blocks.push(Vec::new());
+        } else {
+            blocks
+                .last_mut()
+                .expect("one block at least")
+                .push((index + 1, prose));
+        }
+    }
+    blocks.retain(|block| !block.is_empty());
+    blocks
+}
+
+/// The offset at which each line of `text` starts.
+pub fn line_starts(text: &str) -> Vec<usize> {
+    let mut starts = vec![0];
+    starts.extend(text.match_indices('\n').map(|(at, _)| at + 1));
+    starts
+}
+
+/// The line, from 1, of the byte at `offset`, given the starts of the lines.
+pub fn line_at(starts: &[usize], offset: usize) -> usize {
+    starts.partition_point(|start| *start <= offset)
+}
+
+/// Whether what passes `limit` characters of the comment `line` is one token
+/// that cannot wrap. It is the word over the limit, when that word runs to
+/// the end of the line and would pass the limit even on a line by itself.
+/// Such a line holds the marker and indentation of the comment, then the
+/// word. A word that would fit there can wrap, however long the line before
+/// it.
+fn one_token_past(line: &str, limit: usize) -> bool {
+    let Some((past, ch)) = line.char_indices().nth(limit) else {
+        return false;
+    };
+    let start = line[..past]
+        .rfind(char::is_whitespace)
+        .map_or(0, |at| at + 1);
+    let token = &line[start..];
+    let text = line.trim_start_matches(['/', '!']).trim_start();
+    let marker = line[..line.len() - text.len()].chars().count();
+    let alone = marker + token.chars().count();
+    !ch.is_whitespace() && !token.contains(char::is_whitespace) && alone > limit
+}
+
+/// The lines too wide: one that holds only a comment and passes
+/// [`COMMENT_WIDTH`] characters after its indentation, and any other line
+/// that passes [`CODE_WIDTH`]. A line counts characters, not bytes. A
+/// comment passes when what passes the width is one token too long for a
+/// line by itself, or when it is a row of a table. Neither can wrap, as
+/// `STANDARDS.md` §7 says of Markdown.
+fn widths(source: &str, classes: &[Class]) -> Vec<(usize, Rule, String)> {
     let mut found = Vec::new();
-    for block in &blocks {
+    let mut offset = 0;
+    for (index, line) in source.split('\n').enumerate() {
+        let start = offset;
+        offset += line.len() + 1;
+        let line = line.strip_suffix('\r').unwrap_or(line);
+        if line.len() <= COMMENT_WIDTH {
+            continue;
+        }
+        let body = line.trim_start();
+        let at = start + line.len() - body.len();
+        let comment = matches!(classes.get(at), Some(Class::Comment | Class::Doc));
+        if comment && body.starts_with("//") {
+            let columns = body.chars().count();
+            let row = body
+                .trim_start_matches(['/', '!'])
+                .trim_start()
+                .starts_with('|');
+            if columns > COMMENT_WIDTH && !row && !one_token_past(body, COMMENT_WIDTH) {
+                let message = format!("{columns} characters of comment: wrap at {COMMENT_WIDTH}");
+                found.push((index + 1, Rule::CommentWidth, message));
+            }
+        } else {
+            let columns = line.chars().count();
+            if columns > CODE_WIDTH {
+                let message = format!("{columns} characters: a line fits in {CODE_WIDTH}");
+                found.push((index + 1, Rule::CodeWidth, message));
+            }
+        }
+    }
+    found
+}
+
+/// Rustdoc headings `# Examples`, at any level, in the blocks of prose of
+/// rustdoc: the tree's heading is `# Example`.
+fn example_headings(blocks: &[Vec<(usize, &str)>]) -> Vec<(usize, String)> {
+    let mut found = Vec::new();
+    for (line, prose) in blocks.iter().flatten() {
+        let title = prose.trim_start_matches('#');
+        let heading = title.len() < prose.len() && title.starts_with(' ');
+        if heading && title.trim().eq_ignore_ascii_case("examples") {
+            found.push((*line, format!("`{prose}`: the heading is `# Example`")));
+        }
+    }
+    found
+}
+
+/// The offset of the first whole word `term` in `text`.
+fn first_word(text: &str, term: &str) -> Option<usize> {
+    let bytes = text.as_bytes();
+    let word = |at: usize| {
+        bytes
+            .get(at)
+            .is_some_and(|b| b.is_ascii_alphanumeric() || *b == b'_')
+    };
+    let mut from = 0;
+    while let Some(at) = text[from..].find(term).map(|n| from + n) {
+        if (at == 0 || !word(at - 1)) && !word(at + term.len()) {
+            return Some(at);
+        }
+        from = at + term.len();
+    }
+    None
+}
+
+/// The spans of the attributes of `code`, each from its `#` to the bracket
+/// that closes it.
+fn attributes(code: &str) -> Vec<(usize, usize)> {
+    let bytes = code.as_bytes();
+    let mut spans = Vec::new();
+    let mut from = 0;
+    while let Some(at) = code[from..].find('#').map(|n| from + n) {
+        let open = if bytes.get(at + 1) == Some(&b'!') {
+            at + 2
+        } else {
+            at + 1
+        };
+        let inside = (bytes.get(open) == Some(&b'['))
+            .then(|| text::balanced(code, open))
+            .flatten();
+        from = match inside {
+            Some(inside) => {
+                let end = open + inside.len() + 2;
+                spans.push((at, end));
+                end
+            }
+            None => at + 1,
+        };
+    }
+    spans
+}
+
+/// The spans of the `use` declarations of `code`, each from `use` to its
+/// semicolon.
+fn use_declarations(code: &str) -> Vec<(usize, usize)> {
+    let mut spans: Vec<(usize, usize)> = Vec::new();
+    for at in text::word_offsets(code, "use") {
+        let declared = code[at + 3..].starts_with(char::is_whitespace);
+        if declared && spans.last().is_none_or(|(_, end)| *end <= at) {
+            let end = code[at..].find(';').map_or(code.len(), |n| at + n + 1);
+            spans.push((at, end));
+        }
+    }
+    spans
+}
+
+/// Whether `name` names a type or a trait: a capital, then a lowercase
+/// letter somewhere, or a capital alone, as a type parameter is. A constant
+/// is in capitals throughout.
+fn is_type_name(name: &str) -> bool {
+    name.starts_with(|ch: char| ch.is_ascii_uppercase())
+        && (name.len() == 1 || name.bytes().any(|byte| byte.is_ascii_lowercase()))
+}
+
+/// The paths that write a type or a trait through two modules or more, such
+/// as `std::time::Instant` and `crate::api::Window`. A path that goes on from
+/// the type to a function or a variant is one of them too:
+/// `std::time::Instant::now`. A path passes with one module before the type
+/// (`fmt::Result`, `io::Error`), and with no type in it (`std::mem::take`,
+/// `u64::MAX`). So does a path from `Self` or a type parameter (`T::Item`),
+/// and one that goes on from a bracket (`<A as B>::C`), as neither has a
+/// module before its type. A path in a macro (`$crate::x::Y`) passes too.
+/// `use` declarations and attributes are not read.
+fn full_path_types(
+    code: &str,
+    attributes: &[(usize, usize)],
+    uses: &[(usize, usize)],
+    starts: &[usize],
+) -> Vec<(usize, String)> {
+    let mut bytes = code.as_bytes().to_vec();
+    for (start, end) in attributes.iter().chain(uses) {
+        for byte in &mut bytes[*start..*end] {
+            if *byte != b'\n' {
+                *byte = b' ';
+            }
+        }
+    }
+    let starts_name = |byte: u8| byte.is_ascii_alphabetic() || byte == b'_';
+    let in_name = |byte: u8| byte.is_ascii_alphanumeric() || byte == b'_';
+    let mut found = Vec::new();
+    let mut at = 0;
+    while at < bytes.len() {
+        if !starts_name(bytes[at]) {
+            at += 1;
+            continue;
+        }
+        let start = at;
+        let mut names = Vec::new();
+        loop {
+            let name = at;
+            while at < bytes.len() && in_name(bytes[at]) {
+                at += 1;
+            }
+            names.push(&code[name..at]);
+            if bytes[at..].starts_with(b"::") && bytes.get(at + 2).is_some_and(|b| starts_name(*b))
+            {
+                at += 2;
+            } else {
+                break;
+            }
+        }
+        // A path of a macro names its crate as `$crate`, which it cannot import.
+        let in_macro = start > 0 && bytes[start - 1] == b'$';
+        let typed = names.iter().position(|name| is_type_name(name));
+        if let Some(index) = typed.filter(|index| *index >= 2 && !in_macro) {
+            let path = names[..=index].join("::");
+            let (module, name) = (names[index - 1], names[index]);
+            let message = format!("`{path}`: import `{name}`, or write `{module}::{name}`");
+            found.push((line_at(starts, start), message));
+        }
+    }
+    found
+}
+
+/// Derives written by their path in `#[derive(...)]`, such as
+/// `thiserror::Error`: a derive is imported and written bare.
+fn derive_paths(
+    code: &str,
+    attributes: &[(usize, usize)],
+    starts: &[usize],
+) -> Vec<(usize, String)> {
+    let mut found = Vec::new();
+    for (start, end) in attributes {
+        let attribute = &code[*start..*end];
+        for at in text::word_offsets(attribute, "derive") {
+            let open = at + "derive".len();
+            if attribute.as_bytes().get(open) != Some(&b'(') {
+                continue;
+            }
+            let Some(inside) = text::balanced(attribute, open) else {
+                continue;
+            };
+            for item in text::top_level_items(inside) {
+                if let Some((_, name)) = item.rsplit_once("::") {
+                    let message = format!("`{item}` in a derive: import it and write `{name}`");
+                    found.push((line_at(starts, start + at), message));
+                }
+            }
+        }
+    }
+    found
+}
+
+/// The module path that a `use` tree imports from: what stands before its
+/// braces, or before its last segment. A tree of one segment has none.
+fn module_path(tree: &str) -> Option<String> {
+    let tree = tree.trim_end_matches(';');
+    let path = match tree.find('{') {
+        Some(brace) => tree[..brace].trim_end().trim_end_matches("::"),
+        None => tree.rsplit_once("::")?.0,
+    };
+    let path: String = path.split_whitespace().collect();
+    let path = path.trim_start_matches("::");
+    (!path.is_empty()).then(|| path.to_owned())
+}
+
+/// What stands before a `use` declaration since the statement before it:
+/// its outer attributes and its visibility, with the inner attributes of the
+/// module left out and white space made single.
+fn attributes_and_visibility(text: &str) -> String {
+    let mut kept = String::new();
+    let mut rest = text;
+    while let Some(at) = rest.find("#![") {
+        kept.push_str(&rest[..at]);
+        let inside = text::balanced(rest, at + 2).map_or(rest.len(), str::len);
+        rest = rest.get(at + inside + 4..).unwrap_or("");
+    }
+    kept.push_str(rest);
+    kept.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// The `use` declarations that import from a module path that another one
+/// of their scope imports from, under the same attributes and visibility:
+/// one `use` with braces holds both (`STANDARDS.md` §2). A scope is the file
+/// or a pair of braces, so a `use` in a function body stands apart from those
+/// of its module, and one under a `cfg` from one without it. A `use` that
+/// carries documentation stands apart too, since the braces would lose it.
+fn use_per_path(
+    code: &str,
+    docs: &str,
+    uses: &[(usize, usize)],
+    starts: &[usize],
+) -> Vec<(usize, String)> {
+    let bytes = code.as_bytes();
+    let mut scopes = vec![0_usize];
+    let mut opened = 0;
+    let mut boundary = 0;
+    let mut seen: BTreeSet<(usize, String, String)> = BTreeSet::new();
+    let mut found = Vec::new();
+    let mut next = uses.iter().peekable();
+    let mut at = 0;
+    while at < bytes.len() {
+        if let Some((start, end)) = next.next_if(|(start, _)| *start == at) {
+            let mut prefix = attributes_and_visibility(&code[boundary..*start]);
+            // The documentation of the module is not the declaration's.
+            let outer = docs[boundary..*start]
+                .lines()
+                .filter(|line| !line.trim_start().starts_with("//!"));
+            prefix.extend(outer.map(str::trim));
+            if let Some(path) = module_path(&code[start + 3..*end]) {
+                let scope = *scopes.last().expect("the file's scope");
+                if !seen.insert((scope, prefix, path.clone())) {
+                    let message =
+                        format!("another `use` of this scope imports from `{path}`: join them");
+                    found.push((line_at(starts, *start), message));
+                }
+            }
+            at = *end;
+            boundary = *end;
+            continue;
+        }
+        match bytes[at] {
+            b'{' => {
+                opened += 1;
+                scopes.push(opened);
+                boundary = at + 1;
+            }
+            b'}' => {
+                if scopes.len() > 1 {
+                    scopes.pop();
+                }
+                boundary = at + 1;
+            }
+            b';' => boundary = at + 1,
+            _ => {}
+        }
+        at += 1;
+    }
+    found
+}
+
+/// Tests whose names hold `_and_`: the name of a test that asserts two
+/// behaviours (`STANDARDS.md` §8). A test is the function under `#[test]`,
+/// or under an attribute whose path ends in `::test`, such as
+/// `#[tokio::test]`.
+fn test_names(code: &str, attributes: &[(usize, usize)], starts: &[usize]) -> Vec<(usize, String)> {
+    let mut found = Vec::new();
+    for (start, end) in attributes {
+        let inside = code[*start..*end]
+            .trim_start_matches(['#', '!', '['])
+            .trim_end_matches(']');
+        let path = inside.split('(').next().unwrap_or("").trim();
+        if path != "test" && !path.ends_with("::test") {
+            continue;
+        }
+        let rest = &code[*end..];
+        let Some(at) = first_word(rest, "fn") else {
+            continue;
+        };
+        let name = rest[at + 2..]
+            .trim_start()
+            .split(|ch: char| !(ch.is_alphanumeric() || ch == '_'))
+            .next()
+            .unwrap_or("");
+        if name.contains("_and_") {
+            let message =
+                format!("`{name}`: `_and_` joins two behaviours; give each a test named for it");
+            found.push((line_at(starts, end + at), message));
+        }
+    }
+    found
+}
+
+/// The timeless words and the narration in rustdoc, outside its code.
+fn wording(blocks: &[Vec<(usize, &str)>]) -> Vec<(usize, Rule, String)> {
+    let mut found = Vec::new();
+    for block in blocks {
         for (line, term) in prose::timeless(block) {
             let message = format!("\"{term}\": say what the software does");
             found.push((line, Rule::Timeless, message));
@@ -358,8 +792,10 @@ fn wording(docs: &str) -> Vec<(usize, Rule, String)> {
     found
 }
 
-/// The findings in the Rust file `file`, whose contents are `source`.
-pub fn check(file: &str, source: &str) -> Vec<Finding> {
+/// The findings in the Rust file `file`, whose contents are `source`. The
+/// names its rustdoc and comments give are checked against `names`, the
+/// names of the tree's code, when the tree was read.
+pub fn check(file: &str, source: &str, names: Option<&Names>) -> Vec<Finding> {
     let classes = classify(source);
     let code = only(source, &classes, Class::Code);
     let comments = only(source, &classes, Class::Comment);
@@ -375,8 +811,30 @@ pub fn check(file: &str, source: &str) -> Vec<Finding> {
     add(Rule::LintException, lint_exceptions(&code));
     add(Rule::Todo, todos(&comments));
     add(Rule::Todo, todos(&docs));
-    for (line, rule, message) in signatures(&code).into_iter().chain(wording(&docs)) {
+    let starts = line_starts(source);
+    let attributes = attributes(&code);
+    let uses = use_declarations(&code);
+    let doc_blocks = doc_blocks(&docs);
+    add(Rule::ExampleHeading, example_headings(&doc_blocks));
+    add(
+        Rule::FullPathType,
+        full_path_types(&code, &attributes, &uses, &starts),
+    );
+    add(Rule::DerivePath, derive_paths(&code, &attributes, &starts));
+    add(Rule::UsePerPath, use_per_path(&code, &docs, &uses, &starts));
+    add(Rule::TestNameAnd, test_names(&code, &attributes, &starts));
+    let found = signatures(&code)
+        .into_iter()
+        .chain(wording(&doc_blocks))
+        .chain(widths(source, &classes));
+    for (line, rule, message) in found {
         findings.push(Finding::new(rule, file, line, message));
+    }
+    for block in doc_blocks.iter().chain(&comment_blocks(source, &classes)) {
+        findings.extend(prose::findings(file, block));
+        if let Some(names) = names {
+            findings.extend(names::findings(file, block, names, Shapes::All));
+        }
     }
     findings.sort();
     findings
@@ -387,7 +845,7 @@ mod tests {
     use super::*;
 
     fn rules(source: &str) -> Vec<(usize, Rule)> {
-        check("a.rs", source)
+        check("a.rs", source, None)
             .into_iter()
             .map(|finding| (finding.line, finding.rule))
             .collect()
@@ -516,5 +974,369 @@ mod tests {
             rules("/// Calls `new`.\n/// ```\n/// let new = 1;\n/// ```\nfn f() {}"),
             []
         );
+    }
+
+    /// A comment of `width` characters: words of two letters after `//`, the
+    /// last of them longer when the width asks it.
+    fn comment(width: usize) -> String {
+        let mut line = "//".to_owned();
+        while line.len() + 3 <= width {
+            line.push_str(" aa");
+        }
+        while line.len() < width {
+            line.push('a');
+        }
+        line
+    }
+
+    #[test]
+    fn a_comment_line_holds_at_most_80_characters() {
+        assert_eq!(rules(&comment(80)), []);
+        assert_eq!(rules(&comment(81)), [(1, Rule::CommentWidth)]);
+    }
+
+    #[test]
+    fn the_indentation_of_a_comment_is_not_counted() {
+        assert_eq!(rules(&format!("        {}", comment(80))), []);
+    }
+
+    #[test]
+    fn a_comment_counts_characters_not_bytes() {
+        assert_eq!(rules(&format!("/// {}", "§ ".repeat(38))), []);
+    }
+
+    #[test]
+    fn a_comment_past_the_width_by_a_token_too_long_to_wrap_passes() {
+        let url = format!("https://example.com/{}", "a".repeat(70));
+        assert_eq!(rules(&format!("/// See\n/// {url}")), []);
+        assert_eq!(rules(&format!("/// See {url}.")), []);
+    }
+
+    #[test]
+    fn a_comment_past_the_width_by_a_word_that_can_wrap_is_found() {
+        let path = format!("`crates/{}`", "a".repeat(20));
+        let line = format!("/// {} {path}", "word ".repeat(12).trim_end());
+        assert_eq!(rules(&line), [(1, Rule::CommentWidth)]);
+    }
+
+    #[test]
+    fn a_comment_past_the_width_by_words_is_found() {
+        let url = format!("https://example.com/{}", "a".repeat(70));
+        assert_eq!(
+            rules(&format!("/// See {url} and more.")),
+            [(1, Rule::CommentWidth)]
+        );
+    }
+
+    #[test]
+    fn a_row_of_a_table_in_a_comment_passes() {
+        let row = format!("//! | `GET {}` | a byte-range playlist |", "/a".repeat(40));
+        assert_eq!(rules(&row), []);
+    }
+
+    #[test]
+    fn a_line_of_code_holds_at_most_100_characters() {
+        let line = |width: usize| format!("let a = {};", "1".repeat(width - 9));
+        assert_eq!(rules(&line(100)), []);
+        assert_eq!(rules(&line(101)), [(1, Rule::CodeWidth)]);
+    }
+
+    #[test]
+    fn a_line_of_code_counts_characters_not_bytes() {
+        assert_eq!(rules(&format!("let a = \"{}\";", "§".repeat(89))), []);
+    }
+
+    #[test]
+    fn a_comment_after_code_counts_as_code() {
+        let line = format!("let a = 1; {}", comment(89));
+        assert_eq!(rules(&line), []);
+        let line = format!("let a = 1; {}", comment(90));
+        assert_eq!(rules(&line), [(1, Rule::CodeWidth)]);
+    }
+
+    #[test]
+    fn a_line_of_a_string_counts_as_code() {
+        let source = format!("const A: &str = \"\n{}\n\";", comment(90));
+        assert_eq!(rules(&source), []);
+    }
+
+    #[test]
+    fn an_examples_heading_is_found() {
+        assert_eq!(
+            rules("/// # Examples\nfn f() {}"),
+            [(1, Rule::ExampleHeading)]
+        );
+        assert_eq!(rules("//! ## Examples"), [(1, Rule::ExampleHeading)]);
+        assert_eq!(rules("/// # Example\nfn f() {}"), []);
+    }
+
+    #[test]
+    fn an_examples_line_in_a_code_block_passes() {
+        assert_eq!(rules("/// ```\n/// # Examples\n/// ```\nfn f() {}"), []);
+    }
+
+    #[test]
+    fn a_type_through_two_modules_is_found() {
+        assert_eq!(
+            rules("fn f(a: std::time::Instant) {}"),
+            [(1, Rule::FullPathType)]
+        );
+        assert_eq!(
+            rules("let w: crate::api::Window;"),
+            [(1, Rule::FullPathType)]
+        );
+        assert_eq!(
+            rules("let f = tokio::fs::File::open(p);"),
+            [(1, Rule::FullPathType)]
+        );
+        assert_eq!(
+            rules("impl std::fmt::Display for A {}"),
+            [(1, Rule::FullPathType)]
+        );
+    }
+
+    #[test]
+    fn a_type_through_one_module_passes() {
+        let source = "fn f(a: fmt::Result, b: io::Error) -> serde_json::Value {}";
+        assert_eq!(rules(source), []);
+    }
+
+    #[test]
+    fn a_path_without_a_type_passes() {
+        let source = "let a = std::mem::take(&mut b);\nlet c = iris_client::sound_clock::DELAY;\n\
+                      std::println!(\"{c:?}\");\nlet d = std::f64::consts::PI;";
+        assert_eq!(rules(source), []);
+    }
+
+    #[test]
+    fn a_path_from_self_or_a_type_parameter_passes() {
+        assert_eq!(rules("fn f(a: Self::Item, b: T::Output::Error) {}"), []);
+    }
+
+    #[test]
+    fn a_path_from_super_alone_passes() {
+        assert_eq!(rules("fn f(a: super::Rule) {}"), []);
+        assert_eq!(
+            rules("fn f(a: super::finding::Rule) {}"),
+            [(1, Rule::FullPathType)]
+        );
+    }
+
+    #[test]
+    fn a_path_after_a_bracket_passes() {
+        assert_eq!(rules("fn f(a: <A as B>::C, b: Vec::<u8>::Item) {}"), []);
+    }
+
+    #[test]
+    fn a_path_in_a_macro_passes() {
+        let source = "macro_rules! m {\n    () => {\n        $crate::api::Window::new()\n    };\n}";
+        assert_eq!(rules(source), []);
+    }
+
+    #[test]
+    fn a_path_in_a_use_declaration_passes() {
+        assert_eq!(
+            rules("use std::time::Instant;\nfn f() {\n    use tokio::fs::File;\n}"),
+            []
+        );
+    }
+
+    #[test]
+    fn a_path_in_an_attribute_passes() {
+        assert_eq!(
+            rules("#[cfg_attr(test, doc = std::path::Path)]\nfn f() {}"),
+            []
+        );
+    }
+
+    #[test]
+    fn a_path_in_a_comment_or_a_string_passes() {
+        assert_eq!(
+            rules("// std::time::Instant\nlet a = \"std::time::Instant\";"),
+            []
+        );
+    }
+
+    #[test]
+    fn a_derive_by_its_path_is_found() {
+        let source = "#[derive(Debug, thiserror::Error)]\nenum E {}";
+        assert_eq!(rules(source), [(1, Rule::DerivePath)]);
+        let source = "#[cfg_attr(test, derive(serde::Serialize))]\nstruct S;";
+        assert_eq!(rules(source), [(1, Rule::DerivePath)]);
+    }
+
+    #[test]
+    fn a_bare_derive_passes() {
+        assert_eq!(rules("#[derive(Debug, Error)]\nenum E {}"), []);
+    }
+
+    #[test]
+    fn two_uses_of_one_module_path_are_found() {
+        assert_eq!(rules("use a::b::X;\nuse a::b::Y;"), [(2, Rule::UsePerPath)]);
+        assert_eq!(rules("use std::fs;\nuse std::io;"), [(2, Rule::UsePerPath)]);
+        assert_eq!(
+            rules("use a::b::{X, Y};\nuse a::b::Z as _;"),
+            [(2, Rule::UsePerPath)]
+        );
+    }
+
+    #[test]
+    fn uses_of_one_module_path_in_one_function_are_found() {
+        let source = "fn f() {\n    use a::X;\n    let b = 1;\n    use a::Y;\n}";
+        assert_eq!(rules(source), [(4, Rule::UsePerPath)]);
+    }
+
+    #[test]
+    fn an_inner_attribute_parts_no_uses() {
+        let source = "#![forbid(unsafe_code)]\n\nuse a::X;\nuse a::Y;";
+        assert_eq!(rules(source), [(4, Rule::UsePerPath)]);
+    }
+
+    #[test]
+    fn uses_of_different_module_paths_pass() {
+        assert_eq!(
+            rules("use a::b::X;\nuse a::c::Y;\nuse a::b;\nuse super::*;"),
+            []
+        );
+    }
+
+    #[test]
+    fn one_use_over_several_lines_passes() {
+        assert_eq!(rules("use a::b::{\n    X,\n    Y,\n};"), []);
+    }
+
+    #[test]
+    fn uses_under_different_cfg_attributes_pass() {
+        assert_eq!(rules("use a::b::X;\n#[cfg(test)]\nuse a::b::Y;"), []);
+    }
+
+    #[test]
+    fn uses_of_different_visibility_pass() {
+        assert_eq!(rules("pub use a::X;\nuse a::Y;"), []);
+    }
+
+    #[test]
+    fn a_documented_use_passes() {
+        assert_eq!(rules("/// A.\npub use a::X;\n/// B.\npub use a::Y;"), []);
+    }
+
+    #[test]
+    fn the_documentation_of_a_module_parts_no_uses() {
+        let source = "//! A module.\n\nuse a::X;\nuse a::Y;";
+        assert_eq!(rules(source), [(4, Rule::UsePerPath)]);
+    }
+
+    #[test]
+    fn a_use_in_a_function_beside_one_of_its_module_passes() {
+        assert_eq!(rules("use a::X;\nfn f() {\n    use a::Y;\n}"), []);
+    }
+
+    #[test]
+    fn a_test_whose_name_joins_two_behaviours_is_found() {
+        let tests = [
+            ("#[test]\nfn reads_x_and_writes_y() {}", 2),
+            ("#[tokio::test]\nasync fn reads_x_and_writes_y() {}", 2),
+            (
+                "#[tokio::test(flavor = \"current_thread\")]\n#[ignore]\nasync fn x_and_y() {}",
+                3,
+            ),
+        ];
+        for (source, line) in tests {
+            assert_eq!(rules(source), [(line, Rule::TestNameAnd)], "{source}");
+        }
+    }
+
+    #[test]
+    fn a_function_that_is_no_test_passes() {
+        assert_eq!(
+            rules("fn reads_x_and_writes_y() {}\n#[cfg(test)]\nfn a_and_b() {}"),
+            []
+        );
+    }
+
+    #[test]
+    fn a_test_with_band_in_its_name_passes() {
+        assert_eq!(rules("#[test]\nfn handles_band_edges() {}"), []);
+    }
+
+    /// `count` words of comment after `marker`, ten to a line.
+    fn comment_words(marker: &str, count: usize) -> String {
+        let words = vec!["word"; count];
+        let lines: Vec<String> = words
+            .chunks(10)
+            .map(|chunk| format!("{marker} {}", chunk.join(" ")))
+            .collect();
+        lines.join("\n")
+    }
+
+    #[test]
+    fn a_long_sentence_in_a_comment_is_found() {
+        let source = comment_words("//", 36);
+        assert_eq!(rules(&source), [(1, Rule::SentenceLength)]);
+    }
+
+    #[test]
+    fn a_comment_after_code_is_a_block_by_itself() {
+        let words = comment_words("//", 20);
+        let source = format!("{words}\nlet a = 1; // {}\n{words}", "word ".repeat(10));
+        assert_eq!(rules(&source), []);
+    }
+
+    #[test]
+    fn code_between_comments_parts_their_blocks() {
+        let words = comment_words("//", 20);
+        assert_eq!(rules(&format!("{words}\nfn f() {{}}\n{words}")), []);
+        let docs = comment_words("///", 20);
+        assert_eq!(rules(&format!("{docs}\nfn f() {{}}\n{docs}")), []);
+    }
+
+    #[test]
+    fn a_code_block_in_rustdoc_holds_no_sentence() {
+        let source = format!(
+            "/// ```\n{}\n/// ```\nfn f() {{}}",
+            comment_words("///", 40)
+        );
+        assert_eq!(rules(&source), []);
+    }
+
+    #[test]
+    fn the_rules_of_words_read_every_comment() {
+        let source = "/// It reads as one.\n// It runs over the core.\n/// The `Feed`'s token.";
+        assert_eq!(
+            rules(source),
+            [
+                (1, Rule::BarredPhrase),
+                (2, Rule::TheCore),
+                (3, Rule::PossessiveCodeSpan)
+            ]
+        );
+    }
+
+    /// The rules found in `source` against the names of the Rust code
+    /// `code`.
+    fn named_rules(source: &str, code: &str) -> Vec<(usize, Rule)> {
+        let names = Names::of([("src/b.rs", code)], &[]);
+        check("a.rs", source, Some(&names))
+            .into_iter()
+            .map(|finding| (finding.line, finding.rule))
+            .collect()
+    }
+
+    #[test]
+    fn a_name_in_rustdoc_is_checked() {
+        let found = named_rules("/// The `Gone` type.\nstruct Held;", "struct Held;");
+        assert_eq!(found, [(1, Rule::UnknownName)]);
+    }
+
+    #[test]
+    fn a_name_in_a_comment_is_checked() {
+        let found = named_rules("// See `Held::gone()`.\nstruct Held;", "struct Held;");
+        assert_eq!(found, [(1, Rule::UnknownName)]);
+    }
+
+    #[test]
+    fn a_name_in_a_code_block_of_rustdoc_is_not_checked() {
+        let source = "/// ```\n/// `Gone`\n/// ```\nstruct Held;";
+        assert_eq!(named_rules(source, "struct Held;"), []);
     }
 }

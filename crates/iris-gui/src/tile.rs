@@ -5,24 +5,30 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use anyhow::Context;
 use gst::prelude::*;
 use gtk::prelude::*;
 use gtk::{gdk, glib};
+use iris_client::live::{
+    FeedEvent, LIVE_PAYLOAD_BYTES, LiveBudget, LiveMessage, LiveSink, Reservation, SinkError,
+};
+use iris_client::sound_clock::Medium;
 use iris_core::id::CameraId;
+use iris_transport::Feed;
 use tokio::runtime::Runtime;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
-use crate::live::{self, Feed};
-use crate::sound::{self, Medium, Pacer, Pairing};
+use crate::sound::{self, Pacer, Pairing};
 use crate::stage::{BranchEvent, Stage};
 
-/// Maximum queued bytes; exceeding it reconnects from an init segment and sync frame.
-pub(crate) const SOURCE_QUEUE_BYTES: u64 = 16 << 20;
+/// Maximum queued bytes, one payload at the live protocol's ceiling
+/// ([`LIVE_PAYLOAD_BYTES`]); exceeding it reconnects from an init segment and
+/// sync frame.
+const SOURCE_QUEUE_BYTES: u64 = LIVE_PAYLOAD_BYTES as u64;
 /// Maximum queued buffers. At 30 fps this permits more than 17 seconds of backlog.
 const SOURCE_QUEUE_BUFFERS: u64 = 512;
 /// Default of `--live-budget-mib`: the live payload bytes alive in the viewer at
@@ -31,67 +37,6 @@ pub const DEFAULT_LIVE_BUDGET_MIB: u32 = 256;
 /// Least `--live-budget-mib` accepted: one full source queue, so one payload at
 /// the protocol ceiling can be admitted.
 pub const MIN_LIVE_BUDGET_MIB: u32 = 16;
-
-/// The viewer-wide bound on live payload bytes: every byte a [`Source`] copies
-/// for GStreamer counts from the copy until GStreamer frees the buffer, across
-/// every grid tile and the focused view. The per-source queue limits bound
-/// what waits in `appsrc`; this bounds what is alive anywhere downstream too.
-#[derive(Debug)]
-pub struct LiveBudget {
-    limit: u64,
-    used: AtomicU64,
-}
-
-impl LiveBudget {
-    /// A budget of `limit` bytes.
-    #[must_use]
-    pub fn new(limit: u64) -> Arc<Self> {
-        Arc::new(Self {
-            limit,
-            used: AtomicU64::new(0),
-        })
-    }
-
-    /// Bytes reserved at this moment.
-    #[cfg(test)]
-    pub(crate) fn used(&self) -> u64 {
-        self.used.load(Ordering::Acquire)
-    }
-
-    /// Reserves `bytes`, or returns `None` when they do not fit beside the
-    /// bytes already alive. The reservation is released when it is dropped.
-    fn reserve(self: &Arc<Self>, bytes: u64) -> Option<Reservation> {
-        let mut used = self.used.load(Ordering::Acquire);
-        loop {
-            let next = used.checked_add(bytes).filter(|next| *next <= self.limit)?;
-            match self
-                .used
-                .compare_exchange_weak(used, next, Ordering::AcqRel, Ordering::Acquire)
-            {
-                Ok(_) => {
-                    return Some(Reservation {
-                        budget: Arc::clone(self),
-                        bytes,
-                    });
-                }
-                Err(current) => used = current,
-            }
-        }
-    }
-}
-
-/// Bytes taken from a [`LiveBudget`], returned when dropped.
-#[derive(Debug)]
-struct Reservation {
-    budget: Arc<LiveBudget>,
-    bytes: u64,
-}
-
-impl Drop for Reservation {
-    fn drop(&mut self) {
-        self.budget.used.fetch_sub(self.bytes, Ordering::AcqRel);
-    }
-}
 
 /// A copied live payload that keeps its budget reservation for as long as
 /// GStreamer keeps the buffer wrapping it.
@@ -153,23 +98,8 @@ fn sound_branch(silent: bool) -> String {
     )
 }
 
-/// What a feed asks of its tile.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum TileEvent {
-    /// The feed's session ended; the branch restarts so that the next
-    /// connection's init segment meets a clean demuxer.
-    Restart,
-    /// A live frame exceeded the protocol's message ceiling; the feed retries
-    /// after `retry_in`, doubling the pause while the condition lasts.
-    Oversized {
-        /// The pause before the next attempt.
-        retry_in: Duration,
-    },
-    /// The feed delivers video again after an oversized frame.
-    Live,
-}
-
-/// The feed's handle on the branch input, usable from any thread.
+/// The feed's handle on the branch input, usable from any thread: the tile's
+/// [`LiveSink`].
 #[derive(Debug)]
 pub struct Source {
     src: gst_app::AppSrc,
@@ -181,8 +111,18 @@ pub struct Source {
 impl Source {
     /// Pushes a complete live payload without blocking the runtime. A full queue,
     /// or a viewer-wide budget that cannot admit the payload, fails the session
-    /// so reconnection starts a decodable byte stream.
-    pub fn push(&self, bytes: &[u8]) -> anyhow::Result<()> {
+    /// so reconnection starts a decodable byte stream. The feed reaches it
+    /// through the source's [`LiveSink::push`].
+    ///
+    /// # Errors
+    ///
+    /// - `bytes` is empty.
+    /// - The queued bytes and `bytes` together exceed [`SOURCE_QUEUE_BYTES`].
+    /// - At least [`SOURCE_QUEUE_BUFFERS`] buffers are queued.
+    /// - The viewer's live budget cannot admit `bytes`.
+    /// - `appsrc` refuses the buffer with a flow error, as it does while it
+    ///   flushes.
+    fn push_payload(&self, bytes: &[u8]) -> anyhow::Result<()> {
         anyhow::ensure!(!bytes.is_empty(), "live input payload is empty");
         let queued = self.src.current_level_bytes();
         anyhow::ensure!(
@@ -196,7 +136,7 @@ impl Source {
         let reservation = self.budget.reserve(bytes.len() as u64).ok_or_else(|| {
             anyhow::anyhow!(
                 "live input exceeds the viewer's {} MiB live budget",
-                self.budget.limit >> 20
+                self.budget.limit() >> 20
             )
         })?;
         let buffer = gst::Buffer::from_slice(Payload {
@@ -211,9 +151,11 @@ impl Source {
             .map(|_| ())
             .map_err(|flow| anyhow::anyhow!("appsrc rejected a buffer: {flow:?}"))
     }
+}
 
+impl LiveSink for Source {
     /// Prepares for a fresh byte stream (a reconnection): flushes what is queued.
-    pub fn reset(&self) {
+    fn reset(&self) {
         if let Some(pacer) = &self.pacer {
             pacer.restart();
         }
@@ -223,25 +165,19 @@ impl Source {
             .send_event(gst::event::FlushStop::new(/* reset_time */ true));
     }
 
-    /// A source with the tile's queue limits outside any pipeline and a budget
-    /// of its own, for feed tests.
-    #[cfg(test)]
-    pub(crate) fn for_tests() -> Self {
-        let src = gst_app::AppSrc::builder()
-            .max_bytes(SOURCE_QUEUE_BYTES)
-            .build();
-        src.set_property("max-buffers", SOURCE_QUEUE_BUFFERS);
-        Self {
-            src,
-            budget: LiveBudget::new(u64::from(DEFAULT_LIVE_BUDGET_MIB) << 20),
-            pacer: None,
-        }
-    }
-
-    /// Bytes queued in the source.
-    #[cfg(test)]
-    pub(crate) fn queued_bytes(&self) -> u64 {
-        self.src.current_level_bytes()
+    /// Pushes the payload of an init segment or a fragment as
+    /// [`Source::push_payload`] does. When that push fails, the message is
+    /// refused with the text of the push's failure. A message of any other
+    /// kind is refused too, rather than skipped silently: the demuxer's byte
+    /// stream may need it.
+    fn push(&self, message: LiveMessage<'_>) -> Result<(), SinkError> {
+        let (LiveMessage::Init(payload) | LiveMessage::Fragment(payload)) = message else {
+            return Err(SinkError::new(
+                "live message of a kind the tile does not play",
+            ));
+        };
+        self.push_payload(payload)
+            .map_err(|error| SinkError::new(format!("{error:#}")))
     }
 }
 
@@ -332,14 +268,31 @@ impl Tile {
     /// starts the feed. Starting a started tile restarts it. The label names
     /// the camera while video flows and the last branch error until it does
     /// again.
+    ///
+    /// # Errors
+    ///
+    /// - The branch does not build from its description, or lacks its
+    ///   `appsrc` or its sink.
+    /// - The stage cannot add the branch or bring it to its state
+    ///   ([`Stage::add`]).
     pub fn start(&self, feed: Feed) -> anyhow::Result<()> {
         self.start_branches(feed, None)
     }
 
     /// Starts the tile as [`Tile::start`] does and, beside it, the camera's
     /// audio feed `sound`: once that feed delivers, sound and picture play
-    /// against one clock, [`sound::DELAY`] after they arrive. A camera
-    /// without audio shows its picture as [`Tile::start`] does.
+    /// against one clock, [`iris_client::sound_clock::DELAY`] after they
+    /// arrive. A camera without audio shows its picture as [`Tile::start`]
+    /// does.
+    ///
+    /// # Errors
+    ///
+    /// - The picture's branch or the sound's does not build from its
+    ///   description, or lacks its `appsrc`; the picture's lacks its sink.
+    /// - Either branch lacks the pad where its frames are placed on the
+    ///   clock.
+    /// - The stage cannot add either branch or bring it to its state
+    ///   ([`Stage::add`]).
     pub fn start_with_sound(&self, feed: Feed, sound: Feed) -> anyhow::Result<()> {
         self.start_branches(feed, Some(sound))
     }
@@ -373,7 +326,7 @@ impl Tile {
         pairing: &Arc<Pairing>,
     ) -> anyhow::Result<(gst::Bin, CancellationToken)> {
         let (bin, src) = Self::branch(&sound_branch(sound::silent()))?;
-        let pacer = pairing.pacer(Medium::Sound, Self::shift_pad(&bin)?);
+        let pacer = pairing.pacer(Medium::Audio, Self::shift_pad(&bin)?);
         let (branch_tx, branch_rx) = async_channel::unbounded::<BranchEvent>();
         self.stage
             .add(&format!("sound-{}", self.camera), &bin, branch_tx)?;
@@ -388,14 +341,13 @@ impl Tile {
             }
         });
         let cancel = CancellationToken::new();
-        let (events_tx, events_rx) = async_channel::unbounded::<TileEvent>();
-        self.runtime.spawn(live::run(
-            feed,
-            Source {
+        let (events_tx, events_rx) = async_channel::unbounded::<FeedEvent>();
+        self.runtime.spawn(feed.run(
+            Arc::new(Source {
                 src,
                 budget: Arc::clone(&self.budget),
                 pacer: Some(pacer),
-            },
+            }),
             events_tx,
             cancel.clone(),
         ));
@@ -404,7 +356,7 @@ impl Tile {
             let camera = self.camera.clone();
             async move {
                 while let Ok(event) = events_rx.recv().await {
-                    if event == TileEvent::Restart
+                    if event == FeedEvent::Restart
                         && let Err(error) = Stage::restart(&bin)
                     {
                         warn!(
@@ -437,7 +389,7 @@ impl Tile {
                 sink.set_property("sync", true);
             }
         });
-        let pacer = pairing.pacer(Medium::Picture, Self::shift_pad(bin)?);
+        let pacer = pairing.pacer(Medium::Video, Self::shift_pad(bin)?);
         Ok((pacer, self.start_sound(sound, &pairing)?))
     }
 
@@ -497,14 +449,13 @@ impl Tile {
         });
 
         let cancel = CancellationToken::new();
-        let (events_tx, events_rx) = async_channel::unbounded::<TileEvent>();
-        self.runtime.spawn(live::run(
-            feed,
-            Source {
+        let (events_tx, events_rx) = async_channel::unbounded::<FeedEvent>();
+        self.runtime.spawn(feed.run(
+            Arc::new(Source {
                 src,
                 budget: Arc::clone(&self.budget),
                 pacer,
-            },
+            }),
             events_tx,
             cancel.clone(),
         ));
@@ -516,7 +467,7 @@ impl Tile {
             async move {
                 while let Ok(event) = events_rx.recv().await {
                     match event {
-                        TileEvent::Restart => {
+                        FeedEvent::Restart => {
                             armed.store(true, Ordering::Release);
                             if let Err(error) = Stage::restart(&bin) {
                                 warn!(
@@ -529,10 +480,10 @@ impl Tile {
                                 ));
                             }
                         }
-                        TileEvent::Oversized { retry_in } => {
+                        FeedEvent::Oversized { retry_in } => {
                             label.set_label(&oversized_label(&name, &camera, retry_in));
                         }
-                        TileEvent::Live => label.set_label(&format!("{name} ({camera})")),
+                        FeedEvent::Live => label.set_label(&format!("{name} ({camera})")),
                     }
                 }
             }
@@ -593,6 +544,8 @@ impl Drop for Tile {
 
 #[cfg(test)]
 mod tests {
+    use iris_client::sound_clock::DELAY;
+
     use super::*;
 
     #[test]
@@ -627,67 +580,151 @@ mod tests {
         }
     }
 
-    /// A source that plays against the clock tells its pacer of every
-    /// payload before it is queued, and of a fresh byte stream: the feed's
-    /// first fragment places it, and after a reset the next one does again.
+    /// The `prft` box a live fragment starts with, for the media time
+    /// `ticks`.
+    fn prft(ticks: u64) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&32_u32.to_be_bytes());
+        bytes.extend_from_slice(b"prft");
+        bytes.extend_from_slice(&[1, 0, 0, 0x18, 0, 0, 0, 1]);
+        bytes.extend_from_slice(&0_u64.to_be_bytes());
+        bytes.extend_from_slice(&ticks.to_be_bytes());
+        bytes
+    }
+
+    /// A source that plays against the clock of a playing pipeline: its
+    /// pacer, the sound's, sets the offset of `pad`.
+    struct PacedSource {
+        pipeline: gst::Pipeline,
+        pad: gst::Pad,
+        source: Source,
+    }
+
+    impl PacedSource {
+        fn new() -> Self {
+            Self::with_budget(u64::MAX)
+        }
+
+        /// A paced source whose live budget admits `bytes`.
+        fn with_budget(bytes: u64) -> Self {
+            gst::init().unwrap();
+            let pipeline = gst::Pipeline::new();
+            pipeline.set_state(gst::State::Playing).unwrap();
+            let (_, state, _) = pipeline.state(gst::ClockTime::from_seconds(5));
+            assert_eq!(state, gst::State::Playing);
+            let pairing = Pairing::new(&pipeline, || {});
+            let pad = gst::Pad::builder(gst::PadDirection::Src).build();
+            let source = Source {
+                src: gst_app::AppSrc::builder()
+                    .max_bytes(SOURCE_QUEUE_BYTES)
+                    .build(),
+                budget: Arc::new(LiveBudget::new(bytes)),
+                pacer: Some(pairing.pacer(Medium::Audio, pad.clone())),
+            };
+            Self {
+                pipeline,
+                pad,
+                source,
+            }
+        }
+
+        /// Pushes the feed's first fragment and, 40 ms on, its second, and
+        /// returns the offset the first one set.
+        fn first_two_fragments(&self) -> i64 {
+            self.source.push_payload(&prft(90_000_000)).unwrap();
+            let first = self.pad.offset();
+            std::thread::sleep(Duration::from_millis(40));
+            self.source.push_payload(&prft(90_003_600)).unwrap();
+            first
+        }
+    }
+
+    impl Drop for PacedSource {
+        fn drop(&mut self) {
+            let _ = self.pipeline.set_state(gst::State::Null);
+        }
+    }
+
+    /// A source that plays against the clock tells its pacer of a fragment
+    /// it pushes: the feed's first fragment places the feed.
     #[test]
-    fn a_source_tells_its_pacer_of_payloads_and_of_a_fresh_stream() {
+    fn a_source_tells_its_pacer_of_a_fragment() {
+        let paced = PacedSource::new();
+        paced.source.push_payload(&prft(90_000_000)).unwrap();
+        let first = paced.pad.offset();
+        let delay_ns = i64::try_from(DELAY.as_nanos()).unwrap();
+        assert!(first >= delay_ns, "placed {first} ns in");
+    }
+
+    /// A source tells its pacer of no payload it refuses: a fragment that
+    /// the live budget cannot admit leaves the feed unplaced.
+    #[test]
+    fn a_refused_fragment_leaves_the_feed_unplaced() {
+        let paced = PacedSource::with_budget(0);
+        let _ = paced.source.push_payload(&prft(90_000_000));
+        assert_eq!(
+            paced.pad.offset(),
+            0,
+            "the refused fragment placed the feed"
+        );
+    }
+
+    /// The pacer's estimate holds when the feed's second fragment arrives on
+    /// time: the source's offset stays where the first fragment put it.
+    #[test]
+    fn a_second_fragment_on_time_leaves_the_offset() {
+        let paced = PacedSource::new();
+        let first = paced.first_two_fragments();
+        assert!(
+            (paced.pad.offset() - first).abs() < 5_000_000,
+            "the estimate held"
+        );
+    }
+
+    /// A source tells its pacer of a fresh byte stream: after a reset, the
+    /// feed's next fragment places the feed again, on another run's
+    /// timeline.
+    #[test]
+    fn a_reset_source_tells_its_pacer_of_a_fresh_stream() {
+        let paced = PacedSource::new();
+        let first = paced.first_two_fragments();
+        paced.source.reset();
+        paced.source.push_payload(&prft(9_000)).unwrap();
+        assert!(paced.pad.offset() >= first + 30_000_000, "placed anew");
+    }
+
+    /// A source whose queue holds [`SOURCE_QUEUE_BYTES`], in payloads of
+    /// 1 MiB.
+    fn source_with_a_full_queue() -> Source {
         gst::init().unwrap();
-        let pipeline = gst::Pipeline::new();
-        pipeline.set_state(gst::State::Playing).unwrap();
-        let (_, state, _) = pipeline.state(gst::ClockTime::from_seconds(5));
-        assert_eq!(state, gst::State::Playing);
-        let pairing = Pairing::new(&pipeline, || {});
-        let pad = gst::Pad::builder(gst::PadDirection::Src).build();
         let source = Source {
             src: gst_app::AppSrc::builder()
                 .max_bytes(SOURCE_QUEUE_BYTES)
                 .build(),
-            budget: LiveBudget::new(u64::MAX),
-            pacer: Some(pairing.pacer(Medium::Sound, pad.clone())),
+            budget: Arc::new(LiveBudget::new(u64::MAX)),
+            pacer: None,
         };
-        // A live fragment starts with a `prft` box that holds its media time.
-        let fragment = |ticks: u64| {
-            let mut bytes = Vec::new();
-            bytes.extend_from_slice(&32_u32.to_be_bytes());
-            bytes.extend_from_slice(b"prft");
-            bytes.extend_from_slice(&[1, 0, 0, 0x18, 0, 0, 0, 1]);
-            bytes.extend_from_slice(&0_u64.to_be_bytes());
-            bytes.extend_from_slice(&ticks.to_be_bytes());
-            bytes
-        };
-        let delay = i64::try_from(sound::DELAY.as_nanos()).unwrap();
-        source.push(&fragment(90_000_000)).unwrap();
-        let first = pad.offset();
-        assert!(first >= delay, "placed {first} ns in");
-        std::thread::sleep(Duration::from_millis(40));
-        source.push(&fragment(90_003_600)).unwrap();
-        assert!(
-            (pad.offset() - first).abs() < 5_000_000,
-            "the estimate held"
+        for _ in 0..16 {
+            source.push_payload(&vec![0; 1 << 20]).unwrap();
+        }
+        source
+    }
+
+    /// A full queue refuses a payload with the text of its byte limit.
+    #[test]
+    fn a_full_queue_rejects_a_payload() {
+        let source = source_with_a_full_queue();
+        let refused = source.push_payload(&vec![0; 1 << 20]).unwrap_err();
+        assert_eq!(
+            refused.to_string(),
+            "live input queue exceeded its byte limit"
         );
-        // A fresh byte stream, on another run's timeline.
-        source.reset();
-        source.push(&fragment(9_000)).unwrap();
-        assert!(pad.offset() >= first + 30_000_000, "placed anew");
-        pipeline.set_state(gst::State::Null).unwrap();
     }
 
     #[test]
-    fn a_stalled_source_rejects_payloads_beyond_the_byte_limit() {
-        gst::init().unwrap();
-        let source = Source {
-            src: gst_app::AppSrc::builder()
-                .max_bytes(SOURCE_QUEUE_BYTES)
-                .build(),
-            budget: LiveBudget::new(u64::MAX),
-            pacer: None,
-        };
-        let payload = vec![0; 1 << 20];
-        for _ in 0..16 {
-            source.push(&payload).unwrap();
-        }
-        assert!(source.push(&payload).is_err());
+    fn a_payload_a_full_queue_rejects_is_not_queued() {
+        let source = source_with_a_full_queue();
+        let _ = source.push_payload(&vec![0; 1 << 20]);
         assert_eq!(source.src.current_level_bytes(), SOURCE_QUEUE_BYTES);
     }
 
@@ -701,17 +738,37 @@ mod tests {
         }
     }
 
-    #[test]
-    fn the_live_budget_spans_sources() {
+    /// A budget of 2 MiB and two sources on it, each of which has queued a
+    /// payload of 1 MiB.
+    fn two_sources_on_a_full_budget() -> (Arc<LiveBudget>, Source, Source) {
         gst::init().unwrap();
-        let budget = LiveBudget::new(2 << 20);
+        let budget = Arc::new(LiveBudget::new(2 << 20));
         let (first, second) = (budgeted_source(&budget), budgeted_source(&budget));
         let payload = vec![0; 1 << 20];
-        first.push(&payload).unwrap();
-        second.push(&payload).unwrap();
+        first.push_payload(&payload).unwrap();
+        second.push_payload(&payload).unwrap();
+        (budget, first, second)
+    }
+
+    #[test]
+    fn the_live_budget_counts_the_payloads_of_every_source() {
+        let (budget, _first, _second) = two_sources_on_a_full_budget();
         assert_eq!(budget.used(), 2 << 20);
-        let refused = first.push(&[1]).unwrap_err();
+    }
+
+    /// A source whose payload the shared budget cannot admit refuses it with
+    /// the budget's text, although the source's queue has room.
+    #[test]
+    fn a_full_live_budget_refuses_a_payload() {
+        let (_budget, first, _second) = two_sources_on_a_full_budget();
+        let refused = first.push_payload(&[1]).unwrap_err();
         assert!(refused.to_string().contains("live budget"), "{refused}");
+    }
+
+    #[test]
+    fn a_payload_the_budget_refuses_is_not_queued() {
+        let (_budget, first, _second) = two_sources_on_a_full_budget();
+        let _ = first.push_payload(&[1]);
         assert_eq!(
             first.src.current_level_bytes(),
             1 << 20,
@@ -721,70 +778,152 @@ mod tests {
 
     #[test]
     fn freeing_queued_buffers_returns_their_budget() {
-        gst::init().unwrap();
-        let budget = LiveBudget::new(2 << 20);
-        let (first, second) = (budgeted_source(&budget), budgeted_source(&budget));
-        let payload = vec![0; 1 << 20];
-        first.push(&payload).unwrap();
-        second.push(&payload).unwrap();
+        let (budget, first, second) = two_sources_on_a_full_budget();
         drop(first);
         assert_eq!(
             budget.used(),
             1 << 20,
             "freeing the queued buffers returns their bytes"
         );
-        second.push(&payload).unwrap();
-        assert_eq!(budget.used(), 2 << 20);
+        second.push_payload(&vec![0; 1 << 20]).unwrap();
         drop(second);
         assert_eq!(budget.used(), 0);
     }
 
     #[test]
-    fn an_oversized_payload_is_rejected_without_queueing() {
+    fn a_freed_budget_admits_a_payload_again() {
+        let (budget, first, second) = two_sources_on_a_full_budget();
+        drop(first);
+        second.push_payload(&vec![0; 1 << 20]).unwrap();
+        assert_eq!(budget.used(), 2 << 20);
+    }
+
+    /// A source over an `appsrc` with its default limits.
+    fn default_source() -> Source {
         gst::init().unwrap();
-        let source = Source {
+        Source {
             src: gst_app::AppSrc::builder().build(),
-            budget: LiveBudget::new(u64::MAX),
+            budget: Arc::new(LiveBudget::new(u64::MAX)),
             pacer: None,
-        };
-        assert!(
-            source
-                .push(&vec![0; SOURCE_QUEUE_BYTES as usize + 1])
-                .is_err()
+        }
+    }
+
+    /// A payload one byte above the live protocol's ceiling.
+    fn oversized_payload() -> Vec<u8> {
+        vec![0; SOURCE_QUEUE_BYTES as usize + 1]
+    }
+
+    /// A payload above the byte limit is refused with the text of that
+    /// limit, although the queue is empty.
+    #[test]
+    fn an_oversized_payload_is_rejected() {
+        let refused = default_source()
+            .push_payload(&oversized_payload())
+            .unwrap_err();
+        assert_eq!(
+            refused.to_string(),
+            "live input queue exceeded its byte limit"
         );
-        assert_eq!(source.src.current_level_bytes(), 0);
     }
 
     #[test]
-    fn empty_and_excess_buffers_are_rejected_without_queueing() {
+    fn an_oversized_payload_is_not_queued() {
+        let source = default_source();
+        let _ = source.push_payload(&oversized_payload());
+        assert_eq!(source.src.current_level_bytes(), 0);
+    }
+
+    /// A source with the queue limits a tile's branch gives its `appsrc`.
+    fn buffer_limited_source() -> Source {
         gst::init().unwrap();
         let src = gst_app::AppSrc::builder()
             .max_bytes(SOURCE_QUEUE_BYTES)
             .build();
         src.set_property("max-buffers", SOURCE_QUEUE_BUFFERS);
-        let source = Source {
+        assert_eq!(src.property::<u64>("max-buffers"), SOURCE_QUEUE_BUFFERS);
+        Source {
             src,
-            budget: LiveBudget::new(u64::MAX),
+            budget: Arc::new(LiveBudget::new(u64::MAX)),
             pacer: None,
-        };
-        assert_eq!(
-            source.src.property::<u64>("max-buffers"),
-            SOURCE_QUEUE_BUFFERS
-        );
-        assert!(source.push(&[]).is_err());
-        assert_eq!(source.src.property::<u64>("current-level-buffers"), 0);
-
-        for _ in 0..SOURCE_QUEUE_BUFFERS {
-            source.push(&[1]).unwrap();
         }
+    }
+
+    /// A source whose queue holds [`SOURCE_QUEUE_BUFFERS`] buffers.
+    fn source_at_its_buffer_limit() -> Source {
+        let source = buffer_limited_source();
+        for _ in 0..SOURCE_QUEUE_BUFFERS {
+            source.push_payload(&[1]).unwrap();
+        }
+        source
+    }
+
+    fn queued_buffers(source: &Source) -> u64 {
+        source.src.property::<u64>("current-level-buffers")
+    }
+
+    #[test]
+    fn an_empty_payload_is_rejected() {
+        assert!(buffer_limited_source().push_payload(&[]).is_err());
+    }
+
+    #[test]
+    fn an_empty_payload_is_not_queued() {
+        let source = buffer_limited_source();
+        let _ = source.push_payload(&[]);
+        assert_eq!(queued_buffers(&source), 0);
+    }
+
+    #[test]
+    fn a_source_queues_up_to_its_buffer_limit() {
+        let source = source_at_its_buffer_limit();
+        assert_eq!(queued_buffers(&source), SOURCE_QUEUE_BUFFERS);
+    }
+
+    /// A queue at its buffer limit refuses a payload with the text of that
+    /// limit.
+    #[test]
+    fn a_payload_beyond_the_buffer_limit_is_rejected() {
+        let refused = source_at_its_buffer_limit().push_payload(&[1]).unwrap_err();
         assert_eq!(
-            source.src.property::<u64>("current-level-buffers"),
-            SOURCE_QUEUE_BUFFERS
+            refused.to_string(),
+            "live input queue exceeded its buffer limit"
         );
-        assert!(source.push(&[1]).is_err());
-        assert_eq!(
-            source.src.property::<u64>("current-level-buffers"),
-            SOURCE_QUEUE_BUFFERS
-        );
+    }
+
+    #[test]
+    fn a_payload_beyond_the_buffer_limit_is_not_queued() {
+        let source = source_at_its_buffer_limit();
+        let _ = source.push_payload(&[1]);
+        assert_eq!(queued_buffers(&source), SOURCE_QUEUE_BUFFERS);
+    }
+
+    /// An `appsrc` after its end of stream refuses a buffer with a flow
+    /// error, and the source refuses the payload with the name of the flow.
+    #[test]
+    fn a_flow_error_of_appsrc_refuses_the_payload() {
+        let source = default_source();
+        source.src.end_of_stream().unwrap();
+        let refused = source.push_payload(&[1]).unwrap_err();
+        assert_eq!(refused.to_string(), "appsrc rejected a buffer: Eos");
+    }
+
+    /// A fragment whose push fails is refused with the text of the push's
+    /// failure: for an empty one, "live input payload is empty".
+    #[test]
+    fn a_refused_push_has_the_text_of_its_failure() {
+        gst::init().unwrap();
+        let source = budgeted_source(&Arc::new(LiveBudget::new(u64::MAX)));
+        let refused = LiveSink::push(&source, LiveMessage::Fragment(&[])).unwrap_err();
+        assert_eq!(refused.to_string(), "live input payload is empty");
+    }
+
+    /// The source, as the feed's [`LiveSink`], queues the payloads of an init
+    /// segment and of a fragment alike: four bytes and one.
+    #[test]
+    fn a_source_queues_the_payload_of_either_message_kind() {
+        let source = default_source();
+        LiveSink::push(&source, LiveMessage::Init(&[0, 0, 0, 8])).unwrap();
+        LiveSink::push(&source, LiveMessage::Fragment(&[1])).unwrap();
+        assert_eq!(source.src.current_level_bytes(), 5);
     }
 }

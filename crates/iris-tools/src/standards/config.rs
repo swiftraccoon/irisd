@@ -47,7 +47,11 @@ pub struct Waiver {
 }
 
 /// The rules a waiver may cover: those that read meaning from words or
-/// shapes and so can be wrong. A rule that reads a fact has no exceptions.
+/// shapes and so can be wrong. The widths of Rust lines are among them: a
+/// line can be too wide for a reason the rule cannot see. A waiver also
+/// covers the breaches of a rule in text written before it, and its count
+/// falls as each file is brought to the rule. A rule that reads a fact has
+/// no exceptions.
 fn waivable(rule: Rule) -> bool {
     matches!(
         rule,
@@ -57,6 +61,20 @@ fn waivable(rule: Rule) -> bool {
             | Rule::GetPrefix
             | Rule::BoolParameter
             | Rule::BareTuple
+            | Rule::CommentWidth
+            | Rule::CodeWidth
+            | Rule::ExampleHeading
+            | Rule::FullPathType
+            | Rule::DerivePath
+            | Rule::UsePerPath
+            | Rule::TestNameAnd
+            | Rule::SentenceLength
+            | Rule::BarredPhrase
+            | Rule::TheCore
+            | Rule::PossessiveCodeSpan
+            | Rule::UnknownName
+            | Rule::MissingExample
+            | Rule::UnassertedErrorText
     )
 }
 
@@ -156,5 +174,53 @@ mod tests {
         let unexplained =
             Config::parse("[[allowed]]\ntext = \"a@b.org\"\nreason = \"\"\n").unwrap();
         assert_eq!(unexplained.settle(&[]).len(), 1);
+    }
+
+    #[test]
+    fn a_rule_of_widths_paths_or_words_takes_a_waiver() {
+        let rules = [
+            Rule::CommentWidth,
+            Rule::CodeWidth,
+            Rule::ExampleHeading,
+            Rule::FullPathType,
+            Rule::DerivePath,
+            Rule::UsePerPath,
+            Rule::TestNameAnd,
+            Rule::SentenceLength,
+            Rule::BarredPhrase,
+            Rule::TheCore,
+            Rule::PossessiveCodeSpan,
+        ];
+        for rule in rules {
+            let found = [Finding::new(rule, "a.md", 1, "a breach")];
+            let waived = config(1, rule.name(), "written before the rule").settle(&found);
+            assert_eq!(waived, [], "{}", rule.name());
+        }
+    }
+
+    #[test]
+    fn a_rule_of_names_takes_a_waiver() {
+        let found = [Finding::new(Rule::UnknownName, "a.md", 1, "a breach")];
+        let waived = config(1, "unknown-name", "written before the rule").settle(&found);
+        assert_eq!(waived, []);
+    }
+
+    #[test]
+    fn a_rule_of_examples_takes_a_waiver() {
+        let found = [Finding::new(Rule::MissingExample, "a.md", 1, "a breach")];
+        let waived = config(1, "missing-example", "written before the rule").settle(&found);
+        assert_eq!(waived, []);
+    }
+
+    #[test]
+    fn a_rule_of_error_texts_takes_a_waiver() {
+        let found = [Finding::new(
+            Rule::UnassertedErrorText,
+            "a.md",
+            1,
+            "a breach",
+        )];
+        let waived = config(1, "unasserted-error-text", "written before the rule").settle(&found);
+        assert_eq!(waived, []);
     }
 }

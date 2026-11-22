@@ -2,7 +2,7 @@
 
 use bytes::Bytes;
 
-use crate::boxes::{BoxHeader, BoxWriter};
+use crate::boxes::{self, BoxHeader, BoxWriter};
 use crate::fragment::{NON_SYNC_SAMPLE_FLAGS, SYNC_SAMPLE_FLAGS};
 use iris_core::time::TIMESCALE;
 
@@ -104,24 +104,6 @@ pub fn build_init_segment(entry: &SampleEntry) -> Bytes {
     build(&[(&entry.bytes, kind, VIDEO_TRACK_ID)])
 }
 
-/// The body of the first child box of type `kind` in `buf`, or `None` when
-/// there is none or a box claims more than `buf` holds.
-fn child(buf: &[u8], kind: [u8; 4]) -> Option<&[u8]> {
-    let mut rest = buf;
-    while !rest.is_empty() {
-        let header = BoxHeader::parse(rest)?;
-        let size = usize::try_from(header.size?).ok()?;
-        if size > rest.len() {
-            return None;
-        }
-        if header.kind == kind {
-            return rest.get(usize::from(header.header_len)..size);
-        }
-        rest = &rest[size..];
-    }
-    None
-}
-
 /// The sample entry box of the first track of an initialization segment
 /// (`moov/trak/mdia/minf/stbl/stsd`), whole, as [`SampleEntry::bytes`] holds
 /// it. `None` when a box on the way is missing or does not fit.
@@ -138,7 +120,7 @@ fn child(buf: &[u8], kind: [u8; 4]) -> Option<&[u8]> {
 pub fn sample_entry_bytes(init: &[u8]) -> Option<&[u8]> {
     let mut body = init;
     for kind in [b"moov", b"trak", b"mdia", b"minf", b"stbl", b"stsd"] {
-        body = child(body, *kind)?;
+        body = boxes::child(body, *kind)?;
     }
     // A full box: version and flags, then the entry count, then the entries.
     let entries = body.get(8..)?;

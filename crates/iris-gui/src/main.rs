@@ -24,9 +24,6 @@
 //! names the daemon's origin; plain HTTP is accepted on loopback alone unless
 //! `--allow-insecure-http` is given.
 
-mod api;
-mod fragment;
-mod live;
 mod playback;
 mod snapshot;
 mod sound;
@@ -34,7 +31,6 @@ mod stage;
 mod thumbs;
 mod tile;
 mod timeline;
-mod vod;
 
 use std::cell::RefCell;
 use std::ffi::{OsStr, OsString};
@@ -49,24 +45,27 @@ use async_channel::{Receiver, Sender};
 use clap::Parser;
 use gtk::prelude::*;
 use gtk::{gio, glib};
+use iris_client::api::{
+    Camera, DiscoveredDevice, NewCamera, ProfileStream, StreamUrlsRequest, Window, rtsp_url_problem,
+};
+use iris_client::live::LiveBudget;
+use iris_client::origin::{ApiOrigin, OriginError, PlainHttp};
+use iris_core::event::EventSource;
 use iris_core::id::{CameraId, StreamKind};
 use iris_core::time::WallUs;
 use iris_tls::ClientConfig;
+use iris_transport::{Bearer, Client, ClientError, Feed};
 use tokio::runtime::Runtime;
 use tokio::sync::{Semaphore, oneshot};
 use tracing::{error, info, warn};
-use tracing_subscriber::EnvFilter;
-use tracing_subscriber::Layer as _;
-use tracing_subscriber::filter;
 use tracing_subscriber::layer::SubscriberExt as _;
 use tracing_subscriber::util::SubscriberInitExt as _;
+use tracing_subscriber::{EnvFilter, Layer as _, filter};
 use url::{Host, Url};
 
-use crate::api::{Camera, Client, DiscoveredDevice, NewCamera, ProfileStream, StreamUrlsRequest};
-use crate::live::Feed;
 use crate::playback::{Playback, thumbnail_decoder_pool};
 use crate::stage::Stage;
-use crate::tile::{DEFAULT_LIVE_BUDGET_MIB, LiveBudget, MIN_LIVE_BUDGET_MIB, Tile};
+use crate::tile::{DEFAULT_LIVE_BUDGET_MIB, MIN_LIVE_BUDGET_MIB, Tile};
 use crate::timeline::MICROS_PER_SECOND;
 
 /// The longest `--window`: seven days, the API's longest time range.
@@ -164,6 +163,19 @@ impl fmt::Debug for Args {
     }
 }
 
+impl Args {
+    /// The plain-HTTP policy of `--api`: [`PlainHttp::LoopbackOnly`], or
+    /// [`PlainHttp::Anywhere`] with `--allow-insecure-http`.
+    #[must_use]
+    fn plain_http(&self) -> PlainHttp {
+        if self.allow_insecure_http {
+            PlainHttp::Anywhere
+        } else {
+            PlainHttp::LoopbackOnly
+        }
+    }
+}
+
 /// Parses `--kind` and `--focus-kind`: a stream kind that carries video.
 fn video_kind(value: &str) -> Result<StreamKind, String> {
     match value.parse::<StreamKind>() {
@@ -209,12 +221,15 @@ struct Views {
     playback_task: Option<glib::JoinHandle<()>>,
     thumbnail_decoders: Arc<Semaphore>,
     runtime: Arc<Runtime>,
-    client: Arc<Client>,
+    client: Client,
     tx: Sender<Event>,
     stage: Rc<Stage>,
     /// The live payload budget every tile's feed draws from.
     budget: Arc<LiveBudget>,
-    /// The TLS trust the API client and every `wss` feed share.
+    /// The bearer every feed sends, which the API client sends too.
+    token: Option<Bearer>,
+    /// The TLS trust configuration that every `wss` feed holds. The API
+    /// client was built with a copy of it.
     tls: Arc<ClientConfig>,
     /// The cameras as last listed, for the focused view's remove button.
     cameras: Vec<Camera>,
@@ -230,13 +245,13 @@ struct Views {
 /// cannot import them and copies every frame through the CPU.
 const RENDERER: &str = "gl";
 
-/// tungstenite serializes the complete handshake, including Authorization,
-/// before emitting this dependency trace target. The output layer suppresses
-/// it regardless of the caller's `RUST_LOG` filter.
-const SENSITIVE_LOG_TARGET: &str = "tungstenite::handshake::client";
-
+/// Whether the output layer writes the events of the target of `metadata`. It
+/// drops every event of the target that
+/// [`iris_transport::is_sensitive_log_target`] names, whatever `RUST_LOG`
+/// admits. Under that target, tungstenite writes a live feed's whole
+/// handshake request, with the bearer in its Authorization header.
 fn safe_log_metadata(metadata: &tracing::Metadata<'_>) -> bool {
-    metadata.target() != SENSITIVE_LOG_TARGET
+    !iris_transport::is_sensitive_log_target(metadata.target())
 }
 
 /// Why a token given as `--token` is moved or flagged.
@@ -280,38 +295,41 @@ fn take_token_argument(args: &[OsString]) -> Option<(Vec<OsString>, OsString)> {
     Some((rest, value))
 }
 
-/// Refuses API URLs the viewer must not use: schemes other than `http` and
-/// `https`, userinfo, a path, query, or fragment (the client joins absolute
-/// paths to the origin, so a path prefix would be dropped silently and the
-/// bearer sent elsewhere on the host), and plain HTTP to a host other than
-/// loopback unless `allow_insecure_http` accepts it.
-fn check_api_url(api: &Url, allow_insecure_http: bool) -> anyhow::Result<()> {
-    anyhow::ensure!(
-        matches!(api.scheme(), "http" | "https"),
-        "the API URL must use http or https"
-    );
-    anyhow::ensure!(
-        api.username().is_empty() && api.password().is_none(),
-        "the API URL cannot carry userinfo; pass the bearer token in IRISD_TOKEN"
-    );
-    anyhow::ensure!(
-        api.path() == "/" && api.query().is_none() && api.fragment().is_none(),
-        "the API URL must name only the daemon's origin, such as https://nvr.example:8443; \
-         a path, query, or fragment is not supported"
-    );
-    let loopback = match api.host() {
-        Some(Host::Ipv4(address)) => address.is_loopback(),
-        Some(Host::Ipv6(address)) => address.is_loopback(),
-        Some(Host::Domain(name)) => name.eq_ignore_ascii_case("localhost"),
-        None => anyhow::bail!("the API URL has no host"),
+/// The API origin that `api` names, under the policy `plain_http`.
+/// [`ApiOrigin`] refuses a scheme other than `http` and `https`, userinfo, a
+/// path, a query, a fragment, and plain HTTP that the policy does not admit.
+/// The request builders set absolute paths on the origin, so a path prefix
+/// would be dropped and the bearer sent elsewhere on the host. To the
+/// refusals of userinfo and of plain HTTP, the viewer adds what to do
+/// instead.
+fn api_origin(api: Url, plain_http: PlainHttp) -> anyhow::Result<ApiOrigin> {
+    ApiOrigin::try_new(api, plain_http).map_err(|error| {
+        let advice = match error {
+            OriginError::Userinfo => "pass the bearer token in IRISD_TOKEN",
+            OriginError::PlainHttp { .. } => {
+                "use an https URL through a TLS proxy, or pass --allow-insecure-http"
+            }
+            _ => return anyhow::Error::from(error),
+        };
+        anyhow::anyhow!("{error}; {advice}")
+    })
+}
+
+/// The bearer of `--token` or `IRISD_TOKEN`, checked once at startup. The
+/// viewer treats the value as the daemon treats the token of a request. It
+/// drops the white space around the value, and an empty result is no token,
+/// so a viewer with an empty `IRISD_TOKEN` runs against a daemon without
+/// authentication. A value that then holds a character outside visible
+/// ASCII is refused with a message that names the option and never the
+/// value. Visible ASCII is what the daemon's configuration admits in a
+/// token.
+fn bearer(token: Option<&str>) -> anyhow::Result<Option<Bearer>> {
+    let Some(token) = token.map(str::trim).filter(|token| !token.is_empty()) else {
+        return Ok(None);
     };
-    anyhow::ensure!(
-        api.scheme() == "https" || loopback || allow_insecure_http,
-        "refusing plain HTTP to {}: the bearer token and video would cross the network \
-         unencrypted; use an https URL through a TLS proxy, or pass --allow-insecure-http",
-        api.host_str().unwrap_or_default()
-    );
-    Ok(())
+    Bearer::try_new(token)
+        .map(Some)
+        .map_err(|error| anyhow::anyhow!("{error}; check --token or IRISD_TOKEN"))
 }
 
 /// Re-executes the viewer with `GSK_RENDERER` set when nothing set it. GTK reads
@@ -352,10 +370,20 @@ fn main() -> glib::ExitCode {
     if take_token_argument(&std::env::args_os().skip(1).collect::<Vec<_>>()).is_some() {
         warn!("{TOKEN_ARGUMENT_WARNING}");
     }
-    if let Err(error) = check_api_url(&args.api, args.allow_insecure_http) {
-        error!("{error}");
-        return glib::ExitCode::FAILURE;
-    }
+    let origin = match api_origin(args.api.clone(), args.plain_http()) {
+        Ok(origin) => origin,
+        Err(error) => {
+            error!("{error}");
+            return glib::ExitCode::FAILURE;
+        }
+    };
+    let token = match bearer(args.token.as_deref()) {
+        Ok(token) => token,
+        Err(error) => {
+            error!("{error}");
+            return glib::ExitCode::FAILURE;
+        }
+    };
     let tls = match iris_tls::client_config(args.ca_file.as_deref()) {
         Ok(tls) => tls,
         Err(error) => {
@@ -388,7 +416,15 @@ fn main() -> glib::ExitCode {
         .build();
     let thumbnail_decoders = thumbnail_decoder_pool();
     app.connect_activate(move |app| {
-        build_window(app, &args, &runtime, &thumbnail_decoders, &tls);
+        build_window(
+            app,
+            &args,
+            &origin,
+            token.as_ref(),
+            &runtime,
+            &thumbnail_decoders,
+            &tls,
+        );
     });
     app.run_with_args::<&str>(&[])
 }
@@ -396,6 +432,8 @@ fn main() -> glib::ExitCode {
 fn build_window(
     app: &gtk::Application,
     args: &Args,
+    origin: &ApiOrigin,
+    token: Option<&Bearer>,
     runtime: &Arc<Runtime>,
     thumbnail_decoders: &Arc<Semaphore>,
     tls: &Arc<ClientConfig>,
@@ -420,7 +458,7 @@ fn build_window(
             return;
         }
     };
-    let client = Arc::new(Client::new(args.api.clone(), args.token.clone(), tls));
+    let client = api_client(origin, token, tls);
     fetch_cameras(runtime, &client, &tx, Event::Cameras);
 
     let views = Rc::new(RefCell::new(Views {
@@ -438,7 +476,8 @@ fn build_window(
         client,
         tx: tx.clone(),
         stage,
-        budget: LiveBudget::new(u64::from(args.live_budget_mib) << 20),
+        budget: Arc::new(LiveBudget::new(u64::from(args.live_budget_mib) << 20)),
+        token: token.cloned(),
         tls: Arc::clone(tls),
         cameras: Vec::new(),
         remove_button,
@@ -542,21 +581,28 @@ async fn run_events(views: Rc<RefCell<Views>>, args: Args, rx: Receiver<Event>) 
 /// change, which rebuilds the grid.
 fn fetch_cameras(
     runtime: &Runtime,
-    client: &Arc<Client>,
+    client: &Client,
     tx: &Sender<Event>,
     listed: fn(Vec<Camera>) -> Event,
 ) {
     runtime.spawn({
         let tx = tx.clone();
-        let client = Arc::clone(client);
+        let client = client.clone();
         async move {
             let event = match client.cameras().await {
                 Ok(cameras) => listed(cameras),
-                Err(error) => Event::Status(format!("{error:#}")),
+                Err(error) => Event::Status(failure_text(error)),
             };
             let _ = tx.send(event).await;
         }
     });
+}
+
+/// A failure of the API client as the viewer shows it: its text and then
+/// each of its sources after a colon, as `anyhow` writes an error's chain.
+#[must_use]
+fn failure_text(error: ClientError) -> String {
+    format!("{:#}", anyhow::Error::from(error))
 }
 
 /// Stops every tile and takes it out of the grid, ready for a fresh list.
@@ -603,32 +649,32 @@ fn camera_from_form(form: &CameraForm) -> Result<NewCamera, String> {
     })?;
     let name = required(&form.name, "the camera name")?;
     let rtsp_url = required(&form.rtsp_url, "the RTSP URL")?;
-    if let Some(problem) = api::rtsp_url_problem(&rtsp_url) {
+    if let Some(problem) = rtsp_url_problem(&rtsp_url) {
         return Err(format!("the RTSP URL {problem}"));
     }
     let username = required(&form.username, "the username")?;
     let sub_url = Some(form.sub_url.trim())
         .filter(|url| !url.is_empty())
         .map(str::to_owned);
-    if let Some(problem) = sub_url.as_deref().and_then(api::rtsp_url_problem) {
+    if let Some(problem) = sub_url.as_deref().and_then(rtsp_url_problem) {
         return Err(format!("the sub URL {problem}"));
     }
     let mut record = Vec::new();
     if form.record_main {
-        record.push("main".to_owned());
+        record.push(StreamKind::Main);
     }
     if form.record_sub {
-        record.push("sub".to_owned());
+        record.push(StreamKind::Sub);
     }
     if record.is_empty() {
         return Err("record at least one stream".to_owned());
     }
     let mut events = Vec::new();
     if form.dahua_cgi {
-        events.push("dahua_cgi".to_owned());
+        events.push(EventSource::DahuaCgi);
     }
     if form.onvif_pull_point {
-        events.push("onvif_pull_point".to_owned());
+        events.push(EventSource::OnvifPullPoint);
     }
     Ok(NewCamera {
         id,
@@ -982,10 +1028,10 @@ fn stream_fill(streams: &[ProfileStream]) -> Option<(String, Option<String>)> {
 /// streams" button: each lookup runs on the runtime and its answer applies on
 /// the main loop. The handlers hold the form weakly, so the dialog that owns
 /// the form releases it when it closes.
-fn wire_lookups(form: &Rc<FormWidgets>, client: &Arc<Client>, runtime: &Arc<Runtime>) {
+fn wire_lookups(form: &Rc<FormWidgets>, client: &Client, runtime: &Arc<Runtime>) {
     form.discover.connect_clicked({
         let form = Rc::downgrade(form);
-        let client = Arc::clone(client);
+        let client = client.clone();
         let runtime = Arc::clone(runtime);
         move |button| {
             let Some(shown) = form.upgrade() else {
@@ -998,7 +1044,7 @@ fn wire_lookups(form: &Rc<FormWidgets>, client: &Arc<Client>, runtime: &Arc<Runt
             ));
             let (reply, answer) = oneshot::channel();
             runtime.spawn({
-                let client = Arc::clone(&client);
+                let client = client.clone();
                 async move {
                     let _ = reply.send(client.discover(DISCOVERY_WAIT).await);
                 }
@@ -1013,7 +1059,7 @@ fn wire_lookups(form: &Rc<FormWidgets>, client: &Arc<Client>, runtime: &Arc<Runt
                     };
                     match answer {
                         Ok(Ok(devices)) => form.show_devices(devices),
-                        Ok(Err(error)) => form.notice.set_label(&format!("{error:#}")),
+                        Ok(Err(error)) => form.notice.set_label(&failure_text(error)),
                         Err(_) => form.notice.set_label("discovery was abandoned"),
                     }
                     button.set_sensitive(true);
@@ -1043,7 +1089,7 @@ fn wire_lookups(form: &Rc<FormWidgets>, client: &Arc<Client>, runtime: &Arc<Runt
     });
     form.fetch_streams.connect_clicked({
         let form = Rc::downgrade(form);
-        let client = Arc::clone(client);
+        let client = client.clone();
         let runtime = Arc::clone(runtime);
         move |button| {
             let Some(shown) = form.upgrade() else {
@@ -1060,7 +1106,7 @@ fn wire_lookups(form: &Rc<FormWidgets>, client: &Arc<Client>, runtime: &Arc<Runt
             shown.notice.set_label("asking the camera for its streams");
             let (reply, answer) = oneshot::channel();
             runtime.spawn({
-                let client = Arc::clone(&client);
+                let client = client.clone();
                 async move {
                     let _ = reply.send(client.stream_urls(&request).await);
                 }
@@ -1075,7 +1121,7 @@ fn wire_lookups(form: &Rc<FormWidgets>, client: &Arc<Client>, runtime: &Arc<Runt
                     };
                     match answer {
                         Ok(Ok(streams)) => form.apply_streams(&streams),
-                        Ok(Err(error)) => form.notice.set_label(&format!("{error:#}")),
+                        Ok(Err(error)) => form.notice.set_label(&failure_text(error)),
                         Err(_) => form.notice.set_label("the lookup was abandoned"),
                     }
                     button.set_sensitive(true);
@@ -1089,13 +1135,13 @@ fn wire_lookups(form: &Rc<FormWidgets>, client: &Arc<Client>, runtime: &Arc<Runt
 /// status bar, and lists the cameras again on success.
 fn add_camera_in_background(
     runtime: &Runtime,
-    client: &Arc<Client>,
+    client: &Client,
     tx: &Sender<Event>,
     camera: NewCamera,
 ) {
     let _ = tx.try_send(Event::Status(format!("adding camera {}", camera.id)));
     runtime.spawn({
-        let client = Arc::clone(client);
+        let client = client.clone();
         let tx = tx.clone();
         async move {
             match client.add_camera(&camera).await {
@@ -1109,7 +1155,7 @@ fn add_camera_in_background(
                     let _ = tx.send(Event::Refresh).await;
                 }
                 Err(error) => {
-                    let _ = tx.send(Event::Status(format!("{error:#}"))).await;
+                    let _ = tx.send(Event::Status(failure_text(error))).await;
                 }
             }
         }
@@ -1120,13 +1166,13 @@ fn add_camera_in_background(
 /// outcome in the status bar, and lists the cameras again on success.
 fn remove_camera_in_background(
     runtime: &Runtime,
-    client: &Arc<Client>,
+    client: &Client,
     tx: &Sender<Event>,
     camera: CameraId,
 ) {
     let _ = tx.try_send(Event::Status(format!("removing camera {camera}")));
     runtime.spawn({
-        let client = Arc::clone(client);
+        let client = client.clone();
         let tx = tx.clone();
         async move {
             match client.remove_camera(&camera).await {
@@ -1137,7 +1183,7 @@ fn remove_camera_in_background(
                     let _ = tx.send(Event::Refresh).await;
                 }
                 Err(error) => {
-                    let _ = tx.send(Event::Status(format!("{error:#}"))).await;
+                    let _ = tx.send(Event::Status(failure_text(error))).await;
                 }
             }
         }
@@ -1150,7 +1196,7 @@ fn remove_camera_in_background(
 /// which stays open. The dialog's Add button is the form's one owner, so
 /// closing the dialog releases the form; the returned reference is weak.
 fn add_camera_dialog(
-    client: &Arc<Client>,
+    client: &Client,
     runtime: &Arc<Runtime>,
     tx: &Sender<Event>,
     parent: Option<&gtk::Window>,
@@ -1166,7 +1212,7 @@ fn add_camera_dialog(
     let weak = Rc::downgrade(&form);
     add.connect_clicked({
         let dialog = dialog.downgrade();
-        let client = Arc::clone(client);
+        let client = client.clone();
         let runtime = Arc::clone(runtime);
         let tx = tx.clone();
         move |_| match camera_from_form(&form.values()) {
@@ -1202,7 +1248,7 @@ fn confirm_remove_focused(views: &Rc<RefCell<Views>>) {
         (
             tile.camera().clone(),
             tile.name().to_owned(),
-            Arc::clone(&v.client),
+            v.client.clone(),
             Arc::clone(&v.runtime),
             v.tx.clone(),
             parent_window(&v),
@@ -1285,19 +1331,30 @@ fn open_playback(views: &Rc<RefCell<Views>>, camera: &CameraId, args: &Args) {
         v.stack.add_named(playback.widget(), Some("playback"));
         v.stack.set_visible_child_name("playback");
         v.playback = Some(Rc::clone(&playback));
-        (playback, Arc::clone(&v.client), Arc::clone(&v.runtime))
+        (playback, v.client.clone(), Arc::clone(&v.runtime))
     };
-    let to = WallUs::new(glib::real_time());
-    let from = to.offset(-i64::from(args.window) * MICROS_PER_MINUTE);
+    let window = playback_window(WallUs::new(glib::real_time()), args.window);
     info!(camera = %camera, kind = %args.focus_kind, minutes = args.window, "playback opened");
     let export_to = args.export_to.clone();
     let task = glib::spawn_future_local(async move {
-        playback.open(client, runtime, from, to).await;
+        playback.open(client, runtime, window).await;
         if let Some(path) = export_to {
-            Rc::clone(&playback).export_to(path, from, to).await;
+            Rc::clone(&playback).export_to(path, window).await;
         }
     });
     views.borrow_mut().playback_task = Some(task);
+}
+
+/// The playback window: the `minutes` before `to`.
+///
+/// # Panics
+///
+/// When `minutes` is outside 1 to [`MAX_WINDOW_MINUTES`], the range that
+/// `--window` admits. [`Window`] takes every window in that range.
+#[must_use]
+fn playback_window(to: WallUs, minutes: u32) -> Window {
+    let from = to.offset(-i64::from(minutes) * MICROS_PER_MINUTE);
+    Window::try_new(from, to).expect("a window of 1 to 10,080 minutes is one the API takes")
 }
 
 /// Builds the window's content: the stack with the grid and the focused view,
@@ -1384,13 +1441,25 @@ fn build_widgets(
     )
 }
 
-fn feed(args: &Args, tls: &Arc<ClientConfig>, camera: &CameraId, kind: StreamKind) -> Feed {
+/// The viewer's API client: on `origin`, with the bearer `token` when there is
+/// one, and with a copy of the TLS trust configuration `tls` that every feed
+/// holds.
+#[must_use]
+fn api_client(origin: &ApiOrigin, token: Option<&Bearer>, tls: &ClientConfig) -> Client {
+    Client::new(origin.clone(), token.cloned(), ClientConfig::clone(tls))
+}
+
+/// The live feed of the `kind` stream of `camera`: on the API client's origin,
+/// with the viewer's bearer and TLS trust configuration, which the client
+/// was built with too.
+#[must_use]
+fn feed(views: &Views, camera: &CameraId, kind: StreamKind) -> Feed {
     Feed {
-        api: args.api.clone(),
-        token: args.token.clone(),
+        origin: views.client.origin().clone(),
+        token: views.token.clone(),
         camera: camera.clone(),
         kind,
-        tls: Arc::clone(tls),
+        tls: Arc::clone(&views.tls),
     }
 }
 
@@ -1409,9 +1478,9 @@ fn start_focused(views: &Views, args: &Args) {
         return;
     };
     let camera = tile.camera();
-    let picture = feed(args, &views.tls, camera, args.focus_kind);
+    let picture = feed(views, camera, args.focus_kind);
     let started = if views.sound_button.is_active() && has_audio(&views.cameras, camera) {
-        tile.start_with_sound(picture, feed(args, &views.tls, camera, StreamKind::Audio))
+        tile.start_with_sound(picture, feed(views, camera, StreamKind::Audio))
     } else {
         tile.start(picture)
     };
@@ -1460,7 +1529,7 @@ fn show_grid(views: &mut Views, args: &Args) {
     let limit = usize::try_from(args.max_tiles.get()).unwrap_or(usize::MAX);
     for (index, tile) in views.tiles.iter().enumerate() {
         if index < limit {
-            if let Err(error) = tile.start(feed(args, &views.tls, tile.camera(), args.kind)) {
+            if let Err(error) = tile.start(feed(views, tile.camera(), args.kind)) {
                 error!(
                     camera = %tile.camera(),
                     error = %format!("{error:#}"),
@@ -1523,12 +1592,15 @@ fn focus(views: &mut Views, camera: &CameraId, args: &Args) {
 mod tests {
     use std::convert::Infallible;
     use std::io::{self, Read, Write};
-    use std::net::{TcpListener, TcpStream};
+    use std::net::{Ipv4Addr, TcpListener, TcpStream};
     use std::pin::Pin;
     use std::sync::Mutex;
     use std::task::{Context, Poll};
 
     use clap::error::ErrorKind;
+    use futures::future::Either;
+    use iris_client::api::Call;
+    use tokio::runtime::Builder;
     use tokio_tungstenite::tungstenite::client::IntoClientRequest as _;
     use tracing_subscriber::fmt::MakeWriter;
 
@@ -1542,15 +1614,39 @@ mod tests {
         playback::tests::dropping_playback_releases_the_view_and_button_callbacks();
         playback::tests::closing_playback_cancels_a_pending_playlist();
         playback::tests::closing_playback_cancels_bounded_thumbnail_requests();
-        playback::tests::replacement_views_share_uninterruptible_decoder_permits();
+        playback::tests::the_first_views_decoders_fetch_two_keyframes();
+        playback::tests::the_first_views_decoders_hold_every_permit();
+        playback::tests::closing_a_view_leaves_its_decoders_running();
+        playback::tests::a_closed_views_decoders_keep_their_permits();
+        playback::tests::replacement_views_run_no_more_decoders_than_the_pool_admits();
+        playback::tests::a_cancelled_permit_waiter_fetches_no_keyframe();
+        playback::tests::a_closed_view_shows_no_thumbnail_of_its_generation();
+        playback::tests::ended_decoders_return_their_permits();
         playback::tests::export_terminal_status_cannot_be_overwritten_by_progress();
+        playback::tests::export_shows_the_refusal_of_a_range_over_seven_days();
+        playback::tests::a_refused_range_leaves_a_running_export_running();
         playback::tests::a_window_holding_only_a_stale_open_segment_shows_nothing_recorded();
         playback::tests::playback_error_releases_its_snapshot_listener();
+        playback::tests::playback_error_releases_its_pipeline();
         navigation_event_cancels_a_stalled_playback_request();
-        grid_decodes_at_most_max_tiles_feeds();
-        the_remove_button_shows_only_for_provisioned_cameras();
-        the_sound_button_starts_the_focused_view_with_or_without_sound();
-        closing_the_add_camera_dialog_releases_it_and_its_form();
+        the_grid_starts_a_feed_for_each_tile_up_to_max_tiles();
+        the_grid_starts_no_feed_after_max_tiles();
+        a_tile_after_max_tiles_names_the_option();
+        leaving_the_grid_stops_every_tile();
+        every_feed_carries_the_viewers_bearer();
+        the_remove_button_shows_for_a_provisioned_camera();
+        the_remove_button_hides_for_a_configured_camera();
+        focusing_a_camera_with_audio_plays_its_sound();
+        toggling_the_sound_button_tells_the_main_loop();
+        the_sound_turned_off_starts_the_view_over_without_sound();
+        the_view_started_over_with_the_sound_off_is_running();
+        the_sound_turned_on_again_starts_the_view_over_with_the_sound();
+        focusing_with_the_sound_off_plays_the_picture_alone();
+        the_sound_button_shows_for_a_camera_with_audio();
+        the_sound_button_hides_for_a_camera_without_audio();
+        a_camera_without_audio_plays_the_picture_alone();
+        closing_the_add_camera_dialog_releases_it();
+        closing_the_add_camera_dialog_releases_its_form();
     }
 
     fn camera(id: &str) -> CameraId {
@@ -1684,40 +1780,56 @@ mod tests {
         assert!(!output.contains(TOKEN), "authorization must not reach logs");
     }
 
-    fn check(url: &str, allow: bool) -> anyhow::Result<()> {
-        check_api_url(&Url::parse(url).unwrap(), allow)
+    fn check(url: &str, plain_http: PlainHttp) -> anyhow::Result<ApiOrigin> {
+        api_origin(Url::parse(url).unwrap(), plain_http)
     }
 
     #[test]
-    fn plain_http_to_loopback_and_https_anywhere_are_accepted() {
+    fn plain_http_to_loopback_is_accepted() {
         for accepted in [
             "http://127.0.0.1:8554",
             "http://127.3.4.5:8554",
             "http://[::1]:8554",
             "http://localhost:8554",
-            "https://192.0.2.10:8443",
-            "https://nvr.example:8443/",
         ] {
-            assert!(check(accepted, false).is_ok(), "{accepted}");
+            assert!(
+                check(accepted, PlainHttp::LoopbackOnly).is_ok(),
+                "{accepted}"
+            );
         }
     }
 
     #[test]
-    fn plain_http_to_a_remote_api_needs_an_explicit_opt_in() {
-        let refused = check("http://192.0.2.10:8554", false).unwrap_err();
-        assert!(refused.to_string().contains("--allow-insecure-http"));
-        assert!(check("http://192.0.2.10:8554", true).is_ok());
+    fn https_to_any_host_is_accepted() {
+        for accepted in ["https://192.0.2.10:8443", "https://nvr.example:8443/"] {
+            assert!(
+                check(accepted, PlainHttp::LoopbackOnly).is_ok(),
+                "{accepted}"
+            );
+        }
+    }
+
+    /// Plain HTTP to a host other than loopback is accepted under the
+    /// policy that `--allow-insecure-http` selects.
+    #[test]
+    fn plain_http_to_a_remote_api_is_accepted_with_the_opt_in() {
+        assert!(check("http://192.0.2.10:8554", PlainHttp::Anywhere).is_ok());
     }
 
     #[test]
-    fn api_urls_with_another_scheme_or_userinfo_are_refused() {
+    fn api_urls_with_another_scheme_are_refused() {
+        for refused in ["ftp://127.0.0.1/", "file:///example"] {
+            assert!(check(refused, PlainHttp::Anywhere).is_err(), "{refused}");
+        }
+    }
+
+    #[test]
+    fn api_urls_with_userinfo_are_refused() {
         for refused in [
-            "ftp://127.0.0.1/",
-            "file:///example",
             "http://user:secret@127.0.0.1:8554",
             "https://user@192.0.2.10/",
         ] {
-            assert!(check(refused, true).is_err(), "{refused}");
+            assert!(check(refused, PlainHttp::Anywhere).is_err(), "{refused}");
         }
     }
 
@@ -1729,12 +1841,174 @@ mod tests {
             "https://nvr.example/?token=x",
             "https://nvr.example/#top",
         ] {
-            let error = check(refused, true).unwrap_err();
+            let error = check(refused, PlainHttp::Anywhere).unwrap_err();
             assert!(
                 error.to_string().contains("only the daemon's origin"),
                 "{refused}"
             );
         }
+    }
+
+    /// A token with a character outside visible ASCII stops the viewer at
+    /// startup with a message that names the option and holds no part of
+    /// the value.
+    #[test]
+    fn a_token_outside_visible_ascii_is_refused_without_its_value() {
+        let refused = bearer(Some("t0\nken")).expect_err("a line feed is not visible ASCII");
+        assert_eq!(
+            refused.to_string(),
+            "the bearer token is empty or holds a character outside visible ASCII; check \
+             --token or IRISD_TOKEN"
+        );
+    }
+
+    /// An empty `IRISD_TOKEN` is no token, so the viewer runs against a
+    /// daemon without authentication.
+    #[test]
+    fn an_empty_token_is_no_token() {
+        let token = bearer(Some("")).expect("an empty value is not refused");
+        assert!(token.is_none(), "{token:?}");
+    }
+
+    #[test]
+    fn a_token_of_blanks_is_no_token() {
+        let token = bearer(Some(" \t ")).expect("a value of blanks is not refused");
+        assert!(token.is_none(), "{token:?}");
+    }
+
+    /// The value of the `Authorization` header in the one request that the
+    /// viewer's API client ([`api_client`]) with `token` sends to a listener
+    /// on the loopback, byte for byte. A `Bearer` shows its token nowhere
+    /// else: it has no `Display`, its `Debug` is redacted, and two cannot be
+    /// compared.
+    fn sent_authorization(token: Option<&Bearer>) -> Option<String> {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback fixture");
+        let address = listener.local_addr().expect("fixture address");
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().expect("accept fixture client");
+            socket
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .expect("set fixture timeout");
+            let mut request = Vec::new();
+            let mut buffer = [0u8; 1024];
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                let read = socket.read(&mut buffer).expect("read fixture request");
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buffer[..read]);
+            }
+            socket
+                .write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n")
+                .expect("finish fixture response");
+            request
+        });
+        let origin = ApiOrigin::parse(&format!("http://{address}"), PlainHttp::LoopbackOnly)
+            .expect("the fixture's origin is on the loopback");
+        let tls = iris_tls::client_config(None).expect("the platform's trust");
+        let client = api_client(&origin, token, &tls);
+        let runtime = Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("a runtime for the one request");
+        // The fixture answers 404, which the call refuses: only the request
+        // matters here.
+        let _ = runtime.block_on(client.cameras());
+        let request = server.join().expect("join fixture server");
+        String::from_utf8_lossy(&request).lines().find_map(|line| {
+            let (name, value) = line.split_once(": ")?;
+            name.eq_ignore_ascii_case("authorization")
+                .then(|| value.to_owned())
+        })
+    }
+
+    /// The viewer's API client sends the viewer's bearer in `Authorization`.
+    #[test]
+    fn the_api_client_sends_the_viewers_bearer() {
+        let token = Bearer::try_new("t0ken").expect("the token is visible ASCII");
+        assert_eq!(
+            sent_authorization(Some(&token)),
+            Some("Bearer t0ken".to_owned())
+        );
+    }
+
+    /// The viewer drops the white space around its token, blanks and a line
+    /// end here, as the daemon drops it around the token of a request. The
+    /// client then sends the token alone.
+    #[test]
+    fn white_space_around_a_token_is_dropped() {
+        let token = bearer(Some(" \tt0ken \r\n")).expect("the token inside is visible ASCII");
+        assert_eq!(
+            sent_authorization(token.as_ref()),
+            Some("Bearer t0ken".to_owned())
+        );
+    }
+
+    #[test]
+    fn a_token_with_a_blank_inside_is_refused() {
+        assert!(
+            bearer(Some("t0 ken")).is_err(),
+            "a blank inside a token is outside visible ASCII"
+        );
+    }
+
+    /// A failure of the API client with a source shows the failure's text,
+    /// then the source's after a colon.
+    #[test]
+    fn a_client_failure_shows_its_text_then_its_source() {
+        let source = Vec::<u8>::new()
+            .try_reserve(usize::MAX)
+            .expect_err("no vector holds usize::MAX bytes");
+        let reason = source.to_string();
+        let failure = ClientError::Reserve {
+            call: Call::Cameras,
+            source,
+        };
+        assert_eq!(
+            failure_text(failure),
+            format!("reserving the answer to listing the cameras: {reason}")
+        );
+    }
+
+    /// The refusal of an API URL with userinfo, as startup prints it: the
+    /// text of `iris-client`, then the viewer's advice.
+    #[test]
+    fn the_userinfo_refusal_ends_with_the_bearer_advice() {
+        let url = "https://user:secret@nvr.example:8443";
+        assert_eq!(
+            check(url, PlainHttp::LoopbackOnly).unwrap_err().to_string(),
+            "the API URL cannot carry userinfo; pass the bearer token in IRISD_TOKEN"
+        );
+    }
+
+    /// The refusal of plain HTTP to a host other than loopback, as startup
+    /// prints it: the text of `iris-client`, then the viewer's advice.
+    #[test]
+    fn the_plain_http_refusal_ends_with_the_tls_proxy_advice() {
+        let remote = Ipv4Addr::new(192, 0, 2, 10);
+        let url = format!("http://{remote}:8554");
+        assert_eq!(
+            check(&url, PlainHttp::LoopbackOnly)
+                .unwrap_err()
+                .to_string(),
+            format!(
+                "refusing plain HTTP to {remote}: the bearer token and video would cross the \
+                 network unencrypted; use an https URL through a TLS proxy, or pass \
+                 --allow-insecure-http"
+            )
+        );
+    }
+
+    #[test]
+    fn plain_http_is_loopback_only_without_the_opt_in() {
+        let args = Args::try_parse_from(["iris-gui"]).unwrap();
+        assert_eq!(args.plain_http(), PlainHttp::LoopbackOnly);
+    }
+
+    #[test]
+    fn the_insecure_http_opt_in_admits_plain_http_anywhere() {
+        let args = Args::try_parse_from(["iris-gui", "--allow-insecure-http"]).unwrap();
+        assert_eq!(args.plain_http(), PlainHttp::Anywhere);
     }
 
     #[test]
@@ -1830,6 +2104,21 @@ mod tests {
         }
     }
 
+    /// The window of the shortest and of the longest `--window` is that many
+    /// minutes before the time the view opens.
+    #[test]
+    fn the_playback_window_is_the_minutes_before_the_view_opens() {
+        let opened = WallUs::new(1_800_000_000_000_000);
+        for (minutes, micros) in [(1, 60_000_000), (MAX_WINDOW_MINUTES, 604_800_000_000)] {
+            let window = playback_window(opened, minutes);
+            assert_eq!(
+                (window.from(), window.to()),
+                (opened.offset(-micros), opened),
+                "{minutes} minutes"
+            );
+        }
+    }
+
     #[test]
     fn focus_takes_a_camera_id() {
         let args = Args::try_parse_from(["iris-gui", "--focus", "cam1"]).unwrap();
@@ -1872,9 +2161,11 @@ mod tests {
         }
     }
 
-    #[test]
-    fn the_add_camera_form_becomes_a_trimmed_request() {
-        let form = CameraForm {
+    /// The request of the form as typed: spaces around the id, the RTSP URL,
+    /// and the password, a blank sub URL, both streams to record, and the
+    /// Dahua CGI events.
+    fn typed_camera() -> NewCamera {
+        camera_from_form(&CameraForm {
             id: " cam8 ".into(),
             rtsp_url: " rtsp://192.0.2.10:554/cam/realmonitor?channel=1&subtype=0 ".into(),
             sub_url: "  ".into(),
@@ -1883,23 +2174,57 @@ mod tests {
             dahua_cgi: true,
             onvif_pull_point: false,
             ..valid_form()
-        };
-        let camera = camera_from_form(&form).unwrap();
-        assert_eq!(camera.id.as_str(), "cam8");
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn the_add_camera_form_trims_the_id() {
+        assert_eq!(typed_camera().id.as_str(), "cam8");
+    }
+
+    #[test]
+    fn the_add_camera_form_trims_the_rtsp_url() {
         assert_eq!(
-            camera.rtsp_url,
+            typed_camera().rtsp_url,
             "rtsp://192.0.2.10:554/cam/realmonitor?channel=1&subtype=0"
         );
-        assert_eq!(
-            camera.sub_url, None,
-            "an empty sub URL is left to the daemon"
-        );
-        assert_eq!(camera.password, " p ass ", "passwords keep their spaces");
-        assert_eq!(camera.record, ["main", "sub"]);
-        assert_eq!(camera.events, ["dahua_cgi"]);
-        let json = serde_json::to_value(&camera).unwrap();
+    }
+
+    #[test]
+    fn a_blank_sub_url_is_left_to_the_daemon() {
+        assert_eq!(typed_camera().sub_url, None);
+    }
+
+    #[test]
+    fn the_password_keeps_its_spaces() {
+        assert_eq!(typed_camera().password, " p ass ");
+    }
+
+    #[test]
+    fn the_record_boxes_name_the_streams_to_record() {
+        assert_eq!(typed_camera().record, [StreamKind::Main, StreamKind::Sub]);
+    }
+
+    #[test]
+    fn the_event_boxes_name_the_event_sources() {
+        assert_eq!(typed_camera().events, [EventSource::DahuaCgi]);
+    }
+
+    #[test]
+    fn the_request_sends_the_camera_id_as_text() {
+        let json = serde_json::to_value(typed_camera()).unwrap();
         assert_eq!(json["id"], "cam8");
-        assert!(json.get("sub_url").is_none());
+    }
+
+    #[test]
+    fn the_request_leaves_out_a_blank_sub_url() {
+        let json = serde_json::to_value(typed_camera()).unwrap();
+        assert!(
+            json.as_object()
+                .is_some_and(|fields| !fields.contains_key("sub_url")),
+            "{json}"
+        );
     }
 
     #[test]
@@ -2008,7 +2333,7 @@ mod tests {
     }
 
     /// Views over fresh widgets whose client and feeds talk to `api`.
-    fn test_views(runtime: &Arc<Runtime>, api: &Url, tx: Sender<Event>) -> Views {
+    fn test_views(runtime: &Arc<Runtime>, api: &ApiOrigin, tx: Sender<Event>) -> Views {
         let (_, stack, grid, focus_box, focus_title, status, remove_button, sound_button) =
             build_widgets(&tx);
         Views {
@@ -2023,10 +2348,15 @@ mod tests {
             playback_task: None,
             thumbnail_decoders: thumbnail_decoder_pool(),
             runtime: Arc::clone(runtime),
-            client: Arc::new(Client::for_tests(api.clone(), None)),
+            client: Client::new(
+                api.clone(),
+                None,
+                Arc::unwrap_or_clone(iris_tls::client_config(None).unwrap()),
+            ),
             tx,
             stage: Stage::new().unwrap(),
-            budget: LiveBudget::new(u64::from(DEFAULT_LIVE_BUDGET_MIB) << 20),
+            budget: Arc::new(LiveBudget::new(u64::from(DEFAULT_LIVE_BUDGET_MIB) << 20)),
+            token: None,
             tls: iris_tls::client_config(None).unwrap(),
             cameras: Vec::new(),
             remove_button,
@@ -2041,104 +2371,221 @@ mod tests {
         let _ = gstgtk4::plugin_register_static();
     }
 
-    /// Under a display: the grid starts feeds for the first `--max-tiles`
-    /// tiles only and labels the rest.
-    fn grid_decodes_at_most_max_tiles_feeds() {
+    /// Views over fresh widgets whose client and feeds talk to the discard
+    /// port, where nothing listens, so the feeds only retry.
+    fn idle_views() -> (Views, Receiver<Event>) {
         init_gtk_and_gstreamer();
         let runtime = Arc::new(Runtime::new().unwrap());
-        // Nothing listens on the discard port, so the feeds only retry.
-        let api = Url::parse("http://127.0.0.1:9").unwrap();
-        let (tx, _rx) = async_channel::unbounded();
-        let mut views = test_views(&runtime, &api, tx);
-        let mut args = Args::try_parse_from(["iris-gui", "--max-tiles", "2"]).unwrap();
-        args.api = api;
+        let api = ApiOrigin::parse("http://127.0.0.1:9", PlainHttp::LoopbackOnly).unwrap();
+        let (tx, rx) = async_channel::unbounded();
+        (test_views(&runtime, &api, tx), rx)
+    }
+
+    /// Views whose grid holds a tile of each of `cameras`, as listed.
+    fn views_of(cameras: &[Camera]) -> (Views, Args, Receiver<Event>) {
+        let (mut views, rx) = idle_views();
+        let args = Args::try_parse_from(["iris-gui"]).unwrap();
+        views.cameras = cameras.to_vec();
+        populate_grid(&mut views, cameras, &args);
+        (views, args, rx)
+    }
+
+    /// Views whose grid of three cameras shows under `--max-tiles 2`.
+    fn grid_of_three_under_two_live_tiles() -> (Views, Receiver<Event>) {
+        let (mut views, rx) = idle_views();
+        let args = Args::try_parse_from(["iris-gui", "--max-tiles", "2"]).unwrap();
         let cameras = ["cam1", "cam2", "cam3"].map(|id| listed(id, false));
         populate_grid(&mut views, &cameras, &args);
         show_grid(&mut views, &args);
+        (views, rx)
+    }
+
+    /// Under a display: the grid starts the feeds of its first `--max-tiles`
+    /// tiles.
+    fn the_grid_starts_a_feed_for_each_tile_up_to_max_tiles() {
+        let (mut views, _rx) = grid_of_three_under_two_live_tiles();
         assert!(views.tiles[0].is_running() && views.tiles[1].is_running());
+        leave_views(&mut views);
+    }
+
+    /// Under a display: the grid starts no feed for a tile after the first
+    /// `--max-tiles`.
+    fn the_grid_starts_no_feed_after_max_tiles() {
+        let (mut views, _rx) = grid_of_three_under_two_live_tiles();
         assert!(!views.tiles[2].is_running());
-        assert!(
-            views.tiles[2].label_text().contains("--max-tiles"),
-            "{}",
-            views.tiles[2].label_text()
-        );
+        leave_views(&mut views);
+    }
+
+    /// Under a display: a tile the grid does not start names `--max-tiles`
+    /// as the reason.
+    fn a_tile_after_max_tiles_names_the_option() {
+        let (mut views, _rx) = grid_of_three_under_two_live_tiles();
+        let label = views.tiles[2].label_text();
+        assert!(label.contains("--max-tiles"), "{label}");
+        leave_views(&mut views);
+    }
+
+    /// Under a display: leaving the grid stops every tile.
+    fn leaving_the_grid_stops_every_tile() {
+        let (mut views, _rx) = grid_of_three_under_two_live_tiles();
         leave_views(&mut views);
         assert!(views.tiles.iter().all(|tile| !tile.is_running()));
     }
 
-    /// Under a display: the focused view offers "Remove camera" for a camera
-    /// the API added and hides it for one from the configuration file.
-    fn the_remove_button_shows_only_for_provisioned_cameras() {
-        init_gtk_and_gstreamer();
-        let runtime = Arc::new(Runtime::new().unwrap());
-        let api = Url::parse("http://127.0.0.1:9").unwrap();
-        let (tx, _rx) = async_channel::unbounded();
-        let mut views = test_views(&runtime, &api, tx);
-        let mut args = Args::try_parse_from(["iris-gui"]).unwrap();
-        args.api = api;
-        let cameras = [listed("added", true), listed("configured", false)];
-        views.cameras = cameras.to_vec();
-        populate_grid(&mut views, &cameras, &args);
+    /// Under a display: every feed of the viewer, of a picture or of its
+    /// sound, carries the viewer's bearer.
+    fn every_feed_carries_the_viewers_bearer() {
+        let (mut views, _rx) = idle_views();
+        views.token = Some(Bearer::try_new("t0ken").unwrap());
+        for kind in [StreamKind::Main, StreamKind::Sub, StreamKind::Audio] {
+            assert!(
+                feed(&views, &camera("cam1"), kind).token.is_some(),
+                "the {kind} feed must carry the bearer"
+            );
+        }
+    }
+
+    /// Under a display: the focused view shows "Remove camera" for a camera
+    /// the API added.
+    fn the_remove_button_shows_for_a_provisioned_camera() {
+        let (mut views, args, _rx) = views_of(&[listed("added", /* provisioned */ true)]);
+        views.remove_button.set_visible(false);
         focus(&mut views, &camera("added"), &args);
         assert!(views.remove_button.is_visible());
+        leave_views(&mut views);
+    }
+
+    /// Under a display: the focused view hides "Remove camera" for a camera
+    /// from the configuration file.
+    fn the_remove_button_hides_for_a_configured_camera() {
+        let (mut views, args, _rx) =
+            views_of(&[listed("configured", /* provisioned */ false)]);
         focus(&mut views, &camera("configured"), &args);
         assert!(!views.remove_button.is_visible());
         leave_views(&mut views);
     }
 
-    /// Under a display: the focused view plays the camera's sound while its
-    /// "Sound" button is on, and starts over with the picture alone when the
-    /// button is turned off, and with the sound when it is turned on again.
-    fn the_sound_button_starts_the_focused_view_with_or_without_sound() {
-        init_gtk_and_gstreamer();
-        let runtime = Arc::new(Runtime::new().unwrap());
-        let api = Url::parse("http://127.0.0.1:9").unwrap();
-        let (tx, rx) = async_channel::unbounded();
-        let mut views = test_views(&runtime, &api, tx);
-        let mut args = Args::try_parse_from(["iris-gui"]).unwrap();
-        args.api = api;
-        let cameras = [listed("cam1", false)];
-        views.cameras = cameras.to_vec();
-        populate_grid(&mut views, &cameras, &args);
-        focus(&mut views, &camera("cam1"), &args);
-        let has_sound = |views: &Views| views.focused.as_ref().map(Tile::has_sound);
-        assert_eq!(has_sound(&views), Some(true));
-        while rx.try_recv().is_ok() {}
-        views.sound_button.set_active(false);
-        assert!(matches!(rx.try_recv(), Ok(Event::SoundToggled)));
-        start_focused(&views, &args);
-        assert_eq!(has_sound(&views), Some(false));
-        assert!(views.focused.as_ref().is_some_and(Tile::is_running));
-        views.sound_button.set_active(true);
-        start_focused(&views, &args);
-        assert_eq!(has_sound(&views), Some(true));
-        // Another camera is focused with the button as it stands.
-        views.sound_button.set_active(false);
-        focus(&mut views, &camera("cam1"), &args);
-        assert_eq!(has_sound(&views), Some(false));
-        assert!(views.sound_button.is_visible());
-        // A camera without audio has no button and no sound, whatever the
-        // button was left at.
-        views.sound_button.set_active(true);
-        views.cameras = vec![Camera {
+    /// The camera `cam1`, listed without recorded audio.
+    fn silent_cam1() -> Camera {
+        Camera {
             has_audio: false,
-            ..listed("cam1", false)
-        }];
+            ..listed("cam1", /* provisioned */ false)
+        }
+    }
+
+    /// Whether the focused tile runs the camera's sound; `None` without a
+    /// focused tile.
+    fn focused_sound(views: &Views) -> Option<bool> {
+        views.focused.as_ref().map(Tile::has_sound)
+    }
+
+    /// Under a display: a camera with audio, focused while the "Sound"
+    /// button is on, plays its sound.
+    fn focusing_a_camera_with_audio_plays_its_sound() {
+        let (mut views, args, _rx) = views_of(&[listed("cam1", /* provisioned */ false)]);
         focus(&mut views, &camera("cam1"), &args);
-        assert!(!views.sound_button.is_visible());
-        assert_eq!(has_sound(&views), Some(false));
+        assert_eq!(focused_sound(&views), Some(true));
         leave_views(&mut views);
     }
 
-    /// Under a display: closing the Add camera dialog releases the dialog and
-    /// its form, whose callbacks hold them weakly.
-    fn closing_the_add_camera_dialog_releases_it_and_its_form() {
+    /// Under a display: toggling the "Sound" button tells the main loop.
+    fn toggling_the_sound_button_tells_the_main_loop() {
+        let (views, _args, rx) = views_of(&[listed("cam1", /* provisioned */ false)]);
+        while rx.try_recv().is_ok() {}
+        views.sound_button.set_active(false);
+        assert!(matches!(rx.try_recv(), Ok(Event::SoundToggled)));
+    }
+
+    /// Views focused on `cam1` with its sound, then started over with the
+    /// "Sound" button off.
+    fn focused_view_with_the_sound_turned_off() -> (Views, Args, Receiver<Event>) {
+        let (mut views, args, rx) = views_of(&[listed("cam1", /* provisioned */ false)]);
+        focus(&mut views, &camera("cam1"), &args);
+        views.sound_button.set_active(false);
+        start_focused(&views, &args);
+        (views, args, rx)
+    }
+
+    /// Under a display: with the "Sound" button off, the focused view starts
+    /// over without the camera's sound.
+    fn the_sound_turned_off_starts_the_view_over_without_sound() {
+        let (mut views, _args, _rx) = focused_view_with_the_sound_turned_off();
+        assert_eq!(focused_sound(&views), Some(false));
+        leave_views(&mut views);
+    }
+
+    /// Under a display: with the "Sound" button off, the focused view starts
+    /// over with its picture running.
+    fn the_view_started_over_with_the_sound_off_is_running() {
+        let (mut views, _args, _rx) = focused_view_with_the_sound_turned_off();
+        assert!(views.focused.as_ref().is_some_and(Tile::is_running));
+        leave_views(&mut views);
+    }
+
+    /// Under a display: with the "Sound" button on again, the focused view
+    /// starts over with the sound.
+    fn the_sound_turned_on_again_starts_the_view_over_with_the_sound() {
+        let (mut views, args, _rx) = views_of(&[listed("cam1", /* provisioned */ false)]);
+        focus(&mut views, &camera("cam1"), &args);
+        views.sound_button.set_active(false);
+        start_focused(&views, &args);
+        views.sound_button.set_active(true);
+        start_focused(&views, &args);
+        assert_eq!(focused_sound(&views), Some(true));
+        leave_views(&mut views);
+    }
+
+    /// Under a display: a camera focused while the "Sound" button is off
+    /// plays the picture alone.
+    fn focusing_with_the_sound_off_plays_the_picture_alone() {
+        let (mut views, args, _rx) = views_of(&[listed("cam1", /* provisioned */ false)]);
+        views.sound_button.set_active(false);
+        focus(&mut views, &camera("cam1"), &args);
+        assert_eq!(focused_sound(&views), Some(false));
+        leave_views(&mut views);
+    }
+
+    /// Under a display: focusing a camera with audio shows the "Sound"
+    /// button, which was hidden, though the button is off.
+    fn the_sound_button_shows_for_a_camera_with_audio() {
+        let (mut views, args, _rx) = views_of(&[listed("cam1", /* provisioned */ false)]);
+        views.sound_button.set_visible(false);
+        views.sound_button.set_active(false);
+        focus(&mut views, &camera("cam1"), &args);
+        assert!(views.sound_button.is_visible());
+        leave_views(&mut views);
+    }
+
+    /// Under a display: focusing a camera without audio hides the "Sound"
+    /// button.
+    fn the_sound_button_hides_for_a_camera_without_audio() {
+        let (mut views, args, _rx) = views_of(&[silent_cam1()]);
+        focus(&mut views, &camera("cam1"), &args);
+        assert!(!views.sound_button.is_visible());
+        leave_views(&mut views);
+    }
+
+    /// Under a display: a camera without audio plays the picture alone while
+    /// the "Sound" button is on.
+    fn a_camera_without_audio_plays_the_picture_alone() {
+        let (mut views, args, _rx) = views_of(&[silent_cam1()]);
+        views.sound_button.set_active(true);
+        focus(&mut views, &camera("cam1"), &args);
+        assert_eq!(focused_sound(&views), Some(false));
+        leave_views(&mut views);
+    }
+
+    /// The Add camera dialog and its form, held weakly, once the dialog has
+    /// been presented, closed, and dropped, and the main loop has run until
+    /// both are released or two seconds have passed.
+    fn closed_add_camera_dialog() -> (glib::WeakRef<gtk::Window>, Weak<FormWidgets>) {
         gtk::init().unwrap();
         let runtime = Arc::new(Runtime::new().unwrap());
-        let client = Arc::new(Client::for_tests(
-            Url::parse("http://127.0.0.1:9").unwrap(),
+        let client = Client::new(
+            ApiOrigin::parse("http://127.0.0.1:9", PlainHttp::LoopbackOnly).unwrap(),
             None,
-        ));
+            Arc::unwrap_or_clone(iris_tls::client_config(None).unwrap()),
+        );
         let (tx, _rx) = async_channel::unbounded();
         let (dialog, form) = add_camera_dialog(&client, &runtime, &tx, None);
         dialog.present();
@@ -2153,10 +2600,23 @@ mod tests {
             while context.iteration(false) {}
             std::thread::sleep(Duration::from_millis(5));
         }
+        (window, form)
+    }
+
+    /// Under a display: closing the Add camera dialog releases it, since its
+    /// button callbacks hold it weakly.
+    fn closing_the_add_camera_dialog_releases_it() {
+        let (window, _form) = closed_add_camera_dialog();
         assert!(
             window.upgrade().is_none(),
             "a closed dialog must be released"
         );
+    }
+
+    /// Under a display: closing the Add camera dialog releases its form,
+    /// since the form's widgets hold it weakly.
+    fn closing_the_add_camera_dialog_releases_its_form() {
+        let (_window, form) = closed_add_camera_dialog();
         assert!(
             form.upgrade().is_none(),
             "a closed dialog must release its form"
@@ -2193,13 +2653,13 @@ mod tests {
             );
             axum::serve(listener, app).await.unwrap();
         });
-        let api = Url::parse(&format!("http://{address}")).unwrap();
+        let api = ApiOrigin::parse(&format!("http://{address}"), PlainHttp::LoopbackOnly).unwrap();
         let (tx, rx) = async_channel::unbounded();
         let views = Rc::new(RefCell::new(test_views(&runtime, &api, tx.clone())));
         let args = Args::try_parse_from([
             "iris-gui",
             "--api",
-            api.as_str(),
+            api.url().as_str(),
             "--columns",
             "1",
             "--focus",
@@ -2235,7 +2695,7 @@ mod tests {
         assert!(
             matches!(
                 futures::future::select(received, timeout).await,
-                futures::future::Either::Left(_)
+                Either::Left(_)
             ),
             "{failure}"
         );
@@ -2261,7 +2721,7 @@ mod tests {
         assert!(
             matches!(
                 futures::future::select(transitioned, timeout).await,
-                futures::future::Either::Left(_)
+                Either::Left(_)
             ),
             "the real navigation event must return to the grid"
         );
